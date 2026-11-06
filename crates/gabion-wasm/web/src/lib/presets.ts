@@ -1,7 +1,8 @@
 // Scenario presets — the canned starting conditions the control rail offers.
 //
-// A preset is a config, a blurb, a `pacing`, an optional selected node, an
-// optional feed and an `async seed(sim, config, gateways)` that fires its
+// A preset is a config, a blurb, a `pacing` with its feed (which only a held
+// preset may lack), an optional selected node and an
+// `async seed(sim, config, gateways)` that fires its
 // opening commands (partitions, seed requests) against a freshly built
 // cluster. It is deliberately *not* a timed script: the partition→heal
 // narrative is a user gesture during play (the rail's Heal button).
@@ -122,12 +123,6 @@ export function knobsFromPreset(preset: Preset, defaults: SimConfig): Knobs {
   };
 }
 
-/** How the page meets a wave of data packets. `'held'`: it does not step the
- *  engine while the wave flies, and each count changes when its packet lands.
- *  `'live'`: it steps by time and shows every snapshot at once (Sustained
- *  overload, whose feed submits many requests per frame). */
-export type Pacing = 'held' | 'live';
-
 /** A steady, uncapped feed of one-hit requests for the watched key: round-robin
  *  over the live nodes by global hit index (`'every-node'`), or all at one node
  *  (a node that has left takes none). ⌊rate·T⌋ hits are injected by virtual
@@ -144,18 +139,24 @@ export interface SustainedTraffic {
  *  each other zone while the cluster warmed up. */
 export type Gateways = ReadonlyArray<ReadonlyArray<number | undefined>>;
 
-export interface Preset {
+/** How the page meets a wave of data packets, and the preset's feed, which
+ *  the play loop and Step drive where traffic is the subject (the module
+ *  header names them). `'held'`: the page does not step the engine while the
+ *  wave flies, and each count changes when its packet lands. `'live'`: it
+ *  steps by time and shows every snapshot at once, because its feed submits
+ *  many requests per frame (Sustained overload), so a live preset has one. */
+type Paced =
+  | { readonly pacing: 'held'; readonly traffic?: SustainedTraffic }
+  | { readonly pacing: 'live'; readonly traffic: SustainedTraffic };
+
+export type Preset = Paced & {
   readonly id: string;
   readonly label: string;
   /** What the scenario shows, built from the config the cluster is built with. */
   blurb(config: SimConfig): Blurb;
   readonly config: Partial<SimConfig>;
-  readonly pacing: Pacing;
   /** The node the scenario opens with selected, so its gateways show on load. */
   readonly select?: number;
-  /** A feed the play loop and Step drive, where traffic is the subject (the
-   *  module header names them). */
-  readonly traffic?: SustainedTraffic;
   /** Surfaces the Aggregate-vs-Limit dashboard panel. Only legible when the
    *  scenario drives the aggregate toward a *low* limit (the overload preset):
    *  against a 1 000 000 limit the panel would read as a flat line. */
@@ -163,7 +164,7 @@ export interface Preset {
   /** Fire the preset's opening commands on the warmed cluster, at the current
    *  virtual time. */
   seed(sim: Sim, config: SimConfig, gateways: Gateways): Promise<void>;
-}
+};
 
 /** The nodes the build places in zone `z`: node `i` is in zone `i mod zones`. */
 function members(c: SimConfig, z: number): number[] {

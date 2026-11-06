@@ -1343,6 +1343,8 @@ test('both gateway presets fail over within the window', async ({ page }, info) 
       (await snapshot(page)).nodes.find((n) => n.id === 0)?.gateway_failovers ?? 0;
     await stepUntil(page, async () => (await failovers()) >= 1, WINDOW_MS / PERIOD_MS, `${name}: node 0 failed over`);
     const failedOver = await virtualMs(page);
+    // `stepUntil` checks its deadline before each Step, so the last may overrun it.
+    expect(failedOver - load.virtual_ms, `${name}: node 0 failed over within the window`).toBeLessThan(WINDOW_MS);
     const zoneB = load.nodes.filter((n) => n.zone === 1 && n.id !== faulted).map((n) => n.id);
     await stepUntil(
       page,
@@ -1355,6 +1357,25 @@ test('both gateway presets fail over within the window', async ({ page }, info) 
     );
     console.log(`${name}: failed over ${failedOver - load.virtual_ms} ms after load (the record: ${record.failover_ms} ms)`);
   }
+});
+
+test('the transport stays put when the heartbeat reading appears', async ({ page }, info) => {
+  await open(page);
+  await page.evaluate(() => document.fonts.ready.then(() => undefined));
+  const bar = page.locator('.transport');
+  // Its caption, whose box does not change with the time it reads.
+  const virtualTime = page.locator('.readout-label').first();
+  const before = (await bar.boundingBox())!.height;
+  const left = (await virtualTime.boundingBox())!.x;
+  await page.getByRole('button', { name: 'Play' }).click();
+  await expect(field(page, 'heartbeat-wall')).toHaveAttribute('data-ms', /\d/, { timeout: 30_000 });
+  await page.getByRole('button', { name: 'Pause' }).click();
+  expect((await bar.boundingBox())!.height, 'the bar changed height when the reading appeared').toBe(before);
+  expect((await virtualTime.boundingBox())!.x, 'the virtual time moved when the reading appeared').toBe(left);
+  // From 768 px up, Play, Step, Reset, Speed and both readouts share one row.
+  const play = (await page.getByRole('button', { name: 'Play' }).boundingBox())!.height;
+  if ((page.viewportSize()?.width ?? 0) >= 768) expect(before, 'the bar wrapped').toBeLessThan(2 * play);
+  await bar.screenshot({ path: `audit-shots/${info.project.name}/transport-heartbeat.png` });
 });
 
 // -- A6: interaction -----------------------------------------------------------

@@ -72,7 +72,11 @@ and a one-line annotation reports the latest gateway change or join-sweep
 request.
 
 **Labels.** Zone titles sit at the ring centres and node ids outside the disc,
-else inside it, else along the ring.
+else inside it, else along the ring. The stage paints, back to front, the ring
+guides, the landed routes, the labels with their halo, the beams in flight and
+the nodes: a halo knocks out the ground, while a packet in flight, the figure,
+crosses a zone title on a ring's diameter instead of vanishing under it. A label
+clears every disc and its marks, so it may sit below them.
 Labels are placed greedily (zone titles first, then ids in (zone, id) order). A
 zone title is drawn only if its measured box, halo included, lies inside the
 stage and overlaps no label; a node id must also clear every disc and its marks.
@@ -309,26 +313,33 @@ labels are not rebuilt per snapshot; that every preset opens warmed and settled
 (each seeded node's first wave reaches one gateway per other zone, and
 Propagation opens with its seed everywhere and no beam); that runs go quiet
 after agreement; that both gateway presets fail over within the rule window;
-and the interactions, with touch.
+that the transport bar keeps its height and its readouts their place when the
+heartbeat reading appears, and is one row from 768 px up; and the interactions,
+with touch.
 
 The motion suite (one project, 1440 px, light, motion on) checks rule 29: in
 every held preset, played at 4× after a Send, no node's count rises before a
 beam into it lands or its own request is admitted, no wave leaves while another
 flies, simulated time does not move while a wave is held, and the counts shown
-during a hold are the engine's (also for Steady state at limit 100, whose feed
-flushes at once); back-to-back Sends each flush at once, past the emit floor;
-Step flies Propagation's two waves one at a time, at 1× and at the slowest
-speed, and then reaches the window's edge; a flight lasts longer at a quarter
-speed and Pause freezes it, pool, clock and pixels; the heartbeat readout; the
-stage's allocations over 300 played frames, sampled by the heap profiler and
+during a hold are the engine's (also for Gateway cut at limit 100 and a
+one-second heartbeat, whose trickle flushes at once, held too); back-to-back
+Sends each flush at once, past the emit floor; Step flies Propagation's two
+waves one at a time, at 1× and at the slowest speed, and then reaches the
+window's edge; a flight lasts the flight over the speed, at 1× and at a fifth,
+and Pause freezes it, pool, clock and pixels, with the beams in flight painted
+over the labels; the heartbeat readout; the allocations of the stage's
+per-frame functions over 300 played frames, sampled by the heap profiler and
 mapped to their source through the hidden source maps (boxed doubles, the
-engine's own, aside); and the landed routes, with motion on and reduced.
+engine's own, aside), against the redraws; and the landed routes, with motion
+on and reduced, painted under the labels. The checks of how long a flight or a
+heartbeat takes to watch, and of the back-to-back Sends, run the page on
+Playwright's fake clock, so they hold on any machine.
 
 Full-page PNGs land in `audit-shots/`, which is gitignored; CI uploads it as a
 workflow artifact. All of it downloads a browser, so, like the node
 `smoke.cjs`, it is an on-demand and CI run, not part of `make wasm-check`.
-On the machine that wrote this, `pnpm run audit` takes about two and a half
-minutes with Playwright's default workers.
+On the machine that wrote this, `pnpm run audit` takes three to five minutes
+with Playwright's default workers, depending on what else is running.
 
 ## Why no `vite-plugin-wasm`
 

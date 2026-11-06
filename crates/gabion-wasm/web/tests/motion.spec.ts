@@ -1,23 +1,31 @@
+import { readFileSync } from 'node:fs';
 import { expect, test, type Page } from '@playwright/test';
 import type { ClusterState } from '../src/lib/sim/types';
 import { BEAM_FLIGHT_MS, CONTROL, CROSS, DROPPED, LANDED, RELAY } from '../src/lib/stage/layout';
 import type { BeamPool } from '../src/lib/stage/renderer';
-import { PERIOD_MS, WATCH, setSpeed, step, virtualMs } from './drive';
+import { LANDED_ALPHA } from '../src/lib/theme';
+import { PERIOD_MS, WATCH, setRange, setSpeed, step, virtualMs } from './drive';
 import { sourceOf } from './sourcemap';
 
 // The waves in motion (README "Tests"), run once at 1440 px in the light theme
-// with motion on: cause before effect in every held preset (A13), a Send's
-// eager flush past the emit floor, Step by event (A14), the presentation clock
-// (A15) and the landed routes (A23). Every check reads the engine
+// with motion on: cause before effect in every held preset, a Send's eager
+// flush past the emit floor, Step by event, the presentation clock, the stage's
+// allocations and the landed routes. Every check reads the engine
 // (`window.sim`), the beam pool the stage publishes (`canvas.beams`) or the
 // DOM, never the page's formatters; every wait is a condition with a deadline,
-// in simulated time where one is meant, and wall times are printed, never
-// asserted beyond bounds only a broken mechanism can miss.
+// in simulated time where one is meant. A check of how long something takes to
+// watch runs the page on Playwright's fake clock, so the page's wall time moves
+// only as the test runs it, in frames of the same length on every machine;
+// real wall times are printed, never asserted.
 
 // The flag bits the stage's beam pool packs, passed into the page's functions.
 const BITS = { CROSS, CONTROL, RELAY, DROPPED, LANDED } as const;
 // The animation frames the allocation audit samples.
 const FRAMES = 300;
+// One frame of the fake clock, ms.
+const FRAME_MS = 16;
+// How far the test runs the fake clock between checks: a few frames.
+const RUN_MS = 100;
 
 /** The page's engine, snapshotted, with node `inspect`'s rows. */
 const snapshot = (page: Page, inspect: number | null = null): Promise<ClusterState> =>
@@ -48,10 +56,12 @@ async function loadPreset(page: Page, name: string): Promise<void> {
   await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
 }
 
-/** Rebuild the running scenario with rule limit `limit`. */
-async function rebuildAtLimit(page: Page, limit: number): Promise<void> {
+/** Rebuild the running scenario with rule limit `limit` and, if given, a
+ *  heartbeat period of `heartbeatMs`. */
+async function rebuildAtLimit(page: Page, limit: number, heartbeatMs?: number): Promise<void> {
   await page.getByText('Tune the cluster').click();
   await page.locator('#knob-limit').fill(String(limit));
+  if (heartbeatMs !== undefined) await setRange(page.locator('#knob-gossip'), heartbeatMs);
   await page.getByRole('button', { name: 'Rebuild cluster' }).click();
   await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
   await expect(page.locator('.tune-status')).toContainText('match');
@@ -75,6 +85,49 @@ type Canvas = HTMLCanvasElement & { beams: BeamPool };
 /** Evaluate `read` against the stage's canvas in the page. */
 function pool<T>(page: Page, read: (c: Canvas) => T): Promise<T> {
   return page.locator('.stage canvas').evaluate(read);
+}
+
+/** Put the page on Playwright's fake clock, which runs on its own until
+ *  `stopClock`, and load it. */
+async function openOnFakeClock(page: Page): Promise<void> {
+  await page.clock.install();
+  await open(page);
+}
+
+/** Stop the page's fake clock: from here the page's time moves only as the
+ *  test runs it (`runUntil`), until `page.clock.resume()`. */
+async function stopClock(page: Page): Promise<void> {
+  await page.clock.pauseAt(await page.evaluate((frame) => Date.now() + frame, FRAME_MS));
+}
+
+/** Run the page's fake clock until `done` holds, at most `maxMs` of the page's
+ *  time, and return the time it ran: a deadline in page time, so the outcome is
+ *  the same however loaded the machine. */
+async function runUntil(page: Page, done: () => Promise<boolean>, maxMs: number, what: string): Promise<number> {
+  let ran = 0;
+  while (!(await done())) {
+    if (ran >= maxMs) throw new Error(`${what}: not within ${maxMs} ms of the page's time`);
+    await page.clock.runFor(RUN_MS);
+    ran += RUN_MS;
+  }
+  return ran;
+}
+
+/** Each beam Graphics now drawing a mark, as its layer's paint position
+ *  relative to the labels' layer: above it when positive. Null when the stage
+ *  has no label layer. */
+function paintOrder(page: Page): Promise<number[] | null> {
+  type Node = { parent: Node | null; children: Node[] };
+  type Gfx = Node & { context: { instructions: unknown[] } };
+  return page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { beamGfx: Gfx[] }) => {
+    const root = c.beamGfx[0].parent?.parent;
+    if (root == null) return null;
+    const labels = root.children.findIndex((layer) => layer.children.some((child) => 'text' in child));
+    if (labels < 0) return null;
+    return c.beamGfx
+      .filter((g) => g.context.instructions.length > 0)
+      .map((g) => root.children.indexOf(g.parent as Node) - labels);
+  });
 }
 
 /** Wait `frames` animation frames in the page: a count of frames, not a wall
@@ -260,7 +313,7 @@ async function playFor(page: Page, speed: number, ms: number, timeout: number): 
   if ((await page.locator('.stage-pane').getAttribute('data-held')) !== '0') await step(page);
 }
 
-// -- A13: cause before effect ----------------------------------------------------
+// -- Cause before effect ------------------------------------------------------------
 
 test('every held preset changes each count only when its packet lands', async ({ page }) => {
   test.setTimeout(300_000);
@@ -281,25 +334,41 @@ test('every held preset changes each count only when its packet lands', async ({
     expect(found.rises, `${name}: no count rose by a landed packet`).toBeGreaterThanOrEqual(1);
   }
 
-  // Steady state at limit 100: ε is 1, so the one-hit feed flushes at once
-  // whenever a node's pending hits pass it, and those submits are held too.
-  await loadPreset(page, 'Steady state');
-  await rebuildAtLimit(page, 100);
+  // A feed's eager flush is held too. A node flushes at once only when its
+  // unsent hits pass ε, which is 1 at limit 100, so it needs two hits in one
+  // heartbeat period: Gateway cut's trickle of two a second at node 0 puts two
+  // in every period of a second.
+  const name = 'Gateway cut from its zone';
+  await loadPreset(page, name);
+  await rebuildAtLimit(page, 100, 1000);
   await installCausality(page);
+  await page.evaluate(() => {
+    const w = window as unknown as { feedFlushes: number };
+    w.feedFlushes = 0;
+    const sim = window.sim!;
+    const submit = sim.submitRequest.bind(sim);
+    sim.submitRequest = async (...args) => {
+      const batch = await submit(...args);
+      if (batch.events.some((e) => e.kind.type === 'PacketSent' && e.kind.kind === 'Own')) w.feedFlushes += 1;
+      return batch;
+    };
+  });
   const wall = Date.now();
   await playFor(page, 4, 10_000, 90_000);
   const found = await readCausality(page);
-  console.log(`Steady state at limit 100: ${found.holds} hold(s), ${found.checked} checked, ${found.rises} rise(s), ${Date.now() - wall} ms`);
-  expect(found.violations, 'Steady state at limit 100').toEqual([]);
-  expect(found.checked, 'Steady state at limit 100: too few holds compared').toBeGreaterThanOrEqual(3);
-  expect(found.rises, 'Steady state at limit 100: no count rose by a landed packet').toBeGreaterThanOrEqual(1);
+  const flushes = await page.evaluate(() => (window as unknown as { feedFlushes: number }).feedFlushes);
+  console.log(`${name} at limit 100: ${flushes} feed flush(es), ${found.holds} hold(s), ${found.checked} checked, ${found.rises} rise(s), ${Date.now() - wall} ms`);
+  expect(flushes, `${name} at limit 100: the feed flushed no wave`).toBeGreaterThanOrEqual(1);
+  expect(found.violations, `${name} at limit 100`).toEqual([]);
+  expect(found.checked, `${name} at limit 100: too few holds compared`).toBeGreaterThanOrEqual(3);
+  expect(found.rises, `${name} at limit 100: no count rose by a landed packet`).toBeGreaterThanOrEqual(1);
 });
 
 // -- A Send's eager flush, past the emit floor ------------------------------------
 
 test('back-to-back Sends each flush at once, past the emit floor', async ({ page }) => {
   test.setTimeout(120_000);
-  await open(page);
+  await openOnFakeClock(page);
   await loadPreset(page, 'Sandbox');
   await rebuildAtLimit(page, 100);
   await installCausality(page);
@@ -316,29 +385,30 @@ test('back-to-back Sends each flush at once, past the emit floor', async ({ page
       return batch;
     };
   });
-  // Clicked back to back: each Send fast-forwards the one before past its
-  // relays, so it meets no emit floor, whatever the click cadence. At a tenth
-  // of the speed a wave flown at the speed takes at least `slowFlightMs` of
-  // wall time (the presentation clock never outruns the wall), and three of
-  // the Sends each land the wave before theirs, so the four flush within two
-  // such flights only when each fast-forward ran fast.
+  // Clicked back to back, with the page's clock standing still: each Send
+  // fast-forwards the one before past its relays, so it meets no emit floor.
+  // At a tenth of the speed a wave flown at the speed takes `slowFlightMs` of
+  // the page's time, and three of the Sends each land the wave before theirs,
+  // so the four flush within two such flights only when each fast-forward ran
+  // fast.
+  await stopClock(page);
   await setSpeed(page, 0.1);
   const slowFlightMs = BEAM_FLIGHT_MS / 0.1;
-  const clicked = Date.now();
   for (const node of [0, 1, 2, 2]) await railSend(page, node);
-  await expect
-    .poll(() => page.evaluate(() => (window as unknown as { own: number[] }).own.length), {
-      message: 'the four Sends flushed within two flights at a tenth of the speed',
-      timeout: Math.max(0, clicked + 2 * slowFlightMs - Date.now()),
-    })
-    .toBe(4);
-  console.log(`four back-to-back Sends flushed in ${Date.now() - clicked} ms`);
+  const ran = await runUntil(
+    page,
+    async () => (await page.evaluate(() => (window as unknown as { own: number[] }).own.length)) === 4,
+    2 * slowFlightMs,
+    'the four Sends flushed within two flights at a tenth of the speed',
+  );
+  console.log(`four back-to-back Sends flushed in ${ran} ms of the page's time`);
+  await page.clock.resume();
   await still(page);
   expect(await page.evaluate(() => (window as unknown as { own: number[] }).own), 'Own packets per Send').toEqual([5, 5, 5, 5]);
   expect((await readCausality(page)).violations).toEqual([]);
 });
 
-// -- A14: Step by event ------------------------------------------------------------
+// -- Step by event ------------------------------------------------------------------
 
 for (const speed of [1, 0.1]) {
   test(`Step flies Propagation's waves one at a time at ${speed}×`, async ({ page }) => {
@@ -404,17 +474,18 @@ for (const speed of [1, 0.1]) {
   });
 }
 
-// -- A15: the presentation clock ----------------------------------------------------
+// -- The presentation clock ---------------------------------------------------------
 
 test('flights scale with speed and Pause freezes them', async ({ page }, info) => {
   test.setTimeout(180_000);
-  await open(page);
+  await openOnFakeClock(page);
+  await stopClock(page);
 
-  // A data beam's lifetime, pool entry to landing, in wall ms, over node 0's
-  // two waves played at `speed`.
+  // A data beam's lifetime, pool entry to landing, in the page's ms, over node
+  // 0's two waves played at `speed`.
   const lifetime = async (speed: number): Promise<number> => {
     await page.getByRole('button', { name: 'Reset' }).click();
-    await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
+    await runUntil(page, async () => (await page.locator('.overlay.rebuilding').count()) === 0, 10_000, 'the rebuild');
     await page.evaluate((control) => {
       const w = window as unknown as { lives: number[]; born: Map<string, number> };
       w.lives = [];
@@ -437,20 +508,28 @@ test('flights scale with speed and Pause freezes them', async ({ page }, info) =
     await railSend(page, 0);
     await setSpeed(page, speed);
     await page.getByRole('button', { name: 'Play' }).click();
-    await expect
-      .poll(() => page.evaluate(() => (window as unknown as { lives: number[] }).lives.length), { timeout: 30_000 })
-      .toBeGreaterThanOrEqual(11);
+    await runUntil(
+      page,
+      async () => (await page.evaluate(() => (window as unknown as { lives: number[] }).lives.length)) >= 11,
+      30 * BEAM_FLIGHT_MS,
+      `node 0's two waves at ${speed}×`,
+    );
     await page.getByRole('button', { name: 'Pause' }).click();
     const lives = await page.evaluate(() => (window as unknown as { lives: number[] }).lives.slice(0, 11));
     return lives.reduce((a, b) => a + b, 0) / lives.length;
   };
-  const l1 = await lifetime(1);
-  const l4 = await lifetime(0.25);
-  console.log(`a beam's lifetime: ${l1.toFixed(0)} ms at 1×, ${l4.toFixed(0)} ms at 0.25× (ratio ${(l4 / l1).toFixed(2)}, nominally 4)`);
-  expect(l4 / l1, 'a flight at a quarter speed lasts longer').toBeGreaterThan(2);
+  // The speed slider moves in tenths, so a fifth of the speed is the slowest
+  // round fraction it holds. A lifetime is whole frames, so it is up to a frame
+  // off the flight over the speed.
+  for (const speed of [1, 0.2]) {
+    const life = await lifetime(speed);
+    console.log(`a beam's lifetime at ${speed}×: ${life.toFixed(0)} ms`);
+    expect(Math.abs(life - BEAM_FLIGHT_MS / speed), `a flight at ${speed}× lasts the flight over the speed`).toBeLessThanOrEqual(FRAME_MS);
+  }
+  await page.clock.resume();
 
   // Pause mid-flight freezes the wave: the pool, its clock and the stage's
-  // pixels hold still. Captured for the visual audit as V7.
+  // pixels hold still. Captured for the visual audit.
   const freezeAt = async (relay: boolean, shot: string): Promise<void> => {
     await page.evaluate(
       ({ bits, flight, wantRelay }) => {
@@ -481,33 +560,72 @@ test('flights scale with speed and Pause freezes them', async ({ page }, info) =
     expect((await stage.screenshot()).equals(pixels), 'the stage held still').toBe(true);
     await stage.screenshot({ path: `audit-shots/${info.project.name}/${shot}` });
   };
+  // A packet in flight, the figure, passes over a zone title (a ring's
+  // diameter runs under it) rather than vanishing under its halo.
+  const inFlightAboveLabels = async (): Promise<void> => {
+    const order = await paintOrder(page);
+    expect(order, 'the stage has a label layer').not.toBeNull();
+    expect(order!.length, 'a beam in flight is drawn').toBeGreaterThan(0);
+    expect(order!.filter((d) => d <= 0), 'a beam in flight painted under the labels').toEqual([]);
+  };
   await page.getByRole('button', { name: 'Reset' }).click();
   await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
   await railSend(page, 0);
-  await setSpeed(page, 0.25);
+  await setSpeed(page, 0.2);
   await freezeAt(false, 'propagation-wave1.png');
+  await inFlightAboveLabels();
   await step(page);
   await freezeAt(true, 'propagation-wave2.png');
   await step(page);
 });
 
 test('the transport says how long a heartbeat takes to watch', async ({ page }) => {
-  await open(page);
+  await openOnFakeClock(page);
+  await stopClock(page);
   // Propagation opens settled, so its periods pass with no wave held.
   await setSpeed(page, 4);
   const wallMs = page.locator('[data-field="heartbeat-wall"]');
   await page.getByRole('button', { name: 'Play' }).click();
-  await expect(wallMs).toHaveCount(1);
-  const first = await wallMs.getAttribute('data-ms');
-  await expect(wallMs).not.toHaveAttribute('data-ms', first ?? '');
+  await runUntil(page, async () => (await wallMs.getAttribute('data-ms')) !== null, 4 * PERIOD_MS, 'a heartbeat reading');
   const measured = Number(await wallMs.getAttribute('data-ms'));
   await page.getByRole('button', { name: 'Pause' }).click();
-  console.log(`a heartbeat took ${measured.toFixed(0)} ms to watch at 4× (nominally ${PERIOD_MS / 4} ms)`);
-  // Frames quantise the reading by up to one frame either way, so the bound is
-  // half the nominal: a reading divided by the speed once too often is a
-  // quarter of it.
-  expect(measured, 'the reading is the period over the speed').toBeGreaterThanOrEqual(PERIOD_MS / 4 / 2);
+  console.log(`a heartbeat took ${measured.toFixed(0)} ms to watch at 4×`);
+  // The play loop sees a period end only at a frame, so the reading is up to
+  // a frame off the period over the speed.
+  expect(Math.abs(measured - PERIOD_MS / 4), 'the reading is the period over the speed').toBeLessThanOrEqual(FRAME_MS);
 });
+
+/** The functions the stage runs every frame, by source file: the ticker, the
+ *  beam layer's redraw and every helper it calls. */
+const PER_FRAME = {
+  'renderer.ts': ['#tick', '#drawBeams', '#route', '#tangentAt', '#arrowhead', '#stopBar', 'easeInOutQuad'],
+  'layout.ts': ['pointOn'],
+} as const;
+
+/** Each per-frame function's 1-based line range in its source file, read from
+ *  the source, keyed by file. Throws naming a function it cannot find, so a
+ *  rename cannot quietly empty the check. */
+function perFrameLines(): Map<string, [number, number][]> {
+  const ranges = new Map<string, [number, number][]>();
+  for (const [file, names] of Object.entries(PER_FRAME)) {
+    const lines = readFileSync(`src/lib/stage/${file}`, 'utf8').split('\n');
+    ranges.set(
+      file,
+      names.map((name) => {
+        // A method opens indented two spaces and closes at that indent; a
+        // function opens and closes at the margin.
+        const heads = [`  ${name}(`, `function ${name}(`, `export function ${name}(`];
+        const start = lines.findIndex((line) => heads.some((head) => line.startsWith(head)));
+        if (start < 0) throw new Error(`${file} has no function ${name}`);
+        const close = lines[start].startsWith(' ') ? '  }' : '}';
+        const end = lines.findIndex((line, i) => i > start && line === close);
+        if (end < 0) throw new Error(`${file}'s ${name} has no closing brace`);
+        return [start + 1, end + 1];
+      }),
+    );
+  }
+  return ranges;
+}
 
 test('the stage allocates nothing per frame', async ({ page }) => {
   test.setTimeout(120_000);
@@ -518,6 +636,7 @@ test('the stage allocates nothing per frame', async ({ page }) => {
   await railSend(page, 0);
   await page.getByRole('button', { name: 'Play' }).click();
   await frames(page, 60);
+  const perFrame = perFrameLines();
   const cdp = await page.context().newCDPSession(page);
   await cdp.send('HeapProfiler.enable');
   await cdp.send('HeapProfiler.startSampling', {
@@ -535,7 +654,9 @@ test('the stage allocates nothing per frame', async ({ page }) => {
     }
     boxDoubles();
   });
+  const redrawsFrom = await pool(page, (c) => c.beams.redraws);
   await frames(page, FRAMES);
+  const redraws = (await pool(page, (c) => c.beams.redraws)) - redrawsFrom;
   const { profile } = await cdp.send('HeapProfiler.stopSampling');
   await page.getByRole('button', { name: 'Pause' }).click();
 
@@ -562,30 +683,41 @@ test('the stage allocates nothing per frame', async ({ page }) => {
   let app = 0;
   let own = 0;
   let objects = 0;
+  let framed = 0;
   for (const sample of profile.samples) {
     const frame = byId.get(sample.nodeId)?.callFrame;
-    const file = frame?.url.match(/\/assets\/([^/?#]+\.js)$/)?.[1];
-    if (frame === undefined || file === undefined) continue;
+    const bundle = frame?.url.match(/\/assets\/([^/?#]+\.js)$/)?.[1];
+    if (frame === undefined || bundle === undefined) continue;
     app += 1;
-    const source = sourceOf(`dist/assets/${file}.map`, frame.lineNumber, frame.columnNumber);
-    if (source !== null && !source.includes('node_modules')) own += 1;
-    if (source === null || !source.includes('src/lib/stage/') || sample.size === boxed) continue;
+    const source = sourceOf(`dist/assets/${bundle}.map`, frame.lineNumber, frame.columnNumber);
+    if (source !== null && !source.file.includes('node_modules')) own += 1;
+    if (source === null || !source.file.includes('src/lib/stage/') || sample.size === boxed) continue;
     objects += 1;
-    const where = `${frame.functionName || '(anonymous)'} in ${source}, ${sample.size} bytes`;
+    const ranges = perFrame.get(source.file.slice(source.file.lastIndexOf('/') + 1)) ?? [];
+    const each = ranges.some(([from, to]) => source.line >= from && source.line <= to);
+    if (each) framed += 1;
+    const where = `${each ? 'per frame: ' : ''}${frame.functionName || '(anonymous)'} at ${source.file}:${source.line}, ${sample.size} bytes`;
     stage.set(where, (stage.get(where) ?? 0) + 1);
   }
   console.log(
     `${profile.samples.length} samples, ${app} in the app's bundle, ${own} in the page's own code, ${objects} in src/lib/stage/ other than ` +
-      `boxed doubles (${boxed} bytes): ${JSON.stringify([...stage])}`,
+      `boxed doubles (${boxed} bytes), ${framed} of them per frame, over ${redraws} redraws: ${JSON.stringify([...stage])}`,
   );
-  // What remains are the engine's one-off allocations (a function's feedback,
-  // an aligned box): far fewer than one per frame. Code that builds an object
-  // per frame, or per beam, makes at least one each frame.
+  // A sample names the function it fell in, not its line. What remains in the
+  // per-frame functions are V8's one-off allocations as it tiers them up (27
+  // over 259 redraws when measured, a handful per function). An object of 16
+  // bytes or more is sampled with odds of at least 1 − 1/e at this interval,
+  // so code that builds one per redraw leaves samples in most redraws.
   expect(own, "the source map resolved no sample to the page's own code").toBeGreaterThan(0);
-  expect(objects, 'objects the stage allocated over the played frames').toBeLessThan(FRAMES);
+  expect(redraws, 'the beam layer redrew while the waves flew').toBeGreaterThan(0);
+  expect(framed, 'objects the per-frame functions allocated, against the redraws').toBeLessThanOrEqual(redraws / 3);
 });
 
-// -- A23: landed routes ----------------------------------------------------------
+// -- Landed routes -------------------------------------------------------------------
+
+// Run at 1440 px only: the pool holds whatever the stage draws, and the design
+// audit checks that every width lays out every node, so a narrower stage holds
+// the same routes; ten more runs would only lengthen CI.
 
 for (const reducedMotion of ['no-preference', 'reduce'] as const) {
   test.describe(`motion ${reducedMotion}`, () => {
@@ -636,13 +768,17 @@ for (const reducedMotion of ['no-preference', 'reduce'] as const) {
       expect(await landed(), "both waves' routes stay").toBe(11);
       expect(await pool(page, (c) => c.beams.len), 'nothing but the landed routes').toBe(11);
       // Every mark drawn is a landed route's: a stroke 1 px wide at no more than
-      // C11's 0.15 alpha, with no head (heads and dots are fills).
+      // `LANDED_ALPHA`, with no head (heads and dots are fills), painted under
+      // the labels, whose halos knock out the ground.
       type Marks = { context: { instructions: { action: string; data: { style: { width?: number; alpha: number } } }[] } };
       const marks = await page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { beamGfx: Marks[] }) =>
         c.beamGfx.flatMap((g) => g.context.instructions.map(({ action, data }) => ({ action, width: data.style.width, alpha: data.style.alpha }))),
       );
       expect(marks.length, 'the landed routes are drawn').toBeGreaterThan(0);
-      expect(marks.filter((m) => m.action !== 'stroke' || m.width !== 1 || m.alpha > 0.15), 'a landed route drawn other than 1 px and quiet').toEqual([]);
+      expect(marks.filter((m) => m.action !== 'stroke' || m.width !== 1 || m.alpha > LANDED_ALPHA), 'a landed route drawn other than 1 px and quiet').toEqual([]);
+      const order = await paintOrder(page);
+      expect(order, 'the stage has a label layer').not.toBeNull();
+      expect(order!.filter((d) => d >= 0), 'a landed route painted over the labels').toEqual([]);
 
       const redraws = await pool(page, (c) => c.beams.redraws);
       await frames(page, 60);

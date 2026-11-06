@@ -54,14 +54,15 @@
       <span class="readout-label">virtual time</span>
       <span class="readout-value" data-field="virtual-time" data-ms={virtualMs}>{fmtDuration(virtualMs)}</span>
     </span>
-    {#if heartbeatWallMs !== null}
-      <span class="readout-item">
-        <span class="readout-note">
-          a heartbeat took <span data-field="heartbeat-wall" data-ms={heartbeatWallMs}>{fmtDuration(heartbeatWallMs)}</span>
-          to watch
-        </span>
-      </span>
-    {/if}
+    <!-- Its space is kept before the first period has played, so the bar
+         never reflows when it appears. -->
+    <span class="readout-item" class:pending={heartbeatWallMs === null}>
+      <span class="readout-label">a heartbeat took</span>
+      <span class="readout-value"
+        ><span data-field="heartbeat-wall" data-ms={heartbeatWallMs ?? undefined}>{fmtDuration(heartbeatWallMs ?? 0)}</span
+        ><span class="readout-unit">&nbsp;to watch</span></span
+      >
+    </span>
   </div>
 </div>
 
@@ -117,6 +118,11 @@
     color: var(--color-fg-muted);
   }
 
+  /* Narrow enough that the bar stays one row at 768 px with both readouts. */
+  .speed input {
+    width: 5.5rem;
+  }
+
   .speed-value {
     min-width: 2.5rem;
   }
@@ -124,7 +130,7 @@
   .readout {
     margin-left: auto;
     display: flex;
-    gap: var(--gap-lg);
+    gap: var(--gap-md);
   }
 
   .readout-item {
@@ -146,12 +152,19 @@
     color: var(--color-fg);
   }
 
-  .readout-note {
-    font-size: var(--font-size-caption);
-    color: var(--color-fg);
+  /* Room for a reading such as "500 ms", so its first appearance does not
+     shift the readouts. */
+  .readout-value [data-field] {
+    display: inline-block;
+    min-width: 5.5ch;
+    text-align: right;
   }
 
-  .readout-note [data-field] {
-    font-weight: 600;
+  .readout-unit {
+    font-size: var(--font-size-caption);
+  }
+
+  .pending {
+    visibility: hidden;
   }
 </style>

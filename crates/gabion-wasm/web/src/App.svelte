@@ -218,7 +218,9 @@
 
   /** A wave the engine holds in flight: the page shows it and calls the engine
    *  again only once the stage reports it landed, which resolves `landed`.
-   *  `seq` tells one hold from the next. */
+   *  `seq` tells one hold from the next. The stage keeps the landing's due
+   *  instant (`BeamPool.due`); a landing it reports with nothing held, as
+   *  after a failed command, is ignored (`onLanded`). */
   interface Held {
     readonly seq: number;
     readonly landed: Promise<void>;
@@ -227,19 +229,19 @@
   let held = $state.raw<Held | null>(null);
   let holds = 0;
   // Virtual ms one emit floor after the last held wave's instant: `land` runs
-  // the run on to here.
+  // the run on to here. An instant the run has reached leaves nothing due.
   let floorUntil = 0;
   // The tail of the queue every engine call runs on.
   let queue: Promise<void> = Promise.resolve();
   // Whether landed routes stay drawn until the next command: where no feed runs.
   const trail = $derived<Trail>(activePreset.traffic === undefined ? 'keep' : 'drop');
 
-  // Wall ms the last whole heartbeat period took to play, and the period and
-  // wall instant the measurement runs from (`periodWall` 0 until a period
-  // boundary has been crossed since Play).
+  // Wall ms the last whole heartbeat period took to play, and the period the
+  // play loop stands in since Play, with the wall instant it crossed into it
+  // (null in the period Play started in, which is partial); null before the
+  // first advance.
   let heartbeatWallMs = $state<number | null>(null);
-  let periodIndex = -1;
-  let periodWall = 0;
+  let period: { index: number; wall: number | null } | null = null;
 
   let rafId = 0;
   let lastWall = 0;
@@ -474,17 +476,18 @@
   }
 
   /** Fast-forward the run in flight before a command: land the held wave,
-   *  then run on to one emit floor past it, flying the relays due there the
-   *  same way. The run then stands at least one floor past its last threshold
-   *  round, the instant gabion's floor (`runtime.rs` `want_immediate_flush`)
-   *  lets the next eager flush go, whatever the floor knob says. */
+   *  then run on to one emit floor past it, flying each wave due on the way
+   *  (the relays) the same way; each pushes the floor past itself. A step
+   *  also stops where hits leave the window, so it runs until it gets there.
+   *  The run then stands at least one floor past its last threshold round, the
+   *  instant gabion's floor (`runtime.rs` `want_immediate_flush`) lets the next
+   *  eager flush go, whatever the floor knob says. */
   async function land(s: Sim): Promise<void> {
     await flyFast();
-    if (virtualMs < floorUntil) {
+    while (virtualMs < floorUntil) {
       await meet(s, await s.step(floorUntil - virtualMs, EVENT), 0);
       await flyFast();
     }
-    floorUntil = 0;
   }
 
   /** The node feed hit number `index` goes to, or null when none can take it. */
@@ -528,15 +531,19 @@
    *  two period boundaries the play loop crossed. */
   function notePeriod(now: number): void {
     const p = Math.floor(virtualMs / tickMs);
-    if (p === periodIndex) return;
-    if (periodWall !== 0) heartbeatWallMs = (now - periodWall) / (p - periodIndex);
-    periodWall = periodIndex < 0 ? 0 : now;
-    periodIndex = p;
+    if (period === null) {
+      period = { index: p, wall: null };
+      return;
+    }
+    if (p === period.index) return;
+    if (period.wall !== null) heartbeatWallMs = (now - period.wall) / (p - period.index);
+    period.index = p;
+    period.wall = now;
   }
 
   /** Run `task` against the cluster as a command: first fast-forward the run
-   *  in flight past its relays (Conflict 4) and drop the landed routes, then
-   *  let it show its own effect. */
+   *  in flight past its relays and drop the landed routes, then let it show
+   *  its own effect. */
   function command(task: (s: Sim) => Promise<void>): Promise<void> {
     return run(async (s) => {
       await land(s);
@@ -611,8 +618,7 @@
     if (playing || sim === null || loading) return;
     playing = true;
     lastWall = 0;
-    periodIndex = -1;
-    periodWall = 0;
+    period = null;
     rafId = requestAnimationFrame(frame);
   }
 
@@ -727,6 +733,8 @@
         <dd>A receiver's message "I am missing part of your stream; resend from my ack".</dd>
         <dt>join sweep</dt>
         <dd>A one-off copy of a node's whole live store, sent to a zone member that just joined.</dd>
+        <dt>Step</dt>
+        <dd>→ steps to the next event: the next wave of data packets, flown and delivered, or the next instant hits leave the window.</dd>
         <dt>backstop</dt>
         <dd>A gateway that can reach its origin but not its own zone says it cannot relay, and the origin moves to another gateway.</dd>
       </dl>

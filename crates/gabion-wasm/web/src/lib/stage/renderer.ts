@@ -5,12 +5,15 @@
 // `show` (the packets of an engine batch); the class owns all imperative
 // Pixi/GSAP bookkeeping and cleanup.
 //
-// Layers, back to front (design rule 19): the zone ring guides, the beams, the
-// node discs with their arcs, role glyphs and focus rings, then the labels with
-// a halo. Nodes are keyed by stable id: `setLayout` reconciles the live id set
-// against what is on stage, so a join fades in at its ring slot, a leave scales
-// out (its beams cancelled) and every survivor glides to the slot the new
-// layout gives it.
+// Layers, back to front (design rule 19): the zone ring guides, the landed
+// routes, the labels with a halo, the beams in flight, then the node discs with
+// their arcs, role glyphs and focus rings. A label's halo knocks out the
+// ground (guides, history), while a packet in flight, the figure, passes over
+// a zone title rather than vanishing under it; every label is placed clear of
+// the discs and their marks, so it may sit below them. Nodes are keyed by
+// stable id: `setLayout` reconciles the live id set against what is on stage,
+// so a join fades in at its ring slot, a leave scales out (its beams
+// cancelled) and every survivor glides to the slot the new layout gives it.
 //
 // Beams fly on a presentation clock of their own (`BeamPool.clock`), which
 // advances with the ticker's wall time times the speed while playing, and only
@@ -276,9 +279,6 @@ function labelStyle(theme: Theme): TextStyle {
 
 export class StageRenderer {
   readonly #app: Application;
-  readonly #root: Container;
-  readonly #guideLayer: Container;
-  readonly #beamLayer: Container;
   readonly #nodeLayer: Container;
   readonly #labelLayer: Container;
   readonly #reduceMotion: boolean;
@@ -330,23 +330,22 @@ export class StageRenderer {
       typeof window !== 'undefined' &&
       window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-    this.#root = new Container();
-    this.#guideLayer = new Container();
-    this.#beamLayer = new Container();
+    this.#guides = new Graphics();
     this.#nodeLayer = new Container();
     this.#labelLayer = new Container();
-    this.#root.addChild(this.#guideLayer, this.#beamLayer, this.#nodeLayer, this.#labelLayer);
-    this.#app.stage.addChild(this.#root);
-
-    this.#guides = new Graphics();
-    this.#guideLayer.addChild(this.#guides);
+    const history = new Container();
+    const flight = new Container();
+    const root = new Container();
+    root.addChild(this.#guides, history, this.#labelLayer, flight, this.#nodeLayer);
+    this.#app.stage.addChild(root);
 
     // Parent the beam Graphics before registering the ticker, so the first
-    // tick never fires against an orphaned object.
+    // tick never fires against an orphaned object. The landed styles are the
+    // last two.
     for (let i = 0; i < STYLES * 2; i++) {
       const g = new Graphics();
       this.#beamGfx.push(g);
-      this.#beamLayer.addChild(g);
+      (i < LANDED_IN * 2 ? flight : history).addChild(g);
     }
     this.#restyle();
     this.#app.ticker.add(this.#tick, this);
