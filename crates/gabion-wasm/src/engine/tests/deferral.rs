@@ -143,33 +143,40 @@ fn every_command_closes_an_open_sub_step_first() {
 }
 
 /// The script of the equivalence test: two sends, 700 ms apart, and time to
-/// 12 s after the first, past its window, stepped by `until`.
-fn stepped(until: StepUntil) -> Run {
+/// 12 s after the first, past its window, stepped by `until`; and how many
+/// steps returned with a wave held.
+fn stepped(until: StepUntil) -> (Run, usize) {
     run_with_state(rate_limiting(), |mut state| async move {
         ready(&mut state).await;
         let t0 = state.virtual_ms;
         let mut events = Vec::new();
+        let mut holds = 0;
         for (node, to) in [(0, t0 + 700), (1, t0 + 12_000)] {
             events.extend(send(&mut state, node, 25).await.events);
             while state.virtual_ms < to {
-                let delta = to - state.virtual_ms;
+                let (from, delta) = (state.virtual_ms, to - state.virtual_ms);
                 events.extend(state.step(delta, until).await.events);
+                assert!(state.virtual_ms > from, "a step from {from} stood still");
+                holds += usize::from(state.sub_step == SubStep::Open);
             }
             // A wave at `to` itself is still held: deliver it.
             events.extend(state.step(0, StepUntil::Time).await.events);
         }
         let snap = state.snapshot(Some(1), WATCH).await;
         let run = (events, serde_json::to_value(&snap).unwrap());
-        (state, run)
+        (state, (run, holds))
     })
 }
 
-/// Stepping by event to an instant, call after call, gives exactly the
-/// events and the snapshot of stepping there by time in one call.
+/// Stepping by event to an instant, call after call, stops at each wave and
+/// still gives exactly the events and the snapshot of stepping there by time
+/// in one call.
 #[test]
 fn event_stepping_equals_time_stepping() {
-    let (by_event, event_snap) = stepped(StepUntil::Event);
-    let (by_time, time_snap) = stepped(StepUntil::Time);
+    let ((by_event, event_snap), holds) = stepped(StepUntil::Event);
+    let ((by_time, time_snap), time_holds) = stepped(StepUntil::Time);
+    assert_eq!(holds, 2, "stepping by event stops at each send's relays");
+    assert_eq!(time_holds, 0, "stepping by time holds no wave");
     assert_eq!(by_event, by_time);
     assert_eq!(event_snap, time_snap);
 }

@@ -176,13 +176,25 @@ fn node_ids(state: &ClusterState) -> Vec<u32> {
 
 /// A spawned engine survives many `step` commands, and every node runs one
 /// heartbeat per period at its own phase: every phase is under `T`, so each
-/// node has exactly 25 due instants in `(0, 2500]`.
+/// node has exactly 25 due instants in `(0, 2500]`, and the stream carries a
+/// `Tick` for each, at the instant it ran.
 #[test]
 fn every_node_runs_one_heartbeat_per_period() {
     with_engine(test_config(2), |tx| async move {
+        let mut ticks: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
         for _ in 0..5 {
-            step(&tx, 500).await;
+            for event in step(&tx, 500).await.events {
+                if let EventKind::Tick { node } = event.kind {
+                    ticks.entry(node).or_default().push(event.virtual_ms);
+                }
+            }
         }
+        for (node, at) in &ticks {
+            let first = super::first_heartbeat(*node, T, 0);
+            let due: Vec<u64> = (0..25).map(|k| first + k * T).collect();
+            assert_eq!(*at, due, "node {node}'s ticks");
+        }
+        assert_eq!(ticks.len(), 2, "both nodes tick");
         let state = snapshot(&tx).await;
         assert_eq!(state.nodes.len(), 2);
         assert_eq!(state.virtual_ms, 2_500);
@@ -312,6 +324,19 @@ fn error_budget_and_gateway_counters_surface_in_snapshot() {
             .expect("row for g");
         assert_eq!(silent.answer, AnswerState::Owed);
         assert!(silent.own_unacked >= 1);
+        let held = |cells: Vec<CellView>| -> u64 {
+            cells
+                .iter()
+                .filter(|c| c.key == 0 && c.origin == Some(0))
+                .map(|c| c.count)
+                .sum()
+        };
+        assert_eq!(held(cells_of(&state, 0).await), 8);
+        assert_eq!(
+            held(cells_of(&state, g).await),
+            7,
+            "g heard nothing after the silence"
+        );
 
         // Checkpoint B, the counter mirror: each node's counters are the
         // library's own fields.
@@ -694,6 +719,47 @@ fn removed_node_leaves_and_survivors_keep_converging() {
                 .map(|n| (n.id, n.window_total))
                 .collect::<Vec<_>>(),
         );
+    });
+}
+
+/// A join reaches every survivor before its next round: the first survivor
+/// to beat after it sends the newcomer a packet in that round.
+#[test]
+fn the_first_round_after_a_join_reaches_the_newcomer() {
+    with_state(test_config(12), |mut state| async move {
+        ready(&mut state).await;
+        let joined_at = state.virtual_ms;
+        let mut events = state.add_node(None).await.unwrap().events;
+        let newcomer = state.nodes.last().expect("the joiner").id;
+        events.extend(state.step(T, StepUntil::Time).await.events);
+        let (beat, first) = state
+            .nodes
+            .iter()
+            .filter(|n| n.id != newcomer)
+            .map(|n| (super::first_heartbeat(n.id, T, joined_at), n.id))
+            .min()
+            .expect("survivors");
+        assert!(
+            events.iter().any(|e| e.virtual_ms == beat
+                && matches!(e.kind, EventKind::PacketSent { src, dst, .. }
+                    if src == first && dst == newcomer)),
+            "node {first}, the first to beat after the join, skipped the newcomer at {beat}"
+        );
+        state
+    });
+}
+
+/// A removal shifts the touched marks with the nodes, so a mark left above
+/// the departed node reads the node it named.
+#[test]
+fn a_removal_keeps_each_touched_mark_on_its_node() {
+    with_state(test_config(4), |mut state| async move {
+        state.touched.insert(3);
+        let reads = state.counter_reads;
+        state.remove_node(0).await.unwrap();
+        assert_eq!(state.counter_reads - reads, 1, "node 3, now at position 2");
+        assert!(state.touched.is_empty());
+        state
     });
 }
 

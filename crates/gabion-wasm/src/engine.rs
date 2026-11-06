@@ -516,9 +516,9 @@ struct EngineState {
     substeps: u64,
     /// Whether the current sub-step's packets are still held.
     sub_step: SubStep,
-    /// Positions fired, prompted, sent a packet, or admitting a request in the
-    /// current sub-step: the close half reads the counters of, and sizes its
-    /// drain by, these.
+    /// Positions fired, prompted, sent a packet to, or admitting a request in
+    /// the current sub-step: the close half reads the counters of, and sizes
+    /// its drain by, these.
     touched: NodeSet,
     /// Events drained and stamped, waiting for the next batch.
     outbox: Vec<Event>,
@@ -906,9 +906,8 @@ impl EngineState {
             }
         }
 
-        // Let the newcomer bind and the survivors register the join before we
-        // return, so the immediate snapshot already reflects the new member.
-        self.touched = NodeSet::first(self.nodes.len());
+        // Let the newcomer bind and the survivors register the join before
+        // any of them runs a round. No round runs here, so no counter moves.
         self.drain_pending().await;
         self.drain_log();
         self.observe().await;
@@ -951,11 +950,10 @@ impl EngineState {
         }
         self.addresses.borrow_mut().remove(&addr);
         self.node_id_index.remove(&node_id);
+        self.touched.remove_shift(pos);
 
-        // Let survivors process the departure and the aborted task fully drop.
-        // Every survivor is touched, which also drops any bit a remainder's
-        // drain left at a position the removal has shifted.
-        self.touched = NodeSet::first(self.nodes.len());
+        // Let survivors process the departure, before any of them runs a
+        // round, and the aborted task fully drop.
         self.drain_pending().await;
         self.drain_log();
         self.observe().await;
@@ -1124,7 +1122,7 @@ impl EngineState {
     /// Yield until every touched runtime has been polled after a change, only
     /// the touched nodes having work. Single-thread tokio polls one task per
     /// yield, so the budget is four yields for each touched node, at least
-    /// [`MIN_DRAIN_YIELDS`]; a join or a departure marks every node.
+    /// [`MIN_DRAIN_YIELDS`].
     async fn drain_pending(&mut self) {
         let budget = self.touched.len().saturating_mul(4).max(MIN_DRAIN_YIELDS);
         self.drain_yields += budget as u64;

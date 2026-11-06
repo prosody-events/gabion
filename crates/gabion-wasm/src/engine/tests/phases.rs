@@ -127,6 +127,30 @@ fn quiet_cost_by_counters() {
     });
 }
 
+/// A wave's close reads the counters of its sender and of every node its
+/// packets reached, and of no other node.
+#[test]
+fn a_wave_reads_its_sender_and_receivers() {
+    with_state(rate_limiting(), |mut state| async move {
+        ready(&mut state).await;
+        let held = send(&mut state, 0, 25).await;
+        let mut read: BTreeSet<u32> = held
+            .events
+            .iter()
+            .filter_map(|e| match e.kind {
+                EventKind::PacketSent { dst, .. } => Some(dst),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(read.len(), 5, "the eager flush reached five nodes");
+        read.insert(0);
+        let reads = state.counter_reads;
+        state.step(0, StepUntil::Time).await;
+        assert_eq!(state.counter_reads - reads, read.len() as u64);
+        state
+    });
+}
+
 /// One send's timeline, in ms after the send.
 #[derive(Debug, Default)]
 struct Timeline {
