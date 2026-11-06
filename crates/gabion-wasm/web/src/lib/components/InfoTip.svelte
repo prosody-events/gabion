@@ -62,10 +62,9 @@
     letter-spacing: 0;
     text-transform: none;
     box-shadow: var(--shadow-popover);
-    /* Hidden but kept in the DOM so `aria-describedby` can still reach it. */
-    opacity: 0;
-    visibility: hidden;
-    transition: opacity 120ms ease;
+    /* Hidden but kept in the DOM so `aria-describedby` can still reach it,
+       and out of the layout, so a term near an edge never widens the page. */
+    display: none;
   }
 
   /* Grow inward from the right edge — keeps a right-side term's bubble inside
@@ -77,14 +76,6 @@
 
   .term:hover .bubble,
   .term:focus-visible .bubble {
-    opacity: 1;
-    visibility: visible;
-  }
-
-  /* Reduced motion: no fade, just appear. */
-  @media (prefers-reduced-motion: reduce) {
-    .bubble {
-      transition: none;
-    }
+    display: block;
   }
 </style>

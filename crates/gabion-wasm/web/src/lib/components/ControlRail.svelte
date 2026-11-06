@@ -1,77 +1,95 @@
 <script lang="ts">
-  import { type Knobs, type Preset } from '../presets';
+  import { BURST_HITS_MAX, RULE_LIMIT_MAX, type Knobs, type Preset } from '../presets';
   import { nominalBuckets } from '../buckets';
-  import { fmtCount, zoneLabel, type Blurb } from '../format';
+  import { fmtCount, zoneLabel } from '../format';
   import type { Roles } from '../stage/renderer';
   import type { SimConfig, ZoneView } from '../sim/types';
+  import Icon from './Icon.svelte';
 
-  // The left control rail (the chassis's controls region): scenario presets, the
-  // rebuild knobs (a collapsed disclosure, so the rail stays compact), the
-  // network actions that cut a zone or a gateway and heal them, live membership,
-  // and the keyboard/AT-accessible "send a burst" control (the equivalent of
-  // clicking a disc: the same `burstHits` drives both).
+  // The left control rail: the scenarios in four groups with Hits per Send and
+  // Restart, the rebuild knobs (a collapsed disclosure), the network actions
+  // that cut a zone or one of the selected node's gateways and heal them, and
+  // live membership. Every field is checked when committed (Enter or leaving
+  // it), never while typed, and a disabled control says why beside it.
   let {
     presets,
     activeId,
-    blurb,
-    nodeIds,
+    hitsText = $bindable(),
+    hitsValid,
+    editing,
     zones,
+    selected,
     roles,
     maxZones,
     canAdd,
-    burstHits = $bindable(),
+    canHeal,
+    maxNodes,
     knobs,
     appliedKnobs,
     bucketMs,
     onSelectPreset,
+    onRestart,
+    onCommitHits,
+    onEditHits,
+    onRevertHits,
     onApplyKnobs,
-    onSend,
+    onBackToScenario,
     onCutZone,
     onSilence,
     onCutFromZone,
     onHeal,
     onAddNode,
-    onRemoveNode,
+    onPreview,
   }: {
     presets: readonly Preset[];
     activeId: string;
-    /** The active scenario's blurb, built from the config the cluster runs. */
-    blurb: Blurb;
-    // The live stable ids in rank order (with gaps after churn): what the send
-    // and remove pickers choose from. Authoritative live set, not 0..N.
-    nodeIds: number[];
+    /** What the Hits per Send field holds, typed or committed. */
+    hitsText: string;
+    /** Whether its last committed value is a valid Hits per Send. */
+    hitsValid: boolean;
+    /** Whether it is being typed: then it is the next action's target. */
+    editing: boolean;
     /** Every zone with its live members, in zone order. */
     zones: ZoneView[];
-    /** The selected origin and its gateways, which name the network actions. */
+    /** The selected node, whose gateways the network actions name. */
+    selected: number;
     roles: Roles | null;
     /** The zone stepper's ceiling, from the engine. */
     maxZones: number;
-    // Whether the cluster is below the live-node cap (gates the Add button).
     canAdd: boolean;
-    burstHits: number;
-    // A live `$state` proxy owned by App: the controls mutate its fields in place
-    // (no reassignment, so it need not be `$bindable`). Editing a knob only
-    // *stages* it: nothing rebuilds until `onApplyKnobs`.
+    /** Whether any cut is listed. */
+    canHeal: boolean;
+    maxNodes: number;
+    // A live `$state` proxy owned by the run: the controls mutate its fields
+    // in place. Editing a knob only *stages* it: nothing rebuilds until
+    // `onApplyKnobs`.
     knobs: Knobs;
-    // The knobs the current engine was built from. A field that differs from
-    // `knobs` is staged-but-not-applied; `onApplyKnobs` (Rebuild) applies them.
     appliedKnobs: Knobs;
-    // The rule's bucket width (`defaults.rule_bucket_ms`, sourced from Rust), so
-    // the window readout's bucket count matches the Strata the inspector draws.
+    // The rule's bucket width (`defaults.rule_bucket_ms`, sourced from Rust).
     bucketMs: number;
     onSelectPreset: (preset: Preset) => void;
+    onRestart: () => void;
+    onCommitHits: () => void;
+    onEditHits: (editing: boolean) => void;
+    /** Escape: back to the last committed value. */
+    onRevertHits: () => void;
     onApplyKnobs: () => void;
-    onSend: (node: number) => void;
+    onBackToScenario: () => void;
     onCutZone: (zone: number) => void;
     onSilence: (gateway: number) => void;
     onCutFromZone: (gateway: number, zone: number) => void;
     onHeal: () => void;
     onAddNode: (zone: number) => void;
-    onRemoveNode: (id: number) => void;
+    /** A control that names a node previews it on the stage while hovered or
+     *  focused. */
+    onPreview: (node: number | null) => void;
   } = $props();
 
+  const active = $derived(presets.find((p) => p.id === activeId));
+  const groups = $derived([0, 1, 2, 3].map((g) => presets.filter((p) => p.group === g)));
+
   // Which rebuild knobs have been moved since the last build: staged, awaiting a
-  // Rebuild. The set drives the per-row "changed" cue and gates the button.
+  // Rebuild.
   const KNOB_FIELDS = [
     'zones',
     'zone_mode',
@@ -82,89 +100,126 @@
     'tick_interval_ms',
   ] as const satisfies readonly (keyof SimConfig & keyof Knobs)[];
   const changed = $derived(new Set(KNOB_FIELDS.filter((k) => knobs[k] !== appliedKnobs[k])));
-  const dirty = $derived(changed.size > 0);
+  const zoneCap = $derived(Math.min(maxZones, knobs.nodes));
+  const whole = (v: unknown, max: number): boolean => Number.isInteger(v) && (v as number) >= 1 && (v as number) <= max;
+  const zonesValid = $derived(whole(knobs.zones, zoneCap));
+  const limitValid = $derived(whole(knobs.rule_limit, RULE_LIMIT_MAX));
+  const canRebuild = $derived(changed.size > 0 && zonesValid && limitValid);
+  const rebuildReason = $derived(
+    changed.size === 0 ? 'nothing staged' : !zonesValid || !limitValid ? 'a setting is out of range' : null,
+  );
 
   // Packet loss reads as a percentage; the engine wants the fraction.
   const lossPct = $derived(Math.round(knobs.uniform_loss * 100));
-  const nodeCount = $derived(nodeIds.length);
-  // The window reads in whole seconds; its bar count uses the same bucket math
-  // the Strata uses (one source of truth: `buckets.ts`). This readout tracks the
-  // *staged* slider value, while the inspector strip reflects the *applied*
-  // engine; the knob's "changed" cue flags exactly that gap.
   const windowSec = $derived(Math.round(knobs.rule_window_ms / 1000));
   const windowBuckets = $derived(nominalBuckets(knobs.rule_window_ms, bucketMs));
-  const zoneCap = $derived(Math.min(maxZones, knobs.nodes));
+  const nodeCount = $derived(zones.reduce((n, z) => n + z.live, 0));
 
   // The zones a network action can name: those with members.
   const liveZones = $derived(zones.flatMap((z, i) => (z.live > 0 ? [{ i, name: zoneLabel(z.name) }] : [])));
   // The zone Add defaults to: the fewest live members, the lowest index on a tie.
   const fewest = $derived(zones.reduce((best, z, i) => (z.live < zones[best].live ? i : best), 0));
-  // The origin's gateways, one per remote zone, in zone order, named by the
-  // selection.
+  // The selected node's gateways, one per remote zone, in zone order.
   const gateways = $derived(
-    roles === null
-      ? []
-      : [...roles.gateways].map(([id, g]) => ({ id, ...g })).sort((a, b) => a.zone - b.zone),
+    roles === null ? [] : [...roles.gateways].map(([id, g]) => ({ id, ...g })).sort((a, b) => a.zone - b.zone),
   );
 
-  // Send, remove, cut and add each pick from a live set. A bare `$state` can't
-  // follow it: before the cluster loads it is null, and a pick can leave under
-  // churn. A reconciling effect snaps each pick to the first live choice whenever
-  // it names none, which also seeds it once the cluster arrives. It converges in
-  // one pass (the snapped value is itself live), so it does not loop.
-  let sendPick = $state<number | null>(null);
-  let removePick = $state<number | null>(null);
   let cutPick = $state<number | null>(null);
   let addPick = $state<number | null>(null);
-  $effect(() => {
-    if (sendPick === null || !nodeIds.includes(sendPick)) sendPick = nodeIds[0] ?? null;
-  });
-  $effect(() => {
-    if (removePick === null || !nodeIds.includes(removePick)) removePick = nodeIds[0] ?? null;
-  });
   $effect(() => {
     if (cutPick === null || !liveZones.some((z) => z.i === cutPick)) cutPick = liveZones[0]?.i ?? null;
   });
   const addZone = $derived(addPick ?? fewest);
 
-  function send(): void {
-    if (sendPick !== null) onSend(sendPick);
-  }
-
-  function remove(): void {
-    if (removePick !== null) onRemoveNode(removePick);
-  }
-
   function add(): void {
     onAddNode(addZone);
     addPick = null;
   }
+
+  function onHitsKey(event: KeyboardEvent): void {
+    if (event.key === 'Escape') {
+      // Back to the last committed value before leaving the field, so leaving
+      // it commits nothing.
+      onRevertHits();
+      (event.currentTarget as HTMLInputElement).value = hitsText;
+      (event.currentTarget as HTMLInputElement).blur();
+      event.stopPropagation();
+    }
+  }
+
+  /** The preview events of a control that names node `id`. */
+  const names = (id: number) => ({
+    onpointerenter: () => onPreview(id),
+    onpointerleave: () => onPreview(null),
+    onfocus: () => onPreview(id),
+    onblur: () => onPreview(null),
+  });
 </script>
 
 <aside class="rail" aria-label="Controls">
   <section class="group">
     <h2>Scenario</h2>
     <div class="presets" role="group" aria-label="Scenario preset">
-      {#each presets as preset (preset.id)}
-        <button
-          class="preset"
-          class:active={preset.id === activeId}
-          aria-current={preset.id === activeId ? 'true' : undefined}
-          onclick={() => onSelectPreset(preset)}
-        >
-          {preset.label}
-        </button>
+      {#each groups as group, g (g)}
+        <div class="preset-group">
+          {#each group as preset (preset.id)}
+            <button
+              class="preset"
+              class:active={preset.id === activeId}
+              aria-current={preset.id === activeId ? 'true' : undefined}
+              onclick={() => preset.id !== activeId && onSelectPreset(preset)}
+            >
+              {preset.label}
+            </button>
+          {/each}
+        </div>
       {/each}
     </div>
-    <p class="blurb">{#each blurb as part}{#if typeof part === 'number'}<span data-field="blurb">{part}</span>{:else}{part}{/if}{/each}</p>
+    <div class="hits">
+      <label for="burst-hits">Hits per Send</label>
+      <input
+        id="burst-hits"
+        type="text"
+        inputmode="numeric"
+        autocomplete="off"
+        bind:value={hitsText}
+        data-primary={editing ? '' : undefined}
+        aria-invalid={!hitsValid}
+        aria-describedby={editing ? 'next-action burst-hits-hint' : 'burst-hits-hint'}
+        onfocus={() => onEditHits(true)}
+        onblur={() => onEditHits(false)}
+        onchange={onCommitHits}
+        onkeydown={onHitsKey}
+      />
+    </div>
+    <p class="hint" id="burst-hits-hint" class:bad={!hitsValid}>
+      a whole number from <span data-field="hits-min">{1}</span> to
+      <span data-field="hits-max">{fmtCount(BURST_HITS_MAX)}</span>
+    </p>
+    <button class="btn-secondary restart" title="keeps your settings" onclick={onRestart}>Restart {active?.label ?? ''}</button>
   </section>
 
   <details class="tune">
-    <summary>Tune the cluster</summary>
-    <p class="hint">Edit freely — changes stage until you rebuild.</p>
+    <summary
+      >Tune the cluster{#if changed.size > 0}
+        · <span data-field="staged">{changed.size}</span> staged{/if}</summary
+    >
+    <p class="hint">Edit freely: changes stage until you rebuild.</p>
     <div class="knob" class:changed={changed.has('zones')}>
       <label for="knob-zones">Zones</label>
-      <input id="knob-zones" type="number" min="1" max={zoneCap} step="1" bind:value={knobs.zones} />
+      <input
+        id="knob-zones"
+        type="number"
+        min="1"
+        max={zoneCap}
+        step="1"
+        bind:value={knobs.zones}
+        aria-invalid={!zonesValid}
+        aria-describedby="knob-zones-hint"
+      />
+      <span class="hint" id="knob-zones-hint" class:bad={!zonesValid}
+        >a whole number from <span data-field="zones-min">{1}</span> to <span data-field="zones-max">{zoneCap}</span></span
+      >
     </div>
     <div class="knob" class:changed={changed.has('zone_mode')}>
       <label for="knob-zone-mode">Zone mode</label>
@@ -181,10 +236,6 @@
       <label for="knob-loss">Packet loss<span class="val" data-field="loss">{lossPct}%</span></label>
       <input id="knob-loss" type="range" min="0" max="0.9" step="0.05" bind:value={knobs.uniform_loss} />
     </div>
-    <!-- The rule + gossip knobs. Longer gossip interval = slower propagation;
-         the window readout shows its derived bucket count (the bars the Strata
-         draws); the limit reaches 1 000 000 so a narrative preset's pinned limit
-         is editable, not clamped away. -->
     <div class="knob" class:changed={changed.has('tick_interval_ms')}>
       <label for="knob-gossip">Gossip interval<span class="val" data-field="gossip-interval">{knobs.tick_interval_ms} ms</span></label>
       <input id="knob-gossip" type="range" min="50" max="1000" step="50" bind:value={knobs.tick_interval_ms} />
@@ -195,27 +246,39 @@
     </div>
     <div class="knob" class:changed={changed.has('rule_limit')}>
       <label for="knob-limit">Rule limit</label>
-      <input id="knob-limit" type="number" min="1" max="1000000" step="100" bind:value={knobs.rule_limit} />
+      <input
+        id="knob-limit"
+        type="number"
+        min="1"
+        max={RULE_LIMIT_MAX}
+        step="100"
+        bind:value={knobs.rule_limit}
+        aria-invalid={!limitValid}
+        aria-describedby="knob-limit-hint"
+      />
+      <span class="hint" id="knob-limit-hint" class:bad={!limitValid}
+        >a whole number from <span data-field="limit-min">{1}</span> to
+        <span data-field="limit-max">{fmtCount(RULE_LIMIT_MAX)}</span></span
+      >
     </div>
-    <!-- Build-time settings apply only on an explicit rebuild, so editing never
-         nukes the running sim or collapses this section. The button is live only
-         while there is a staged change. -->
     <div class="tune-apply">
-      <p class="tune-status" aria-live="polite">
-        {#if dirty}
-          <span class="staged-dot" aria-hidden="true"></span>
-          <span data-field="staged">{changed.size}</span> staged — rebuild to apply
-        {:else}
-          Settings match the running cluster.
-        {/if}
-      </p>
-      <button class="rebuild" onclick={onApplyKnobs} disabled={!dirty}>Rebuild cluster</button>
+      <div class="with-reason">
+        <button
+          class="btn-secondary"
+          onclick={onApplyKnobs}
+          disabled={!canRebuild}
+          aria-describedby={rebuildReason === null ? undefined : 'rebuild-reason'}>Rebuild cluster</button
+        >
+        {#if rebuildReason !== null}<span class="reason" id="rebuild-reason">{rebuildReason}</span>{/if}
+      </div>
+      <button class="btn-secondary" onclick={onBackToScenario} disabled={changed.size === 0}
+        >Back to the scenario's settings</button
+      >
     </div>
   </details>
 
   <section class="group">
     <h2>Network</h2>
-    <p class="hint">Cut links to watch the cluster fall behind, then heal them and play to reconcile.</p>
     <div class="field wide">
       <label for="cut-zone">Zone</label>
       <select id="cut-zone" bind:value={cutPick} disabled={liveZones.length === 0}>
@@ -225,33 +288,37 @@
       </select>
     </div>
     <button
-      class="secondary"
+      class="btn-secondary action"
       onclick={() => cutPick !== null && onCutZone(cutPick)}
       disabled={cutPick === null || liveZones.length < 2}
     >
-      Cut {liveZones.find((z) => z.i === cutPick)?.name ?? 'zone'} off
+      <Icon name="cut" />Cut {liveZones.find((z) => z.i === cutPick)?.name ?? 'zone'} off
     </button>
-    {#if gateways.length === 0}
-      <p class="hint">Select a node to see its gateways</p>
-    {:else}
-      {#each gateways as gateway (gateway.zone)}
+    {#if gateways.length > 0}
+      <h3>node <span data-field="node">{selected}</span>'s gateways</h3>
+      {#each gateways as gateway (gateway.id)}
         {@const zone = zoneLabel(zones[gateway.zone].name)}
-        <button class="secondary" onclick={() => onSilence(gateway.id)}>
-          Silence node <span data-field="node">{gateway.id}</span>, the gateway into {zone}
+        <button class="btn-secondary action" onclick={() => onSilence(gateway.id)} {...names(gateway.id)}>
+          <Icon name="silence" />Silence node <span data-field="node">{gateway.id}</span>
         </button>
-        <button class="secondary" onclick={() => onCutFromZone(gateway.id, gateway.zone)}>
-          Cut node <span data-field="node">{gateway.id}</span> from {zone}
+        <button class="btn-secondary action" onclick={() => onCutFromZone(gateway.id, gateway.zone)} {...names(gateway.id)}>
+          <Icon name="cut" />Cut node <span data-field="node">{gateway.id}</span> off from {zone}
         </button>
       {/each}
     {/if}
-    <button class="secondary" onclick={onHeal} disabled={nodeCount === 0}>Heal network</button>
+    <div class="with-reason">
+      <button
+        class="btn-secondary action"
+        onclick={onHeal}
+        disabled={!canHeal}
+        aria-describedby={canHeal ? undefined : 'heal-reason'}><Icon name="reconnect" />Heal network</button
+      >
+      {#if !canHeal}<span class="reason" id="heal-reason">nothing to heal</span>{/if}
+    </div>
   </section>
 
   <section class="group">
     <h2>Cluster</h2>
-    <p class="hint">Add or remove members live — ids stay stable.</p>
-    <!-- The current size, so the +/− pair reads against a live value (system
-         status) without counting discs on the stage. -->
     <div class="members">
       <span class="members-label">Members</span>
       <span class="members-value" data-field="members">{fmtCount(nodeCount)}</span>
@@ -264,51 +331,18 @@
         {/each}
       </select>
     </div>
-    <!-- Which node "Remove" takes: the AT/keyboard path to what the inspector's
-         "Remove this node" does for the selection. Disabled (not hidden) at one
-         node, so the section never changes height. -->
-    <div class="field">
-      <label for="remove-node">Remove</label>
-      <select id="remove-node" bind:value={removePick} disabled={nodeCount <= 1}>
-        {#each nodeIds as id (id)}
-          <option value={id} data-field="node">node {id}</option>
-        {/each}
-      </select>
-    </div>
-    <!-- Add and Remove as a balanced pair, so they read as the inverse of one
-         another. The glyphs are the signifier; the aria-labels carry the action
-         for assistive tech. -->
-    <div class="cluster-actions">
-      <button class="cluster-btn" aria-label="Add node" onclick={add} disabled={!canAdd}>
-        <span class="sign" aria-hidden="true">+</span>Add
-      </button>
+    <div class="with-reason">
       <button
-        class="cluster-btn"
-        aria-label="Remove node"
-        onclick={remove}
-        disabled={nodeCount <= 1}
+        class="btn-secondary action"
+        aria-label="Add node"
+        onclick={add}
+        disabled={!canAdd}
+        aria-describedby={canAdd ? undefined : 'add-reason'}>Add node</button
       >
-        <span class="sign" aria-hidden="true">−</span>Remove
-      </button>
+      {#if !canAdd}<span class="reason" id="add-reason"
+          >the visualizer holds at most <span data-field="max-nodes">{maxNodes}</span> nodes</span
+        >{/if}
     </div>
-  </section>
-
-  <section class="group">
-    <h2>Send a burst</h2>
-    <p class="hint">Pick a node, or click any disc on the stage.</p>
-    <div class="field">
-      <label for="burst-node">Node</label>
-      <select id="burst-node" bind:value={sendPick} disabled={nodeCount === 0}>
-        {#each nodeIds as id (id)}
-          <option value={id} data-field="node">node {id}</option>
-        {/each}
-      </select>
-    </div>
-    <div class="field">
-      <label for="burst-hits">Hits</label>
-      <input id="burst-hits" type="number" min="1" bind:value={burstHits} />
-    </div>
-    <button class="send" onclick={send} disabled={nodeCount === 0}>Send burst</button>
   </section>
 </aside>
 
@@ -334,53 +368,98 @@
   h2 {
     margin: 0;
     font-size: var(--font-size-caption-sm);
-    font-weight: 650;
-    letter-spacing: 0.04em;
+    font-weight: 600;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
     color: var(--color-fg-muted);
   }
 
+  h3 {
+    margin: var(--gap-xs) 0 0;
+    font-size: var(--font-size-caption);
+    font-weight: 600;
+    color: var(--color-fg);
+  }
+
   .hint {
-    margin: 0 0 var(--gap-xs);
+    margin: 0;
     font-size: var(--font-size-caption);
     color: var(--color-fg-muted);
+  }
+
+  .hint.bad {
+    color: var(--color-bad);
   }
 
   .presets {
     display: flex;
     flex-direction: column;
-    gap: var(--gap-xs);
+    gap: 6px;
   }
 
+  .preset-group {
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* A list of scenarios: plain rows, the current one marked by a rule at its
+     left, weight and a tint, never by the fill the next action owns. */
   .preset {
-    padding: var(--gap-xs) var(--gap-sm);
-    border: 1px solid var(--color-border-line);
-    border-radius: var(--radius);
-    background: var(--color-bg);
+    min-height: 32px;
+    padding: 0 var(--gap-sm);
+    border: none;
+    border-left: 3px solid transparent;
+    border-radius: 0;
+    background: none;
     font-size: var(--font-size-caption);
     text-align: left;
-    transition:
-      background 120ms ease,
-      border-color 120ms ease;
   }
 
   .preset:hover {
-    background: var(--color-panel);
-    border-color: var(--color-fg-muted);
+    background: var(--color-bg);
   }
 
-  /* Active scenario marked by fill + weight, not color alone. */
   .preset.active {
-    background: var(--color-fg);
-    border-color: var(--color-fg);
-    color: var(--color-panel);
+    border-left-color: var(--color-fg);
+    background: var(--color-bg);
     font-weight: 600;
+    cursor: default;
   }
 
-  .blurb {
-    margin: var(--gap-xs) 0 0;
+  .hits {
+    display: grid;
+    grid-template-columns: 1fr 4.5rem;
+    align-items: center;
+    gap: var(--gap-sm);
+    margin-top: var(--gap-sm);
     font-size: var(--font-size-caption);
-    line-height: 1.45;
+  }
+
+  .hits input {
+    text-align: right;
+  }
+
+  .restart,
+  .action {
+    align-self: flex-start;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--gap-xs);
+    min-height: 32px;
+    padding: 0 var(--gap-md);
+    font-size: var(--font-size-caption);
+    text-align: left;
+  }
+
+  .with-reason {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--gap-xs) var(--gap-sm);
+  }
+
+  .reason {
+    font-size: var(--font-size-caption);
     color: var(--color-fg-muted);
   }
 
@@ -398,15 +477,24 @@
   }
 
   input[type='number'],
+  input[type='text'],
   select {
     width: 100%;
     padding: var(--gap-xs) var(--gap-sm);
-    border: 1px solid var(--color-border-line);
+    border: 1px solid var(--chart-axis);
     border-radius: var(--radius);
-    background: var(--color-bg);
-    font-family: inherit;
+    background: var(--color-panel);
     font-size: var(--font-size-caption);
     color: var(--color-fg);
+  }
+
+  input[aria-invalid='true'] {
+    border-color: var(--color-bad);
+  }
+
+  input:focus-visible {
+    border: 2px solid var(--color-fg);
+    outline: none;
   }
 
   select:disabled {
@@ -414,76 +502,19 @@
     cursor: not-allowed;
   }
 
-  /* The live member count: a quiet readout the +/− pair acts on. The number
-     dominates its label (visual hierarchy) and is tabular, so it never jitters
-     as nodes join and leave. */
   .members {
     display: flex;
     align-items: baseline;
     justify-content: space-between;
-    padding: var(--gap-xs) var(--gap-sm);
-    border: 1px solid var(--color-border-line);
-    border-radius: var(--radius);
-    background: var(--color-bg);
-  }
-
-  .members-label {
     font-size: var(--font-size-caption);
     color: var(--color-fg-muted);
   }
 
   .members-value {
-    font-size: var(--font-size-heading);
     font-weight: 600;
-    line-height: 1;
     color: var(--color-fg);
   }
 
-  /* Add and Remove on one 8-pt row, equal halves — the inverse-pair reading.
-     `minmax(0, 1fr)` keeps the halves inside the rail at its narrowest, where
-     the 8-px padding still fits each label. */
-  .cluster-actions {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: var(--gap-sm);
-  }
-
-  .cluster-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 0.4em;
-    padding: var(--gap-sm);
-    border: 1px solid var(--color-border-line);
-    border-radius: var(--radius);
-    background: var(--color-bg);
-    font-size: var(--font-size-caption);
-    transition:
-      background 120ms ease,
-      border-color 120ms ease;
-  }
-
-  .cluster-btn:hover:not(:disabled) {
-    background: var(--color-panel);
-    border-color: var(--color-fg-muted);
-  }
-
-  .cluster-btn:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
-  }
-
-  /* The +/− signifier rides a touch larger than the verb and in the soft ink,
-     so it reads as an icon paired with the label, not part of the word. */
-  .cluster-btn .sign {
-    font-size: 1.15em;
-    line-height: 1;
-    color: var(--color-fg-muted);
-  }
-
-  /* Rebuild knobs — collapsed by default so the rail stays compact (Hick's law:
-     fewer simultaneous choices), and so the network/burst controls stay near the
-     top. */
   .tune {
     border-top: 1px solid var(--color-border-line);
     padding-top: var(--gap-sm);
@@ -492,13 +523,13 @@
   .tune summary {
     cursor: pointer;
     font-size: var(--font-size-caption-sm);
-    font-weight: 650;
-    letter-spacing: 0.04em;
+    font-weight: 600;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
     color: var(--color-fg-muted);
   }
 
-  .tune .hint {
+  .tune > .hint {
     margin: var(--gap-sm) 0 0;
   }
 
@@ -535,18 +566,12 @@
     color: var(--color-warn);
   }
 
-  .knob.changed input[type='number'] {
-    border-color: var(--color-warn);
-  }
-
   input[type='range'] {
     width: 100%;
     accent-color: var(--color-fg);
     cursor: pointer;
   }
 
-  /* The explicit apply control: a status line (staged count or "matches") and
-     the Rebuild button, live only while a change is staged. */
   .tune-apply {
     display: flex;
     flex-direction: column;
@@ -554,81 +579,9 @@
     margin-top: var(--gap-md);
   }
 
-  .tune-status {
-    display: flex;
-    align-items: center;
-    gap: 0.4em;
-    margin: 0;
+  .tune-apply button {
+    min-height: 32px;
+    padding: 0 var(--gap-md);
     font-size: var(--font-size-caption);
-    color: var(--color-fg-muted);
-  }
-
-  .staged-dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: var(--color-warn);
-    flex: none;
-  }
-
-  .rebuild {
-    align-self: flex-start;
-    padding: var(--gap-sm) var(--gap-md);
-    border: 1px solid var(--color-fg);
-    border-radius: var(--radius);
-    background: var(--color-fg);
-    color: var(--color-panel);
-    font-size: var(--font-size-caption);
-    transition: background 120ms ease;
-  }
-
-  .rebuild:hover:not(:disabled) {
-    background: var(--color-fg-muted);
-  }
-
-  .rebuild:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
-  }
-
-  .send {
-    margin-top: var(--gap-xs);
-    padding: var(--gap-sm) var(--gap-md);
-    border: 1px solid var(--color-fg);
-    border-radius: var(--radius);
-    background: var(--color-fg);
-    color: var(--color-panel);
-    font-size: var(--font-size-caption);
-    transition: background 120ms ease;
-  }
-
-  .send:hover:not(:disabled) {
-    background: var(--color-fg-muted);
-  }
-
-  .send:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
-  }
-
-  .secondary {
-    align-self: flex-start;
-    text-align: left;
-    padding: var(--gap-sm) var(--gap-md);
-    border: 1px solid var(--color-border-line);
-    border-radius: var(--radius);
-    background: var(--color-bg);
-    font-size: var(--font-size-caption);
-    transition: background 120ms ease;
-  }
-
-  .secondary:hover:not(:disabled) {
-    background: var(--color-panel);
-    border-color: var(--color-fg-muted);
-  }
-
-  .secondary:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
   }
 </style>

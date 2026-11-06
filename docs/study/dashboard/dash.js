@@ -37,7 +37,14 @@
       run();
     },
   };
-  get('params.json').catch((e) => (console.error(e), {})).then((defaults) => {
+  // The faces load before the first render measures any text; a face that
+  // fails, or a slow network past the gate, falls back rather than blocking.
+  const FACES = ['400 1em "Source Sans 3"', '600 1em "Source Sans 3"', '400 1em "Source Serif 4"'];
+  const fontsReady = Promise.race([
+    Promise.allSettled(FACES.map((face) => document.fonts.load(face))),
+    new Promise((resolve) => setTimeout(resolve, 3000)),
+  ]);
+  fontsReady.then(() => get('params.json')).catch((e) => (console.error(e), {})).then((defaults) => {
     state = { ...defaults, ...Object.fromEntries(new URLSearchParams(location.hash.slice(1))) };
     for (const [id, file] of Object.entries(FILES)) {
       get(`../data/${file}.json`).then((rows) => ({ status: 'ok', data: rows }), (e) => (console.error(e), { status: 'error', data: [] }))

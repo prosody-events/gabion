@@ -1,14 +1,27 @@
+<script module lang="ts">
+  /** A node's decision on a Send: how many hits, and whether it admitted. */
+  export interface Decision {
+    readonly hits: number;
+    readonly admitted: boolean;
+  }
+</script>
+
 <script lang="ts">
-  import { fmtCount, fmtDuration, noun, zoneLabel } from '../format';
-  import type { Roles } from '../stage/renderer';
-  import { HIT_MIN, type StageLayout } from '../stage/layout';
+  import { claim, fmtCount, fmtDuration, noun, zoneLabel } from '../format';
+  import type { LabelBox, Roles } from '../stage/renderer';
+  import { HIT_MIN, RING_REACH, type StageLayout } from '../stage/layout';
   import { missingFor, type ClusterState } from '../sim/types';
+  import RoleGlyph from './RoleGlyph.svelte';
+  import Sentence from './Sentence.svelte';
 
   // The stage's text and keyboard alternative. The canvas is opaque to assistive
   // tech and to test tooling, so every node also exists here as a grid cell laid
   // exactly over its disc: focusable with a roving tabindex, named by a sentence,
-  // and the source of the tooltip. "Show as table" lists the same rows as a
-  // table. One row model feeds all three, in (zone, id) order, never re-sorted.
+  // the source of the tooltip, and the home of the node's count, centred in its
+  // disc, and of a Send's decision beside it. "Show as table" lists the same
+  // rows as a table. One row model feeds all three, in (zone, id) order, never
+  // re-sorted. Rows are rebuilt per snapshot: at most 100, by DOM
+  // reconciliation, outside the renderer's no-allocation contract.
   //
   // The cells never take the pointer (`pointer-events: none`): the stage's hit
   // test picks the node under it, so a mouse, a touch and a test all reach the
@@ -21,8 +34,14 @@
     height,
     hoveredId,
     focusedId,
+    showCounts,
+    gliding,
+    decisions,
+    labelBoxes,
+    phone,
+    decisionWidth,
     onSelect,
-    onDeselect,
+    onEscape,
     onFocus,
   }: {
     cluster: ClusterState;
@@ -33,14 +52,26 @@
     height: number;
     hoveredId: number | null;
     focusedId: number | null;
+    /** Whether every count fits its disc: all shown or all hidden. */
+    showCounts: boolean;
+    /** Nodes gliding to a new slot, whose counts hide while they move. */
+    gliding: readonly number[];
+    /** Each node's decision on the last Send, until it is cleared. */
+    decisions: ReadonlyMap<number, Decision>;
+    /** The stage's name boxes, which a decision keeps clear of. */
+    labelBoxes: readonly LabelBox[];
+    phone: boolean;
+    /** A decision's width in px, by its text. */
+    decisionWidth: (text: string) => number;
     onSelect: (id: number) => void;
-    onDeselect: () => void;
+    /** Escape on a cell: the selection returns to the scenario's node. */
+    onEscape: () => void;
     /** The node whose cell has keyboard focus, or `null` once focus leaves. */
     onFocus: (id: number | null) => void;
   } = $props();
 
-  /** What a node is to the selected origin. */
-  type Role = 'origin' | 'gateway' | 'suspect' | null;
+  /** What a node is to the selection. */
+  type Role = 'selected' | 'gateway' | 'suspect' | null;
 
   interface Row {
     id: number;
@@ -54,6 +85,7 @@
     role: Role;
     x: number;
     y: number;
+    r: number;
     /** The cell's half-size, px: the disc, or a 24 px target for a smaller one. */
     half: number;
   }
@@ -63,27 +95,25 @@
     return layout.spots.flatMap((spot) => {
       const node = byId.get(spot.id);
       if (node === undefined) return [];
+      if (import.meta.env.DEV && node.window_total > cluster.oracle_total) {
+        console.error(`node ${node.id} sees ${node.window_total}, more than the true total ${cluster.oracle_total}`);
+      }
       const gateway = roles?.gateways.get(spot.id);
       const role: Role =
-        roles?.origin === spot.id
-          ? 'origin'
-          : gateway === undefined
-            ? null
-            : gateway.suspect
-              ? 'suspect'
-              : 'gateway';
+        roles?.selected === spot.id ? 'selected' : gateway === undefined ? null : gateway.suspect ? 'suspect' : 'gateway';
       return [
         {
           id: spot.id,
           zone: spot.zone,
           zoneName: zoneLabel(cluster.zones[spot.zone].name),
           view: node.window_total,
-          behind: Math.max(cluster.oracle_total - node.window_total, 0),
+          behind: cluster.oracle_total - node.window_total,
           missingFor: missingFor(node.lag),
           gatewayFor: node.gateway_for,
           role,
           x: spot.x,
           y: spot.y,
+          r: spot.r,
           half: Math.max(spot.r, HIT_MIN),
         },
       ];
@@ -131,19 +161,33 @@
     hot === undefined ? 0 : Math.max(0, Math.min(hot.y - tipHeight / 2, height - tipHeight)),
   );
 
+  // A decision stands this far outside the node's ring.
+  const DECISION_GAP = 9;
+
+  /** Where node `row`'s decision text goes: right of its ring, or left when
+   *  the right would leave the stage or touch a name. */
+  function decisionLeft(row: Row, text: string): { left: number; flipped: boolean } {
+    const w = decisionWidth(text);
+    const reach = row.r + RING_REACH + DECISION_GAP;
+    const right = { x: row.x + reach, y: row.y - 10, w, h: 20 };
+    const crosses = labelBoxes.some(
+      (b) => right.x < b.x + b.w && b.x < right.x + right.w && right.y < b.y + b.h && b.y < right.y + right.h,
+    );
+    return crosses || right.x + w > width ? { left: row.x - reach - w, flipped: true } : { left: right.x, flipped: false };
+  }
+
+  const decisionText = (d: Decision): string =>
+    phone ? (d.admitted ? `+${d.hits}` : `${d.hits}`) : d.admitted ? `+${d.hits} admitted` : `${d.hits} rejected`;
+
   /** The cell's accessible name: the live sentence for the cell in the tab order
    *  (the one a screen reader lands on), the bare identity for the rest, so a
    *  frame rewrites one label rather than every node's. */
   function label(row: Row): string {
-    const who = `Node ${row.id}, ${row.zoneName}`;
+    const who = `Select node ${row.id}, ${row.zoneName}`;
     if (row.id !== tabbable) return who;
-    const tail =
-      row.gatewayFor > 0
-        ? `, gateway into ${row.zoneName} for ${row.gatewayFor} ${noun(row.gatewayFor, 'origin')}`
-        : '';
     const missing =
       row.missingFor === undefined ? '' : `, not caught up for at least ${fmtDuration(row.missingFor)}`;
-    return `${who}, sees ${fmtCount(row.view)} of ${fmtCount(cluster.oracle_total)}, ${fmtCount(row.behind)} behind${missing}${tail}`;
+    return `${who}, sees ${fmtCount(row.view)} of ${fmtCount(cluster.oracle_total)}, ${fmtCount(row.behind)} behind${missing}`;
   }
 
   function focusCell(id: number | undefined): void {
@@ -152,7 +196,8 @@
 
   /** Left and Right move within the zone, Up and Down to the same rank in the
    *  adjacent zone with nodes (the rank clamped), Home and End to the zone's
-   *  ends; Enter or Space selects and Escape deselects. */
+   *  ends; Enter or Space selects and Escape returns the selection to the
+   *  scenario's node. */
   function onKeydown(event: KeyboardEvent, row: Row): void {
     const g = groups.findIndex((group) => group[0].zone === row.zone);
     const group = groups[g];
@@ -183,7 +228,7 @@
         break;
       case 'Escape':
         dismissed = true;
-        onDeselect();
+        onEscape();
         break;
       default:
         return;
@@ -206,15 +251,39 @@
             tabindex={row.id === tabbable ? 0 : -1}
             data-node={row.id}
             aria-label={label(row)}
-            style="left: {row.x - row.half}px; top: {row.y - row.half}px; width: {2 *
-              row.half}px; height: {2 * row.half}px"
+            style="left: {row.x - row.half}px; top: {row.y - row.half}px; width: {2 * row.half}px; height: {2 *
+              row.half}px"
             onfocus={() => {
               roving = row.id;
               onFocus(row.id);
             }}
             onblur={() => onFocus(null)}
             onkeydown={(event) => onKeydown(event, row)}
-          ></div>
+          >
+            {#if showCounts && !gliding.includes(row.id)}
+              <span class="count" data-field="node-view" aria-hidden="true">{fmtCount(row.view)}</span>
+            {/if}
+          </div>
+          {@const d = decisions.get(row.id)}
+          {#if d !== undefined && showCounts && !gliding.includes(row.id)}
+            {@const text = decisionText(d)}
+            {@const at = decisionLeft(row, text)}
+            <span
+              class="decision"
+              class:rejected={!d.admitted}
+              class:flipped={at.flipped}
+              data-node={row.id}
+              style="left: {at.left}px; top: {row.y}px"
+              ><Sentence
+                parts={phone
+                  ? [d.admitted ? '+' : '', claim(d.hits, row.id, d.admitted ? 'admitted' : 'rejected')]
+                  : d.admitted
+                    ? ['+', claim(d.hits, row.id, 'admitted'), ' admitted']
+                    : [claim(d.hits, row.id, 'rejected'), ' rejected']}
+                field="decision"
+              />{#if phone && !d.admitted}<RoleGlyph kind="rejected" />{/if}</span
+            >
+          {/if}
         {/each}
       </div>
     {/each}
@@ -226,14 +295,16 @@
       style="left: {tipLeft}px; top: {tipTop}px"
       bind:borderBoxSize={tipSize}
     >
-      Node <span data-field="node">{hot.id}</span> · {hot.zoneName} · sees
+      select node <span data-field="node">{hot.id}</span> · {hot.zoneName} · sees
       <span data-field="view">{fmtCount(hot.view)}</span> of
       <span data-field="true-total">{fmtCount(cluster.oracle_total)}</span>
       (<span data-field="behind">{fmtCount(hot.behind)}</span> behind){#if hot.missingFor !== undefined}
-        · not caught up (≥ <span data-field="missing-for">{fmtDuration(hot.missingFor)}</span>){/if}{#if hot.gatewayFor > 0}
+        · not caught up (≥ <span data-field="missing-for">{fmtDuration(hot.missingFor)}</span>){/if}{#if (hot.role === 'gateway' || hot.role === 'suspect') && roles !== null}
+        · node <span data-field="carrier">{hot.id}</span> carries node <span data-field="sender">{roles.selected}</span>'s hits
+        into {hot.zoneName}{/if}{#if hot.gatewayFor > 0}
         · gateway into {hot.zoneName} for
         <span data-field="gateway-for">{fmtCount(hot.gatewayFor)}</span>
-        {noun(hot.gatewayFor, 'origin')}{/if}
+        {noun(hot.gatewayFor, 'node')}{/if}
     </div>
   {/if}
 </div>
@@ -255,21 +326,21 @@
         {#each rows as row (row.id)}
           <tr data-node={row.id} data-zone={row.zone}>
             <td>{row.zoneName}</td>
-            <td data-field="node">{row.id}</td>
+            <td>node <span data-field="node">{row.id}</span></td>
             <td data-field="view">{fmtCount(row.view)}</td>
             <td data-field="behind">{fmtCount(row.behind)}</td>
-            <td>
-              {#if row.role === 'origin'}
-                <span aria-hidden="true">●</span> origin
+            <td data-role={row.role ?? undefined}>
+              {#if row.role === 'selected'}
+                <RoleGlyph kind="selected" /> selected
               {:else if row.role === 'gateway'}
-                <span aria-hidden="true">◆</span> gateway from the origin
+                <RoleGlyph kind="port" /> its gateway
               {:else if row.role === 'suspect'}
-                <span aria-hidden="true">◇</span> suspected gateway
+                <RoleGlyph kind="suspect" /> suspected gateway
               {/if}
               {#if row.gatewayFor > 0}
                 gateway into {row.zoneName} for
                 <span data-field="gateway-for">{fmtCount(row.gatewayFor)}</span>
-                {noun(row.gatewayFor, 'origin')}
+                {noun(row.gatewayFor, 'node')}
               {:else if row.role === null}
                 —
               {/if}
@@ -298,6 +369,9 @@
 
   .cell {
     position: absolute;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     border-radius: 50%;
     pointer-events: none;
   }
@@ -305,6 +379,37 @@
   .cell:focus-visible {
     outline: 2px solid var(--color-warn);
     outline-offset: 0;
+  }
+
+  /* The count, centred in its disc, haloed in the panel colour so it reads on
+     the fill and on the empty inside alike. */
+  .count {
+    font-size: var(--font-size-count);
+    font-weight: 600;
+    line-height: 1;
+    color: var(--color-fg);
+    paint-order: stroke;
+    -webkit-text-stroke: 3px var(--color-panel);
+  }
+
+  /* A Send's decision beside the disc, its baseline on the count's. */
+  .decision {
+    position: absolute;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    transform: translateY(-50%);
+    font-size: var(--font-size-caption);
+    font-weight: 600;
+    line-height: 1;
+    white-space: nowrap;
+    color: var(--color-fg);
+    paint-order: stroke;
+    -webkit-text-stroke: 3px var(--color-bg);
+  }
+
+  .decision.rejected {
+    color: var(--color-bad);
   }
 
   .tooltip {

@@ -1,37 +1,49 @@
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
-  import { blurb, zoneLabel, type Blurb } from '../format';
+  import { blurb, fmtCount, type Blurb } from '../format';
+  import { capHeight, textWidth } from '../measure';
   import type { ClusterState, EventBatch } from '../sim/types';
-  import { StageRenderer, labelExtent, type Finish, type Landing, type Roles, type Trail } from '../stage/renderer';
   import {
-    CROSS_WIDTH,
-    IN_WIDTH,
-    LABEL_GAP,
-    R_MAX,
-    nodeAt,
-    stageLayout,
-    type Point,
-    type StageLayout,
-  } from '../stage/layout';
-  import type { Theme } from '../theme';
-  import NodeGrid from './NodeGrid.svelte';
+    MARK,
+    StageRenderer,
+    type Fault,
+    type Finish,
+    type LabelBox,
+    type Landing,
+    type Roles,
+    type Scale,
+    type Trail,
+  } from '../stage/renderer';
+  import { R_MAX, countFits, nodeAt, stageLayout, stageMargin, type Point, type StageLayout } from '../stage/layout';
+  import { fontsReady, type Theme } from '../theme';
+  import InfoTip from './InfoTip.svelte';
+  import NodeGrid, { type Decision } from './NodeGrid.svelte';
+  import RoleGlyph, { type Glyph } from './RoleGlyph.svelte';
+  import Sentence from './Sentence.svelte';
 
   // The tier view. The WebGL canvas (managed imperatively by `StageRenderer`)
-  // draws one ring per zone, the nodes with their cell arcs and role glyphs, and
-  // the packets in flight. State arrives as props (`cluster`, `roles`, whether
-  // the clock runs, its speed, the trail); the packets arrive as commands
-  // (`show`, `finish`, `clearTrail`, `reset`), which App calls in the order its
-  // one queue runs the engine, and the renderer reports a held wave's landing
-  // through `onLanded`. `NodeGrid` lays the same nodes over the canvas as
-  // focusable cells with a tooltip, and a table, because the canvas is opaque
-  // to assistive tech and to test tooling.
+  // draws one ring per zone, each node as a vessel inside its ring with its
+  // name, the selection and its gateways' ports, and the packets in flight.
+  // State arrives as props; the packets and a refusal arrive as commands
+  // (`show`, `finish`, `clearTrail`, `reset`, `reject`), which App calls in the
+  // order its one queue runs the engine, and the renderer reports a held
+  // wave's landing through `onLanded`. `NodeGrid` lays the same nodes over the
+  // canvas as focusable cells holding each count, with a tooltip and a table,
+  // because the canvas is opaque to assistive tech and to test tooling.
   //
-  // Clicking or tapping a disc selects that node and shows its tooltip; clicking
-  // the bare stage deselects. The key and the one-line annotation sit under the
-  // canvas, outside it, so nothing overlaps the drawing.
+  // Clicking or tapping a disc selects that node and shows its tooltip; the
+  // selection never clears. The key under the canvas lists only what is drawn
+  // now.
   let {
     cluster,
     roles,
+    scale,
+    grace,
+    faults,
+    awaiting,
+    previewId,
+    decisions,
+    phone,
     running,
     speed,
     trail,
@@ -40,13 +52,24 @@
     focusedId,
     theme,
     onSelect,
-    onDeselect,
+    onEscape,
     onHover,
     onFocus,
   }: {
     cluster: ClusterState | null;
-    /** The selected origin's marks, or `null` with no selection. */
+    /** The selected node's marks. */
     roles: Roles | null;
+    scale: Scale;
+    /** How long a feed's newest hits may lag before they open a ring. */
+    grace: number;
+    faults: ReadonlyMap<number, Fault>;
+    /** How far the selected node is through the wait for its heartbeat, or
+     *  null while it holds nothing unsent. */
+    awaiting: number | null;
+    /** The node a hovered or focused control names, previewed dashed. */
+    previewId: number | null;
+    decisions: ReadonlyMap<number, Decision>;
+    phone: boolean;
     /** Whether the presentation clock runs freely: the page is playing. */
     running: boolean;
     /** The presentation clock's speed against wall time. */
@@ -58,7 +81,7 @@
     focusedId: number | null;
     theme: Theme;
     onSelect: (node: number) => void;
-    onDeselect: () => void;
+    onEscape: () => void;
     onHover: (node: number | null) => void;
     onFocus: (node: number | null) => void;
   } = $props();
@@ -71,10 +94,14 @@
   let renderer: StageRenderer | null = null;
   let ready = $state(false);
   let size = $state({ w: 0, h: 0 });
+  let marks = $state(0);
+  let gliding = $state.raw<readonly number[]>([]);
+  let labelBoxes = $state.raw<readonly LabelBox[]>([]);
 
-  // The room a node needs outside its centre: the largest disc, the gap to its
-  // label and the label's width.
-  const margin = $derived(R_MAX + LABEL_GAP + labelExtent(theme));
+  // The line a node's name takes, px: the room a node needs outside its
+  // centre is its disc, its ring, the gap to its name and this line.
+  const labelLine = $derived(Math.ceil(theme.captionSmPx * 1.25) + 4);
+  const margin = $derived(stageMargin(labelLine));
 
   // The layout, recomputed only when the stage's size, the zone count or the
   // (id, zone) list changes: an O(N) comparison per snapshot and no allocation
@@ -104,7 +131,12 @@
     ) {
       return m.layout;
     }
-    const next = stageLayout(size.w, size.h, zones, nodes, margin);
+    // Laid out for the largest disc first; a stage too small for it is laid
+    // out again with the room its own discs need, so small stages keep their
+    // rings as large as they can.
+    const first = stageLayout(size.w, size.h, zones, nodes, margin);
+    const r = first.spots[0]?.r ?? 0;
+    const next = r < R_MAX ? stageLayout(size.w, size.h, zones, nodes, stageMargin(labelLine, r)) : first;
     memo = {
       w: size.w,
       h: size.h,
@@ -117,16 +149,21 @@
     return next;
   });
 
-  // The latest gateway change or join-sweep request, in a sentence: it stands
-  // until a later one replaces it.
-  let annotation = $state.raw<Blurb>([]);
+  // Whether the counts fit their discs, decided for every node at once from
+  // the true total's width: recomputed when it gains a digit, the layout or
+  // the theme changes.
+  const countFont = $derived(`600 ${theme.countPx}px ${theme.font}`);
+  const digits = $derived(fmtCount(cluster?.oracle_total ?? 0).replace(/\d/g, '0'));
+  const showCounts = $derived(
+    layout !== null && layout.spots.length > 0 && countFits(textWidth(digits, countFont), layout.spots[0].r, capHeight(countFont)),
+  );
+  const decisionFont = $derived(`600 ${theme.captionPx}px ${theme.font}`);
 
   /** Draw `batch`'s packets as beams that leave `delay` ms of presentation
-   *  clock from now, and read its annotation; with `'held'`, call `onLanded`
-   *  once they have all landed. False when no renderer exists yet: then
-   *  nothing will land, and the caller delivers at once. */
+   *  clock from now; with `'held'`, call `onLanded` once they have all
+   *  landed. False when no renderer exists yet: then nothing will land, and
+   *  the caller delivers at once. */
   export function show(batch: EventBatch, delay: number, landing: Landing): boolean {
-    annotation = annotate(batch) ?? annotation;
     if (!ready || renderer === null) return false;
     renderer.show(batch.events, delay, landing);
     return true;
@@ -143,38 +180,14 @@
     renderer?.clearTrail();
   }
 
-  /** Drop every beam, any landing still due and the annotation: a rebuild. */
+  /** Drop every beam and any landing still due: a rebuild. */
   export function reset(): void {
     renderer?.reset();
-    annotation = [];
   }
 
-  /** Zone `z`'s name as the stage writes it. */
-  function zoneName(z: number): string {
-    return zoneLabel(cluster?.zones[z]?.name ?? '');
-  }
-
-  /** The newest gateway change or join-sweep request in `batch`, in a sentence,
-   *  or null with neither. */
-  function annotate(batch: EventBatch): Blurb | null {
-    const events = batch.events;
-    for (let i = events.length - 1; i >= 0; i--) {
-      const kind = events[i].kind;
-      if (kind.type === 'GatewayChanged') {
-        const { origin, to, from } = kind;
-        return to === undefined
-          ? blurb`node ${origin} has no gateway into ${zoneName(kind.zone)}`
-          : from === undefined
-            ? blurb`node ${origin} now reaches ${zoneName(kind.zone)} through node ${to}`
-            : blurb`node ${origin} now reaches ${zoneName(kind.zone)} through node ${to}, after node ${from}`;
-      }
-      if (kind.type === 'PacketSent' && kind.kind === 'SweepRequest') {
-        // A request to a node that has since left names no zone: skip it.
-        const dst = cluster?.nodes.find((n) => n.id === kind.dst);
-        if (dst !== undefined) return blurb`node ${kind.src} asked ${zoneName(dst.zone)} for missed changes`;
-      }
-    }
-    return null;
+  /** Play node `node`'s refusal of `hits`. */
+  export function reject(node: number, hits: number): void {
+    renderer?.reject(node, hits);
   }
 
   $effect(() => {
@@ -187,7 +200,12 @@
   $effect(() => {
     if (ready && renderer !== null && layout !== null) {
       renderer.setLayout(layout, untrack(() => cluster?.zones.map((z) => z.name) ?? []));
+      labelBoxes = JSON.parse(container.querySelector('canvas')?.dataset.labelBoxes ?? '[]');
     }
+  });
+
+  $effect(() => {
+    if (ready && renderer !== null) renderer.setScale(scale, grace);
   });
 
   $effect(() => {
@@ -207,11 +225,25 @@
   });
 
   $effect(() => {
-    if (ready && renderer !== null) renderer.setRoles(roles);
+    if (ready && renderer !== null) {
+      renderer.setRoles(roles);
+      labelBoxes = JSON.parse(container.querySelector('canvas')?.dataset.labelBoxes ?? '[]');
+    }
   });
 
   $effect(() => {
-    if (ready && renderer !== null) renderer.setFocus(focusedId);
+    if (ready && renderer !== null) {
+      renderer.setFaults(faults);
+      labelBoxes = JSON.parse(container.querySelector('canvas')?.dataset.labelBoxes ?? '[]');
+    }
+  });
+
+  $effect(() => {
+    if (ready && renderer !== null) renderer.setAwaiting(awaiting);
+  });
+
+  $effect(() => {
+    if (ready && renderer !== null) renderer.setPreview(previewId ?? hoveredId ?? focusedId);
   });
 
   $effect(() => {
@@ -244,8 +276,61 @@
     const node = nodeUnder(event);
     onHover(node);
     if (node !== null) onSelect(node);
-    else onDeselect();
   }
+
+  /** The key's items, in a fixed order: each mark's glyph, its phrase and the
+   *  glossary sentence it opens. An item shows only while its mark is drawn. */
+  const KEY: readonly { bit: number; glyph: Glyph; text: Blurb; tip: string }[] = $derived([
+    {
+      bit: MARK.COUNT,
+      glyph: 'vessel',
+      text: ['count of hits in the window; the fill rises to the brim, the limit'],
+      tip: "The number is the hits this node counts in its window. The fill rises with it: the brim is the limit, so a full vessel is a node that refuses more.",
+    },
+    {
+      bit: MARK.FAR,
+      glyph: 'far',
+      text: blurb`count of hits; the limit (${scale.limit}) is far away here`,
+      tip: 'This scenario sets its limit far above what it sends, so no node comes near refusing: watch the count and the ring instead.',
+    },
+    {
+      bit: MARK.RING,
+      glyph: 'ring',
+      text: ['the ring closes when the node has heard every hit'],
+      tip: "The ring is the share of the cluster's hits this node has heard. It is closed and grey when the node holds them all, amber while it is behind.",
+    },
+    {
+      bit: MARK.SELECTED,
+      glyph: 'selected',
+      text: ['the selected node'],
+      tip: 'Send goes to the selected node, and its gateways are marked. Click any node to select it; Escape returns to the scenario’s node.',
+    },
+    {
+      bit: MARK.PORT,
+      glyph: 'port',
+      text: ['its gateway into that zone'],
+      tip: 'Each node picks its own gateway into each other zone; the port points into the zone that gateway relays to.',
+    },
+    {
+      bit: MARK.SUSPECT,
+      glyph: 'suspect',
+      text: ['a gateway it suspects'],
+      tip: 'A hollow port: the selected node has waited too long for this gateway, or was told it cannot relay, and will pick another.',
+    },
+    {
+      bit: MARK.CAP,
+      glyph: 'cap',
+      text: ['red brim: at the limit'],
+      tip: 'The brim turns red while the node counts the limit: it refuses any request until the oldest hits leave its window.',
+    },
+    { bit: MARK.LOST, glyph: 'lost', text: ['lost packet'], tip: 'A packet the network dropped: it stops partway, and is resent.' },
+    {
+      bit: MARK.DOT,
+      glyph: 'ack',
+      text: ['dot: ack, probe, gap report or sweep request'],
+      tip: 'Control packets carry no hits: acknowledgements, probes, gap reports and requests for a join sweep.',
+    },
+  ]);
 
   onMount(() => {
     let disposed = false;
@@ -253,7 +338,15 @@
     let timer = 0;
 
     void (async () => {
-      const r = await StageRenderer.create(container, theme, () => onLanded());
+      // The canvas measures its names in the page's faces: it waits for them,
+      // failing open after a short gate.
+      await fontsReady();
+      if (disposed) return;
+      const r = await StageRenderer.create(container, theme, {
+        onLanded: () => onLanded(),
+        onMarks: (bits) => (marks = bits),
+        onGliding: (ids) => (gliding = ids),
+      });
       if (disposed) {
         r.destroy();
         return;
@@ -296,43 +389,32 @@
     class:actionable={hoveredId !== null}
     bind:this={container}
     role="presentation"
+    aria-keyshortcuts="Escape"
     onpointerdown={onPointerDown}
     onpointermove={onPointerMove}
     onpointerleave={onPointerLeave}
   ></div>
 
-  <ul class="key" aria-label="Key">
-    <li>
-      <svg width="28" height="10" aria-hidden="true">
-        <line class="in" x1="1" y1="5" x2="27" y2="5" stroke-width={IN_WIDTH} />
-      </svg>
-      inside a zone (a relay starts at a ◆)
-    </li>
-    <li>
-      <svg width="28" height="10" aria-hidden="true">
-        <line class="cross" x1="1" y1="5" x2="20" y2="5" stroke-width={CROSS_WIDTH} />
-        <polygon class="arrow" points="19,1 27,5 19,9" />
-      </svg>
-      across zones
-    </li>
-    <li>
-      <svg width="10" height="10" aria-hidden="true"><circle class="dot" cx="5" cy="5" r="2" /></svg>
-      ack, probe or gap report
-    </li>
-    <li>
-      <svg width="28" height="12" aria-hidden="true">
-        <line class="lost" x1="1" y1="6" x2="20" y2="6" stroke-width={IN_WIDTH} />
-        <line class="lost" x1="20" y1="1" x2="20" y2="11" stroke-width={IN_WIDTH} />
-      </svg>
-      lost on the way
-    </li>
-    <li><span aria-hidden="true">◆</span> gateway</li>
-    <li><span aria-hidden="true">◇</span> suspected gateway</li>
-  </ul>
-
-  <p class="annotation" aria-live="polite">
-    {#each annotation as part}{#if typeof part === 'number'}<span data-field="annotation">{part}</span>{:else}{part}{/if}{/each}
-  </p>
+  <!-- The key lists what is drawn now. Every item, laid out unseen in the
+       same cell, holds the key's height, so an item that appears never moves
+       the canvas. -->
+  <div class="key-box">
+    <ul class="key" aria-label="Key">
+      {#each KEY as item (item.bit)}
+        {#if (marks & item.bit) !== 0}
+          <li data-mark={item.bit}>
+            <RoleGlyph kind={item.glyph} />
+            <InfoTip text={item.tip}><Sentence parts={item.text} field="key" /></InfoTip>
+          </li>
+        {/if}
+      {/each}
+    </ul>
+    <ul class="key sizer" aria-hidden="true">
+      {#each KEY as item (item.bit)}
+        <li><RoleGlyph kind={item.glyph} /><Sentence parts={item.text} field="key" /></li>
+      {/each}
+    </ul>
+  </div>
 
   {#if cluster !== null && layout !== null}
     <NodeGrid
@@ -343,8 +425,14 @@
       height={size.h}
       {hoveredId}
       {focusedId}
+      {showCounts}
+      {gliding}
+      {decisions}
+      {labelBoxes}
+      {phone}
+      decisionWidth={(text) => textWidth(text, decisionFont)}
       {onSelect}
-      {onDeselect}
+      {onEscape}
       {onFocus}
     />
   {/if}
@@ -372,22 +460,44 @@
     cursor: pointer;
   }
 
-  /* The phone: the stage is a square, so the rings keep their shape. */
-  @media (width < 640px) {
+  /* Where the page scrolls, the stage keeps a shape of its own: 4 by 3 on
+     a tablet, a square on the phone, so the rings keep their size. */
+  @media (width < 1100px) {
     .stage {
       flex: none;
+      aspect-ratio: 4 / 3;
+    }
+  }
+
+  @media (width < 640px) {
+    .stage {
       aspect-ratio: 1;
     }
+  }
+
+
+  .key-box {
+    display: grid;
+  }
+
+  .key-box > .key {
+    grid-area: 1 / 1;
+  }
+
+  .key.sizer {
+    visibility: hidden;
   }
 
   .key {
     display: flex;
     flex-wrap: wrap;
+    align-content: flex-start;
     gap: var(--gap-xs) var(--gap-md);
     margin: 0;
-    padding: var(--gap-xs) var(--gap-md);
+    padding: var(--gap-sm) 0 0;
     list-style: none;
     font-size: var(--font-size-caption);
+    line-height: 1.25;
     color: var(--color-fg);
   }
 
@@ -395,33 +505,5 @@
     display: flex;
     align-items: center;
     gap: var(--gap-xs);
-  }
-
-  .key .in {
-    stroke: var(--chart-muted);
-  }
-
-  .key .cross {
-    stroke: var(--color-fg);
-  }
-
-  .key .arrow {
-    fill: var(--color-fg);
-  }
-
-  .key .dot {
-    fill: var(--chart-muted);
-  }
-
-  .key .lost {
-    stroke: var(--chart-muted);
-  }
-
-  .annotation {
-    min-height: 1.5em;
-    margin: 0;
-    padding: 0 var(--gap-md) var(--gap-xs);
-    font-size: var(--font-size-caption);
-    color: var(--color-fg);
   }
 </style>

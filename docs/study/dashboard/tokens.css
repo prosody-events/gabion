@@ -5,7 +5,34 @@
  * `<html data-theme="light|dark">` overrides it. Text colours clear 4.5:1 and
  * graphics colours 3:1 on --color-bg, --color-panel and --surface-popover in
  * both themes; `tests/audit.spec.ts` (A7) checks every visible text node and
- * the canvas colours, but not yet the hidden popover. Canvas colours are opaque. */
+ * the canvas colours, but not yet the hidden popover. Canvas colours are opaque.
+ * The three faces are self-hosted subsets of google/fonts (web/README.md,
+ * "Fonts"); `font-display: block` holds text until they load, and the canvas
+ * waits on them too, failing open after a short gate (`lib/theme.ts`). */
+@font-face {
+  font-family: 'Source Sans 3';
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: block;
+  src: url('./fonts/SourceSans3.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Source Serif 4';
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: block;
+  src: url('./fonts/SourceSerif4.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Source Code Pro';
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+  src: url('./fonts/SourceCodePro.woff2') format('woff2');
+}
+
 :root {
   color-scheme: light dark;
   --color-fg: light-dark(#1b2330, #e6e9ee);
@@ -22,14 +49,20 @@
   --chart-muted: light-dark(#636d7b, #8691a0);
   --surface-popover: light-dark(#ffffff, #262d37);
   --shadow-popover: 0 2px 8px light-dark(rgb(27 35 48 / 18%), rgb(0 0 0 / 50%));
-  --font-sans:
-    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-  --font-serif: ui-serif, Georgia, 'Times New Roman', serif;
+  /* The vessel's fill: ink at 28 % over the panel, so admitted hits read as
+     ink, not hue. */
+  --color-level: color-mix(in srgb, var(--color-fg) 28%, var(--color-panel));
+  --font-sans: 'Source Sans 3', sans-serif;
+  --font-serif: 'Source Serif 4', serif;
+  --font-mono: 'Source Code Pro', monospace;
   --font-size-caption-sm: 0.64rem;
   --font-size-caption: 0.8rem;
   --font-size-body: 1rem;
   --font-size-heading: 1.25rem;
   --font-size-title: 1.563rem;
+  /* The count in a node's disc: one step down below 640 px, so three digits
+     still fit the smaller disc. */
+  --font-size-count: 0.875rem;
   --font-weight-medium: 500;
   --gap-xs: 4px;
   --gap-sm: 8px;
@@ -40,6 +73,12 @@
   --pad-sm: 8px;
   --radius: 8px;
   --dur-slow: 0.45s;
+}
+
+@media (width < 640px) {
+  :root {
+    --font-size-count: 0.75rem;
+  }
 }
 
 :root[data-theme='light'] {

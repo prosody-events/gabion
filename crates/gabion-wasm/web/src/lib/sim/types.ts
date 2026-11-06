@@ -162,7 +162,8 @@ export type Role = 'unheard' | 'zone' | 'gateway' | 'remote' | 'incompatible';
 export type AnswerState = 'settled' | 'owed' | 'suspect' | 'cannot_relay';
 
 /** Each answer state as the page shows it: whether the gateway is suspected
- *  (a hollow ◇ rather than a filled ◆) and the word the targets table prints. */
+ *  (a hollow port rather than a solid one) and the word the targets table
+ *  prints. */
 export const ANSWER: Record<AnswerState, { readonly suspect: boolean; readonly label: string }> = {
   settled: { suspect: false, label: 'ok' },
   owed: { suspect: false, label: 'ok' },

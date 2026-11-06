@@ -1,8 +1,15 @@
 <script lang="ts">
-  // The time dock: play/pause, Step to the next event, reset, a speed control,
-  // the current virtual-time readout and, once a heartbeat period has played,
-  // how long it took to watch at the chosen speed.
-  import { fmtDuration } from '../format';
+  // The time dock: Play/Pause, Step to the next event, then Send, then Speed,
+  // and the simulated-time readout, which says while a run plays itself and
+  // while packets hold the clock; once a heartbeat period has played, how long
+  // it took to watch at the chosen speed. Whichever control the next action
+  // names is filled (`primary`); the others are secondary. A disabled control
+  // says why beside it.
+  import { fmtCount, fmtDuration, type Blurb } from '../format';
+  import { BURST_HITS_MAX } from '../presets';
+  import type { Control, Flight, UntilSettled } from '../next';
+  import Icon from './Icon.svelte';
+  import Sentence from './Sentence.svelte';
 
   let {
     playing,
@@ -10,38 +17,89 @@
     speed = $bindable(),
     virtualMs,
     heartbeatWallMs,
+    sendLabel,
+    sendValid,
+    primary,
+    untilSettled,
+    flight,
     onToggle,
     onStep,
-    onReset,
+    onSend,
+    onSendHover,
   }: {
     playing: boolean;
-    /** A rebuild is running: the controls wait for it. */
+    /** The engine is starting: the controls wait for it. */
     busy: boolean;
     speed: number;
     virtualMs: number;
     /** Wall ms the last whole heartbeat period took to play, or null before
      *  one has. */
     heartbeatWallMs: number | null;
+    /** Send's label at this width, from `sendLabel`. */
+    sendLabel: Blurb;
+    /** Whether Hits per Send holds a valid committed value. */
+    sendValid: boolean;
+    /** The control the next action names, or null. */
+    primary: Control | null;
+    untilSettled: UntilSettled;
+    flight: Flight;
     onToggle: () => void;
     onStep: () => void;
-    onReset: () => void;
+    onSend: () => void;
+    /** Send names its target: hovering or focusing it previews that node. */
+    onSendHover: (on: boolean) => void;
   } = $props();
+
+  const describe = (control: Control, reason: string | null): string | undefined =>
+    [primary === control ? 'next-action' : null, reason].filter((id) => id !== null).join(' ') || undefined;
+  const starting = $derived(busy ? 'transport-reason' : null);
 </script>
 
 <div class="transport" role="group" aria-label="Playback controls">
   <button
-    class="primary"
+    class={primary === 'play' ? undefined : 'btn-secondary'}
+    data-primary={primary === 'play' ? '' : undefined}
     onclick={onToggle}
     disabled={busy}
-    aria-pressed={playing}
-    aria-label={playing ? 'Pause' : 'Play'}
+    aria-keyshortcuts="Space"
+    aria-describedby={describe('play', starting)}
+    title="Space plays or pauses"
   >
-    {playing ? '❚❚ Pause' : '▶ Play'}
+    <Icon name={playing ? 'pause' : 'play'} />{playing ? 'Pause' : 'Play'}
   </button>
-  <button onclick={onStep} disabled={busy} aria-label="Step to the next event" title="→ steps to the next event">
-    ▸❙ Step
+  <button
+    class={primary === 'step' ? undefined : 'btn-secondary'}
+    data-primary={primary === 'step' ? '' : undefined}
+    onclick={onStep}
+    disabled={busy}
+    aria-label="Step to the next event"
+    aria-keyshortcuts="ArrowRight"
+    aria-describedby={describe('step', starting)}
+    title="→ steps to the next event"
+  >
+    <Icon name="step" />Step
   </button>
-  <button onclick={onReset} disabled={busy} aria-label="Reset to start"> ↺ Reset </button>
+  <button
+    class="send {primary === 'send' ? '' : 'btn-secondary'}"
+    data-primary={primary === 'send' ? '' : undefined}
+    onclick={onSend}
+    disabled={busy || !sendValid}
+    aria-describedby={describe('send', starting ?? (sendValid ? null : 'send-reason'))}
+    onpointerenter={() => onSendHover(true)}
+    onpointerleave={() => onSendHover(false)}
+    onfocus={() => onSendHover(true)}
+    onblur={() => onSendHover(false)}
+  >
+    <Sentence parts={sendLabel} field="send" />
+  </button>
+  {#if busy}
+    <span class="reason" id="transport-reason">starting the simulator…</span>
+  {:else if !sendValid}
+    <span class="reason" id="send-reason"
+      >Hits per Send must be a whole number from <span data-field="hits-min">{1}</span> to
+      <span data-field="hits-max">{fmtCount(BURST_HITS_MAX)}</span></span
+    >
+  {/if}
 
   <label class="speed">
     <span>Speed</span>
@@ -51,18 +109,15 @@
 
   <div class="readout">
     <!-- Its space is kept before the first period has played, so the bar
-         never reflows when it appears, and kept left of the virtual time, so
-         that stays flush right. -->
-    <span class="readout-item" class:pending={heartbeatWallMs === null}>
-      <span class="readout-label">a heartbeat took</span>
-      <span class="readout-value"
-        ><span data-field="heartbeat-wall" data-ms={heartbeatWallMs ?? undefined}>{fmtDuration(heartbeatWallMs ?? 0)}</span
-        ><span class="readout-unit">&nbsp;to watch</span></span
-      >
+         never reflows when it appears. -->
+    <span class="readout-item heartbeat" class:pending={heartbeatWallMs === null}>
+      a heartbeat took
+      <span data-field="heartbeat-wall" data-ms={heartbeatWallMs ?? undefined}>{fmtDuration(heartbeatWallMs ?? 0)}</span>
+      to watch
     </span>
-    <span class="readout-item">
-      <span class="readout-label">virtual time</span>
-      <span class="readout-value" data-field="virtual-time" data-ms={virtualMs}>{fmtDuration(virtualMs)}</span>
+    <span class="readout-item time">
+      <span class="time-value" data-field="virtual-time" data-ms={virtualMs}>{fmtDuration(virtualMs)}</span>
+      simulated{#if untilSettled !== 'off'}{' · playing until every node has it'}{/if}{#if flight !== 'none'}{' · packets in flight'}{/if}
     </span>
   </div>
 </div>
@@ -72,7 +127,7 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: var(--gap-md);
+    gap: var(--gap-sm);
     padding: var(--gap-sm) var(--gap-md);
     background: var(--color-panel);
     border-top: 1px solid var(--color-border-line);
@@ -81,45 +136,39 @@
   button {
     display: inline-flex;
     align-items: center;
-    gap: var(--gap-xs);
-    padding: var(--gap-sm) var(--gap-md);
-    border: 1px solid var(--color-border-line);
-    border-radius: var(--radius);
-    background: var(--color-panel);
-    font-size: var(--font-size-caption);
-    transition: background 120ms ease;
-  }
-
-  button:hover:not(:disabled) {
-    background: var(--color-bg);
-  }
-
-  button:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
-  }
-
-  .primary {
-    background: var(--color-fg);
-    color: var(--color-panel);
-    border-color: var(--color-fg);
-    min-width: 6.5rem;
     justify-content: center;
+    gap: var(--gap-xs);
+    min-height: 36px;
+    padding: 0 var(--gap-md);
+    border-radius: var(--radius);
+    font-size: var(--font-size-caption);
+    font-weight: 600;
   }
 
-  .primary:hover:not(:disabled) {
-    background: var(--color-fg-muted);
+  button:first-child {
+    min-width: 6.5em;
+  }
+
+  /* Send keeps its distance from the time controls. */
+  .send {
+    margin-left: var(--gap-sm);
+  }
+
+  .reason {
+    font-size: var(--font-size-caption);
+    color: var(--color-fg-muted);
   }
 
   .speed {
     display: inline-flex;
     align-items: center;
     gap: var(--gap-sm);
+    margin-left: var(--gap-sm);
     font-size: var(--font-size-caption);
     color: var(--color-fg-muted);
   }
 
-  /* Narrow enough that the bar stays one row at 768 px with both readouts. */
+  /* Narrow enough that the bar stays one row at 1100 px. */
   .speed input {
     width: 5.5rem;
   }
@@ -131,38 +180,19 @@
   .readout {
     margin-left: auto;
     display: flex;
+    align-items: baseline;
     gap: var(--gap-md);
-  }
-
-  .readout-item {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-    line-height: 1.1;
-  }
-
-  .readout-label {
-    font-size: var(--font-size-caption-sm);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
+    font-size: var(--font-size-caption);
     color: var(--color-fg-muted);
   }
 
-  .readout-value {
-    font-size: var(--font-size-heading);
+  .readout [data-field] {
     color: var(--color-fg);
+    font-weight: 600;
   }
 
-  /* Room for a reading such as "500 ms", so its first appearance does not
-     shift the readouts. */
-  .readout-value [data-field] {
-    display: inline-block;
-    min-width: 5.5ch;
+  .time {
     text-align: right;
-  }
-
-  .readout-unit {
-    font-size: var(--font-size-caption);
   }
 
   .pending {

@@ -35,10 +35,14 @@ export function readTheme() {
     panel: read('--color-panel'),
     ok: read('--color-ok'),
     warn: read('--color-warn'),
-    /** Type: the page's family and the two caption sizes, in px. */
+    bad: read('--color-bad'),
+    axis: read('--chart-axis'),
+    level: read('--color-level'),
+    /** Type: the page's family, the two caption sizes and the count's, in px. */
     font: getComputedStyle(document.documentElement).fontFamily,
     captionPx: size('--font-size-caption'),
     captionSmPx: size('--font-size-caption-sm'),
+    countPx: size('--font-size-count'),
   };
   probe.remove();
   return theme;
@@ -47,6 +51,26 @@ export function readTheme() {
 /** The tokens the stage and the charts draw with: colours as packed `0xRRGGBB`,
  *  and the canvas type. */
 export type Theme = ReturnType<typeof readTheme>;
+
+/** The longest the canvas waits for the faces before it draws with a
+ *  fallback: a missing face is a typographic loss, not a functional one. */
+export const FONT_GATE_MS = 3000;
+
+/** The faces the canvas and the charts measure with. */
+const FACES = ['400 1em "Source Sans 3"', '600 1em "Source Sans 3"', '400 1em "Source Serif 4"', '400 1em "Source Code Pro"'];
+
+let faces: Promise<unknown> | null = null;
+
+/** Settles once every face has loaded or failed, or the gate has passed,
+ *  whichever is first; it never rejects, so a face that fails to load fails
+ *  open. Asked for once, the first time something measures text. */
+export function fontsReady(): Promise<unknown> {
+  faces ??= Promise.race([
+    Promise.allSettled(FACES.map((face) => document.fonts.load(face))),
+    new Promise((resolve) => setTimeout(resolve, FONT_GATE_MS)),
+  ]);
+  return faces;
+}
 
 /** The peak alpha of every stage beam, delivered or dropped, and the REJECTING
  *  band's fill: the design audit composites each over its surface before

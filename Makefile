@@ -130,6 +130,7 @@ help:
 	@printf '%s\n' '  make study-data      Download the study data release asset, check its sha256 and unpack it into docs/study/data'
 	@printf '%s\n' '  make study-test      Check the study data compaction and run the study dashboard browser audit (Playwright)'
 	@printf '%s\n' '  make wasm-check      Cross-compile gabion-wasm, run its native tests, and build the web frontend'
+	@printf '%s\n' '  make fonts           Rebuild the visualizer and study dashboard font subsets from google/fonts (needs the network and fonttools)'
 	@printf '%s\n' '  make nginx-config    Validate the base nginx:stable-alpine config'
 	@printf '%s\n' '  make nginx-module    Build and load-test the Gabion NGINX module config'
 	@printf '%s\n' '  make nginx-test      Build the module for NGINX and OpenResty and assert 200, 200, 429 responses'
@@ -252,6 +253,8 @@ hygiene:
 		rg -q -- "^\s*$$token:" $(WEB_DIR)/src/tokens.css || { echo "design token \`$$token\` is not defined in $(WEB_DIR)/src/tokens.css, so it resolves to nothing; use a token defined there (web/README.md \"Design rules\") or define it:"; rg -nF -- "$$token" $(WEB_DIR)/src; exit 1; }; \
 	done
 	cmp $(WEB_DIR)/src/tokens.css docs/study/dashboard/tokens.css
+	diff -r $(WEB_DIR)/src/fonts docs/study/dashboard/fonts
+	rg -n 'font-family' $(WEB_DIR)/src --glob '!tokens.css' --glob '!app.css'; test $$? -eq 1
 	@awk '/^  ([a-z]+ )*(#?[A-Za-z]+|constructor)\(/ { fn = $$0 } /^(export )?(async )?function / { fn = $$0 } /new Graphics/ && fn !~ /constructor\(|#createNode\(/ { print FILENAME ":" FNR ": " $$0; bad = 1 } END { exit bad }' $(WEB_DIR)/src/lib/stage/renderer.ts || { echo "renderer.ts builds a Graphics outside its constructor and #createNode, so a frame or an event can allocate GPU objects; draw into the pre-built Graphics instead ($(WEB_DIR)/README.md, \"Beams\")"; exit 1; }
 	@bad=$$(rg -n '\bgabion(_server)?\s*(::|as\b|;)|\bcrate\s+gabion' $(SIM)/src --glob '!**/harness/adapter.rs' | rg -v '$(SIM_BOUNDARY)'); \
 	test -z "$$bad" || { printf '%s\n' "$$bad" "these lines in $(SIM) name gabion outside src/harness/adapter.rs, so the regression gate's arms would no longer share one core; outside it import only gabion::gossip::{Clock, GossipTransport, Ticker} and gabion::discovery::{Peer, PeerEvent}, one use line each, and reach anything else through a re-export from adapter.rs (crates/gossip-bench/README.md, \"The adapter contract\")"; exit 1; }
@@ -346,6 +349,37 @@ bench-check:
 # the production Vite build. The Playwright screenshot/in-browser smoke
 # (`pnpm run screenshot`) downloads a browser, so it stays a documented
 # on-demand run rather than part of this gate — same treatment as smoke.cjs.
+# The three faces the visualizer and the study dashboard set (web/README.md,
+# "Fonts"): Source Sans 3, Source Serif 4 and Source Code Pro from the
+# google/fonts registry at one pinned commit, instanced to the weights the
+# design uses (400 and 600) and subset to the characters the pages print.
+# Needs the network and fonttools (`pip install fonttools brotli`), so it is
+# not part of `make test`; its outputs are committed, byte-identical in both
+# folders (hygiene checks it).
+FONTS_COMMIT := 24ddc1f324cac5d9f5aedca126d298f56e3f1640
+FONTS_RAW := https://raw.githubusercontent.com/google/fonts/$(FONTS_COMMIT)/ofl
+FONTS_TMP := target/fonts
+FONTS_UNICODES := U+0020-007E,U+00A0-00FF,U+2009,U+202F,U+2013-2014,U+2018-201E,U+2026,U+2190-2193,U+2212,U+2264-2265,U+03A3,U+03B5,U+03C3,U+2713
+
+.PHONY: fonts
+fonts:
+	mkdir -p $(FONTS_TMP) $(WEB_DIR)/src/fonts docs/study/dashboard/fonts
+	curl -fsSL --retry 3 -o $(FONTS_TMP)/SourceSans3.ttf '$(FONTS_RAW)/sourcesans3/SourceSans3%5Bwght%5D.ttf'
+	curl -fsSL --retry 3 -o $(FONTS_TMP)/SourceSerif4.ttf '$(FONTS_RAW)/sourceserif4/SourceSerif4%5Bopsz,wght%5D.ttf'
+	curl -fsSL --retry 3 -o $(FONTS_TMP)/SourceCodePro.ttf '$(FONTS_RAW)/sourcecodepro/SourceCodePro%5Bwght%5D.ttf'
+	curl -fsSL --retry 3 -o $(WEB_DIR)/src/fonts/OFL-SourceSans3.txt '$(FONTS_RAW)/sourcesans3/OFL.txt'
+	curl -fsSL --retry 3 -o $(WEB_DIR)/src/fonts/OFL-SourceSerif4.txt '$(FONTS_RAW)/sourceserif4/OFL.txt'
+	curl -fsSL --retry 3 -o $(WEB_DIR)/src/fonts/OFL-SourceCodePro.txt '$(FONTS_RAW)/sourcecodepro/OFL.txt'
+	fonttools varLib.instancer -q -o $(FONTS_TMP)/SourceSans3-i.ttf $(FONTS_TMP)/SourceSans3.ttf wght=400:600
+	fonttools varLib.instancer -q -o $(FONTS_TMP)/SourceSerif4-i.ttf $(FONTS_TMP)/SourceSerif4.ttf wght=400:600 opsz=8:20
+	fonttools varLib.instancer -q -o $(FONTS_TMP)/SourceCodePro-i.ttf $(FONTS_TMP)/SourceCodePro.ttf wght=400
+	for face in SourceSans3 SourceSerif4 SourceCodePro; do \
+		pyftsubset $(FONTS_TMP)/$$face-i.ttf --layout-features='*' --flavor=woff2 \
+			--unicodes='$(FONTS_UNICODES)' --output-file=$(WEB_DIR)/src/fonts/$$face.woff2 || exit 1; \
+	done
+	rm -f docs/study/dashboard/fonts/*
+	cp $(WEB_DIR)/src/fonts/* docs/study/dashboard/fonts/
+
 .PHONY: wasm-check
 wasm-check: require-nextest require-wasm-target require-wasm-pack require-pnpm require-wasm-nightly
 	$(CARGO_ENV) $(STABLE_CARGO) check --target $(WASM_TARGET) -p gabion-wasm

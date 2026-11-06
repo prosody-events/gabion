@@ -42,9 +42,9 @@ pub struct Sim {
 #[wasm_bindgen]
 impl Sim {
     /// Build the cluster and spawn its engine. `config` is a [`SimConfig`] as a
-    /// plain JS object; an invalid config **throws synchronously** so a typo in
-    /// a shared URL surfaces immediately instead of producing a quietly
-    /// different run.
+    /// plain JS object; an invalid config **throws synchronously** so a value
+    /// the page let through surfaces immediately instead of producing a
+    /// quietly different run.
     #[wasm_bindgen(constructor)]
     pub fn new(config: JsValue) -> Result<Sim, JsValue> {
         let config: SimConfig = serde_wasm_bindgen::from_value(config)?;

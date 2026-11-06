@@ -1387,6 +1387,17 @@ def safe(fn, S, *a, **k):
     except Exception as e:
         rec('harness.' + fn.__name__, str(a[:1]), False, f'harness error (machine under memory pressure?): {type(e).__name__}: {str(e)[:160]}')
 
+def check_fonts(S, scope):
+    """A10: the self-hosted faces are loaded and every request stays on the page's own origin."""
+    o = S.pg.evaluate("""() => ({
+        loaded: [...document.fonts].filter((f) => f.status === 'loaded').map((f) => f.family.replace(/"/g, '')),
+        check: document.fonts.check('16px "Source Sans 3"') && document.fonts.check('16px "Source Serif 4"'),
+        foreign: performance.getEntriesByType('resource').map((e) => e.name).filter((u) => new URL(u).origin !== location.origin),
+    })""")
+    want_faces = {'Source Sans 3', 'Source Serif 4'}
+    rec('A10.faces-loaded', scope, o['check'] and want_faces <= set(o['loaded']), f'selector=document.fonts | seen={sorted(set(o["loaded"]))} | expected={sorted(want_faces)} loaded')
+    rec('A10.requests-same-origin', scope, not o['foreign'], f'selector=performance resources | seen={o["foreign"][:3]} | expected=none off the page origin')
+
 def main():
     handler = functools.partial(Quiet, directory=str(STUDY))
     srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
@@ -1426,13 +1437,14 @@ def main():
                     step(f'400/dark {var}')
                 use_variant('baseline')
                 if want('A5'): check_rows_identical_across_variants()
-            if any(want(p) for p in ('A5', 'A6', 'A7')):
+            if any(want(p) for p in ('A5', 'A6', 'A7', 'A10')):
                 S.open(1440, 'light')
                 try:
                     if want('A6'): safe(check_hover_targets, S, '1440/light')
                     if want('A6'): safe(check_interaction, S, '1440/light'); step('interaction')
                     if want('A7'): safe(check_focus_and_a11y, S, '1440/light'); safe(check_contrast, S, '1440/light'); step('a11y light')
                     if want('A6'): safe(check_link, S, '1440/light')
+                    if want('A10'): safe(check_fonts, S, '1440/light')
                 finally: S.close()
                 S.open(1440, 'dark')
                 try:

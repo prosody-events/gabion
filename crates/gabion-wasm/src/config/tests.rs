@@ -90,7 +90,7 @@ fn zone_count_is_bounded() {
     }
 }
 
-/// A shared URL's zone count reaches `validate` as it was written, so zero
+/// A zone count from the page reaches `validate` as it was written, so zero
 /// gets the operator message rather than a deserializer's.
 #[test]
 fn zone_count_from_json_is_refused_by_validate() {

@@ -6,20 +6,27 @@ import {
   ARC_GAP,
   ARC_WIDTH,
   CONTROL,
+  COUNT_FIT,
   CROSS,
-  DIAMOND_SCALE,
   DROPPED,
+  PORT_GAP,
   RELAY,
+  RING_REACH,
   R_MAX,
+  SELECTION_REACH,
+  STRATA_MIN_INNER,
   beamPath,
   pointOn,
+  portHalf,
   type Point,
   type QuadPath,
   type Spot,
 } from '../src/lib/stage/layout';
+import { MARK, RING_BEHIND, RING_CAUGHT_UP, type GlyphTable } from '../src/lib/stage/renderer';
+import { VESSEL_SCALE } from '../src/lib/limit';
 import { BAND_ALPHA, BEAM_ALPHA, readTheme, type Theme } from '../src/lib/theme';
 import timings from './phase-timings.json' with { type: 'json' };
-import { PERIOD_MS, WATCH, period, setSpeed, step, stepUntil, virtualMs } from './drive';
+import { PERIOD_MS, WATCH, period, send, setSpeed, step, stepUntil, still, virtualMs } from './drive';
 
 // The automated half of the audit checklist in `../README.md` ("Design rules"):
 // A1 to A9. Each audit project fixes a width and a colour scheme; the main test
@@ -131,13 +138,14 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
   for (const name of names) {
     await loadPreset(page, name);
     await expect(canvas).toBeVisible();
-    // Sandbox opens empty: a burst by hand at node 0 gives its converged pass
-    // something to converge on, with no feed to make it nondeterministic.
-    if (name === 'Sandbox') await page.locator('.rail').getByRole('button', { name: 'Send burst' }).click();
+    // Sandbox and Rate limiting open empty: a Send by hand at node 0 gives
+    // their converged pass something to converge on, with no feed to make it
+    // nondeterministic.
+    if (name === 'Sandbox' || name === 'Rate limiting') await send(page, 0);
     // The engine's own snapshot after every Step, which A4 recomputes from.
     const series: ClusterState[] = [await snapshot(page)];
     for (let s = 0; s < STEPS; s++) await period(page, async () => void series.push(await snapshot(page)));
-    converged += await page.locator('.headline.converged').count();
+    converged += await page.locator('[data-template]', { hasText: /^✓/ }).count();
     charted += await page.locator('.plot').count();
     inspected += await page.locator('.inspector').count();
 
@@ -166,6 +174,7 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
         band: BAND_ALPHA,
       });
       expect(findings, where).toEqual({ A1: [], A2: [], A3: [], A7: [], A8: [], A9: [] });
+      await checkGlyphs(page, where, name);
       await expect
         .poll(() => stagePixel(page, canvas), {
           message: `${where}: the stage does not draw readTheme().bg (A7)`,
@@ -186,7 +195,7 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
   // Text shown only once every node agrees (the converged badge) is checked too.
   expect(converged, 'no preset was audited in a converged state (A3)').toBeGreaterThan(0);
   expect(charted, 'no preset showed the charts, so none were checked (A3, A7)').toBeGreaterThan(0);
-  expect(inspected, 'no preset opened with its origin selected, so Gossip targets were never checked (A4)').toBeGreaterThan(0);
+  expect(inspected, 'no preset opened with its node selected, so Gossip targets were never checked (A4)').toBeGreaterThan(0);
   expect(errors, 'page errors, console errors or failed requests (A1)').toEqual([]);
 });
 
@@ -339,21 +348,7 @@ async function checkData(page: Page, name: string, series: ClusterState[]): Prom
       String(snap.zones.filter((z) => z.live > 0).length),
     );
   }
-  await expect(field(page, 'status-total'), where).toHaveText(int(oracle));
-
-  // Rule 12: while a node lacks a change, the headline gives the longest any
-  // node has lacked one, at least, as a censored "≥".
-  let longest: number | undefined;
-  for (const node of nodes) {
-    const t = missingFor(node.lag);
-    if (t !== undefined && (longest === undefined || t > longest)) longest = t;
-  }
-  const hero = page.locator('.headline [data-field="missing-for"]');
-  if (longest !== undefined) {
-    await expect(hero, `${where}: not caught up`).toHaveText(duration(longest));
-  } else {
-    await expect(hero, `${where}: no node lacks a change`).toHaveCount(0);
-  }
+  await checkHeading(page, where, snap);
 
   // Each node's behind-by, view and the origins it is a gateway for, from every
   // node's own peer rows inverted.
@@ -369,8 +364,11 @@ async function checkData(page: Page, name: string, series: ClusterState[]): Prom
     await expect(row.locator('[data-field="view"]'), `${where}: node ${node.id} view`).toHaveText(
       int(node.window_total),
     );
+    if (node.lag.kind !== 'Stranded') {
+      expect(node.window_total, `${where}: node ${node.id} sees no more than the truth`).toBeLessThanOrEqual(oracle);
+    }
     await expect(row.locator('[data-field="behind"]'), `${where}: node ${node.id} behind`).toHaveText(
-      int(Math.max(oracle - node.window_total, 0)),
+      int(oracle - node.window_total),
     );
     const want = gatewayFor.get(node.id) ?? 0;
     const printed = row.locator('[data-field="gateway-for"]');
@@ -414,7 +412,7 @@ async function checkData(page: Page, name: string, series: ClusterState[]): Prom
   // The selected origin's Gossip targets: each remote zone's gateway, unacked
   // positions, wait and the counters.
   if ((await page.locator('.inspector').count()) > 0) {
-    const origin = Number(await text(page.locator('.inspector h2 [data-field="node"]')));
+    const origin = Number(await text(page.locator('.pane-title [data-field="node"]')));
     const inspected = (await snapshot(page, origin)).inspected;
     const state = nodes.find((n) => n.id === origin)!;
     const peers = inspected?.peers ?? [];
@@ -453,6 +451,178 @@ async function checkData(page: Page, name: string, series: ClusterState[]): Prom
       );
     }
   }
+}
+
+/** A18: the stage heading, recomputed from the engine's snapshot: its form,
+ *  the truth it prints, how many nodes are up, the gap, the reopening
+ *  countdown and rule 12's censored "≥". */
+async function checkHeading(page: Page, where: string, snap: ClusterState): Promise<void> {
+  const h = page.locator('[data-template]');
+  const id = await h.getAttribute('data-template');
+  const nodes = snap.nodes;
+  const t = snap.oracle_total;
+  if (id === 'hd-feed') return;
+  if (id === 'rl-4') {
+    expect(t, `${where}: the window is empty`).toBe(0);
+    return;
+  }
+  const claims = async (noun: string): Promise<string[]> =>
+    (await h.locator(`[data-noun="${noun}"]`).allTextContents()).map((v) => v.trim());
+  const view = await claims('view');
+  if (view.length > 0) expect(view[0], `${where}: the heading's truth`).toBe(int(t));
+  const up = nodes.filter((n) => n.lag.kind === 'CaughtUp').length;
+  const stranded = nodes.filter((n) => n.lag.kind === 'Stranded').length;
+  if (id === 'hd-stranded') {
+    expect(up, `${where}: every reachable node is up`).toBe(nodes.length - stranded);
+    return;
+  }
+  const printed = ((await h.textContent()) ?? '').replace(/\s+/g, ' ').trim();
+  if (up < nodes.length) {
+    expect(printed.startsWith(`${up} of ${nodes.length} `), `${where}: "${printed}" counts ${up} up`).toBe(true);
+    const gap = Math.max(...nodes.filter((n) => n.lag.kind !== 'Stranded').map((n) => t - n.window_total));
+    expect((await claims('behind'))[0], `${where}: the gap`).toBe(int(gap));
+  } else {
+    expect(printed.includes(`All ${nodes.length} nodes`), `${where}: "${printed}" says every node`).toBe(true);
+  }
+  const selected = Number(await text(page.locator('.pane-title [data-field="node"]')));
+  const next = (await snapshot(page, selected)).inspected?.next_send;
+  const reopens = await claims('reopens');
+  if (id === 'rl-3' && next?.kind === 'Rejected' && next.reopens.kind === 'In') {
+    expect(reopens, `${where}: the countdown`).toEqual([`${(Math.floor(next.reopens.ms / 100) / 10).toFixed(1)} s`]);
+  } else {
+    expect(reopens, `${where}: no countdown while node ${selected} admits`).toEqual([]);
+  }
+  let longest = 0;
+  for (const node of nodes) if (node.lag.kind === 'Behind') longest = Math.max(longest, node.lag.missing_for_ms);
+  const late = h.locator('[data-noun="behind"]', { hasText: /\d+(\.\d)? m?s/ });
+  if (longest >= PERIOD_MS) await expect(late, `${where}: not caught up`).toHaveText(duration(longest));
+  else await expect(late, `${where}: rule 12 prints from one period up`).toHaveCount(0);
+}
+
+/** A42 (static): every node mark as the stage published it, against the
+ *  layout, the DOM's counts and names, and the engine's snapshot. */
+async function checkGlyphs(page: Page, where: string, name: string): Promise<void> {
+  const snap = await snapshot(page);
+  const feed = ['Steady state', 'No zone configured', 'Sustained overload', 'Gateway cut'].includes(name);
+  const findings = await page.evaluate(
+    ({ k, nodes, grace }) => {
+      const found: string[] = [];
+      const c = document.querySelector('.stage canvas') as HTMLCanvasElement & { glyphs: GlyphTable };
+      const g = c.glyphs;
+      const rings = JSON.parse(c.dataset.rings ?? '[]') as { x: number; y: number }[];
+      const labels = (JSON.parse(c.dataset.labelBoxes ?? '[]') as { text: string; x: number; y: number; w: number; h: number; size: number }[]).filter((l) => l.text.startsWith('node'));
+      const at = c.getBoundingClientRect();
+      const zoneOf = new Map<number, number>();
+      for (const row of document.querySelectorAll<HTMLElement>('[role="grid"] [role="row"]')) {
+        for (const cell of row.querySelectorAll<HTMLElement>('[role="gridcell"]')) zoneOf.set(Number(cell.dataset.node), Number(row.dataset.zone));
+      }
+      const byId = new Map(nodes.map((n) => [n.id, n]));
+      const slots: number[] = [];
+      for (let s = 0; s < g.len; s++) if (g.id[s] >= 0) slots.push(s);
+      // The DOM counts, as boxes of their width and figure height, in canvas px.
+      const counts = [...document.querySelectorAll<HTMLElement>('.count')];
+      const ctx = new OffscreenCanvas(1, 1).getContext('2d')!;
+      const boxes = counts.map((el) => {
+        const r = el.getBoundingClientRect();
+        ctx.font = getComputedStyle(el).font;
+        const cap = ctx.measureText('0').actualBoundingBoxAscent;
+        const cx = r.left + r.width / 2 - at.left;
+        const cy = r.top + r.height / 2 - at.top;
+        return { id: Number(el.closest<HTMLElement>('[data-node]')?.dataset.node), x0: cx - r.width / 2, x1: cx + r.width / 2, y0: cy - cap / 2, y1: cy + cap / 2, w: r.width, cap, size: parseFloat(getComputedStyle(el).fontSize) };
+      });
+      if (counts.length !== 0 && counts.length !== slots.length) found.push(`${counts.length} of ${slots.length} counts shown: all or none`);
+      if (innerWidth >= 1100 && counts.length === 0) found.push('no count shown at 1100 px or wider');
+      const overlaps = (a: { x0: number; x1: number; y0: number; y1: number }, b: { x0: number; x1: number; y0: number; y1: number }): boolean =>
+        a.x0 < b.x1 && b.x0 < a.x1 && a.y0 < b.y1 && b.y0 < a.y1;
+      for (const s of slots) {
+        const id = g.id[s];
+        const [x, y, r] = [g.x[s], g.y[s], g.r[s]];
+        const node = byId.get(id);
+        const box = boxes.find((b) => b.id === id);
+        if (box !== undefined) {
+          if ((box.w / 2) ** 2 + (box.cap / 2) ** 2 > (k.COUNT_FIT * r) ** 2 + 0.5) found.push(`node ${id}'s count does not fit its disc`);
+          if (Math.abs((box.x0 + box.x1) / 2 - x) > 1 || Math.abs((box.y0 + box.y1) / 2 - y) > 1.5) found.push(`node ${id}'s count is off its disc's centre`);
+        }
+        // The vessel: the fill's top and the brim, on the 1.25-limit scale.
+        if (g.onScale === 1 && node !== undefined) {
+          const inner = 2 * (r - 1);
+          const full = k.VESSEL_SCALE * g.limit;
+          const top = r - 1 - (inner * Math.min(node.window_total, full)) / full;
+          const brim = r - 1 - inner / k.VESSEL_SCALE;
+          if (Math.abs(g.fillTop[s] - top) > 0.5) found.push(`node ${id}'s fill tops at ${g.fillTop[s].toFixed(1)}, not ${top.toFixed(1)}`);
+          if (Math.abs(g.brimY[s] - brim) > 0.5) found.push(`node ${id}'s brim at ${g.brimY[s].toFixed(1)}, not ${brim.toFixed(1)}`);
+          if ((g.cap[s] === 1) !== (node.brim.kind === 'Rejected')) found.push(`node ${id}'s cap does not follow its brim decision`);
+        } else if (g.onScale === 0 && !Number.isNaN(g.brimY[s])) {
+          found.push(`node ${id} draws a brim though the limit is off the scale`);
+        }
+        // The ring's colour role, from the lag past the feed's grace.
+        if (node !== undefined) {
+          const behind = node.lag.kind !== 'CaughtUp' && node.lag.missing_for_ms >= grace;
+          if (g.ring[s] !== (behind ? k.RING_BEHIND : k.RING_CAUGHT_UP)) found.push(`node ${id}'s ring role does not follow its lag`);
+        }
+        // A port: on its circle, toward its own zone's centre, clear of its disc,
+        // of every ring and of every count.
+        if (!Number.isNaN(g.portX[s])) {
+          const ring = rings[zoneOf.get(id) ?? -1];
+          const want = Math.atan2(ring.y - y, ring.x - x);
+          const got = Math.atan2(g.portY[s] - y, g.portX[s] - x);
+          const off = Math.abs(((got - want + 3 * Math.PI) % (2 * Math.PI)) - Math.PI);
+          if (off > Math.PI / 180) found.push(`node ${id}'s port points ${((off * 180) / Math.PI).toFixed(1)}° off its zone's centre`);
+          const half = Math.max(k.PORT_MIN, r / 3);
+          const d = Math.hypot(g.portX[s] - x, g.portY[s] - y);
+          if (Math.abs(d - (r + k.RING_REACH + half + k.PORT_GAP)) > 0.5) found.push(`node ${id}'s port is not on its port circle`);
+          if (d - half <= r) found.push(`node ${id}'s port covers its own disc`);
+          const port = { x0: g.portX[s] - half, x1: g.portX[s] + half, y0: g.portY[s] - half, y1: g.portY[s] + half };
+          for (const t of slots) {
+            const dt = Math.hypot(g.portX[s] - g.x[t], g.portY[s] - g.y[t]);
+            if (Math.abs(dt - (g.r[t] + k.ARC_GAP)) < k.ARC_WIDTH / 2 + half - 1e-6) found.push(`node ${id}'s port crosses node ${g.id[t]}'s ring`);
+          }
+          for (const b of boxes) if (overlaps(port, b)) found.push(`node ${id}'s port covers node ${b.id}'s count`);
+        }
+      }
+      // The selection outline: clear of every other node's ring.
+      if (g.selected >= 0) {
+        const s = g.selected;
+        for (const t of slots) {
+          if (t === s) continue;
+          const d = Math.hypot(g.x[s] - g.x[t], g.y[s] - g.y[t]);
+          if (d < g.r[s] + g.r[t] + k.SELECTION_REACH + k.RING_REACH - 1e-6) found.push(`the selection outline crosses node ${g.id[t]}'s ring`);
+        }
+      }
+      // The names: what they say, smaller than the counts, inside the canvas,
+      // apart from one another and clear of every ring and count.
+      for (const [i, l] of labels.entries()) {
+        if (!/^node \d+( · (silenced|can't reach zone [a-z]))?$/.test(l.text)) found.push(`the name "${l.text}" is not a node's name`);
+        if (boxes.length > 0 && l.size >= boxes[0].size) found.push(`the name "${l.text}" is not smaller than the counts`);
+        if (l.x < 0 || l.y < 0 || l.x + l.w > c.clientWidth || l.y + l.h > c.clientHeight) found.push(`the name "${l.text}" leaves the canvas`);
+        const box = { x0: l.x, x1: l.x + l.w, y0: l.y, y1: l.y + l.h };
+        for (const o of labels.slice(i + 1)) {
+          const vertical = l.y < o.y + o.h && o.y < l.y + l.h;
+          const apart = Math.max(o.x - (l.x + l.w), l.x - (o.x + o.w));
+          // Twelve px apart where the stage has room for its names (1100 px
+          // and wider); clear of each other everywhere.
+          const least = innerWidth >= 1100 ? 12 : 1;
+          if (vertical && apart < least - 1e-6) found.push(`"${l.text}" and "${o.text}" stand ${apart.toFixed(1)} px apart`);
+        }
+        for (const t of slots) {
+          const nx = Math.max(box.x0, Math.min(g.x[t], box.x1));
+          const ny = Math.max(box.y0, Math.min(g.y[t], box.y1));
+          const reach = g.r[t] + (t === g.selected ? k.SELECTION_REACH : k.RING_REACH);
+          if (Math.hypot(g.x[t] - nx, g.y[t] - ny) <= reach) found.push(`the name "${l.text}" touches node ${g.id[t]}'s marks`);
+        }
+        for (const b of boxes) if (overlaps(box, b)) found.push(`the name "${l.text}" covers node ${b.id}'s count`);
+      }
+      if (labels.length !== slots.length) found.push(`${labels.length} names for ${slots.length} nodes`);
+      if (g.onScale === 0 && (g.marks & k.FAR) === 0) found.push('the limit is off the scale but the key does not say so');
+      return found;
+    },
+    {
+      k: { COUNT_FIT, VESSEL_SCALE, RING_REACH, SELECTION_REACH, PORT_GAP, PORT_MIN: portHalf(0), ARC_GAP, ARC_WIDTH, RING_BEHIND, RING_CAUGHT_UP, FAR: MARK.FAR },
+      nodes: snap.nodes.map((n) => ({ id: n.id, lag: n.lag, window_total: n.window_total, brim: n.brim })),
+      grace: feed ? PERIOD_MS + 5 : 0,
+    },
+  );
+  expect(findings, `${where} (A42)`).toEqual([]);
 }
 
 // -- A5: fixed order -----------------------------------------------------------
@@ -668,13 +838,13 @@ function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number
       if (clipped.cutOff) found.A3.push(`canvas label "${l.text}" is cut off by an overflow: hidden box`);
       if (clipped.box !== null) boxes.push({ key: l, name: `canvas "${l.text}"`, box: clipped.box });
     }
-    // The stage names every node it draws: an id the labeller found no room
+    // The stage names every node it draws: a node the labeller found no room
     // for leaves its disc unnamed.
     if (canvas.closest('.stage') !== null) {
-      const drawn = new Set(labels.map((l) => l.text));
+      const drawn = new Set(labels.map((l) => /^node (\d+)/.exec(l.text)?.[1]));
       for (const c of document.querySelectorAll<HTMLElement>('[role="gridcell"][data-node]')) {
         const id = c.dataset.node ?? '';
-        if (!drawn.has(id)) found.A3.push(`the stage draws node ${id} with no id label`);
+        if (!drawn.has(id)) found.A3.push(`the stage draws node ${id} with no name`);
       }
     }
   }
@@ -777,6 +947,8 @@ function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number
     }
   };
   scan(found.A2, [/\bNaN\b|\bundefined\b|\bnull\b|\bInfinity\b|\[object|\de\+\d/g]);
+  // A3: glyphs that carry meaning are drawn, never set from a font.
+  scan(found.A3, [/[◆◇●▸❙❚↺]/g]);
   scan(found.A8, [/confidence|significant|p-value|standard error/gi, /\bCI\b/g, /\b\d{1,2}:\d{2}\b/g]);
 
   // A9: no digit outside a data-bound element, visible or not. "level 0" and
@@ -831,27 +1003,34 @@ test('chart 1 prints the windowed share and follows the placement', async ({ pag
   // the bytes each origin sent in the window, which opens at a kept mark, not
   // the session start, so the mark's per-origin bytes count.
   await loadPreset(page, 'Sandbox');
+  // Every snapshot the page takes is recorded as it takes it: a Send and an
+  // Add each run until the cluster settles, and the chart's marks are kept
+  // from every snapshot of that run.
+  await page.evaluate(() => {
+    const w = window as unknown as { taken: ClusterState[] };
+    w.taken = [];
+    const sim = window.sim! as typeof window.sim & { recorded?: boolean };
+    if (sim.recorded === true) return;
+    sim.recorded = true;
+    const take = sim.snapshot.bind(sim);
+    sim.snapshot = async (...args) => {
+      const snap = await take(...args);
+      w.taken.push(snap);
+      return snap;
+    };
+  });
   await page.getByRole('button', { name: 'Add node' }).click();
   await expect(page.locator('[data-field="status-nodes"]')).toHaveText('13');
-  const rail = page.locator('.rail');
-  const sandbox: ClusterState[] = [];
-  const recordSandbox = async (): Promise<void> => void sandbox.push(await snapshot(page));
-  // A Send first lands the run in flight, which may move time one emit floor:
-  // its snapshot is recorded once the page has applied its own.
-  const burst = async (node: string): Promise<void> => {
-    await page.getByLabel('Node', { exact: true }).selectOption(node);
-    const sent = (await snapshot(page)).admitted_hits;
-    await rail.getByRole('button', { name: 'Send burst' }).click();
-    await expect.poll(async () => (await snapshot(page)).admitted_hits).toBeGreaterThan(sent);
-    await expect(page.locator('.stage-pane')).toHaveAttribute('data-held', '0');
-    await recordSandbox();
-  };
-  await burst('0');
-  await burst('1');
+  await expect(page.locator('.stage-pane')).toHaveAttribute('data-run', 'off', { timeout: 30_000 });
+  await send(page, 0);
+  await send(page, 1);
   for (let i = 0; i < 26; i++) {
-    if (i === 22) await burst('0');
-    await period(page, recordSandbox);
+    if (i === 22) await send(page, 0);
+    await period(page);
   }
+  const sandbox = (await page.evaluate(() => (window as unknown as { taken: ClusterState[] }).taken)).filter(
+    (snap, i, all) => i === 0 || snap.virtual_ms >= all[i - 1].virtual_ms,
+  );
   expect(sandbox[0].zones.map((z) => z.live), 'zones of 5, 4 and 4').toEqual([5, 4, 4]);
   const opened = windowStart(sandbox);
   expect(opened.t, 'the window opens at a kept mark').toBeGreaterThan(0);
@@ -871,7 +1050,8 @@ test('chart 1 prints the windowed share and follows the placement', async ({ pag
   await checkOrder(page, 'Sandbox after add');
 
   // The same run with one node left: no reference line, attribute or label.
-  const remove = page.getByRole('button', { name: 'Remove node', exact: true });
+  // The pane's Remove takes the selected node, and the selection moves on.
+  const remove = page.locator('.pane-foot').getByRole('button', { name: /^Remove node/ });
   for (let left = 12; left >= 1; left--) {
     await remove.click();
     // Each removal lands before the next click, which would otherwise pick the
@@ -1007,13 +1187,14 @@ test('stage geometry holds for every zone count', async ({ page }, info) => {
     );
     expect(spots, where).toHaveLength(12);
 
-    // No two nodes of different rings come within each other's arc or diamond.
-    const extent = (r: number): number => Math.max(r + ARC_GAP + ARC_WIDTH / 2, DIAMOND_SCALE * r);
+    // No two nodes of different rings come within each other's ring, nor
+    // within the selection outline either might wear.
     const touching: string[] = [];
     for (const a of spots) {
       for (const b of spots) {
         if (a.zone >= b.zone) continue;
-        const room = Math.hypot(a.x - b.x, a.y - b.y) - extent(stage.rings[a.zone].r) - extent(stage.rings[b.zone].r);
+        const room =
+          Math.hypot(a.x - b.x, a.y - b.y) - (stage.rings[a.zone].r + SELECTION_REACH) - (stage.rings[b.zone].r + RING_REACH);
         if (room < 0) touching.push(`node ${a.id} and node ${b.id} overlap by ${(-room).toFixed(1)} px`);
       }
     }
@@ -1078,11 +1259,10 @@ test('stage geometry holds for every zone count', async ({ page }, info) => {
         .evaluate((c: HTMLCanvasElement & { drawn?: Drawn[] }) => c.drawn ?? []);
     const zoneOf = new Map(spots.map((s) => [s.id, s.zone]));
     const crosses = (b: { src: number; dst: number }): boolean => zoneOf.get(b.src) !== zoneOf.get(b.dst);
-    // Propagation opens quiet (its seed settled, no feed), so a Send gives the
-    // Steps a wave that crosses zones. Forty heartbeat periods: a deadline in
-    // simulated time, not in wall time.
-    await page.locator('.rail').getByRole('button', { name: 'Send burst' }).click();
-    await stepUntil(page, async () => (await drawn()).some(crosses), 40, `${where}: a Step drew a cross-zone beam`);
+    // Rate limiting opens quiet (no seed, no feed), so a Send flushes a wave
+    // that crosses zones at once, and its run draws it.
+    await send(page, 0);
+    await stepUntil(page, async () => (await drawn()).some(crosses), 40, `${where}: a cross-zone beam was drawn`);
     const beams = await drawn();
     for (const b of beams) {
       const [fx, fy, cx, cy, tx, ty] = b.route;
@@ -1158,14 +1338,22 @@ test("every drawn beam carries its packet's kind, tier and fate", async ({ page 
   // A Send's waves are own streams, relays and acknowledgements. Once every
   // store holds its hits, a node added to the live cluster asks its zone for a
   // join sweep and is sent one.
-  const rail = page.locator('.rail');
-  await rail.getByRole('button', { name: 'Send burst' }).click();
+  await send(page, 0, true);
   await period(page);
   await period(page);
+  // Add runs until the newcomer has caught up: the join's packets, a sweep
+  // request and the sweep, are each drawn once as they are sent.
+  const seen = new Set<PacketKind>();
+  await take();
   await page.getByRole('button', { name: 'Add node' }).click();
   await expect(field(page, 'status-nodes')).toHaveText('13');
-  await rail.getByRole('button', { name: 'Send burst' }).click();
-  const seen = new Set<PacketKind>();
+  await expect(page.locator('.stage-pane')).toHaveAttribute('data-run', 'off', { timeout: 30_000 });
+  await still(page);
+  const joined = await take();
+  const name = ({ src, dst }: { src: number; dst: number }): string => `node ${src} to node ${dst}`;
+  expect(joined.beams.map(name).sort(), "the join's beams are its packets, one each").toEqual(joined.packets.map(name).sort());
+  for (const p of joined.packets) seen.add(p.kind);
+  await send(page, 0, true);
   for (let i = 0; i < 40 && seen.size < Object.keys(KIND).length; i++) {
     for (const kind of await checkStep()) seen.add(kind);
   }
@@ -1298,7 +1486,8 @@ test('runs go quiet after agreement', async ({ page }, info) => {
   // its node's next heartbeat, so the period after that sends nothing at all.
   await loadPreset(page, 'Propagation');
   await logPackets(page);
-  await page.locator('.rail').getByRole('button', { name: 'Send burst' }).click();
+  // Propagation's Send stops before its first wave; Steps fly the waves.
+  await send(page, 0);
   await step(page);
   await stepUntil(page, () => agreed(page), 4, 'Propagation agreed');
   const at = await virtualMs(page);
@@ -1314,7 +1503,7 @@ test('runs go quiet after agreement', async ({ page }, info) => {
   // Zone partition, healed: it reconciles, then sends no data.
   await loadPreset(page, 'Zone partition');
   await page.getByRole('button', { name: 'Heal network' }).click();
-  await expect(field(page, 'status-cut')).toHaveText('0');
+  await expect(field(page, 'status-cut')).toHaveCount(0);
   await logPackets(page);
   await stepUntil(page, () => agreed(page), 16, 'Zone partition agreed');
   await takePackets(page);
@@ -1338,7 +1527,7 @@ test('both gateway presets fail over within the window', async ({ page }, info) 
   for (const [name, record, trickle] of [
     ['Gateway failure', timings.gateway_failure, 0],
     // The trickle's hits in the last period may not have reached zone b yet.
-    ['Gateway cut from its zone', timings.gateway_cut, Math.ceil((2 * PERIOD_MS) / 1000)],
+    ['Gateway cut', timings.gateway_cut, Math.ceil((2 * PERIOD_MS) / 1000)],
   ] as const) {
     await loadPreset(page, name);
     const load = await snapshot(page, 0);
@@ -1368,23 +1557,20 @@ test('the transport stays put when the heartbeat reading appears', async ({ page
   await open(page);
   await page.evaluate(() => document.fonts.ready.then(() => undefined));
   const bar = page.locator('.transport');
-  // The virtual time's caption, whose box does not change with the time it reads.
-  const virtualTime = page.locator('.readout-item', { has: field(page, 'virtual-time') }).locator('.readout-label');
+  const time = page.locator('.readout-item.time');
   const before = (await bar.boundingBox())!.height;
-  const caption = (await virtualTime.boundingBox())!;
+  const at = (await time.boundingBox())!;
   const row = (await page.locator('.readout').boundingBox())!;
-  expect(caption.x + caption.width, "the virtual time stands short of the bar's right edge").toBeCloseTo(
-    row.x + row.width,
-    0,
-  );
+  expect(at.x + at.width, "the simulated time stands at the bar's right edge").toBeCloseTo(row.x + row.width, 0);
   await page.getByRole('button', { name: 'Play' }).click();
   await expect(field(page, 'heartbeat-wall')).toHaveAttribute('data-ms', /\d/, { timeout: 30_000 });
   await page.getByRole('button', { name: 'Pause' }).click();
   expect((await bar.boundingBox())!.height, 'the bar changed height when the reading appeared').toBe(before);
-  expect((await virtualTime.boundingBox())!.x, 'the virtual time moved when the reading appeared').toBe(caption.x);
-  // From 768 px up, Play, Step, Reset, Speed and both readouts share one row.
+  const after = (await time.boundingBox())!;
+  expect(after.x + after.width, 'the simulated time moved when the reading appeared').toBeCloseTo(at.x + at.width, 0);
+  // From 1100 px up, Play, Step, Send, Speed and both readouts share one row.
   const play = (await page.getByRole('button', { name: 'Play' }).boundingBox())!.height;
-  if ((page.viewportSize()?.width ?? 0) >= 768) expect(before, 'the bar wrapped').toBeLessThan(2 * play);
+  if ((page.viewportSize()?.width ?? 0) >= 1100) expect(before, 'the bar wrapped').toBeLessThan(2 * play);
   await bar.screenshot({ path: `audit-shots/${info.project.name}/transport-heartbeat.png` });
 });
 
@@ -1398,7 +1584,8 @@ test.describe('interaction', () => {
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
     await open(page);
-    const status = (name: string): Locator => field(page, `status-${name}`);
+    const lede = page.locator('.lede');
+    const title = page.locator('.pane-title [data-field="node"]');
     const rings = (): Promise<number> =>
       page.locator('.stage canvas').evaluate((c: HTMLCanvasElement) => JSON.parse(c.dataset.rings ?? '[]').length);
 
@@ -1406,35 +1593,37 @@ test.describe('interaction', () => {
     await page.getByText('Tune the cluster').click();
     await page.locator('#knob-zones').fill('4');
     await page.getByRole('button', { name: 'Rebuild cluster' }).click();
-    await expect(status('zones')).toHaveText('4');
+    await expect(field(page, 'status-zones')).toHaveText('4');
     await expect.poll(rings).toBe(4);
 
-    // Steady state: cut zone c off, then heal.
+    // Steady state: cut zone c off, then heal. The lede names the cut.
     await loadPreset(page, 'Steady state');
     await page.locator('#cut-zone').selectOption({ label: 'zone c' });
     await page.getByRole('button', { name: 'Cut zone c off' }).click();
-    await expect(status('cut')).toHaveText('32');
+    await expect(lede).toContainText('zone c cut off');
     await page.getByRole('button', { name: 'Heal network' }).click();
-    await expect(status('cut')).toHaveText('0');
+    await expect(lede).not.toContainText('cut off');
 
-    // Propagation, with node 0 selected: silence its gateway, then cut one
-    // direction of another. The cluster warmed up before it opened, so the
-    // gateway is already found.
+    // Propagation, with node 0 selected: silence one of its gateways, then cut
+    // another off from its zone. The cluster warmed up before it opened, so
+    // the gateways are already found.
     await loadPreset(page, 'Propagation');
-    const silence = page.getByRole('button', { name: /^Silence node \d+, the gateway into zone b$/ });
-    await expect(silence).toHaveCount(1);
+    await expect(page.getByRole('heading', { name: "node 0's gateways" })).toBeVisible();
+    const silence = page.getByRole('button', { name: /^Silence node \d+$/ }).first();
+    const silenced = (await silence.locator('[data-field="node"]').textContent()) ?? '';
     await silence.click();
-    await expect(status('cut')).toHaveText('11');
+    await expect(lede).toContainText(`node ${silenced} silenced`);
     await page.getByRole('button', { name: 'Heal network' }).click();
-    await expect(status('cut')).toHaveText('0');
-    await page.getByRole('button', { name: /^Cut node \d+ from zone b$/ }).click();
-    await expect(status('cut')).toHaveText('3');
+    await expect(lede).not.toContainText('silenced');
+    await page.getByRole('button', { name: /^Cut node \d+ off from zone b$/ }).click();
+    await expect(lede).toContainText('unheard by zone b');
     await page.getByRole('button', { name: 'Heal network' }).click();
-    await expect(status('cut')).toHaveText('0');
+    await expect(lede).not.toContainText('unheard');
 
     // The keyboard: Shift+Tab from "Show as table" lands on the grid's one tab
     // stop. Right moves within the zone; Down to the same rank in the next zone;
-    // End and Home to the zone's ends; Enter selects; Escape deselects.
+    // End and Home to the zone's ends; Enter selects; Escape returns the
+    // selection to the scenario's node.
     const focused = (): Promise<string | undefined> => page.evaluate(() => (document.activeElement as HTMLElement).dataset.node);
     await page.getByText('Show as table').focus();
     await page.keyboard.press('Shift+Tab');
@@ -1447,20 +1636,20 @@ test.describe('interaction', () => {
     expect(await focused(), 'End: the last node of zone b').toBe('10');
     await page.keyboard.press('Home');
     expect(await focused(), 'Home: the first node of zone b').toBe('1');
-    await expect(page.locator('.stage-box .tooltip'), 'focus shows the tooltip').toContainText('Node 1');
+    await expect(page.locator('.stage-box .tooltip'), 'focus shows the tooltip').toContainText('select node 1');
     await page.keyboard.press('Enter');
-    await expect(page.locator('.inspector')).toContainText('Node 1');
+    await expect(title).toHaveText('1');
     await page.keyboard.press('Escape');
-    await expect(page.locator('.inspector')).toHaveCount(0);
+    await expect(title, "Escape returns the selection to the scenario's node").toHaveText('0');
     await expect(page.locator('.stage-box .tooltip')).toHaveCount(0);
 
-    // Focus survives a rebuild: Reset, clicked without moving focus, leaves it on
-    // the same node.
+    // Focus survives a rebuild: Restart, clicked without moving focus, leaves it
+    // on the same node.
     await cell(page, 5).focus();
     // Mark the engine, so the rebuild is seen as a new one rather than as the
     // overlay not having appeared yet.
     await page.evaluate(() => Object.assign(window.sim!, { old: true }));
-    await page.getByRole('button', { name: 'Reset' }).dispatchEvent('click');
+    await page.getByRole('button', { name: 'Restart Propagation' }).dispatchEvent('click');
     await expect.poll(() => page.evaluate(() => window.sim !== undefined && !('old' in window.sim))).toBe(true);
     await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
     expect(await focused(), 'focus stayed on node 5 through the rebuild').toBe('5');
@@ -1473,28 +1662,240 @@ test.describe('interaction', () => {
     if (box === null) throw new Error('node 7 has no box');
     const [x, y] = [box.x + box.width / 2, box.y + box.height / 2];
     await page.mouse.move(x, y);
-    await expect(page.locator('.stage-box .tooltip')).toContainText('Node 7');
+    await expect(page.locator('.stage-box .tooltip')).toContainText('select node 7');
     await page.mouse.move(0, 0);
     await expect(page.locator('.stage-box .tooltip')).toHaveCount(0);
     await page.touchscreen.tap(x, y);
-    await expect(page.locator('.inspector')).toContainText('Node 7');
-    await expect(page.locator('.stage-box .tooltip')).toContainText('Node 7');
+    await expect(title).toHaveText('7');
+    await expect(page.locator('.stage-box .tooltip')).toContainText('select node 7');
 
-    // Removing a cut node takes its cut links with it.
-    const cutFrom = page.getByRole('button', { name: /^Cut node \d+ from zone \w$/ }).first();
+    // Removing a cut node takes its cut with it.
+    const cutFrom = page.getByRole('button', { name: /^Cut node \d+ off from zone \w$/ }).first();
     await expect(cutFrom, 'node 7 found its gateways while the cluster warmed up').toBeVisible();
-    const cutNode = (await cutFrom.locator('[data-field="node"]').textContent()) ?? '';
+    const cutNode = Number((await cutFrom.locator('[data-field="node"]').textContent()) ?? '');
     await cutFrom.click();
-    await expect(status('cut')).toHaveText('3');
-    await page.locator('#remove-node').selectOption(cutNode);
-    await page.getByRole('button', { name: 'Remove node', exact: true }).click();
-    await expect(status('nodes')).toHaveText('11');
-    await expect(status('cut')).toHaveText('0');
+    await expect(lede).toContainText(`node ${cutNode} unheard`);
+    await page.locator(`[role="gridcell"][data-node="${cutNode}"]`).press('Enter');
+    await expect(title).toHaveText(String(cutNode));
+    await page.locator('.pane-foot').getByRole('button', { name: `Remove node ${cutNode}` }).click();
+    await expect(field(page, 'status-nodes')).toHaveText('11');
+    await expect(lede).not.toContainText('unheard');
 
     // The study link: the base URL's form, not that it resolves (`study/` joins
     // the site only in the Pages build).
-    await page.locator('.method summary').click();
-    await expect(page.getByRole('link', { name: 'gossip study' })).toHaveAttribute('href', '/study/dashboard/');
+    await expect(page.getByRole('link', { name: 'measured results in the study' })).toHaveAttribute('href', '/study/dashboard/');
     expect(errors, 'page errors').toEqual([]);
   });
+});
+
+// -- A42, A16, C37: the node glyph in motion -------------------------------------
+
+/** The relative luminance of a packed `0xRRGGBB` and the contrast of two. */
+const lum = (rgb: number): number => {
+  const c = [(rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff].map((v) => {
+    const x = v / 255;
+    return x <= 0.04045 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+};
+const contrastOf = (a: number, b: number): number => {
+  const [hi, lo] = [lum(a), lum(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+};
+
+/** The stage's glyph table, read in the page. */
+const glyphs = <T>(page: Page, read: (g: GlyphTable) => T): Promise<T> =>
+  page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { glyphs: GlyphTable }, src) => {
+    // The reader arrives as source: Playwright ships functions as text.
+    return (0, eval)(src)(c.glyphs);
+  }, read.toString()) as Promise<T>;
+
+test('the node glyph tells level, strata, cap, refusal and ring (A42, A16, C37)', async ({ page }, info) => {
+  test.setTimeout(240_000);
+  await open(page);
+  await loadPreset(page, 'Rate limiting');
+  const wide = (page.viewportSize()?.width ?? 0) >= 1100;
+  const where = info.project.name;
+  const theme = await page.evaluate(readTheme);
+  expect(contrastOf(theme.fg, theme.level), `${where}: a count over the fill (A16)`).toBeGreaterThanOrEqual(4.5);
+  expect(contrastOf(theme.fg, theme.panel), `${where}: a count over the empty inside (A16)`).toBeGreaterThanOrEqual(4.5);
+
+  // During the first Send's held flight every receiver's ring is behind and
+  // shows less than the whole, though it has heard nothing yet.
+  await page.locator('[role="gridcell"][data-node="0"]').press('Enter');
+  await page.locator('.transport').getByRole('button', { name: /^Send/ }).click();
+  await page.waitForFunction(() => document.querySelector<HTMLElement>('.stage-pane')?.dataset.held !== '0');
+  const held = await glyphs(page, (g) => {
+    const out: [number, number, number][] = [];
+    for (let s = 0; s < g.len; s++) if (g.id[s] >= 0 && g.id[s] !== 0) out.push([g.id[s], g.ring[s], g.arc[s]]);
+    return out;
+  });
+  for (const [id, ring, arc] of held) {
+    expect(ring, `${where}: node ${id}'s ring while the wave flies`).toBe(RING_BEHIND);
+    expect(arc, `${where}: node ${id}'s arc while the wave flies`).toBeLessThan(1);
+  }
+  await still(page, 60_000);
+
+  // Sends at nodes 1, 2 and 2, each in a bucket of its own where strata show.
+  for (const node of [1, 2, 2]) {
+    if (wide) {
+      const bucket = (await snapshot(page)).bucket_epoch_now;
+      await page.getByRole('button', { name: 'Play' }).click();
+      await expect.poll(async () => (await snapshot(page)).bucket_epoch_now, { timeout: 30_000 }).toBeGreaterThan(bucket);
+      await page.getByRole('button', { name: 'Pause' }).click();
+      await still(page);
+    }
+    await send(page, node);
+  }
+  const snap = await snapshot(page);
+  await checkGlyphs(page, `${where}, at the limit`, 'Rate limiting');
+  const strata = await glyphs(page, (g) => Array.from({ length: g.len }, (_, s) => [g.id[s], g.strata[s]] as [number, number]));
+  // Strata show where the inside is tall enough: one per non-empty bucket.
+  const tall = (await glyphs(page, (g) => 2 * (g.r[0] - 1))) >= STRATA_MIN_INNER;
+  const buckets = snap.window_buckets.length / snap.nodes.length;
+  for (const [i, node] of snap.nodes.entries()) {
+    const row = snap.window_buckets.slice(i * buckets, (i + 1) * buckets);
+    const want = tall ? row.filter((v) => v > 0).length : 0;
+    expect(strata.find(([id]) => id === node.id)?.[1], `${where}: node ${node.id}'s strata`).toBe(want);
+    // Every count is the engine's where counts fit; from 1100 px they always do.
+    const count = page.locator(`[role="gridcell"][data-node="${node.id}"] .count`);
+    if (wide || (await count.count()) > 0) await expect(count, `${where}: node ${node.id}'s count`).toHaveText(int(node.window_total));
+  }
+  if (tall) expect(Math.max(...strata.map(([, n]) => n)), `${where}: four Sends in four buckets`).toBe(4);
+
+  // The fifth Send at node 2 is refused: its band plays in node 2's headroom,
+  // inside its disc, above its brim and clear of its count; no beam flies and
+  // no count changes.
+  const counts = await page.locator('.count').allTextContents();
+  await page.evaluate(() => {
+    const w = window as unknown as { pushed: number };
+    w.pushed = 0;
+    const pool = document.querySelector<HTMLCanvasElement & { beams: { push: (...a: unknown[]) => void } }>('.stage canvas')!.beams;
+    const push = pool.push.bind(pool);
+    pool.push = (...a: unknown[]) => {
+      w.pushed += 1;
+      push(...a);
+    };
+  });
+  await page.locator('.transport').getByRole('button', { name: /^Send/ }).click();
+  await page.waitForFunction(() => document.querySelector<HTMLCanvasElement>('.stage canvas')?.dataset.bounce === '2');
+  const frames = await page.evaluate(
+    () =>
+      new Promise<{ top: number; bottom: number; brim: number; masked: number }[]>((done) => {
+        const c = document.querySelector('.stage canvas') as HTMLCanvasElement & { glyphs: GlyphTable };
+        const out: { top: number; bottom: number; brim: number; masked: number }[] = [];
+        const tick = (): void => {
+          const g = c.glyphs;
+          if (g.bounce < 0) {
+            done(out);
+            return;
+          }
+          out.push({ top: g.bandTop, bottom: g.bandBottom, brim: g.brimY[g.bounce], masked: g.bandMasked });
+          requestAnimationFrame(tick);
+        };
+        tick();
+      }),
+  );
+  expect(frames.length, `${where}: the refusal played`).toBeGreaterThan(0);
+  const cap = await page.locator('[role="gridcell"][data-node="2"]').evaluate((el) => {
+    const ctx = new OffscreenCanvas(1, 1).getContext('2d')!;
+    const style = getComputedStyle(el);
+    ctx.font = `600 ${style.getPropertyValue('--font-size-count')} ${style.fontFamily}`;
+    return ctx.measureText('0').actualBoundingBoxAscent;
+  });
+  for (const f of frames) {
+    expect(f.masked, `${where}: the disc clips the band`).toBe(1);
+    expect(f.bottom, `${where}: the band never passes the brim`).toBeLessThanOrEqual(f.brim + 1e-3);
+    expect(f.bottom, `${where}: the band never reaches the count`).toBeLessThanOrEqual(-cap / 2);
+  }
+  if (info.project.use.reducedMotion === 'reduce') {
+    expect(new Set(frames.map((f) => f.top)).size, `${where}: under reduced motion the band rests`).toBe(1);
+  }
+  expect(await page.evaluate(() => (window as unknown as { pushed: number }).pushed), `${where}: a refusal sends nothing`).toBe(0);
+  expect(await page.locator('.count').allTextContents(), `${where}: a refusal counts nothing`).toEqual(counts);
+});
+
+// -- A10, C2: the faces -----------------------------------------------------------
+
+test('every visible text is set in the three faces, from the page itself (A10)', async ({ page }, info) => {
+  test.skip(info.project.name !== 'audit-1440-light', 'the faces, checked once');
+  const origins = new Set<string>();
+  page.on('request', (request) => origins.add(new URL(request.url()).origin));
+  await open(page);
+  await page.evaluate(() => document.fonts.ready.then(() => undefined));
+  const loaded = await page.evaluate(() =>
+    ['400 16px "Source Sans 3"', '600 16px "Source Sans 3"', '400 16px "Source Serif 4"', '400 16px "Source Code Pro"'].map(
+      (f) => document.fonts.check(f) && [...document.fonts].some((face) => face.status === 'loaded' && f.includes(face.family.replace(/"/g, ''))),
+    ),
+  );
+  expect(loaded, 'each face is loaded').toEqual([true, true, true, true]);
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send('DOM.enable');
+  await cdp.send('CSS.enable');
+  const { root } = await cdp.send('DOM.getDocument', { depth: -1 });
+  const families = new Set<string>();
+  const parents: number[] = [];
+  const walk = (node: { nodeId: number; nodeType: number; nodeValue?: string; children?: unknown[] }, parent: number): void => {
+    if (node.nodeType === 3 && (node.nodeValue ?? '').trim() !== '') parents.push(parent);
+    for (const child of (node.children ?? []) as (typeof node)[]) walk(child, node.nodeId);
+  };
+  walk(root as never, root.nodeId);
+  for (const id of new Set(parents)) {
+    const visible = await cdp
+      .send('DOM.resolveNode', { nodeId: id })
+      .then(({ object }) =>
+        cdp.send('Runtime.callFunctionOn', {
+          objectId: object.objectId!,
+          functionDeclaration: 'function () { return this.checkVisibility ? this.checkVisibility() : false; }',
+          returnByValue: true,
+        }),
+      )
+      .then((r) => r.result.value === true)
+      .catch(() => false);
+    if (!visible) continue;
+    const { fonts } = await cdp.send('CSS.getPlatformFontsForNode', { nodeId: id }).catch(() => ({ fonts: [] }));
+    for (const f of fonts) families.add(f.familyName);
+  }
+  // An instanced variable face reports its family with its default style.
+  const ours = (f: string): boolean => ['Source Sans 3', 'Source Serif 4', 'Source Code Pro'].some((face) => f.startsWith(face));
+  expect([...families].filter((f) => !ours(f)), 'faces outside the three').toEqual([]);
+  expect([...origins], 'every request goes to the page itself').toEqual([new URL(page.url()).origin]);
+});
+
+test('the stage draws though a face fails to load (C2)', async ({ page }, info) => {
+  test.skip(info.project.name !== 'audit-1440-light', 'the font gate, checked once');
+  const failed: string[] = [];
+  page.on('requestfailed', (request) => failed.push(request.url()));
+  await page.route('**/SourceSans3*.woff2', (route) => route.abort());
+  await page.goto('/');
+  await expect(page.locator('.stage canvas')).toBeVisible({ timeout: 30_000 });
+  await expect
+    .poll(() => page.locator('.stage canvas').evaluate((c: HTMLCanvasElement) => JSON.parse(c.dataset.labelBoxes ?? '[]').length))
+    .toBeGreaterThan(0);
+  expect(failed.length, 'the aborted face is the only failure').toBeGreaterThan(0);
+  expect(failed.every((url) => /SourceSans3.*\.woff2/.test(url)), 'only the aborted face failed').toBe(true);
+});
+
+// -- A5: the key lists what is drawn ----------------------------------------------
+
+test('the key lists exactly the marks drawn, in its fixed order (A5)', async ({ page }, info) => {
+  test.skip(!['audit-1440-light', 'audit-400-dark'].includes(info.project.name), 'the key, checked at the widest and narrowest');
+  await open(page);
+  const presets = page.getByRole('group', { name: 'Scenario preset' }).getByRole('button');
+  const names = (await presets.allInnerTexts()).map((name) => name.trim());
+  for (const name of names) {
+    await loadPreset(page, name);
+    await expect
+      .poll(async () => {
+        const marks = Number(await page.locator('.stage canvas').getAttribute('data-marks'));
+        const items = await page.locator('.key:not(.sizer) li').evaluateAll((els) => els.map((el) => Number((el as HTMLElement).dataset.mark)));
+        const bits = Object.values(MARK).filter((bit) => (marks & bit) !== 0);
+        return JSON.stringify(items) === JSON.stringify(bits);
+      }, { message: `${name}: the key lists the marks drawn, in order` })
+      .toBe(true);
+    if (info.project.name === 'audit-1440-light') {
+      const lines = await page.locator('.key:not(.sizer) li').evaluateAll((els) => new Set(els.map((el) => Math.round(el.getBoundingClientRect().top))).size);
+      expect(lines, `${name}: the key takes at most two lines at 1440`).toBeLessThanOrEqual(2);
+    }
+  }
 });

@@ -1,7 +1,8 @@
 // The stage's geometry, in CSS pixels of the stage box: one ring per zone, the
 // rings set evenly on a larger circle around an empty centre. The renderer, the
 // node grid, the pointer hit test and the audit all read it from here, so a
-// node's disc, its label, its keyboard cell and its beams share one address.
+// node's disc, its name, its port, its keyboard cell and its beams share one
+// address.
 // Everything is screen-size, so labels never scale with the stage. It also
 // holds the beam encoding the pool packs and the audit reads.
 
@@ -10,7 +11,7 @@
  *  ring. */
 export const K_Z = 0.75;
 /** The largest disc, in px. */
-export const R_MAX = 20;
+export const R_MAX = 24;
 /** A ring of `n` discs of radius `r` holds them `S_D · r` apart along its circle. */
 export const S_D = 4;
 /** The sampled least distance from a cross-zone beam to a third ring's node
@@ -29,16 +30,35 @@ export const CONTROL = 2;
 export const RELAY = 4;
 export const DROPPED = 8;
 export const LANDED = 16;
-/** The gap between a disc and its label, in px: clear of the origin's thick ring. */
-export const LABEL_GAP = 12;
-/** A node's cell arc: its gap outside the disc and its stroke width, px. */
+/** A node's ring (the share of the cluster's hits it has heard): its gap
+ *  outside the disc and its stroke width, px, and how far it reaches. */
 export const ARC_GAP = 4;
 export const ARC_WIDTH = 3;
-/** How far a node's arc reaches beyond its disc. */
-const ARC_REACH = ARC_GAP + ARC_WIDTH / 2;
-/** A gateway diamond's half-diagonal as a multiple of the disc radius. */
-export const DIAMOND_SCALE = 1.35;
-/** The least clear space between the arcs or diamonds of two nodes in
+export const RING_REACH = ARC_GAP + ARC_WIDTH / 2;
+/** The selection outline: its gap outside the disc, its stroke and its reach,
+ *  px. The preview of a selection is the same circle, dashed. */
+export const SELECTION_GAP = 10;
+export const SELECTION_WIDTH = 1.5;
+export const SELECTION_REACH = SELECTION_GAP + SELECTION_WIDTH / 2;
+export const PREVIEW_DASH: readonly number[] = [4, 3];
+/** A gateway's port: its least half-diagonal and its gap outside the ring, px. */
+export const PORT_MIN = 4;
+export const PORT_GAP = 1;
+/** A name's near edge outside its node's ring, and the least room between two
+ *  names side by side, px. */
+export const LABEL_GAP = 7;
+export const LABEL_SPACING = 12;
+/** The share of the disc's radius a centred count may reach. */
+export const COUNT_FIT = 0.95;
+/** The vessel: strata show from this inside height up, while each is at least
+ *  `STRATUM_MIN` px; the brim's overhang past the disc and its strokes, px. */
+export const STRATA_MIN_INNER = 32;
+export const STRATUM_MIN = 3;
+export const STRATUM_GAP = 1.5;
+export const BRIM_OVERHANG = 2;
+export const BRIM_WIDTH = 1.5;
+export const CAP_WIDTH = 3;
+/** The least clear space between the outer marks of two nodes in
  *  neighbouring rings, px. */
 const NEIGHBOUR_GAP = 4;
 /** The smallest pointer target radius: a 24 px target. */
@@ -118,8 +138,8 @@ export function stageLayout(
     rank[zone] += 1;
   }
 
-  // The nearest two nodes of different rings, centre to centre: each may reach
-  // half of it, less half the gap, with its arc or its diamond.
+  // The nearest two nodes of different rings, centre to centre: one may wear
+  // the selection outline and the other its ring, with the gap between.
   let nearest = Number.POSITIVE_INFINITY;
   for (let i = 0; i < spots.length; i++) {
     for (let j = i + 1; j < spots.length; j++) {
@@ -128,25 +148,41 @@ export function stageLayout(
       }
     }
   }
-  const reach = (nearest - NEIGHBOUR_GAP) / 2;
-  for (const [z, ring] of rings.entries()) {
-    // The disc is capped by the room on the ring, by the clearance a beam leaves
-    // round a third ring less half a cross-zone stroke, and by the facing node
-    // of a neighbouring ring.
-    ring.r = Math.max(
-      Math.min(
-        R_MAX,
-        (2 * Math.PI * rz) / (S_D * Math.max(size[z], 1)),
-        BEAM_CLEARANCE * rz - CROSS_WIDTH / 2,
-        reach - ARC_REACH,
-        reach / DIAMOND_SCALE,
-      ),
-      R_FLOOR,
-    );
-  }
-  for (const spot of spots) spot.r = rings[spot.zone].r;
+  const facing = (nearest - NEIGHBOUR_GAP - RING_REACH - SELECTION_REACH) / 2;
+  // Every ring takes the least disc of any ring, so levels compare across
+  // zones and a lopsided cluster draws one size. The disc is capped by the
+  // room on the ring, by the clearance a beam leaves round a third ring less
+  // half a cross-zone stroke, and by the facing node of a neighbouring ring.
+  let r = Math.min(R_MAX, BEAM_CLEARANCE * rz - CROSS_WIDTH / 2, facing);
+  for (let z = 0; z < zones; z++) r = Math.min(r, (2 * Math.PI * rz) / (S_D * Math.max(size[z], 1)));
+  r = Math.max(r, R_FLOOR);
+  for (const ring of rings) ring.r = r;
+  for (const spot of spots) spot.r = r;
   return { centre, rings, spots };
 }
+
+/** A gateway port's half-diagonal on a disc of radius `r`. */
+export const portHalf = (r: number): number => Math.max(PORT_MIN, r / 3);
+
+/** Where a gateway's port sits, from the gateway's centre: outside its ring,
+ *  toward its own zone ring's centre (the zone it relays into), with the
+ *  angle it points along. Written into `out`. */
+export function portAt(spot: Spot, ring: Point, out: { x: number; y: number; angle: number }): void {
+  const angle = Math.atan2(ring.y - spot.y, ring.x - spot.x);
+  const d = spot.r + RING_REACH + portHalf(spot.r) + PORT_GAP;
+  out.x = d * Math.cos(angle);
+  out.y = d * Math.sin(angle);
+  out.angle = angle;
+}
+
+/** How far a node's centre must stay from the stage's edge: a disc of radius
+ *  `r`, its ring, the gap to its name and the name's line. */
+export const stageMargin = (labelHeight: number, r = R_MAX): number => r + RING_REACH + LABEL_GAP + labelHeight;
+
+/** Whether a count `width` px wide and `capHeight` px tall fits centred in a
+ *  disc of radius `r`. */
+export const countFits = (width: number, r: number, capHeight: number): boolean =>
+  width <= 2 * Math.sqrt(Math.max((COUNT_FIT * r) ** 2 - (capHeight / 2) ** 2, 0));
 
 /** A beam's route as a quadratic Bézier. */
 export interface QuadPath {

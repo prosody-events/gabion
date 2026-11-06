@@ -2,6 +2,7 @@
   import { fmtCount, fmtDuration, noun, zoneLabel } from '../format';
   import { ANSWER, type NodeState, type PeerView, type ZoneMode, type ZoneView } from '../sim/types';
   import InfoTip from './InfoTip.svelte';
+  import RoleGlyph from './RoleGlyph.svelte';
 
   // Who the selected node sends its changes to, and how that is going: its own
   // zone, the peers in it, one row per remote zone naming the gateway the node's
@@ -13,11 +14,14 @@
     peers,
     zones,
     zoneMode,
+    onPreview,
   }: {
     node: NodeState;
     peers: PeerView[];
     zones: ZoneView[];
     zoneMode: ZoneMode;
+    /** A node the route sentence names, previewed on the stage. */
+    onPreview: (node: number | null) => void;
   } = $props();
 
   const own = $derived(zones[node.zone]);
@@ -34,6 +38,23 @@
     ),
   );
 </script>
+
+{#if zoneMode === 'Configured'}
+  <p class="route">
+    node <span data-field="node">{node.id}</span> sends to its own zone directly{#each remote as { z, name, gateway }, i (z)}{i ===
+      remote.length - 1
+        ? ', and'
+        : ','} to {name}
+      {#if gateway?.id === undefined}with no gateway yet{:else}through <span
+          class="named"
+          role="note"
+          onpointerenter={() => onPreview(gateway.id ?? null)}
+          onpointerleave={() => onPreview(null)}>node <span data-field="node">{gateway.id}</span></span
+        >{/if}{/each}.
+  </p>
+{:else}
+  <p class="route">node <span data-field="node">{node.id}</span> knows no zone, so it sends to every peer directly.</p>
+{/if}
 
 <table class="targets">
   <tbody>
@@ -65,7 +86,7 @@
             <td>no gateway yet</td>
           {:else}
             <td>
-              <span aria-hidden="true">{ANSWER[gateway.answer].suspect ? '◇' : '◆'}</span>
+              <RoleGlyph kind={ANSWER[gateway.answer].suspect ? 'suspect' : 'port'} />
               gateway node <span data-field="gateway">{gateway.id ?? '—'}</span> ·
               <span data-field="unacked">{fmtCount(gateway.own_unacked)}</span>
               {noun(gateway.own_unacked, 'change')} not yet acknowledged ·
@@ -111,6 +132,20 @@
 </table>
 
 <style>
+  .route {
+    margin: 0 0 var(--gap-sm);
+    font-size: var(--font-size-caption);
+    line-height: 1.45;
+  }
+
+  .route :global([data-field]) {
+    font-weight: 600;
+  }
+
+  .named {
+    cursor: default;
+  }
+
   .targets {
     width: 100%;
     border-collapse: collapse;

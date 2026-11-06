@@ -19,8 +19,8 @@ body {
   height: 100%;
 }
 
-/* Below 640 px the page scrolls instead. */
-@media (width >= 640px) {
+/* Below 1100 px the page scrolls instead, so the stage keeps its height. */
+@media (width >= 1100px) {
   #app {
     height: 100vh;
   }
@@ -40,6 +40,11 @@ button {
   cursor: pointer;
 }
 
+input,
+select {
+  font-family: inherit;
+}
+
 /* WCAG 2.5.8: pointer targets are at least 24 px tall. */
 summary,
 input[type='range'] {
@@ -49,4 +54,75 @@ input[type='range'] {
 :focus-visible {
   outline: 2px solid var(--color-warn);
   outline-offset: 2px;
+}
+
+/* One button sheet (design language, "One style per role"). The next action
+   alone is filled; every other action is a panel with a 1 px axis border
+   (3:1 or more on the panel and the page); the help toggle alone is a dotted
+   underline. While Hits per Send is being typed it is the target: a 2 px ink
+   border, nothing filled. */
+button[data-primary] {
+  border: 1px solid var(--color-fg);
+  border-radius: var(--radius);
+  background: var(--color-fg);
+  color: var(--color-panel);
+  font-weight: 600;
+}
+
+button[data-primary]:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--color-fg) 85%, var(--color-panel));
+}
+
+input[data-primary] {
+  border: 2px solid var(--color-fg);
+}
+
+.btn-secondary {
+  border: 1px solid var(--chart-axis);
+  border-radius: var(--radius);
+  background: var(--color-panel);
+  color: var(--color-fg);
+  font-weight: 600;
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: var(--color-bg);
+}
+
+.btn-tertiary {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--color-fg);
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Instruction and glossary prose: the serif, its figures proportional. */
+.serif {
+  font-family: var(--font-serif);
+  font-variant-numeric: proportional-nums;
+}
+
+/* The first Tab stop: hidden until focused. */
+.skip-link {
+  position: absolute;
+  top: var(--gap-sm);
+  left: var(--gap-sm);
+  z-index: 10;
+  padding: var(--gap-xs) var(--gap-sm);
+  border-radius: var(--radius);
+  background: var(--color-panel);
+  color: var(--color-fg);
+  font-weight: 600;
+  transform: translateY(-200%);
+}
+
+.skip-link:focus {
+  transform: none;
 }

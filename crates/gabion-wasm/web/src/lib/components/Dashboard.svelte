@@ -12,22 +12,25 @@
     type YRange,
   } from '../charts/options';
   import { fmtCount, fmtDuration, fmtPercent, zoneLabel } from '../format';
+  import type { ChartId } from '../presets';
   import type { ClusterState } from '../sim/types';
   import type { Theme } from '../theme';
 
-  // The abstract rung: the convergence story as charts, shown while no node is
-  // selected. Fed the rolling `history` and a `version` counter that ticks on
-  // every new sample, the single signal the charts redraw on. Chart 1 is the
-  // study's central result made visible in one run: the share of data bytes
-  // that crossed zones, over what the cost model predicts with zones and without.
-  // Charts 2 and 3 are small multiples, one panel per zone with members, in zone
-  // order; chart 4 (aggregate vs limit) is shown only under the overload preset.
+  // The abstract rung: the convergence story as charts, under the selected
+  // node's title in the detail pane. Fed the rolling `history` and a
+  // `version` counter that ticks on every new sample, the single signal the
+  // charts redraw on. Chart 1 is the study's central result made visible in
+  // one run: the share of data bytes that crossed zones, over what the cost
+  // model predicts with zones and without. Charts 2 and 3 are small multiples,
+  // one panel per zone with members, in zone order; chart 4 (the true total
+  // against the limit) is shown where the scenario's limit is on the scale.
+  // The scenario lists its charts, in order.
   let {
     cluster,
     history,
     version,
     limit,
-    showLimit,
+    charts,
     theme,
     hotId,
   }: {
@@ -35,7 +38,8 @@
     history: ChartHistory;
     version: number;
     limit: number;
-    showLimit: boolean;
+    /** The charts the scenario shows, in order. */
+    charts: readonly ChartId[];
     theme: Theme;
     /** The node hovered or focused, whose own line joins its zone's panel. */
     hotId: number | null;
@@ -135,7 +139,7 @@
     ...panels.map(() => spreadPanel(theme, false, spreadRange)),
     spreadPanel(theme, true, spreadRange),
   ]);
-  const aggregateOpts = $derived(showLimit ? aggregateLimitOptions(limit, theme) : null);
+  const aggregateOpts = $derived(charts.includes('limit') ? aggregateLimitOptions(limit, theme) : null);
 
   /** One zone's agreement panel data: the true total, the band's edges and the
    *  hovered node's line when it is in this zone. */
@@ -185,94 +189,98 @@
 </script>
 
 <div class="dashboard" aria-label="Convergence dashboard">
-  <section class="block">
-    <h3>Share of data bytes that crossed zones</h3>
-    <p class="note">
-      Control packets are left out; they were
-      <span data-field="control-share">{fmtPercent(controlShare)}</span> of all bytes in this run.
-    </p>
-    {#if cluster.zones.length === 1}
-      <p class="empty">No bytes crossed zones in this run: every node is in one zone</p>
-    {:else if !hasShare}
-      <p class="empty">No traffic yet: send a burst from the rail</p>
+  {#each charts as chart (chart)}
+    {#if chart === 'share'}
+      <section class="block">
+        <h3>Share of data bytes that crossed zones</h3>
+        <p class="note">
+          Control packets are left out; they were
+          <span data-field="control-share">{fmtPercent(controlShare)}</span> of all bytes in this run.
+        </p>
+        {#if cluster.zones.length === 1}
+          <p class="empty">No bytes crossed zones in this run: every node is in one zone</p>
+        {:else if !hasShare}
+          <p class="empty">No data bytes have crossed a zone yet</p>
+        {:else}
+          <Chart
+            opts={shareOpts}
+            data={data.share}
+            {stamp}
+            height={SHARE_HEIGHT}
+            attrs={refAttrs}
+          >
+            {#snippet caption()}
+              <span data-field="share">{share === null ? '—' : fmtPercent(share)}</span>
+              over the last <span data-field="window">{fmtDuration(history.windowMs)}</span>
+            {/snippet}
+          </Chart>
+        {/if}
+      </section>
+    {:else if chart === 'agreement'}
+      <section class="block">
+        <h3>Agreement by zone</h3>
+        <p class="note">
+          Each band runs from the least to the most informed node in the zone, and closes on
+          the dashed true total when the zone agrees.
+        </p>
+        {#each panels as zone, i (zone)}
+          <Chart
+            opts={agreementOpts[i]}
+            data={data.agreement[i]}
+            {stamp}
+            {zone}
+            height={PANEL_HEIGHT + (i === lastZone ? X_AXIS_ROOM : 0)}
+          >
+            {#snippet caption()}{names[zone]}{/snippet}
+          </Chart>
+        {/each}
+      </section>
+    {:else if chart === 'spread'}
+      <section class="block">
+        <h3>Disagreement by zone</h3>
+        <p class="note">
+          The gap between the most and least informed node, in hits. A zone that lags after a
+          partition shows in its own panel.
+        </p>
+        {#each panels as zone, i (zone)}
+          <Chart
+            opts={spreadOpts[i]}
+            data={data.spread[i]}
+            {stamp}
+            {zone}
+            height={PANEL_HEIGHT}
+          >
+            {#snippet caption()}{names[zone]} · <span data-field="spread">{fmtCount(spreadNow.zones[i])}</span>{/snippet}
+          </Chart>
+        {/each}
+        <Chart
+          opts={spreadOpts[panels.length]}
+          data={data.spread[panels.length]}
+          {stamp}
+          height={PANEL_HEIGHT + X_AXIS_ROOM}
+        >
+          {#snippet caption()}whole cluster · <span data-field="spread">{fmtCount(spreadNow.cluster)}</span>{/snippet}
+        </Chart>
+      </section>
     {:else}
-      <Chart
-        opts={shareOpts}
-        data={data.share}
-        {stamp}
-        height={SHARE_HEIGHT}
-        attrs={refAttrs}
-      >
-        {#snippet caption()}
-          <span data-field="share">{share === null ? '—' : fmtPercent(share)}</span>
-          over the last <span data-field="window">{fmtDuration(history.windowMs)}</span>
-        {/snippet}
-      </Chart>
+      {#if aggregateOpts !== null}
+        <section class="block">
+          <h3>Aggregate vs. limit</h3>
+          <p class="note">
+            The true total across the window climbs through the limit into the rejecting band.
+          </p>
+          <Chart
+            opts={aggregateOpts}
+            data={data.aggregate}
+            {stamp}
+            height={LIMIT_HEIGHT}
+          >
+            {#snippet caption()}true total{/snippet}
+          </Chart>
+        </section>
+      {/if}
     {/if}
-  </section>
-
-  <section class="block">
-    <h3>Agreement by zone</h3>
-    <p class="note">
-      Each band runs from the least to the most informed node in the zone, and closes on
-      the dashed true total when the zone agrees.
-    </p>
-    {#each panels as zone, i (zone)}
-      <Chart
-        opts={agreementOpts[i]}
-        data={data.agreement[i]}
-        {stamp}
-        {zone}
-        height={PANEL_HEIGHT + (i === lastZone ? X_AXIS_ROOM : 0)}
-      >
-        {#snippet caption()}{names[zone]}{/snippet}
-      </Chart>
-    {/each}
-  </section>
-
-  <section class="block">
-    <h3>Disagreement by zone</h3>
-    <p class="note">
-      The gap between the most and least informed node, in hits. A zone that lags after a
-      partition shows in its own panel.
-    </p>
-    {#each panels as zone, i (zone)}
-      <Chart
-        opts={spreadOpts[i]}
-        data={data.spread[i]}
-        {stamp}
-        {zone}
-        height={PANEL_HEIGHT}
-      >
-        {#snippet caption()}{names[zone]} · <span data-field="spread">{fmtCount(spreadNow.zones[i])}</span>{/snippet}
-      </Chart>
-    {/each}
-    <Chart
-      opts={spreadOpts[panels.length]}
-      data={data.spread[panels.length]}
-      {stamp}
-      height={PANEL_HEIGHT + X_AXIS_ROOM}
-    >
-      {#snippet caption()}whole cluster · <span data-field="spread">{fmtCount(spreadNow.cluster)}</span>{/snippet}
-    </Chart>
-  </section>
-
-  {#if aggregateOpts !== null}
-    <section class="block">
-      <h3>Aggregate vs. limit</h3>
-      <p class="note">
-        The true total across the window climbs through the limit into the rejecting band.
-      </p>
-      <Chart
-        opts={aggregateOpts}
-        data={data.aggregate}
-        {stamp}
-        height={LIMIT_HEIGHT}
-      >
-        {#snippet caption()}true total{/snippet}
-      </Chart>
-    </section>
-  {/if}
+  {/each}
 </div>
 
 <style>

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, untrack, type Snippet } from 'svelte';
   import uPlot from 'uplot';
+  import { fontsReady } from '../theme';
 
   // A thin Svelte shell around one uPlot instance. uPlot is imperative, so the
   // component never re-renders it reactively: `stamp` (changed by the owner on
@@ -9,7 +10,8 @@
   // mutated in place by `ChartHistory`, so it must NOT be tracked: `stamp` is
   // the single redraw signal. The built chart is left on the plot element as
   // `uplot`, which the design audit reads to check every mark lies inside its
-  // plot.
+  // plot. It first measures once the page's faces have loaded (or failed),
+  // so its label boxes are the face's own.
   let {
     opts,
     data,
@@ -40,6 +42,7 @@
 
   let host: HTMLDivElement;
   let chart: uPlot | null = null;
+  let ready = $state(false);
 
   function size(): { width: number; height: number } {
     const r = host.getBoundingClientRect();
@@ -53,6 +56,7 @@
   }
 
   onMount(() => {
+    void fontsReady().then(() => (ready = true));
     let timer = 0;
     let measured = false;
     const observer = new ResizeObserver(() => {
@@ -78,7 +82,7 @@
   // untracked so a sample doesn't trigger a teardown.
   $effect(() => {
     void opts;
-    untrack(build);
+    if (ready) untrack(build);
   });
 
   // Each new sample: hand uPlot the current columns. `data` is read untracked.

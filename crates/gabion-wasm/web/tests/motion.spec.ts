@@ -5,7 +5,7 @@ import type { ClusterState } from '../src/lib/sim/types';
 import { BEAM_FLIGHT_MS, CONTROL, CROSS, DROPPED, LANDED, RELAY } from '../src/lib/stage/layout';
 import type { BeamPool } from '../src/lib/stage/renderer';
 import { LANDED_ALPHA } from '../src/lib/theme';
-import { PERIOD_MS, WATCH, setRange, setSpeed, step, virtualMs } from './drive';
+import { PERIOD_MS, WATCH, send, sendButton, setRange, setSpeed, step, virtualMs } from './drive';
 import { sourceOf } from './sourcemap';
 
 // The waves in motion (README "Tests"), run once at 1440 px in the light theme
@@ -65,13 +65,14 @@ async function rebuildAtLimit(page: Page, limit: number, heartbeatMs?: number): 
   if (heartbeatMs !== undefined) await setRange(page.locator('#knob-gossip'), heartbeatMs);
   await page.getByRole('button', { name: 'Rebuild cluster' }).click();
   await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
-  await expect(page.locator('.tune-status')).toContainText('match');
+  await expect(page.locator('.tune summary')).not.toContainText('staged');
 }
 
-/** The control rail's Send at `node`. */
-async function railSend(page: Page, node: number): Promise<void> {
-  await page.getByLabel('Node', { exact: true }).selectOption(String(node));
-  await page.locator('.rail').getByRole('button', { name: 'Send burst' }).click();
+/** Select node `node` and press Send, waiting for neither: the page's queue
+ *  keeps their order however its clock runs. */
+async function pressSend(page: Page, node: number): Promise<void> {
+  await page.locator(`[role="gridcell"][data-node="${node}"]`).press('Enter');
+  await sendButton(page).click();
 }
 
 /** Wait until no wave is held and no beam is in flight. */
@@ -326,7 +327,8 @@ test('every held preset changes each count only when its packet lands', async ({
     await loadPreset(page, name);
     await installCausality(page);
     const wall = Date.now();
-    await railSend(page, 0);
+    await setSpeed(page, 4);
+    await send(page, 0);
     await playFor(page, 4, 2000, 60_000);
     const found = await readCausality(page);
     console.log(`${name}: ${found.holds} hold(s), ${found.checked} checked, ${found.rises} rise(s), ${Date.now() - wall} ms of wall time`);
@@ -339,7 +341,7 @@ test('every held preset changes each count only when its packet lands', async ({
   // unsent hits pass ε, which is 1 at limit 100, so it needs two hits in one
   // heartbeat period: Gateway cut's trickle of two a second at node 0 puts two
   // in every period of a second.
-  const name = 'Gateway cut from its zone';
+  const name = 'Gateway cut';
   await loadPreset(page, name);
   await rebuildAtLimit(page, 100, 1000);
   await installCausality(page);
@@ -395,7 +397,7 @@ test('back-to-back Sends each flush at once, past the emit floor', async ({ page
   await stopClock(page);
   await setSpeed(page, 0.1);
   const slowFlightMs = BEAM_FLIGHT_MS / 0.1;
-  for (const node of [0, 1, 2, 2]) await railSend(page, node);
+  for (const node of [0, 1, 2, 2]) await pressSend(page, node);
   const ran = await runUntil(
     page,
     async () => (await page.evaluate(() => (window as unknown as { own: number[] }).own.length)) === 4,
@@ -415,6 +417,7 @@ for (const speed of [1, 0.1]) {
   test(`Step flies Propagation's waves one at a time at ${speed}×`, async ({ page }) => {
     test.setTimeout(120_000);
     await open(page);
+    await loadPreset(page, 'Propagation');
     await setSpeed(page, speed);
     await page.evaluate(() => {
       const w = window as unknown as { pushed: { src: number; dst: number; flags: number }[] };
@@ -433,8 +436,11 @@ for (const speed of [1, 0.1]) {
         w.pushed = [];
         return drawn;
       }, BITS.CONTROL);
-    await railSend(page, 0);
+    // Propagation's Send plays to node 0's heartbeat and stops there, its
+    // first wave held for Step.
+    await send(page, 0);
     await expect(page.locator('.node-table tr[data-node="0"] [data-field="view"]')).toHaveText('75');
+    await expect(page.locator('.stage-pane')).toHaveAttribute('data-flight', 'waiting');
     expect(await data(), "Propagation's Send stopped before its first wave").toEqual([]);
     const gateways = ((await snapshot(page, 0)).inspected?.peers ?? [])
       .filter((p) => p.role === 'gateway')
@@ -484,8 +490,9 @@ test('flights scale with speed and Pause freezes them', async ({ page }, info) =
 
   // A data beam's lifetime, pool entry to landing, in the page's ms, over node
   // 0's two waves played at `speed`.
+  await loadPreset(page, 'Propagation');
   const lifetime = async (speed: number): Promise<number> => {
-    await page.getByRole('button', { name: 'Reset' }).click();
+    await page.getByRole('button', { name: 'Restart Propagation' }).click();
     await runUntil(page, async () => (await page.locator('.overlay.rebuilding').count()) === 0, 10_000, 'the rebuild');
     await page.evaluate((control) => {
       const w = window as unknown as { lives: number[]; born: Map<string, number> };
@@ -506,7 +513,9 @@ test('flights scale with speed and Pause freezes them', async ({ page }, info) =
         land(i);
       };
     }, BITS.CONTROL);
-    await railSend(page, 0);
+    // The reader's Pause ends the Send's own run; Play then plays freely.
+    await pressSend(page, 0);
+    await page.getByRole('button', { name: 'Pause' }).click();
     await setSpeed(page, speed);
     await page.getByRole('button', { name: 'Play' }).click();
     await runUntil(
@@ -540,7 +549,7 @@ test('flights scale with speed and Pause freezes them', async ({ page }, info) =
             const f = p.flags[i];
             if ((f & (bits.CONTROL | bits.LANDED)) !== 0 || ((f & bits.RELAY) !== 0) !== wantRelay) continue;
             if (p.clock - p.start[i] >= flight / 2) {
-              document.querySelector<HTMLButtonElement>('button[aria-label="Pause"]')?.click();
+              [...document.querySelectorAll<HTMLButtonElement>('.transport button')].find((b) => b.textContent?.trim() === 'Pause')?.click();
               return;
             }
           }
@@ -569,9 +578,10 @@ test('flights scale with speed and Pause freezes them', async ({ page }, info) =
     expect(order!.length, 'a beam in flight is drawn').toBeGreaterThan(0);
     expect(order!.filter((d) => d <= 0), 'a beam in flight painted under the labels').toEqual([]);
   };
-  await page.getByRole('button', { name: 'Reset' }).click();
+  await page.getByRole('button', { name: 'Restart Propagation' }).click();
   await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
-  await railSend(page, 0);
+  await pressSend(page, 0);
+  await page.getByRole('button', { name: 'Pause' }).click();
   await setSpeed(page, 0.2);
   await freezeAt(false, 'propagation-wave1.png');
   await inFlightAboveLabels();
@@ -610,6 +620,11 @@ const PER_FRAME = {
     '#arrowhead',
     '#stopBar',
     'easeInOutQuad',
+    '#tickRings',
+    '#tickRefusal',
+    '#syncNode',
+    '#drawRing',
+    '#drawVessel',
   ],
   'layout.ts': ['pointOn'],
 } as const;
@@ -682,100 +697,153 @@ const INTERPRETED = '--js-flags=--no-opt --no-maglev --no-sparkplug';
 // the last of these comes in the third stretch.
 const WARM_STRETCHES = 3;
 
-test('the stage allocates nothing per frame', async ({ playwright, baseURL, viewport, colorScheme, reducedMotion }) => {
-  test.setTimeout(120_000);
-  const browser = await playwright.chromium.launch({ args: [INTERPRETED] });
-  try {
-    const page = await browser.newPage({ baseURL, viewport, colorScheme, reducedMotion });
-    await openOnFakeClock(page);
-    await stopClock(page);
-    // Packet loss: no feed, so landed routes stay; loss draws stop bars;
-    // resends keep waves coming, and a Send each stretch starts more. Its
-    // origin selected, so the beams are drawn as the origin's own or faded
-    // context, and its gateways' relays are told apart from other beams.
-    await loadPreset(page, 'Packet loss');
-    const inspector = page.getByRole('region', { name: `Node ${ORIGIN} inspector` });
-    await page.locator(`[role="gridcell"][data-node="${ORIGIN}"]`).press('Enter');
-    await expect(inspector).toBeVisible();
-    await page.getByRole('button', { name: 'Play' }).click();
-    const stretch = async (): Promise<void> => {
-      await railSend(page, ORIGIN);
-      await page.clock.runFor(FRAMES * FRAME_MS);
-    };
-    for (let warm = 0; warm < WARM_STRETCHES; warm++) await stretch();
-    const perFrame = perFrameLines();
-    const cdp = await page.context().newCDPSession(page);
-    const chunks: string[] = [];
-    cdp.on('HeapProfiler.addHeapSnapshotChunk', ({ chunk }) => void chunks.push(chunk));
-    await cdp.send('HeapProfiler.enable');
-    // Tracking allocations counts every one, with its call stack. A double the
-    // interpreter computes is boxed (a HeapNumber): the engine's, not an object
-    // the code made. A box's size is read from a function that does nothing
-    // else, so the per-frame functions' bytes are that size times their count
-    // exactly, and any object of another size leaves bytes over.
-    await cdp.send('HeapProfiler.startTrackingHeapObjects', { trackAllocations: true });
-    await page.evaluate(() => {
-      const field: { v: unknown } = { v: '' };
-      function boxDoubles(): void {
-        for (let i = 0; i < 2000; i++) field.v = i + 0.5;
-      }
-      boxDoubles();
-    });
-    const redrawsFrom = await pool(page, (c) => c.beams.redraws);
-    await stretch();
-    const redraws = (await pool(page, (c) => c.beams.redraws)) - redrawsFrom;
-    await cdp.send('HeapProfiler.stopTrackingHeapObjects', { reportProgress: false });
-    const tracked = JSON.parse(chunks.join('')) as TrackedSnapshot;
-    // The landed routes the tracked stretch drew that are relays sent by the
-    // origin's gateways: the beams only a selected origin's roles single out.
-    await expect(inspector, 'the origin stayed selected').toBeVisible();
-    const gateways = (await snapshot(page, ORIGIN)).inspected!.peers.flatMap((p) =>
-      p.role === 'gateway' && p.id !== undefined ? [p.id] : [],
-    );
-    const gatewayRelays = await page.locator('.stage canvas').evaluate(
-      (c: Canvas, [relay, ids]) => {
-        let n = 0;
-        for (let i = 0; i < c.beams.len; i++) if ((c.beams.flags[i] & relay) !== 0 && ids.includes(c.beams.src[i])) n += 1;
-        return n;
-      },
-      [RELAY, gateways] as const,
-    );
+/** Each stretch of the allocation audit: a preset played with node 0
+ *  selected, and what each stretch presses. Packet loss draws stop bars and
+ *  resends, and its landed routes stay; Rate limiting redraws vessels, sweeps
+ *  rings and, two Sends of 50 a stretch against its limit of 100, plays
+ *  refusals; Propagation sweeps the selection toward node 0's heartbeat. */
+const STRETCHES: readonly { name: string; hits?: number; sends: number; warm: number }[] = [
+  { name: 'Packet loss', sends: 1, warm: WARM_STRETCHES },
+  // Its stretches repeat every three, admitted, refused, refused, so the
+  // tracked one repeats a warm one.
+  { name: 'Rate limiting', hits: 50, sends: 2, warm: 2 * WARM_STRETCHES },
+  { name: 'Propagation', sends: 1, warm: WARM_STRETCHES },
+];
 
-    const box = { count: 0, size: 0 };
-    for (const a of allocations(tracked)) {
-      if (a.name !== 'boxDoubles') continue;
-      box.count += a.count;
-      box.size += a.size;
+for (const stretchOf of STRETCHES) {
+  test(`the stage allocates nothing per frame: ${stretchOf.name}`, async ({ playwright, baseURL, viewport, colorScheme, reducedMotion }) => {
+    test.setTimeout(120_000);
+    const browser = await playwright.chromium.launch({ args: [INTERPRETED] });
+    try {
+      const page = await browser.newPage({ baseURL, viewport, colorScheme, reducedMotion });
+      await openOnFakeClock(page);
+      await stopClock(page);
+      await loadPreset(page, stretchOf.name);
+      if (stretchOf.hits !== undefined) {
+        await page.locator('#burst-hits').fill(String(stretchOf.hits));
+        await page.locator('#burst-hits').press('Enter');
+      }
+      const title = page.locator('.pane-title [data-field="node"]');
+      await page.locator(`[role="gridcell"][data-node="${ORIGIN}"]`).press('Enter');
+      await expect(title).toHaveText(String(ORIGIN));
+      await page.getByRole('button', { name: 'Play' }).click();
+      // Sends while playing leave time alone: the stretch's frames are the
+      // play loop's.
+      const stretch = async (): Promise<void> => {
+        for (let i = 0; i < stretchOf.sends; i++) await sendButton(page).click();
+        await page.clock.runFor(FRAMES * FRAME_MS);
+      };
+      for (let warm = 0; warm < stretchOf.warm; warm++) await stretch();
+      const perFrame = perFrameLines();
+      const cdp = await page.context().newCDPSession(page);
+      const chunks: string[] = [];
+      cdp.on('HeapProfiler.addHeapSnapshotChunk', ({ chunk }) => void chunks.push(chunk));
+      await cdp.send('HeapProfiler.enable');
+      // Tracking allocations counts every one, with its call stack. A double the
+      // interpreter computes is boxed (a HeapNumber): the engine's, not an object
+      // the code made. A box's size is read from a function that does nothing
+      // else, so the per-frame functions' bytes are that size times their count
+      // exactly, and any object of another size leaves bytes over.
+      await cdp.send('HeapProfiler.startTrackingHeapObjects', { trackAllocations: true });
+      await page.evaluate(() => {
+        const field: { v: unknown } = { v: '' };
+        function boxDoubles(): void {
+          for (let i = 0; i < 2000; i++) field.v = i + 0.5;
+        }
+        boxDoubles();
+      });
+      const redrawsFrom = await pool(page, (c) => c.beams.redraws);
+      await stretch();
+      const redraws = (await pool(page, (c) => c.beams.redraws)) - redrawsFrom;
+      await cdp.send('HeapProfiler.stopTrackingHeapObjects', { reportProgress: false });
+      const tracked = JSON.parse(chunks.join('')) as TrackedSnapshot;
+      await expect(title, 'node 0 stayed selected').toHaveText(String(ORIGIN));
+      if (stretchOf.name === 'Packet loss') {
+        // The relays of node 0's gateways: the beams only a selection's roles
+        // single out.
+        const gateways = (await snapshot(page, ORIGIN)).inspected!.peers.flatMap((p) =>
+          p.role === 'gateway' && p.id !== undefined ? [p.id] : [],
+        );
+        const relays = await page.locator('.stage canvas').evaluate(
+          (c: Canvas, [relay, ids]) => {
+            let n = 0;
+            for (let i = 0; i < c.beams.len; i++) if ((c.beams.flags[i] & relay) !== 0 && ids.includes(c.beams.src[i])) n += 1;
+            return n;
+          },
+          [RELAY, gateways] as const,
+        );
+        expect(relays, "the stretch drew a relay from one of node 0's gateways").toBeGreaterThan(0);
+      }
+
+      const box = { count: 0, size: 0 };
+      for (const a of allocations(tracked)) {
+        if (a.name !== 'boxDoubles') continue;
+        box.count += a.count;
+        box.size += a.size;
+      }
+      const boxed = Math.floor(box.size / box.count);
+      let count = 0;
+      let over = 0;
+      const where: [string, number][] = [];
+      for (const a of allocations(tracked)) {
+        const bundle = a.script.match(/\/assets\/([^/?#]+\.js)$/)?.[1];
+        if (a.count === 0 || bundle === undefined || a.line === 0) continue;
+        // The function's opening line in its source.
+        const source = sourceOf(`dist/assets/${bundle}.map`, a.line - 1, a.column - 1);
+        if (source === null || !source.file.includes('src/lib/stage/')) continue;
+        const ranges = perFrame.get(source.file.slice(source.file.lastIndexOf('/') + 1)) ?? [];
+        if (!ranges.some(([from, to]) => source.line >= from && source.line <= to)) continue;
+        // Unsigned, so one call stack's shortfall cannot hide another's excess.
+        const extra = Math.abs(a.size - boxed * a.count);
+        count += a.count;
+        over += extra;
+        if (extra !== 0) where.push([`${source.file}:${source.line}`, extra]);
+      }
+      console.log(
+        `${stretchOf.name}: ${count} allocations in the per-frame functions over ${redraws} redraws, ` +
+          `boxed doubles of ${boxed} bytes, ${over} bytes over: ${JSON.stringify(where)}`,
+      );
+      expect(boxed, "a boxed double's size was measured").toBeGreaterThan(0);
+      expect(redraws, 'the beam layer redrew while the waves flew').toBeGreaterThan(0);
+      expect(count, 'the source map placed no allocation in the per-frame functions').toBeGreaterThan(0);
+      expect(over, `bytes over boxed doubles in the per-frame functions over ${FRAMES} frames`).toBe(0);
+    } finally {
+      await browser.close();
     }
-    const boxed = Math.floor(box.size / box.count);
-    let count = 0;
-    let over = 0;
-    const where: [string, number][] = [];
-    for (const a of allocations(tracked)) {
-      const bundle = a.script.match(/\/assets\/([^/?#]+\.js)$/)?.[1];
-      if (a.count === 0 || bundle === undefined || a.line === 0) continue;
-      // The function's opening line in its source.
-      const source = sourceOf(`dist/assets/${bundle}.map`, a.line - 1, a.column - 1);
-      if (source === null || !source.file.includes('src/lib/stage/')) continue;
-      const ranges = perFrame.get(source.file.slice(source.file.lastIndexOf('/') + 1)) ?? [];
-      if (!ranges.some(([from, to]) => source.line >= from && source.line <= to)) continue;
-      // Unsigned, so one call stack's shortfall cannot hide another's excess.
-      const extra = Math.abs(a.size - boxed * a.count);
-      count += a.count;
-      over += extra;
-      if (extra !== 0) where.push([`${source.file}:${source.line}`, extra]);
-    }
-    console.log(
-      `${count} allocations in the per-frame functions over ${redraws} redraws, ` +
-        `boxed doubles of ${boxed} bytes, ${over} bytes over: ${JSON.stringify(where)}`,
-    );
-    expect(boxed, "a boxed double's size was measured").toBeGreaterThan(0);
-    expect(redraws, 'the beam layer redrew while the waves flew').toBeGreaterThan(0);
-    expect(gatewayRelays, "the stretch drew a relay from one of the selected origin's gateways").toBeGreaterThan(0);
-    expect(count, 'the source map placed no allocation in the per-frame functions').toBeGreaterThan(0);
-    expect(over, `bytes over boxed doubles in the per-frame functions over ${FRAMES} frames`).toBe(0);
-  } finally {
-    await browser.close();
+  });
+}
+
+// -- The ring's sweep ----------------------------------------------------------------
+
+test('a ring sweeps up to its new share as its packet lands (A13)', async ({ page }) => {
+  test.setTimeout(60_000);
+  await open(page);
+  await loadPreset(page, 'Rate limiting');
+  await setSpeed(page, 1);
+  await page.evaluate(() => {
+    const w = window as unknown as { arcs: Map<number, number[]> };
+    w.arcs = new Map();
+    const c = document.querySelector('.stage canvas') as HTMLCanvasElement & { glyphs: { len: number; id: Int32Array; arc: Float32Array } };
+    const sample = (): void => {
+      const g = c.glyphs;
+      for (let s = 0; s < g.len; s++) {
+        if (g.id[s] <= 0) continue;
+        const seen = w.arcs.get(g.id[s]) ?? [];
+        if (seen.at(-1) !== g.arc[s]) seen.push(g.arc[s]);
+        w.arcs.set(g.id[s], seen);
+      }
+      requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+  });
+  await send(page, 0);
+  const arcs = await page.evaluate(() => [...(window as unknown as { arcs: Map<number, number[]> }).arcs]);
+  expect(arcs.length, 'every receiver was sampled').toBe(11);
+  for (const [id, seen] of arcs) {
+    const low = seen.indexOf(Math.min(...seen));
+    const rise = seen.slice(low);
+    expect(rise.every((v, i) => i === 0 || v >= rise[i - 1]), `node ${id}'s ring only rises once its packet lands: ${seen}`).toBe(true);
+    expect(rise.some((v) => v > rise[0] && v < rise.at(-1)!), `node ${id}'s ring sweeps through its way up: ${seen}`).toBe(true);
   }
 });
 
@@ -803,9 +871,10 @@ for (const reducedMotion of ['no-preference', 'reduce'] as const) {
           },
           BITS,
         );
-      await railSend(page, 0);
+      await loadPreset(page, 'Propagation');
+      // Propagation's Send stops before each wave; Step flies it.
+      await send(page, 0);
       await step(page);
-      await still(page);
       expect(await landed(), "wave 1's routes stay").toBe(5);
 
       // From here until wave 2 leaves, the pool never empties.
@@ -828,8 +897,8 @@ for (const reducedMotion of ['no-preference', 'reduce'] as const) {
       });
       await step(page);
       expect(await page.evaluate(() => (window as unknown as { least: number }).least), 'the pool read 0 between the waves').toBeGreaterThan(0);
-      // The acknowledgements fly on the next Step and leave; the routes stay.
-      await step(page);
+      // The run plays on until the acknowledgements have flown and left; the
+      // routes stay.
       await still(page);
       expect(await landed(), "both waves' routes stay").toBe(11);
       expect(await pool(page, (c) => c.beams.len), 'nothing but the landed routes').toBe(11);
@@ -851,7 +920,7 @@ for (const reducedMotion of ['no-preference', 'reduce'] as const) {
       expect(await pool(page, (c) => c.beams.redraws), 'a still stage redraws nothing').toBe(redraws);
 
       // A command clears them.
-      await railSend(page, 0);
+      await sendButton(page).click();
       await expect.poll(landed).toBe(0);
     });
   });

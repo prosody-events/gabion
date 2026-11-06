@@ -77,7 +77,7 @@ pub struct SimConfig {
     pub uniform_loss: f64,
     /// Zones nodes are placed in: node `i` at build in zone `i mod zones`.
     /// Must be in `1..=MAX_ZONES`; [`SimConfig::validate`] rejects anything
-    /// else, so a zero from a shared URL gets the same message as a seven.
+    /// else, so a zero from the page gets the same message as a seven.
     pub zones: usize,
     pub zone_mode: ZoneMode,
 }
@@ -107,13 +107,13 @@ impl Default for SimConfig {
 }
 
 /// Rejected configs that the engine cannot honor. Surfaced to the operator
-/// (the page) rather than silently clamped, so a typo in a shared URL is
-/// visible instead of producing a quietly different simulation.
+/// (the page) rather than silently clamped, so a value the page let through
+/// is visible instead of producing a quietly different simulation.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error(
         "cluster size {got} is out of range: the visualizer simulates 1 to {MAX_NODES} nodes. \
-         Lower `nodes` in the controls or shared URL."
+         Lower `nodes` in the Tune controls."
     )]
     NodeCountOutOfRange { got: usize },
     #[error(
@@ -123,7 +123,7 @@ pub enum ConfigError {
     LossOutOfRange { got: f64 },
     #[error(
         "zone count {got} is out of range: the visualizer places nodes in 1 to {MAX_ZONES} zones. \
-         Set `zones` in the controls or shared URL to a count in that range."
+         Set Zones in the Tune controls to a count in that range."
     )]
     ZonesOutOfRange { got: usize },
     #[error(transparent)]

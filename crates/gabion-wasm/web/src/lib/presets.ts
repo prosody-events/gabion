@@ -1,11 +1,15 @@
-// Scenario presets — the canned starting conditions the control rail offers.
+// Scenario presets: the canned starting conditions the control rail offers,
+// in four groups: what gabion does (Rate limiting, Propagation, Sustained
+// overload), what faults do to it (Zone partition, Packet loss, Gateway
+// failure, Gateway cut), the study's measurement (Steady state, No zone
+// configured) and Sandbox.
 //
-// A preset is a config, a blurb, a `pacing` with its feed (which only a held
-// preset may lack), an optional selected node and an
-// `async seed(sim, config, gateways)` that fires its
-// opening commands (partitions, seed requests) against a freshly built
-// cluster. It is deliberately *not* a timed script: the partition→heal
-// narrative is a user gesture during play (the rail's Heal button).
+// A preset is a config, a `pacing` with its feed, the node it selects, the
+// Hits per Send it opens with, the charts its pane shows, the story its
+// caption tells (`lib/next.ts`), the scenario its story hands over to, and an
+// `async seed(sim, config, gateways)` that fires its opening commands (cuts,
+// seed requests) against a freshly built cluster. It is not a timed script:
+// the reader drives every step the caption names.
 //
 // Every preset opens on a warmed, settled cluster (`warm`): before its seed,
 // the page steps whole heartbeat periods until every node has a gateway into
@@ -14,39 +18,30 @@
 // gateway map `warm` gathers is how the gateway presets name the node they
 // fault.
 //
-// Most presets pin the rule limit high (`NARRATIVE_LIMIT`, 1 000 000) on
-// purpose — well above the seeded volumes. A request then stays well under
-// gabion's threshold anti-entropy budget (ε ≈ limit·bps/(10⁴·N), ~833 at this
-// limit with N=12), so it waits for its node's next heartbeat, which sends it
-// to the node's zone and one gateway in each other zone. The `overload` preset
-// tells the limit-crossing story instead.
+// Rate limiting, Zone partition and Sustained overload set a low limit, so
+// the vessels draw it and admission refuses past it; at limit 100 with twelve
+// nodes gabion's error budget ε is 1, so every Send of two hits or more is
+// flushed at once to the node's zone and one gateway in each other zone. The
+// rest pin the limit far off (`NARRATIVE_LIMIT`, 1 000 000), where ε is in the
+// hundreds, so a request waits for its node's next heartbeat: the propagation
+// story.
 //
 // The feed exists only where traffic is the subject: Steady state, No zone
 // configured and Sustained overload, plus Gateway cut's trickle at node 0,
 // which keeps node 0 sending data that a gateway cut off from its zone must
-// answer with "cannot relay". The one-Send presets (Propagation, Zone
-// partition, Packet loss, Gateway failure, Sandbox) have none, so their hits
-// leave the window visibly. A feed injects ⌊rate·T⌋ one-hit requests by
+// answer with "cannot relay". A feed injects ⌊rate·T⌋ one-hit requests by
 // virtual time T, counted from the moment the build is handed to the reader,
-// so it is deterministic under Step and replayable from load.
-//
-// The `overload` preset tells the opposite — and the reason gabion exists —
-// story. A single request that approaches the limit can't: to keep each node's
-// local delta under ε while twelve nodes' sum exceeds the limit you'd need
-// L/N < ε = L·bps/(10⁴·N), i.e. bps > 10⁴, an absurd error budget. So overload
-// feeds the cluster fast against a low limit: it offers ≈ `rate · window` ≈ 800
-// hits a window, twice the 400 limit; each node admits what expiry frees and
-// rejects the rest. There, eager threshold flushing is the healthy behaviour
-// on display, and `showsLimitChart` surfaces the Aggregate-vs-Limit panel. It
-// alone is `pacing: 'live'`: its feed submits many requests per frame.
+// so it is deterministic under Step and repeatable from load. Sustained
+// overload alone is `pacing: 'live'`: its feed submits many requests per
+// frame.
 
-import { blurb, noun, type Blurb } from './format';
-import type { Sim } from './sim/sim';
+import type { PresetId, Story } from './next';
+import type { Member, Sim } from './sim/sim';
 import type { SimConfig, SimEvent, ZoneMode } from './sim/types';
 
-/** The single watched rule's key. Every preset seed and every interactive Send
- *  (stage click, rail Send) targets this key, so they all grow the same
- *  counter and the convergence story stays about one number. */
+/** The single watched rule's key. Every preset seed and every Send targets
+ *  this key, so they all grow the same counter and the story stays about one
+ *  number. */
 export const WATCHED_KEY = 1;
 
 /** The cluster size the presets build: three zones of four. */
@@ -61,15 +56,21 @@ const BURST = 50;
 /** The node the one-Send presets seed, select on load and read the gateways of. */
 export const ORIGIN = 0;
 
-/** The pods in the production peak the Steady blurb compares with. */
-const PROD_PEAK = 183;
-
-/** The rule limit every preset but Sustained overload pins. Far above their
- *  seeded volumes, so ε stays large and a request spreads by heartbeat: the
- *  propagation story. Overrides the much lower viz-friendly default
- *  (`SimConfig::default`), which exists for the limit-crossing story the
- *  `overload` preset tells. */
+/** The limit the far-off presets pin: far above their volumes, so ε stays
+ *  large and a request spreads by heartbeat. */
 const NARRATIVE_LIMIT = 1_000_000;
+
+/** The limit Rate limiting and Zone partition enforce: four Sends of 25 reach
+ *  it exactly. */
+const RATE_LIMIT = 100;
+
+/** Hits per Send every preset opens with, and the range the field accepts. */
+const BURST_HITS = 25;
+export const BURST_HITS_MIN = 1;
+export const BURST_HITS_MAX = 1000;
+
+/** The highest rule limit the Tune controls accept. */
+export const RULE_LIMIT_MAX = 1_000_000;
 
 /** Steady state's and No zone configured's feed (hits/sec, round-robin over
  *  the live nodes). The windowed oracle plateaus at roughly
@@ -149,49 +150,42 @@ type Paced =
   | { readonly pacing: 'held'; readonly traffic?: SustainedTraffic }
   | { readonly pacing: 'live'; readonly traffic: SustainedTraffic };
 
+/** A chart the detail pane shows, by what it plots: the share of data bytes
+ *  that crossed zones, the agreement and disagreement panels, and the cluster
+ *  total against the limit. */
+export type ChartId = 'share' | 'agreement' | 'spread' | 'limit';
+
 export type Preset = Paced & {
-  readonly id: string;
+  readonly id: PresetId;
   readonly label: string;
-  /** What the scenario shows, built from the config the cluster is built with. */
-  blurb(config: SimConfig): Blurb;
+  /** The rail's group: what gabion does, faults, measurement, Sandbox. */
+  readonly group: 0 | 1 | 2 | 3;
   readonly config: Partial<SimConfig>;
-  /** The node the scenario opens with selected, so its gateways show on load. */
-  readonly select?: number;
-  /** Surfaces the Aggregate-vs-Limit dashboard panel. Only legible when the
-   *  scenario drives the aggregate toward a *low* limit (the overload preset):
-   *  against a 1 000 000 limit the panel would read as a flat line. */
-  readonly showsLimitChart?: boolean;
+  /** The node the scenario opens with selected. */
+  readonly select: number;
+  /** Hits per Send the scenario opens with. */
+  readonly burst_hits: number;
+  /** The charts the detail pane shows, in order. */
+  readonly charts: readonly ChartId[];
+  /** The story the caption tells, and the scenario it hands over to. */
+  readonly story: Story;
+  readonly next: PresetId | null;
   /** Fire the preset's opening commands on the warmed cluster, at the current
    *  virtual time. */
   seed(sim: Sim, config: SimConfig, gateways: Gateways): Promise<void>;
 };
 
-/** The nodes the build places in zone `z`: node `i` is in zone `i mod zones`. */
-function members(c: SimConfig, z: number): number[] {
-  return Array.from({ length: c.nodes }, (_, i) => i).filter((i) => i % c.zones === z);
-}
-
-/** How many of an origin's N − 1 data packets cross a zone with no zone set,
- *  averaged over the build's origins: N − n_z for an origin in a zone of n_z,
- *  so N − Σ n_z² / N, the unweighted mean chart 1's no-zone reference starts
- *  from. Two decimals at most. */
-function acrossNoZone(c: SimConfig): number {
-  let squares = 0;
-  for (let z = 0; z < c.zones; z++) squares += members(c, z).length ** 2;
-  return Math.round((c.nodes - squares / c.nodes) * 100) / 100;
-}
-
-/** Every build node not in `group`. */
-function except(c: SimConfig, group: readonly number[]): number[] {
-  return Array.from({ length: c.nodes }, (_, i) => i).filter((i) => !group.includes(i));
+/** The nodes a build places: node `i` in zone `i mod zones`. */
+export function buildNodes(c: SimConfig): Member[] {
+  return Array.from({ length: c.nodes }, (_, id) => ({ id, zone: id % c.zones }));
 }
 
 /** The node that seeds zone `z` in the spread-out presets: the zone's `z`-th
  *  member, so the seeds sit at different ranks around the stage (nodes 0, 4 and
  *  8 of twelve in three zones). */
 function seedNode(c: SimConfig, z: number): number {
-  const zone = members(c, z);
-  return zone[z] ?? zone[0] ?? z;
+  const zone = buildNodes(c).filter((n) => n.zone === z);
+  return zone[z]?.id ?? zone[0]?.id ?? z;
 }
 
 /** Step whole heartbeat periods, at most `WARM_PERIODS_MAX`, until a period
@@ -239,37 +233,46 @@ function noGateway(zone: number): never {
   );
 }
 
+const CHARTS: readonly ChartId[] = ['share', 'agreement', 'spread'];
+const LIMIT_FIRST: readonly ChartId[] = ['limit', 'share', 'agreement', 'spread'];
+
+/** The scenarios, in the rail's order. */
 export const PRESETS: readonly Preset[] = [
+  {
+    id: 'rate-limiting',
+    label: 'Rate limiting',
+    group: 0,
+    config: { nodes: NODES, zones: ZONES, rule_limit: RATE_LIMIT },
+    pacing: 'held',
+    select: ORIGIN,
+    burst_hits: BURST_HITS,
+    charts: LIMIT_FIRST,
+    story: 'rate-limiting',
+    next: 'partition',
+    async seed() {
+      // Opens settled at 0: the reader's Sends are the story.
+    },
+  },
   {
     id: 'propagation',
     label: 'Propagation',
-    blurb: (c) =>
-      blurb`${c.zones} ${noun(c.zones, 'zone')}, far below the limit: a request waits for its node's next heartbeat, which sends it to the node's own zone and to one gateway in each other zone, and the gateways relay it one relay floor (${c.min_emit_interval_ms} ms) later.`,
+    group: 0,
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
     pacing: 'held',
     select: ORIGIN,
+    burst_hits: BURST_HITS,
+    charts: CHARTS,
+    story: 'propagation',
+    next: 'rate-limiting',
     async seed(sim, c) {
       await sim.submitRequest(ORIGIN, WATCHED_KEY, BURST);
       await settle(sim, c);
     },
   },
   {
-    id: 'steady',
-    label: 'Steady state',
-    blurb: (c) =>
-      blurb`Light traffic across zones. Each change reaches every other node once, and ${c.zones - 1} of those ${c.nodes - 1} data packets cross a zone, so the data-byte share settles on its expected-with-zones line: ${c.zones - 1} of ${c.nodes - 1} here, and ${c.zones - 1} of ${PROD_PEAK - 1} at ${PROD_PEAK} nodes, which is why the saving grows with cluster size.`,
-    config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
-    pacing: 'held',
-    traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC, at: 'every-node' },
-    async seed(sim, c) {
-      for (let z = 0; z < c.zones; z++) await sim.submitRequest(seedNode(c, z), WATCHED_KEY, 10);
-    },
-  },
-  {
     id: 'overload',
     label: 'Sustained overload',
-    blurb: () =>
-      blurb`Steady traffic floods the cluster against a low limit. Play to watch each node admit hits up to the limit and reject the rest.`,
+    group: 0,
     // A low limit so the window fills within seconds; ε is then 1, so eager
     // flushing keeps every node's view close behind the truth. The feed offers
     // ≈ rate·window ≈ 800 hits a window, twice the limit, so once the window
@@ -277,7 +280,11 @@ export const PRESETS: readonly Preset[] = [
     config: { nodes: NODES, zones: ZONES, rule_limit: 400 },
     pacing: 'live',
     traffic: { rate_per_sec: OVERLOAD_RATE_PER_SEC, at: 'every-node' },
-    showsLimitChart: true,
+    select: ORIGIN,
+    burst_hits: BURST_HITS,
+    charts: LIMIT_FIRST,
+    story: 'watch',
+    next: 'rate-limiting',
     async seed() {
       // No opening request: the sustained feed (driven during play) is the story.
     },
@@ -285,24 +292,29 @@ export const PRESETS: readonly Preset[] = [
   {
     id: 'partition',
     label: 'Zone partition',
-    blurb: () =>
-      blurb`The last zone is cut off from the rest and ${BURST} hits land on each side. Nodes cannot hear across the cut until you heal the network; the disagreement of every zone then returns to zero.`,
-    config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
+    group: 1,
+    config: { nodes: NODES, zones: ZONES, rule_limit: RATE_LIMIT },
     pacing: 'held',
+    select: ORIGIN,
+    burst_hits: BURST_HITS,
+    charts: LIMIT_FIRST,
+    story: 'partition',
+    next: 'gateway-failure',
     async seed(sim, c) {
-      const cut = members(c, c.zones - 1);
-      await sim.cutZone(cut, except(c, cut));
-      await sim.submitRequest(0, WATCHED_KEY, BURST);
-      await sim.submitRequest(cut[0], WATCHED_KEY, BURST);
+      await sim.cut({ kind: 'zone', zone: c.zones - 1 }, buildNodes(c));
     },
   },
   {
     id: 'loss',
     label: 'Packet loss',
-    blurb: (c) =>
-      blurb`Every link drops ${Math.round(c.uniform_loss * 100)}% of packets. Convergence still arrives, just over more rounds.`,
+    group: 1,
     config: { nodes: NODES, zones: ZONES, uniform_loss: 0.3, rule_limit: NARRATIVE_LIMIT },
     pacing: 'held',
+    select: ORIGIN,
+    burst_hits: BURST_HITS,
+    charts: CHARTS,
+    story: 'watch',
+    next: 'rate-limiting',
     async seed(sim) {
       await sim.submitRequest(ORIGIN, WATCHED_KEY, BURST);
     },
@@ -310,40 +322,66 @@ export const PRESETS: readonly Preset[] = [
   {
     id: 'gateway-failure',
     label: 'Gateway failure',
-    blurb: () =>
-      blurb`The origin's gateway into the second zone is silenced without telling anyone, then a request lands at the origin. After the suspect timeout the origin picks another gateway, and the zone catches up.`,
+    group: 1,
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
     pacing: 'held',
     select: ORIGIN,
+    burst_hits: BURST_HITS,
+    charts: CHARTS,
+    story: 'watch',
+    next: 'gateway-cut',
     async seed(sim, c, gateways) {
       const g = gateways[ORIGIN]?.[1] ?? noGateway(1);
-      await sim.silence(g, except(c, [g]));
+      await sim.cut({ kind: 'silenced', node: g }, buildNodes(c));
       await sim.submitRequest(ORIGIN, WATCHED_KEY, BURST);
     },
   },
   {
     id: 'gateway-cut',
-    label: 'Gateway cut from its zone',
-    blurb: () =>
-      blurb`The origin's gateway into the second zone can hear its zone but not be heard by it. The origin keeps sending, ${TRICKLE_RATE_PER_SEC} hits a second, so the gateway says it cannot relay, and the origin moves to another gateway.`,
+    label: 'Gateway cut',
+    group: 1,
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
     pacing: 'held',
-    select: ORIGIN,
     traffic: { rate_per_sec: TRICKLE_RATE_PER_SEC, at: { node: ORIGIN } },
+    select: ORIGIN,
+    burst_hits: BURST_HITS,
+    charts: CHARTS,
+    story: 'watch',
+    next: 'sandbox',
     async seed(sim, c, gateways) {
       const g = gateways[ORIGIN]?.[1] ?? noGateway(1);
-      await sim.cutFromZone(g, members(c, 1).filter((i) => i !== g));
+      await sim.cut({ kind: 'unheard-in-zone', node: g, zone: 1 }, buildNodes(c));
       await sim.submitRequest(ORIGIN, WATCHED_KEY, BURST);
+    },
+  },
+  {
+    id: 'steady',
+    label: 'Steady state',
+    group: 2,
+    config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
+    pacing: 'held',
+    traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC, at: 'every-node' },
+    select: ORIGIN,
+    burst_hits: BURST_HITS,
+    charts: CHARTS,
+    story: 'watch',
+    next: 'rate-limiting',
+    async seed(sim, c) {
+      for (let z = 0; z < c.zones; z++) await sim.submitRequest(seedNode(c, z), WATCHED_KEY, 10);
     },
   },
   {
     id: 'no-zone',
     label: 'No zone configured',
-    blurb: (c) =>
-      blurb`Nodes are placed in ${c.zones} zones but told nothing, so every node sends to every peer directly: on average ${acrossNoZone(c)} of ${c.nodes - 1} data packets cross a zone.`,
+    group: 2,
     config: { nodes: NODES, zones: ZONES, zone_mode: 'Unset', rule_limit: NARRATIVE_LIMIT },
     pacing: 'held',
     traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC, at: 'every-node' },
+    select: ORIGIN,
+    burst_hits: BURST_HITS,
+    charts: CHARTS,
+    story: 'watch',
+    next: 'rate-limiting',
     async seed(sim, c) {
       for (let z = 0; z < c.zones; z++) await sim.submitRequest(seedNode(c, z), WATCHED_KEY, 10);
     },
@@ -351,20 +389,25 @@ export const PRESETS: readonly Preset[] = [
   {
     id: 'sandbox',
     label: 'Sandbox',
-    blurb: () =>
-      blurb`A blank, quiet cluster with no background traffic. Click a node, send it a request, then step to watch the change spread one event at a time. You drive every step.`,
-    // No feed and an empty seed: the cluster starts silent and the user drives
-    // every hit by hand, advancing one event at a time with Step. The narrative
-    // limit (not the low default) so the eager threshold flush never fires: a
-    // request then spreads only at its node's next heartbeat, which is the
-    // whole point of this scenario.
+    group: 3,
+    // No feed and an empty seed: the cluster starts silent and the reader
+    // drives every hit. The far-off limit, so a request spreads at its node's
+    // next heartbeat, one event at a time under Step.
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
     pacing: 'held',
+    select: ORIGIN,
+    burst_hits: BURST_HITS,
+    charts: CHARTS,
+    story: 'sandbox',
+    next: null,
     async seed() {
-      // Deliberately empty: the user injects the first hit.
+      // Deliberately empty: the reader sends the first hit.
     },
   },
 ];
 
-/** The preset the page opens on. */
+/** The preset the page opens on: the product's job, first. */
 export const DEFAULT_PRESET = PRESETS[0];
+
+/** The preset with id `id`. */
+export const presetById = (id: PresetId): Preset => PRESETS.find((p) => p.id === id) ?? DEFAULT_PRESET;
