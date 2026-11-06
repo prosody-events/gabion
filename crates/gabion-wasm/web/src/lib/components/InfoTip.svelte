@@ -7,15 +7,7 @@
   // links it to the trigger with `aria-describedby` so assistive tech announces
   // it. The trigger wears the conventional help affordance: a dotted underline
   // and `cursor: help`.
-  // `align` decides which edge the bubble grows from: left by default (grows
-  // rightward, for terms in the left of the panel), or right for a term near the
-  // panel's right edge so the bubble grows inward and isn't clipped by the
-  // inspector's `overflow` box.
-  let {
-    text,
-    align = 'left',
-    children,
-  }: { text: string; align?: 'left' | 'right'; children: Snippet } = $props();
+  let { text, children }: { text: string; children: Snippet } = $props();
 
   // Per-instance id tying the trigger to its description. Generated once at
   // construction — stable for the component's life.
@@ -24,7 +16,7 @@
 
 <button class="term" type="button" aria-describedby={id}>
   {@render children()}
-  <span class="bubble" class:right={align === 'right'} role="tooltip" {id}>{text}</span>
+  <span class="bubble" role="tooltip" {id}>{text}</span>
 </button>
 
 <style>
@@ -65,13 +57,6 @@
     /* Hidden but kept in the DOM so `aria-describedby` can still reach it,
        and out of the layout, so a term near an edge never widens the page. */
     display: none;
-  }
-
-  /* Grow inward from the right edge — keeps a right-side term's bubble inside
-     the inspector's overflow box. */
-  .bubble.right {
-    left: auto;
-    right: 0;
   }
 
   .term:hover .bubble,

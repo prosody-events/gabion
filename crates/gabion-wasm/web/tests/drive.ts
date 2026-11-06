@@ -170,7 +170,7 @@ export interface BandFrame {
 }
 
 /** Press Send at the selected node `node`, which refuses it, and return every
- *  frame of the refusal's band, checking each (C37): it never passes the brim
+ *  frame of the refusal's band, checking each: it never passes the brim
  *  nor reaches the count where one is shown. The recorder starts before the
  *  press, so a band however short is seen from its first frame. */
 export async function refusal(page: Page, node: number, where: string): Promise<BandFrame[]> {

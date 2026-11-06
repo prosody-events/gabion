@@ -881,7 +881,7 @@ test('a ring sweeps up to its new share as its packet lands (A13)', async ({ pag
 
 // -- The refusal in motion -----------------------------------------------------------
 
-test("a refusal's band drops, rebounds and fades in the headroom (C37)", async ({ page }) => {
+test("a refusal's band drops, rebounds and fades in the headroom", async ({ page }) => {
   // The stage at its full size, the table closed, so node 0 shows its count.
   await page.goto('/');
   await expect(page.locator('.stage canvas')).toBeVisible({ timeout: 30_000 });

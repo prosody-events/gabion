@@ -43,6 +43,7 @@
     observe,
     pressClause,
     progress,
+    type Clock,
     type Flight,
     type NextAction,
     type PresetId,
@@ -82,7 +83,7 @@
   // its own effect; a rebuild discards the wave instead. The `'live'` preset
   // shows every snapshot at once.
   //
-  // One time model (C39): a Send, Heal or Add pressed while paused plays until
+  // One time model: a Send, Heal or Add pressed while paused plays until
   // every node that waiting can reach has the hits and one heartbeat period
   // has passed since the last landing, so the acknowledgements have flown,
   // then pauses itself; in Propagation it also stops before each wave, which
@@ -147,9 +148,8 @@
   const grace = $derived(run?.preset.traffic === undefined ? 0 : tickMs + floorMs);
 
   /** A wave the engine holds in flight: the page shows it and calls the engine
-   *  again only once the stage reports it landed, which resolves `landed`.
-   *  `seq` tells one hold from the next. Under Propagation's per-wave run a
-   *  wave is held unflown until Step (`flight` `'waiting'`). */
+   *  again only once it landed, which resolves `landed`: the stage reports it,
+   *  or its delivery does. `seq` tells one hold from the next. */
   interface Held {
     readonly seq: number;
     readonly batch: EventBatch;
@@ -157,8 +157,11 @@
     readonly landed: Promise<void>;
     readonly land: () => void;
   }
-  let held = $state.raw<Held | null>(null);
-  let flight = $state<Flight>('none');
+  /** The wave the page holds: none, or one held unflown until Step (under
+   *  Propagation's per-wave run), flying, or frozen mid-flight by Pause. */
+  type Wave = { readonly kind: 'none' } | { readonly kind: Exclude<Flight, 'none'>; readonly held: Held };
+  const NO_WAVE: Wave = { kind: 'none' };
+  let wave = $state.raw<Wave>(NO_WAVE);
   let holds = 0;
   // Virtual ms one emit floor after the last held wave's instant: `land` runs
   // the run on to here. An instant the run has reached leaves nothing due.
@@ -168,15 +171,18 @@
   // Whether landed routes stay drawn until the next command: where no feed runs.
   const trail = $derived<Trail>(run?.preset.traffic === undefined ? 'keep' : 'drop');
 
-  // The bounded run a paused command started, where it started and its last
-  // data landing, in virtual ms; and whether it stopped at its cap.
-  let untilSettled = $state<UntilSettled>('off');
-  let runStart = 0;
-  let lastLanding = 0;
-  let capped = $state(false);
+  /** A command's bounded run: none, one that stopped at its cap (until the
+   *  next Play or command), or one playing on its own, with where it started
+   *  and its last data landing, in virtual ms. */
+  type Bound =
+    | { readonly kind: 'off' | 'capped' }
+    | { readonly kind: UntilSettled; readonly start: number; lastLanding: number };
+  const OFF: Bound = { kind: 'off' };
+  let bound = $state.raw<Bound>(OFF);
 
   // The last Send: each node's decision text, the decision itself, and the
-  // narration sentence it was told in. Cleared at the next command.
+  // narration sentence it was told in. Cleared at the next command; an
+  // admitted decision's text also when its run ends.
   let decisions = $state.raw<ReadonlyMap<number, Decision>>(new Map());
   let lastDecision = $state.raw<Admission | null>(null);
   let decided: { zone: number; admission: Admission } | null = null;
@@ -381,7 +387,7 @@
   /** Keep `old` for Undo, closing the wave it holds first: its engine then
    *  holds nothing in flight, and its saved snapshot is the engine's own. */
   async function keep(old: Run): Promise<void> {
-    if (held !== null) {
+    if (wave.kind !== 'none') {
       await old.sim.step(0);
       old.cluster = await old.sim.snapshot(old.selected, watchOf(old));
     }
@@ -400,11 +406,9 @@
 
   /** Make `r` the run: a fresh picture, paused, nothing held or decided. */
   function adopt(r: Run): void {
-    held = null;
-    flight = 'none';
+    wave = NO_WAVE;
     floorUntil = 0;
-    untilSettled = 'off';
-    capped = false;
+    bound = OFF;
     decisions = new Map();
     lastDecision = null;
     decided = null;
@@ -463,7 +467,7 @@
     r.history.push(snap);
     r.chartVersion += 1;
     const nextSend = snap.inspected?.next_send;
-    r.progress = observe(r.progress, r.preset.story, {
+    r.story = observe(r.story, {
       decided,
       nextSend,
       oracle: snap.oracle_total,
@@ -494,7 +498,7 @@
     if (stepping) return;
     // Virtual time waits while a wave flies, and the next advance does not
     // make up the wait.
-    if (held !== null) {
+    if (wave.kind !== 'none') {
       lastWall = now;
       return;
     }
@@ -527,8 +531,7 @@
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
         commandError = `The simulator stopped a command: ${message} The cluster is paused as it was; press Restart to start the scenario again.`;
-        held = null;
-        flight = 'none';
+        wave = NO_WAVE;
         pause();
       }
     });
@@ -543,7 +546,7 @@
    *  leaving their node, a gateway change of the selected node. */
   function note(r: Run, batch: EventBatch): void {
     for (const { kind } of batch.events) {
-      if (kind.type === 'PacketSent' && CARRIES_CELLS[kind.kind]) {
+      if ((kind.type === 'PacketSent' || kind.type === 'PacketDropped') && CARRIES_CELLS[kind.kind]) {
         if (kind.src === awaitingNode) awaitingNode = null;
         dataSent += 1;
         if (kind.tier === 'CrossZone') dataCrossed += 1;
@@ -572,10 +575,9 @@
     await refresh(r);
     const { promise, resolve } = Promise.withResolvers<void>();
     const h: Held = { seq: ++holds, batch, delay, landed: promise, land: resolve };
-    held = h;
     floorUntil = batch.virtual_ms + floorMs;
-    if (untilSettled === 'per-wave') {
-      flight = 'waiting';
+    if (bound.kind === 'per-wave') {
+      wave = { kind: 'waiting', held: h };
       halt();
       return;
     }
@@ -584,7 +586,7 @@
 
   /** Draw held wave `h`'s beams; with no stage to draw on, deliver it at once. */
   async function fly(h: Held): Promise<void> {
-    flight = 'flying';
+    wave = { kind: 'flying', held: h };
     const drawn = stage?.show(h.batch, h.delay, 'held') ?? false;
     if (!playing) stage?.finish('at-speed');
     if (!drawn) await deliver(h, false);
@@ -592,39 +594,40 @@
 
   /** Deliver held wave `h`, unless something else already has: `step(0)`
    *  closes the engine's sub-step at the same virtual instant, so the
-   *  receivers merge it, and their counts show. With `resume`, a per-wave run
-   *  plays on to its next wave. */
+   *  receivers merge it, and their counts show; whatever awaits its landing
+   *  then goes on. With `resume`, a per-wave run plays on to its next wave. */
   async function deliver(h: Held, resume: boolean): Promise<void> {
     const r = run;
-    if (held !== h || r === null) return;
+    if (wave.kind === 'none' || wave.held !== h || r === null) return;
     const batch = await r.sim.step(0);
     note(r, batch);
     stage?.show(batch, 0, 'free');
     hops += 1;
     await refresh(r);
-    held = null;
-    flight = 'none';
-    lastLanding = r.cluster.virtual_ms;
-    if (resume && untilSettled === 'per-wave') play();
+    wave = NO_WAVE;
+    h.land();
+    if (bound.kind === 'settled' || bound.kind === 'per-wave') bound.lastLanding = r.cluster.virtual_ms;
+    if (resume && bound.kind === 'per-wave') play();
     settle(r);
   }
 
   /** The stage reports the held wave landed. */
   function onLanded(): void {
-    const h = held;
-    if (h === null) return;
-    h.land();
-    void exec(() => deliver(h, true));
+    const w = wave;
+    if (w.kind === 'none') return;
+    w.held.land();
+    void exec(() => deliver(w.held, true));
   }
 
   /** Fly the held wave, if any, to its landing within a short wall time and
    *  deliver it. */
   async function flyFast(): Promise<void> {
-    const h = held;
-    if (h === null) return;
+    const w = wave;
+    if (w.kind === 'none') return;
+    const h = w.held;
+    if (w.kind === 'waiting') await fly(h);
+    else wave = { kind: 'flying', held: h };
     if (stage) {
-      if (flight === 'waiting') await fly(h);
-      flight = 'flying';
       stage.finish('fast');
       await h.landed;
     }
@@ -685,23 +688,24 @@
 
   /** The one stop rule: a command's run pauses itself once no node that
    *  waiting can reach is behind and one heartbeat period has passed since
-   *  the last landing, or at its cap. */
+   *  the last landing, or at its cap. Its Send's admitted text goes with it. */
   function settle(r: Run): void {
-    if (untilSettled === 'off' || held !== null) return;
+    const b = bound;
+    if ((b.kind !== 'settled' && b.kind !== 'per-wave') || wave.kind !== 'none') return;
     const now = r.cluster.virtual_ms;
     const late = r.cluster.nodes.find((n) => n.lag.kind === 'Behind' && n.lag.missing_for_ms >= grace);
-    if (late === undefined && now >= lastLanding + tickMs) {
-      halt();
-      // The acknowledgements still in the air land rather than freeze.
-      stage?.finish('at-speed');
-      untilSettled = 'off';
+    const ends = late === undefined && now >= b.lastLanding + tickMs;
+    if (!ends && now < b.start + UNTIL_SETTLED_MAX_PERIODS * tickMs) return;
+    halt();
+    // The acknowledgements still in the air land rather than freeze.
+    stage?.finish('at-speed');
+    for (const d of decisions.values()) if (d.admitted) decisions = new Map();
+    if (ends) {
+      bound = OFF;
       const stranded = r.cluster.nodes.some((n) => n.lag.kind === 'Stranded');
       narration = stranded ? say.strandedStop(r.cuts.map((c) => cutState(c, r.cluster.zones))) : [...told, ...say.EVERY_NODE];
-    } else if (now >= runStart + UNTIL_SETTLED_MAX_PERIODS * tickMs) {
-      halt();
-      stage?.finish('at-speed');
-      untilSettled = 'off';
-      capped = true;
+    } else {
+      bound = { kind: 'capped' };
       narration = say.cappedStop(UNTIL_SETTLED_MAX_PERIODS, late?.id ?? r.selected);
     }
   }
@@ -732,7 +736,7 @@
       stage?.clearTrail();
       decisions = new Map();
       lastDecision = null;
-      capped = false;
+      if (bound.kind === 'capped') bound = OFF;
       await task(r);
     });
   }
@@ -748,9 +752,8 @@
    *  propagated, then pauses itself. While playing, time is left alone. */
   function runOn(r: Run, mode: UntilSettled): void {
     if (playing) return;
-    untilSettled = mode;
-    runStart = r.cluster.virtual_ms;
-    lastLanding = runStart;
+    const start = r.cluster.virtual_ms;
+    bound = { kind: mode, start, lastLanding: start };
     play();
   }
 
@@ -791,7 +794,7 @@
       awaitingNode = eager ? null : node;
       told = eager ? say.admittedEager(node, hits, admission.total_before, limit) : say.admittedWaiting(node, hits, limit, r.config.target_err_bps);
       narration = told;
-      runOn(r, r.preset.story === 'propagation' ? 'per-wave' : 'settled');
+      runOn(r, r.story.kind === 'propagation' ? 'per-wave' : 'settled');
       await meet(r, batch, ARRIVAL_MS);
     });
 
@@ -811,7 +814,7 @@
       r.selected = id;
       inspected = snap.inspected ?? null;
       r.cluster = snap;
-      if (untilSettled === 'off' && held === null) narration = idleOf(r);
+      if (bound.kind !== 'settled' && bound.kind !== 'per-wave' && wave.kind === 'none') narration = idleOf(r);
     });
 
   /** Make fault `cut` over the live nodes. */
@@ -861,7 +864,9 @@
   function play(): void {
     if (playing || run === null || busy) return;
     playing = true;
-    if (flight === 'frozen') flight = 'flying';
+    // Playing ends a stop at the cap, and a frozen wave flies on.
+    if (bound.kind === 'capped') bound = OFF;
+    if (wave.kind === 'frozen') wave = { kind: 'flying', held: wave.held };
     lastWall = 0;
     period = null;
     rafId = requestAnimationFrame(frame);
@@ -880,8 +885,8 @@
    *  run ends. */
   function pause(): void {
     halt();
-    untilSettled = 'off';
-    if (flight === 'flying') flight = 'frozen';
+    bound = OFF;
+    if (wave.kind === 'flying') wave = { kind: 'frozen', held: wave.held };
   }
 
   function toggle(): void {
@@ -889,10 +894,10 @@
       pause();
       return;
     }
-    untilSettled = 'off';
+    bound = OFF;
     // A wave held for Step flies once Play runs the clock.
-    const h = held;
-    if (h !== null && flight === 'waiting') void exec(() => fly(h));
+    const w = wave;
+    if (w.kind === 'waiting') void exec(() => fly(w.held));
     play();
   }
 
@@ -903,14 +908,14 @@
    *  wave lands and the run plays on to the next. */
   async function stepOnce(): Promise<void> {
     if (busy) return;
-    if (untilSettled === 'per-wave' && held !== null) halt();
+    if (bound.kind === 'per-wave' && wave.kind !== 'none') halt();
     else pause();
     await exec(async (r) => {
-      const h = held;
-      if (h !== null) {
-        tellWave(r, h.batch);
-        if (flight === 'waiting') await fly(h);
-        flight = 'flying';
+      const w = wave;
+      if (w.kind !== 'none') {
+        tellWave(r, w.held.batch);
+        if (w.kind === 'waiting') await fly(w.held);
+        else if (w.kind === 'frozen') wave = { kind: 'flying', held: w.held };
         stage?.finish('at-speed');
         return;
       }
@@ -920,8 +925,8 @@
       const delta = live || expiry === undefined ? tickMs : expiry - r.cluster.virtual_ms;
       const batch = await r.sim.step(delta, live ? 'Time' : EVENT);
       if (!isWave(batch) && expiry === undefined && r.cluster.oracle_total === 0) narration = say.NOTHING_WAITING;
-      if (isWave(batch)) tellWave(r, batch);
       await meet(r, batch, 0);
+      if (isWave(batch)) tellWave(r, batch);
     });
   }
 
@@ -951,7 +956,7 @@
     } else if (relays.length > 0 && own.length === 0) {
       const gateways = [...new Set(relays.map((p) => p.src))].sort((a, b) => a - b);
       const lost = relays.filter((p) => p.type === 'PacketDropped').length;
-      narration = say.waveTwo(gateways, relays.length - lost, dataCrossed, dataSent + relays.length, lost);
+      narration = say.waveTwo(gateways, relays.length - lost, dataCrossed, dataSent, lost);
     }
   }
 
@@ -1016,6 +1021,9 @@
 
   // -- What the page shows, derived from the run --------------------------
 
+  // What time does, for the next action and the transport.
+  const clock = $derived<Clock>(bound.kind === 'off' ? (playing ? 'playing' : 'paused') : bound.kind);
+
   const view = $derived.by((): RunView | null => {
     const r = run;
     if (r === null || selectedNode === null) return null;
@@ -1023,21 +1031,18 @@
     let strata = 0;
     for (let b = from; b < from + buckets; b++) if ((r.cluster.window_buckets[b] ?? 0) > 0) strata += 1;
     return {
-      story: r.preset.story,
-      next: r.preset.next,
-      progress: r.progress,
+      story: r.story,
       selected: r.selected,
       selectedZone: selectedNode.zone,
       nodes: r.cluster.nodes,
       nextSend: r.cluster.inspected?.next_send,
+      subjectCount: selectedNode.window_total,
       subjectStrata: strata,
       subjectAtLimit: selectedNode.brim.kind === 'Rejected',
-      cuts: r.cuts.length,
       cutZone,
-      untilSettled,
-      flight,
-      playing,
-      capped,
+      repair: heading?.repair ?? null,
+      clock,
+      flight: wave.kind,
       busy,
       hits: editingHits ? 'editing' : hitsValid ? 'valid' : 'invalid',
       lastDecision,
@@ -1055,7 +1060,7 @@
   });
   const action = $derived<NextAction>(view === null ? { kind: 'wait', reason: 'starting' } : nextAction(view));
   const primary = $derived(action.kind === 'press' ? action.control : null);
-  const goal = $derived(view === null || run === null ? [] : goalOf(view, run.preset.id));
+  const goal = $derived(view === null ? [] : goalOf(view));
   const send = $derived(sendLabel(width, hitsValid && run !== null ? run.hits : null, run?.selected ?? 0));
   const pressLabel = $derived(
     action.kind !== 'press' ? [] : action.control === 'send' ? send : action.control === 'play' ? ['Play'] : ['Step'],
@@ -1068,7 +1073,7 @@
       ? blurb`a request of ${run?.hits ?? 0} can never fit the limit of ${limit}`
       : hitsCommitted.trim() === ''
         ? ['Hits per Send is empty']
-        : blurb`Hits per Send must be a whole number from ${BURST_HITS_MIN} to ${BURST_HITS_MAX}`,
+        : blurb`Hits per Send must be a whole number from ${BURST_HITS_MIN} to\u00a0${BURST_HITS_MAX}`,
   );
   const heading = $derived(
     run === null
@@ -1165,12 +1170,12 @@
           <span data-field="status-window">{run.applied.rule_window_ms / 1000} s</span>
         {:else}
           share one rate limit
-        {/if}{#each run.cuts as c, i (i)}
-          · <Sentence parts={cutName(c, cluster.zones)} field="status-cut" />{/each}
+        {/if}{#each run.cuts as c, i (i)}{' · '}<Sentence parts={cutName(c, cluster.zones)} field="status-cut" />{/each}
       </p>
     {/if}
     <p class="once">
-      One simulated run · <a href={`${import.meta.env.BASE_URL}study/dashboard/`}>measured results in the study</a>
+      <span class="one-run">One simulated run ·</span>
+      <a href={`${import.meta.env.BASE_URL}study/dashboard/`}>measured results in the study</a>
     </p>
     <button class="btn-tertiary help" aria-expanded={helpOpen} aria-controls="glossary" onclick={() => (helpOpen = !helpOpen)}
       >How to read this</button
@@ -1276,9 +1281,9 @@
           class="stage-pane"
           aria-label="Stage"
           aria-describedby="next-action"
-          data-held={held?.seq ?? 0}
-          data-flight={flight}
-          data-run={untilSettled}
+          data-held={wave.kind === 'none' ? 0 : wave.held.seq}
+          data-flight={wave.kind}
+          data-run={clock === 'settled' || clock === 'per-wave' ? clock : 'off'}
           data-playing={playing ? '1' : '0'}
         >
           <StageCaption
@@ -1289,7 +1294,6 @@
             phone={width === 'narrow'}
             subject={r.selected}
             {useHitsReason}
-            repairLabel={heading.repair}
             zoneName={(z) => zoneAt(cluster.zones, z)}
             {meter}
             presetLabel={(id) => presetById(id).label}
@@ -1410,8 +1414,8 @@
       sendLabel={send}
       sendValid={hitsValid}
       {primary}
-      {untilSettled}
-      {flight}
+      bounded={playing && (clock === 'settled' || clock === 'per-wave')}
+      inFlight={wave.kind === 'flying' || wave.kind === 'frozen'}
       onToggle={toggle}
       onStep={() => void stepOnce()}
       onSend={() => void sendBurst()}
@@ -1467,6 +1471,14 @@
 
   .once a {
     color: var(--color-fg);
+  }
+
+  /* Below 1280 px the lede and its listed cuts need the row: the link alone
+     keeps the header one row. */
+  @media (width < 1280px) {
+    .one-run {
+      display: none;
+    }
   }
 
   .help {

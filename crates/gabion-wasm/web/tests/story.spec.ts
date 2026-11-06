@@ -4,6 +4,8 @@ import type { GlyphTable } from '../src/lib/stage/renderer';
 import { CONTROL, CROSS, RELAY, STRATA_MIN_INNER } from '../src/lib/stage/layout';
 import { readTheme } from '../src/lib/theme';
 import { WATCH, sendButton, still } from './drive';
+import { WATCHES } from '../src/lib/next';
+import { PRESETS, presetById } from '../src/lib/presets';
 import { COMMANDS, clauses } from './next-actions';
 
 // Each scenario's story, walked the way a newcomer walks it: pressing only the
@@ -71,7 +73,7 @@ async function checkState(page: Page, where: string): Promise<string | null> {
         voices.set(said, first ?? voice);
       }
       // A19: the narration takes at most two lines where the stage has its
-      // measure (from 1100 px; the narrower layouts come with C22 and C23).
+      // measure (from 1100 px; the narrower layouts come in a later phase).
       const narration = innerWidth >= 1100 ? document.querySelector('.narration') : null;
       if (narration !== null) {
         const range = document.createRange();
@@ -116,8 +118,8 @@ async function checkState(page: Page, where: string): Promise<string | null> {
   expect(name.startsWith(label), `${where}: its accessible name "${name}" begins with its label`).toBe(true);
   expect(await line(page).getByRole('button').count(), `${where}: at most one button in the line`).toBeLessThanOrEqual(1);
   // A49.6: in view once the line is scrolled to the top, where the page does
-  // not scroll (from 1100 px; the scrolling layouts' sticky bar comes with C22
-  // and C23).
+  // not scroll (from 1100 px; the scrolling layouts' sticky bar comes in a
+  // later phase).
   if ((page.viewportSize()?.width ?? 0) >= 1100) {
     await line(page).evaluate((el) => el.scrollIntoView({ block: 'start' }));
     const box = await p.boundingBox();
@@ -152,6 +154,29 @@ async function untilNext(page: Page, where: string, timeout = 60_000): Promise<v
   }
 }
 
+/** Record every text `selector` shows from now on, repeats collapsed, into
+ *  `window[key]`; `recorded` reads the record and starts it afresh. */
+async function record(page: Page, key: string, selector: string): Promise<void> {
+  await page.evaluate(([key, selector]) => {
+    const w = window as unknown as Record<string, string[]>;
+    w[key] = [];
+    const take = (): void => {
+      const text = (document.querySelector(selector)?.textContent ?? '').replace(/\s+/g, ' ').trim();
+      if (w[key].at(-1) !== text) w[key].push(text);
+    };
+    take();
+    new MutationObserver(take).observe(document.body, { subtree: true, childList: true, characterData: true });
+  }, [key, selector] as const);
+}
+
+const recorded = (page: Page, key: string): Promise<string[]> =>
+  page.evaluate((key) => {
+    const w = window as unknown as Record<string, string[]>;
+    const out = w[key];
+    w[key] = out.slice(-1);
+    return out;
+  }, key);
+
 /** Record every heading the page shows, from now on, as its template and
  *  text, repeats collapsed. */
 async function recordTemplates(page: Page): Promise<void> {
@@ -178,11 +203,15 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
   // checks between presses then cost the story next to nothing in simulated
   // time.
   await recordTemplates(page);
+  // Every narration and readout from the first press on, so a sentence is
+  // read whatever the playing clock says after it.
+  await record(page, 'narrations', '.narration');
+  await record(page, 'readouts', '.readout .time');
   const pressed: string[] = [];
   let refusals = 0;
   // A57: the buckets the Sends admitted after Play were pressed in.
   const paced: number[] = [];
-  for (let step = 0; step < 40; step++) {
+  for (let step = 0; step < 60; step++) {
     const where = `${info.project.name}, state ${step}`;
     await untilNext(page, where);
     const label = await checkState(page, where);
@@ -190,6 +219,7 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
     pressed.push(label.startsWith('Send') ? 'Send' : label);
     if (label.startsWith('Go to')) break;
     const before = await snapshot(page);
+    await recorded(page, 'narrations');
     await primary(page).click();
     if (label.startsWith('Send')) {
       await expect.poll(async () => {
@@ -199,8 +229,10 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
       const after = await snapshot(page);
       if (after.rejected_hits > before.rejected_hits) {
         refusals += 1;
-        // The one rejection template, naming the nodes that filled the window.
-        const narration = squash(await page.locator('.narration').textContent());
+        // The one rejection template, naming the nodes that filled the window,
+        // among the sentences said since the press.
+        const said = await recorded(page, 'narrations');
+        const narration = said.find((t) => / rejected all 25/.test(t)) ?? said.join(' | ');
         expect(narration, `${where}: the rejection`).toMatch(/^node \d+ rejected all 25: it sees 100/);
         if (refusals === 1) expect(narration, `${where}: who filled the window`).toContain('admitted at nodes 0, 1 and 2');
       } else if (pressed.includes('Play')) {
@@ -213,7 +245,12 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
       await expect(page.locator('.pane-title [data-field="node"]')).toHaveText(label.replace('Select node ', ''));
     }
   }
-  expect(pressed, `${info.project.name}: the presses`).toEqual([
+  // Paused, the presses are the script's own; once Play runs the clock, the
+  // sliding-window act asks for a Send in each new bucket until one is
+  // refused (four in the window, one more on a slow runner whose checks let
+  // the oldest leave first), then for the Send after the fall-off.
+  const played = pressed.indexOf('Play') + 1;
+  expect(pressed.slice(0, played), `${info.project.name}: the presses while paused`).toEqual([
     'Send',
     'Select node 1',
     'Send',
@@ -222,15 +259,17 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
     'Send',
     'Send',
     'Play',
-    'Send',
-    'Send',
-    'Send',
-    'Send',
-    'Send',
-    'Send',
-    'Go to Zone partition',
   ]);
+  const after = pressed.slice(played);
+  expect(after.at(-1), `${info.project.name}: the end`).toBe('Go to Zone partition');
+  expect(after.slice(0, -1), `${info.project.name}: the presses after Play`).toEqual(after.slice(0, -1).map(() => 'Send'));
+  expect(after.length - 1, `${info.project.name}: four admitted, one refused, one after the fall-off`).toBeGreaterThanOrEqual(6);
   expect(refusals, 'two refusals: at the limit and in the sliding window').toBe(2);
+  // A46: the readout said while a paused Send's run bounded it, and while its
+  // packets flew.
+  const readouts = await recorded(page, 'readouts');
+  expect(readouts.some((t) => t.endsWith('simulated · playing until every node has it · packets in flight')), `the readouts: ${readouts.slice(0, 6).join(' | ')}`).toBe(true);
+  expect(readouts.some((t) => t.endsWith('simulated · playing until every node has it')), 'a bounded run between its waves').toBe(true);
   // A18: the heading opens on rl-0; every Send's spreading (rl-1) ends in
   // agreement, with the badge (rl-2, two hops: the flush and the relays) or
   // the countdown (rl-3) where the selected node now refuses; the window's
@@ -246,7 +285,7 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
   expect(ids.filter((id) => id === 'rl-3').length, 'the countdown at each limit').toBeGreaterThanOrEqual(2);
   expect(ids.some((id) => id === 'rl-4' || id === 'rl-5'), 'the window slid').toBe(true);
   expect(templates.some(([, text]) => text.includes('see 75 of the 100 limit')), 'the partial fall-off').toBe(true);
-  expect(paced.length, 'A57: the five Sends admitted after Play').toBe(5);
+  expect(paced.length, 'A57: the Sends admitted after Play').toBeGreaterThanOrEqual(5);
   expect(new Set(paced).size, `A57: each Send after Play in a bucket of its own: ${paced}`).toBe(paced.length);
   // A paused Send's run is its own two waves: the flush and the relays. (A
   // Send while playing may share its run with other waves.)
@@ -261,7 +300,7 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
   if (inner >= STRATA_MIN_INNER) expect(strata, 'the sliding window left its strata').toBeGreaterThanOrEqual(2);
 });
 
-test('Propagation stops before each wave and Step flies it (A55, Q16)', async ({ page }, info) => {
+test('Propagation stops before each wave and Step flies it (A55)', async ({ page }, info) => {
   test.skip(!['audit-1440-light-motion', 'audit-1440-light', 'audit-400-dark'].includes(info.project.name), 'the waves, checked where they move and at the widest and narrowest');
   test.setTimeout(120_000);
   await open(page);
@@ -307,7 +346,11 @@ test('Propagation stops before each wave and Step flies it (A55, Q16)', async ({
   // (2) Step, to send wave 1.
   expect(await checkState(page, `${where}: wave 1 held`)).toBe('Step');
   await expect(line(page)).toContainText('to send wave 1');
+  // A46: halted before the wave, the readout claims neither a playing run
+  // nor packets in flight.
+  await expect(page.locator('.readout .time')).toHaveText(/simulated$/);
   expect(await data(), 'nothing flew before Step').toEqual([]);
+  await record(page, 'narrations', '.narration');
   // (3) Wave 1 alone: node 0's own packets, Z − 1 of them across zones.
   await primary(page).click();
   await untilNext(page, `${where}: before wave 2`);
@@ -317,12 +360,20 @@ test('Propagation stops before each wave and Step flies it (A55, Q16)', async ({
   expect(wave1.filter((b) => (b.flags & CROSS) !== 0).length).toBe(2);
   expect(await checkState(page, `${where}: wave 2 held`)).toBe('Step');
   await expect(line(page)).toContainText('for wave 2, the relays');
+  const one = await recorded(page, 'narrations');
+  expect(
+    one.some((t) => /^node 0 sent them to 3 nodes of zone a and to gateways node \d+ \(zone b\) and node \d+ \(zone c\)$/.test(t)),
+    `wave 1, told on its Step: ${one.join(' | ')}`,
+  ).toBe(true);
   // (4) Wave 2: the relays, from node 0's gateways; then every count is the truth.
   const gateways = ((await snapshot(page, 0)).inspected?.peers ?? []).filter((p) => p.role === 'gateway').map((p) => p.id);
   await primary(page).click();
   await untilNext(page, `${where}: after the relays`);
   const wave2 = await data();
   expect(wave2.length, 'wave 2: the six relays').toBe(6);
+  // Wave 2's sentence counts each data packet once: 5 in wave 1, 6 relays.
+  const told = (await recorded(page, 'narrations')).find((t) => t.startsWith('gateways '));
+  expect(told, 'wave 2, told on its Step').toMatch(/passed them on to 6 nodes · 2 of the 11 packets crossed a zone$/);
   expect(wave2.every((b) => (b.flags & RELAY) !== 0 && gateways.includes(b.src))).toBe(true);
   const agreed = await snapshot(page);
   expect(agreed.nodes.every((n) => n.window_total === agreed.oracle_total)).toBe(true);
@@ -338,7 +389,7 @@ test('Propagation stops before each wave and Step flies it (A55, Q16)', async ({
   expect(await checkState(page, `${where}: the end`)).toBe('Go to Rate limiting');
 });
 
-test('a Send while a wave waits for Step lands it first (A55, Q16)', async ({ page }, info) => {
+test('a Send while a wave waits for Step lands it first (A55)', async ({ page }, info) => {
   test.skip(!['audit-1440-light-motion', 'audit-1440-light'].includes(info.project.name), 'the waiting wave, with motion on and reduced');
   test.setTimeout(60_000);
   await open(page);
@@ -616,12 +667,51 @@ test('what can be pressed looks pressable, and a named node is previewed (A51, o
   await check();
 });
 
-test('the page says what it is (A20, Q13, A22)', async ({ page }, info) => {
+test('every watched scenario and Sandbox names its next action, at load and once playing (A49)', async ({ page }, info) => {
+  test.skip(!['audit-1440-light', 'audit-400-dark'].includes(info.project.name), 'the other scenarios, at the widest and narrowest');
+  test.setTimeout(180_000);
   await open(page);
-  if ((page.viewportSize()?.width ?? 0) >= 1100) {
+  for (const preset of PRESETS) {
+    const story = preset.story;
+    if (story.kind !== 'watch' && story.kind !== 'sandbox') continue;
+    const where = `${info.project.name}, ${preset.label}`;
+    await loadPreset(page, preset.label);
+    if (story.kind === 'sandbox') {
+      expect(await checkState(page, `${where}: load`)).toMatch(/^Send/);
+      continue;
+    }
+    expect(await checkState(page, `${where}: load`)).toBe('Play');
+    await primary(page).click();
+    // Once playing, between the waits for its waves, the line watches what
+    // this scenario shows and offers the next one, read in one go.
+    const deadline = Date.now() + 30_000;
+    let said = squash(await line(page).textContent());
+    while (!said.startsWith('Watch')) {
+      if (Date.now() > deadline) throw new Error(`${where}: still "${said}"`);
+      await page.waitForTimeout(100);
+      said = squash(await line(page).textContent());
+    }
+    expect(said, `${where}: the watch`).toBe(`Watch ${WATCHES[story.watched]} Go to ${presetById(story.next).label}`);
+    expect(await checkState(page, `${where}: playing`)).toBeNull();
+  }
+});
+
+test('the page says what it is (A20, A22)', async ({ page }, info) => {
+  await open(page);
+  const wide = (page.viewportSize()?.width ?? 0) >= 1100;
+  if (wide) {
     const header = (await page.locator('header').boundingBox())!;
     expect(header.height, `${info.project.name}: the header is one row`).toBeLessThanOrEqual(56);
   }
+  // The longest lede, with its cut listed after a spaced separator, keeps
+  // the header one row.
+  await loadPreset(page, 'Gateway cut');
+  await expect(page.locator('.lede')).toContainText(/share one rate limit · node \d+ unheard by zone b/);
+  if (wide) {
+    const header = (await page.locator('header').boundingBox())!;
+    expect(header.height, `${info.project.name}: the header with a cut is one row`).toBeLessThanOrEqual(56);
+  }
+  await loadPreset(page, 'Rate limiting');
   expect(await page.title()).toBe('Gabion rate limiter');
   await expect(page.locator('h1')).toHaveText('Gabion · a distributed rate limiter');
   const visible = await page.evaluate(() => document.body.innerText);
@@ -656,7 +746,7 @@ test('the pane is one column that never swaps (A5)', async ({ page }, info) => {
   expect(after.slice(1, -1), 'selecting another node swaps nothing').toEqual(before.slice(1, -1));
 });
 
-test("a story's end hands over, and Undo brings it back (C55, A6)", async ({ page }, info) => {
+test("a story's end hands over, and Undo brings it back (A6)", async ({ page }, info) => {
   test.skip(info.project.name !== 'audit-1440-light', 'the hand-over, checked once');
   test.setTimeout(120_000);
   await open(page);

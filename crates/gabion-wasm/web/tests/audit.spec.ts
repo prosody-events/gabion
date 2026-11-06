@@ -9,6 +9,7 @@ import {
   COUNT_FIT,
   CROSS,
   DROPPED,
+  LABEL_GAP,
   PORT_GAP,
   RELAY,
   RING_REACH,
@@ -619,13 +620,23 @@ async function checkGlyphs(page: Page, where: string, name: string): Promise<voi
           if (Math.hypot(g.x[t] - nx, g.y[t] - ny) <= reach) found.push(`the name "${l.text}" touches node ${g.id[t]}'s marks`);
         }
         for (const b of boxes) if (overlaps(box, b)) found.push(`the name "${l.text}" covers node ${b.id}'s count`);
+        // A name stands against its own disc: next to it, overlapping the
+        // disc's span across or down the stage, so it names the node it
+        // stands by.
+        const own = slots.find((t) => g.id[t] === id);
+        if (own !== undefined) {
+          const [x, y, r] = [g.x[own], g.y[own], g.r[own]];
+          const spans = (box.x0 < x + r && x - r < box.x1) || (box.y0 < y + r && y - r < box.y1);
+          const gap = Math.hypot(Math.max(box.x0 - x, 0, x - box.x1), Math.max(box.y0 - y, 0, y - box.y1));
+          if (!spans || gap > r + k.RING_REACH + k.LABEL_GAP + 0.5) found.push(`the name "${l.text}" does not stand against node ${id}'s disc`);
+        }
       }
       if (labels.length !== slots.length) found.push(`${labels.length} names for ${slots.length} nodes`);
       if (g.onScale === 0 && (g.marks & k.FAR) === 0) found.push('the limit is off the scale but the key does not say so');
       return found;
     },
     {
-      k: { COUNT_FIT, VESSEL_SCALE, RING_REACH, SELECTION_REACH, PORT_GAP, PORT_MIN: portHalf(0), ARC_GAP, ARC_WIDTH, RING_BEHIND, RING_CAUGHT_UP, FAR: MARK.FAR },
+      k: { COUNT_FIT, VESSEL_SCALE, RING_REACH, LABEL_GAP, SELECTION_REACH, PORT_GAP, PORT_MIN: portHalf(0), ARC_GAP, ARC_WIDTH, RING_BEHIND, RING_CAUGHT_UP, FAR: MARK.FAR },
       nodes: snap.nodes.map((n) => ({ id: n.id, lag: n.lag, window_total: n.window_total, brim: n.brim })),
       grace: feed ? PERIOD_MS + 5 : 0,
       names: Object.fromEntries(names),
@@ -1741,7 +1752,7 @@ test.describe('interaction', () => {
   });
 });
 
-// -- A42, A16, C37: the node glyph in motion -------------------------------------
+// -- A42, A16: the node glyph in motion ------------------------------------------
 
 /** The relative luminance of a packed `0xRRGGBB` and the contrast of two. */
 const lum = (rgb: number): number => {
@@ -1763,7 +1774,7 @@ const glyphs = <T>(page: Page, read: (g: GlyphTable) => T): Promise<T> =>
     return (0, eval)(src)(c.glyphs);
   }, read.toString()) as Promise<T>;
 
-/** C14: each decision stands right of its ring, and on its left only when
+/** Each decision stands right of its ring, and on its left only when
  *  the right would leave the stage or touch a name. */
 async function checkDecisions(page: Page, where: string): Promise<void> {
   const found = await page.evaluate(() => {
@@ -1790,7 +1801,7 @@ async function checkDecisions(page: Page, where: string): Promise<void> {
   expect(found, `${where}: the decisions`).toEqual([]);
 }
 
-test('the node glyph tells level, strata, cap, refusal and ring (A42, A16, C37)', async ({ page }, info) => {
+test('the node glyph tells level, strata, cap, refusal and ring (A42, A16)', async ({ page }, info) => {
   test.setTimeout(240_000);
   await open(page);
   await loadPreset(page, 'Rate limiting');
@@ -1838,9 +1849,11 @@ test('the node glyph tells level, strata, cap, refusal and ring (A42, A16, C37)'
     if (tall) expect(strata, `${where}: node ${id}'s strata while the wave flies`).toBe(origin ? 1 : 0);
     if (wide || count !== null) expect(count, `${where}: node ${id}'s count while the wave flies`).toBe(origin ? '25' : '0');
   }
-  await still(page, 60_000);
+  // The admitted text stands while its run plays, and goes when it ends.
   if (wide) await expect(page.locator('.decision'), `${where}: node 0's decision`).toHaveCount(1);
   await checkDecisions(page, `${where}, admitted`);
+  await still(page, 60_000);
+  await expect(page.locator('.decision'), `${where}: the admitted text once its run ended`).toHaveCount(0);
 
   // Sends at nodes 1, 2 and 2, each in a bucket of its own where strata show.
   for (const node of [1, 2, 2]) {
@@ -1889,7 +1902,7 @@ test('the node glyph tells level, strata, cap, refusal and ring (A42, A16, C37)'
   expect(await page.locator('.count').allTextContents(), `${where}: a refusal counts nothing`).toEqual(counts);
 });
 
-// -- A10, C2: the faces -----------------------------------------------------------
+// -- A10: the faces ---------------------------------------------------------------
 
 test('every visible text is set in the three faces, from the page itself (A10)', async ({ page }, info) => {
   test.skip(info.project.name !== 'audit-1440-light', 'the faces, checked once');
@@ -1936,7 +1949,7 @@ test('every visible text is set in the three faces, from the page itself (A10)',
   expect([...origins], 'every request goes to the page itself').toEqual([new URL(page.url()).origin]);
 });
 
-test('the stage draws though a face fails to load (C2)', async ({ page }, info) => {
+test('the stage draws though a face fails to load', async ({ page }, info) => {
   test.skip(info.project.name !== 'audit-1440-light', 'the font gate, checked once');
   const failed: string[] = [];
   page.on('requestfailed', (request) => failed.push(request.url()));

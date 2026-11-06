@@ -163,9 +163,9 @@ export type Preset = Paced & {
   readonly config: Partial<SimConfig>;
   /** The charts the detail pane shows, in order. */
   readonly charts: readonly ChartId[];
-  /** The story the caption tells, and the scenario it hands over to. */
+  /** The story the caption tells, as it opens, with the scenario it hands
+   *  over to. */
   readonly story: Story;
-  readonly next: PresetId | null;
   /** Fire the preset's opening commands on the warmed cluster, at the current
    *  virtual time. */
   seed(sim: Sim, config: SimConfig, gateways: Gateways): Promise<void>;
@@ -241,8 +241,7 @@ export const PRESETS: readonly Preset[] = [
     config: { nodes: NODES, zones: ZONES, rule_limit: RATE_LIMIT },
     pacing: 'held',
     charts: LIMIT_FIRST,
-    story: 'rate-limiting',
-    next: 'partition',
+    story: { kind: 'rate-limiting', next: 'partition', act: 'open', zones: 0, sendBucket: null },
     async seed() {
       // Opens settled at 0: the reader's Sends are the story.
     },
@@ -254,8 +253,7 @@ export const PRESETS: readonly Preset[] = [
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
     pacing: 'held',
     charts: CHARTS,
-    story: 'propagation',
-    next: 'rate-limiting',
+    story: { kind: 'propagation', next: 'rate-limiting', act: 'open' },
     async seed(sim, c) {
       await sim.submitRequest(ORIGIN, WATCHED_KEY, SEED_HITS);
       await settle(sim, c);
@@ -273,8 +271,7 @@ export const PRESETS: readonly Preset[] = [
     pacing: 'live',
     traffic: { rate_per_sec: OVERLOAD_RATE_PER_SEC, at: 'every-node' },
     charts: LIMIT_FIRST,
-    story: 'watch',
-    next: 'rate-limiting',
+    story: { kind: 'watch', watched: 'overload', next: 'rate-limiting' },
     async seed() {
       // No opening request: the sustained feed (driven during play) is the story.
     },
@@ -286,8 +283,7 @@ export const PRESETS: readonly Preset[] = [
     config: { nodes: NODES, zones: ZONES, rule_limit: RATE_LIMIT },
     pacing: 'held',
     charts: LIMIT_FIRST,
-    story: 'partition',
-    next: 'gateway-failure',
+    story: { kind: 'partition', next: 'gateway-failure', act: 'open' },
     async seed(sim, c) {
       await sim.cut({ kind: 'zone', zone: c.zones - 1 }, buildNodes(c));
     },
@@ -299,8 +295,7 @@ export const PRESETS: readonly Preset[] = [
     config: { nodes: NODES, zones: ZONES, uniform_loss: 0.3, rule_limit: NARRATIVE_LIMIT },
     pacing: 'held',
     charts: CHARTS,
-    story: 'watch',
-    next: 'rate-limiting',
+    story: { kind: 'watch', watched: 'loss', next: 'rate-limiting' },
     async seed(sim) {
       await sim.submitRequest(ORIGIN, WATCHED_KEY, SEED_HITS);
     },
@@ -312,8 +307,7 @@ export const PRESETS: readonly Preset[] = [
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
     pacing: 'held',
     charts: CHARTS,
-    story: 'watch',
-    next: 'gateway-cut',
+    story: { kind: 'watch', watched: 'gateway-failure', next: 'gateway-cut' },
     async seed(sim, c, gateways) {
       const g = gateways[ORIGIN]?.[1] ?? noGateway(1);
       await sim.cut({ kind: 'silenced', node: g }, buildNodes(c));
@@ -328,8 +322,7 @@ export const PRESETS: readonly Preset[] = [
     pacing: 'held',
     traffic: { rate_per_sec: TRICKLE_RATE_PER_SEC, at: { node: ORIGIN } },
     charts: CHARTS,
-    story: 'watch',
-    next: 'sandbox',
+    story: { kind: 'watch', watched: 'gateway-cut', next: 'sandbox' },
     async seed(sim, c, gateways) {
       const g = gateways[ORIGIN]?.[1] ?? noGateway(1);
       await sim.cut({ kind: 'unheard-in-zone', node: g, zone: 1 }, buildNodes(c));
@@ -344,8 +337,7 @@ export const PRESETS: readonly Preset[] = [
     pacing: 'held',
     traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC, at: 'every-node' },
     charts: CHARTS,
-    story: 'watch',
-    next: 'rate-limiting',
+    story: { kind: 'watch', watched: 'steady', next: 'rate-limiting' },
     async seed(sim, c) {
       for (let z = 0; z < c.zones; z++) await sim.submitRequest(seedNode(c, z), WATCHED_KEY, 10);
     },
@@ -358,8 +350,7 @@ export const PRESETS: readonly Preset[] = [
     pacing: 'held',
     traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC, at: 'every-node' },
     charts: CHARTS,
-    story: 'watch',
-    next: 'rate-limiting',
+    story: { kind: 'watch', watched: 'no-zone', next: 'rate-limiting' },
     async seed(sim, c) {
       for (let z = 0; z < c.zones; z++) await sim.submitRequest(seedNode(c, z), WATCHED_KEY, 10);
     },
@@ -374,8 +365,7 @@ export const PRESETS: readonly Preset[] = [
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
     pacing: 'held',
     charts: CHARTS,
-    story: 'sandbox',
-    next: null,
+    story: { kind: 'sandbox' },
     async seed() {
       // Deliberately empty: the reader sends the first hit.
     },

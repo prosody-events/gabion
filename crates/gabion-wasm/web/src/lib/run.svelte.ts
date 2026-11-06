@@ -5,7 +5,7 @@
 
 import { ChartHistory } from './charts/history';
 import type { Cut } from './cuts';
-import { START, type Progress } from './next';
+import type { Story } from './next';
 import { ORIGIN, type Knobs, type Preset } from './presets';
 import { RequestLog } from './requests';
 import type { Sim } from './sim/sim';
@@ -31,7 +31,8 @@ export class Run {
   /** The faults the scenario's own seed made: Restart discards only the
    *  reader's. */
   readonly seededCuts: number;
-  progress: Progress = $state.raw(START);
+  /** Where the run stands in its preset's story. */
+  story: Story = $state.raw() as Story;
   /** Ticks with each chart sample: the one signal the dashboard redraws on. */
   chartVersion = $state(0);
   readonly history = new ChartHistory();
@@ -52,6 +53,7 @@ export class Run {
     this.cluster = cluster;
     this.cuts = sim.cuts();
     this.seededCuts = this.cuts.length;
+    this.story = preset.story;
     this.feedFrom = cluster.virtual_ms;
     this.history.reset(applied.rule_window_ms);
   }

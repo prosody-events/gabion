@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
 import { heading } from '../src/lib/heading';
 import { admittedWaiting, strandedStop, waveOneCounted } from '../src/lib/narration';
-import { goal, nextAction, observe, progress, START, type RunView } from '../src/lib/next';
+import { goal, nextAction, observe, pressClause, progress, type Observation, type RunView, type Story } from '../src/lib/next';
 import { PRESETS } from '../src/lib/presets';
 import type { NodeState } from '../src/lib/sim/types';
 import { BASE, COMMANDS, TABLE, clauses } from './next-actions';
@@ -21,39 +21,87 @@ for (const row of TABLE) {
 }
 
 test('no goal commands, and none quotes a control (A56)', () => {
-  for (const row of TABLE) {
-    const view: RunView = { ...BASE, ...row.view };
-    for (const { id: scenario } of PRESETS) {
-      const said = text(goal(view, scenario));
-      for (const clause of clauses(said)) {
-        const first = clause.split(/\s+/)[0].toLowerCase();
-        expect(COMMANDS as readonly string[], `"${said}" (${row.name}): the clause "${clause}"`).not.toContain(first);
-      }
-      for (const label of ['Send', 'Play', 'Step', 'Select node', 'Use 25 hits', 'Go to']) {
-        expect(new RegExp(`\\b${label}\\b`, 'i').test(said), `"${said}" quotes "${label}"`).toBe(false);
-      }
+  // Every row's state, every scenario's opening, and Zone partition's
+  // endings either way.
+  const partition = (act: 'counted' | 'done', both: boolean): Story => ({ kind: 'partition', next: 'gateway-failure', act, both });
+  const views: [string, RunView][] = [
+    ...TABLE.map((row): [string, RunView] => [row.name, { ...BASE, ...row.view }]),
+    ...PRESETS.map((p): [string, RunView] => [p.label, { ...BASE, story: p.story }]),
+    ...[partition('counted', false), partition('done', false)].map((story): [string, RunView] => ['healed early', { ...BASE, story }]),
+  ];
+  for (const [name, view] of views) {
+    const said = text(goal(view));
+    for (const clause of clauses(said)) {
+      const first = clause.split(/\s+/)[0].toLowerCase();
+      expect(COMMANDS as readonly string[], `"${said}" (${name}): the clause "${clause}"`).not.toContain(first);
+    }
+    for (const label of ['Send', 'Play', 'Step', 'Select node', 'Use 25 hits', 'Go to']) {
+      expect(new RegExp(`\\b${label}\\b`, 'i').test(said), `"${said}" quotes "${label}"`).toBe(false);
     }
   }
 });
 
+test('each watched scenario watches itself', () => {
+  for (const p of PRESETS) if (p.story.kind === 'watch') expect(p.story.watched, p.label).toBe(p.id);
+});
+
+const admitted = { kind: 'Admitted' as const, total_before: 0 };
+const refused = { kind: 'Rejected' as const, total: 100, reopens: { kind: 'In' as const, ms: 1 } };
+const quiet: Observation = { decided: null, nextSend: refused, oracle: 100, bucket: 3, cuts: 0, cutZone: null };
+const actOf = (s: Story): string => ('act' in s ? s.act : s.kind);
+
 test("Rate limiting's acts move on decisions and reopenings only", () => {
-  const admitted = { kind: 'Admitted' as const, total_before: 0 };
-  const refused = { kind: 'Rejected' as const, total: 100, reopens: { kind: 'In' as const, ms: 1 } };
-  const o = { decided: null, nextSend: refused, oracle: 100, bucket: 3, cuts: 0, cutZone: null };
-  let p = observe(START, 'rate-limiting', { ...o, decided: { zone: 0, admission: admitted } });
-  expect(p).toEqual({ act: 'filling', zones: 1, sendBucket: 3 });
-  p = observe(p, 'rate-limiting', { ...o, decided: { zone: 2, admission: refused } });
-  expect(p.act).toBe('refused');
-  p = observe(p, 'rate-limiting', o);
-  expect(p.act, 'still refused while the window holds').toBe('refused');
-  p = observe(p, 'rate-limiting', { ...o, nextSend: admitted });
-  expect(p.act).toBe('reopened');
-  p = observe(p, 'rate-limiting', { ...o, decided: { zone: 2, admission: refused } });
-  expect(p.act).toBe('sliding-refused');
-  p = observe(p, 'rate-limiting', { ...o, nextSend: admitted });
-  expect(p.act).toBe('drained');
-  p = observe(p, 'rate-limiting', { ...o, decided: { zone: 2, admission: admitted } });
-  expect(p.act).toBe('done');
+  const o = quiet;
+  let s = observe(PRESETS[0].story, { ...o, decided: { zone: 0, admission: admitted } });
+  expect(s).toEqual({ kind: 'rate-limiting', next: 'partition', act: 'filling', zones: 1, sendBucket: 3 });
+  s = observe(s, { ...o, decided: { zone: 2, admission: refused } });
+  expect(actOf(s)).toBe('refused');
+  s = observe(s, o);
+  expect(actOf(s), 'still refused while the window holds').toBe('refused');
+  s = observe(s, { ...o, nextSend: admitted });
+  expect(actOf(s)).toBe('reopened');
+  s = observe(s, { ...o, decided: { zone: 2, admission: refused } });
+  expect(actOf(s)).toBe('sliding-refused');
+  s = observe(s, { ...o, nextSend: admitted });
+  expect(actOf(s)).toBe('drained');
+  s = observe(s, { ...o, decided: { zone: 2, admission: admitted } });
+  expect(actOf(s)).toBe('done');
+});
+
+test("Zone partition's ending says whether both sides refused before the heal", () => {
+  const opening = PRESETS.find((p) => p.id === 'partition')!.story;
+  const cut: Observation = { ...quiet, cuts: 1, cutZone: 2 };
+  // Healed with nothing sent: reconnected, and not the over-admission ending.
+  let s = observe(opening, quiet);
+  expect(s).toEqual({ kind: 'partition', next: 'gateway-failure', act: 'counted', both: false });
+  s = observe(s, { ...quiet, oracle: 0 });
+  expect(s).toEqual({ kind: 'partition', next: 'gateway-failure', act: 'done', both: false });
+  expect(text(goal({ ...BASE, story: s }))).not.toContain('each side admitted');
+  // Both sides refused, then healed: the over-admission ending.
+  s = observe(opening, { ...cut, decided: { zone: 0, admission: refused } });
+  expect(s).toEqual({ kind: 'partition', next: 'gateway-failure', act: 'far-side', refused: 'near' });
+  s = observe(s, { ...cut, decided: { zone: 1, admission: refused } });
+  expect(actOf(s), 'the same side again').toBe('far-side');
+  s = observe(s, { ...cut, decided: { zone: 2, admission: refused } });
+  expect(actOf(s)).toBe('repair');
+  s = observe(observe(s, quiet), { ...quiet, oracle: 0 });
+  expect(s).toEqual({ kind: 'partition', next: 'gateway-failure', act: 'done', both: true });
+  expect(text(goal({ ...BASE, story: s }))).toContain('each side admitted on what it could hear');
+});
+
+test("the action line's clauses say what the press does", () => {
+  const prop: RunView = { ...BASE, story: { kind: 'propagation', next: 'rate-limiting', act: 'sent' } };
+  const behind = BASE.nodes.map((n) => (n.id === 0 ? n : { ...n, lag: { kind: 'Behind' as const, missing_for_ms: 5 } }));
+  // Paused before any wave: Step flies the next one, not the window's edge.
+  expect(text(pressClause({ ...prop, nodes: behind }, 'step', 1))).toBe(' to send wave 1');
+  expect(text(pressClause({ ...prop, nodes: behind }, 'step', 2))).toBe(' for wave 2, the relays');
+  expect(text(pressClause({ ...prop, flight: 'waiting' }, 'step', 1))).toBe(' to send wave 1');
+  expect(text(pressClause(prop, 'step', 3))).toBe(" to reach the window's edge");
+  // The drained Send names the selected node's own count, and only while it
+  // still counts some.
+  const drained: RunView = { ...BASE, story: { kind: 'rate-limiting', next: 'partition', act: 'drained', zones: 7, sendBucket: 3 }, selected: 2, oracle: 100, subjectCount: 75 };
+  expect(text(pressClause(drained, 'send', 1))).toBe(' · node 2 admits while it still counts 75');
+  expect(text(pressClause({ ...drained, subjectCount: 0 }, 'send', 1))).toBe('');
 });
 
 test("a run's meter counts the reachable nodes that have the hits", () => {

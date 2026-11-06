@@ -473,6 +473,7 @@ export class StageRenderer {
   #bounceDrop = 0;
   #bounceRest = 0;
   #bounceHeight = 0;
+  #bounceHits = 0;
   // Marks a lost packet or a dot drew since the last command.
   #beamMarks = 0;
   readonly #onLanded: () => void;
@@ -571,6 +572,7 @@ export class StageRenderer {
         if (gfx.radius !== spot.r) {
           gfx.radius = spot.r;
           this.#drawNode(gfx);
+          if (this.#bounceGfx === gfx) this.#shapeRefusal(gfx);
           resized = true;
         }
       }
@@ -682,10 +684,26 @@ export class StageRenderer {
     const gfx = this.#nodes.get(id);
     if (gfx === undefined || !this.#scale.onScale) return;
     this.#endBounce();
+    const band = gfx.refusal;
+    band.visible = true;
+    band.alpha = 1;
+    band.position.y = 0;
+    this.#bounceGfx = gfx;
+    this.#bounceStart = this.#pool.clock;
+    this.#bounceHits = hits;
+    this.#glyphs.bounce = gfx.slot;
+    this.#shapeRefusal(gfx);
+    this.#animEnd = Math.max(this.#animEnd, this.#pool.clock + BOUNCE_MS);
+    this.#app.canvas.dataset.bounce = String(id);
+  }
+
+  /** Draw the refusal's band for `gfx`'s radius, from its brim up by the
+   *  refused hits, and the bounce's rest and drop with it: on the press, and
+   *  again when a relayout resizes the disc mid-bounce. */
+  #shapeRefusal(gfx: NodeGfx): void {
     const full = VESSEL_SCALE * this.#scale.limit;
-    const bottom = gfx.radius - 1;
     const brimY = levelY(gfx.radius, this.#scale.limit, full);
-    const top = levelY(gfx.radius, this.#scale.limit + hits, full);
+    const top = levelY(gfx.radius, this.#scale.limit + this.#bounceHits, full);
     const band = gfx.refusal;
     band.clear();
     if (this.#reduceMotion) {
@@ -695,18 +713,10 @@ export class StageRenderer {
       chord(band, gfx.radius - 1, top, brimY);
       band.fill(this.#theme.bad);
     }
-    band.visible = true;
-    band.alpha = 1;
-    band.position.y = 0;
-    this.#bounceGfx = gfx;
-    this.#bounceStart = this.#pool.clock;
     this.#bounceRest = brimY;
     this.#bounceHeight = brimY - top;
-    this.#bounceDrop = brimY + bottom;
-    this.#glyphs.bounce = gfx.slot;
+    this.#bounceDrop = brimY + gfx.radius - 1;
     this.#tickRefusal();
-    this.#animEnd = Math.max(this.#animEnd, this.#pool.clock + BOUNCE_MS);
-    this.#app.canvas.dataset.bounce = String(id);
   }
 
   /** Run the presentation clock freely (playing) or stop it. Stopping leaves
@@ -1291,6 +1301,10 @@ export class StageRenderer {
       }
       return true;
     };
+    // A name stands against its own disc when it overlaps the disc's span
+    // across or down the stage, so it reads as that node's.
+    const against = (box: LabelBox, own: Spot): boolean =>
+      (box.x < own.x + own.r && own.x - own.r < box.x + box.w) || (box.y < own.y + own.r && own.y - own.r < box.y + box.h);
     layout.rings.forEach((ring, z) => {
       const title = this.#titles[z];
       if (title === undefined) return;
@@ -1323,9 +1337,11 @@ export class StageRenderer {
       const above = spot.y < ring.y - 1e-6;
       const near = spot.r + RING_REACH + LABEL_GAP;
       // Above or below the disc, its own side first, centred, then nudged
-      // along; then beside it. The first spot clear by `LABEL_SPACING` wins,
-      // else the first merely clear, else the first clear of every other name
-      // (a stage too small for its names), else the first.
+      // along; then beside it. Of the spots that stand against the disc, the
+      // first clear by `LABEL_SPACING` wins,
+      // else the first merely clear; then any spot merely clear, else the
+      // first clear of every other name (a stage too small for its names),
+      // else the first.
       const at = (x: number, y: number): LabelBox => ({ text: label.text, x, y, w, h, size });
       const candidates: LabelBox[] = [];
       for (const up of [above, !above]) {
@@ -1335,7 +1351,8 @@ export class StageRenderer {
       const side = spot.x < ring.x ? -1 : 1;
       for (const s of [side, -side]) candidates.push(at(s < 0 ? spot.x - near - w : spot.x + near, spot.y - h / 2));
       const box =
-        candidates.find((c) => clear(c, spot.id, LABEL_SPACING)) ??
+        candidates.find((c) => against(c, spot) && clear(c, spot.id, LABEL_SPACING)) ??
+        candidates.find((c) => against(c, spot) && clear(c, spot.id, 1)) ??
         candidates.find((c) => clear(c, spot.id, 1)) ??
         candidates.find((c) => clear(c, spot.id, 1, false)) ??
         at(Math.max(0, Math.min(spot.x - w / 2, width - w)), above ? spot.y - near - h : spot.y + near);

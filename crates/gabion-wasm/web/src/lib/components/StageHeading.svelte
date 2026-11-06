@@ -44,6 +44,7 @@
     font-size: var(--font-size-heading);
     font-weight: 400;
     line-height: 1.4;
+    text-wrap: balance;
   }
 
   h2 :global([data-field]) {

@@ -18,7 +18,6 @@
     phone,
     subject,
     useHitsReason,
-    repairLabel,
     zoneName,
     meter,
     presetLabel,
@@ -37,8 +36,6 @@
     subject: number;
     /** Why Hits per Send needs fixing. */
     useHitsReason: Blurb;
-    /** The heading's repair, by its label. */
-    repairLabel: Blurb | null;
     zoneName: (zone: number) => string;
     /** A wait's progress in [0, 1] and in words, or null while it has no end. */
     meter: { value: number; text: string } | null;
@@ -83,7 +80,7 @@
       <span>· <Sentence parts={useHitsReason} field="next" /></span>
     {:else if action.kind === 'repair'}
       <span
-        >press <strong><Icon name="reconnect" /><Sentence parts={repairLabel ?? []} field="next" /></strong> in the heading</span
+        >press <strong><Icon name="reconnect" /><Sentence parts={action.label} field="next" /></strong> in the heading</span
       >
     {:else if action.kind === 'go'}
       {@const to = action.to}
@@ -93,7 +90,7 @@
       <span>· {GOES_TO[to]}</span>
     {:else if action.kind === 'edit'}
       <span
-        >type a whole number from <span data-field="next">{1}</span> to <span data-field="next">{fmtCount(BURST_HITS_MAX)}</span> in
+        >type a whole number from <span data-field="next">{1}</span> to&nbsp;<span data-field="next">{fmtCount(BURST_HITS_MAX)}</span> in
         <strong>Hits per Send</strong>, then press Enter</span
       >
     {:else if action.kind === 'wait'}
@@ -113,7 +110,7 @@
       {/if}
     {:else if action.kind === 'watch'}
       {@const to = action.next}
-      <span>{WATCHES[to] ?? 'the run'}</span>
+      <span>{WATCHES[action.what]}</span>
       <button class="btn-secondary go" onclick={() => onGo(to)}>Go to {presetLabel(to)}<Icon name="go" /></button>
     {/if}
   </p>
@@ -159,9 +156,11 @@
     color: var(--color-fg);
   }
 
+  /* On the baseline of the words around it, its icon sitting on that
+     baseline too. */
   strong {
     display: inline-flex;
-    align-items: center;
+    align-items: baseline;
     gap: var(--gap-xs);
     font-weight: 600;
   }

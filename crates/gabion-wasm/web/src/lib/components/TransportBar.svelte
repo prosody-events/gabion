@@ -7,7 +7,7 @@
   // says why beside it.
   import { fmtCount, fmtDuration, type Blurb } from '../format';
   import { BURST_HITS_MAX } from '../presets';
-  import type { Control, Flight, UntilSettled } from '../next';
+  import type { Control } from '../next';
   import Icon from './Icon.svelte';
   import Sentence from './Sentence.svelte';
 
@@ -20,8 +20,8 @@
     sendLabel,
     sendValid,
     primary,
-    untilSettled,
-    flight,
+    bounded,
+    inFlight,
     onToggle,
     onStep,
     onSend,
@@ -41,8 +41,10 @@
     sendValid: boolean;
     /** The control the next action names, or null. */
     primary: Control | null;
-    untilSettled: UntilSettled;
-    flight: Flight;
+    /** A command's bounded run is playing. */
+    bounded: boolean;
+    /** A held wave is in the air, flying or frozen. */
+    inFlight: boolean;
     onToggle: () => void;
     onStep: () => void;
     onSend: () => void;
@@ -96,8 +98,9 @@
     <span class="reason" id="transport-reason">starting the simulator…</span>
   {:else if !sendValid}
     <span class="reason" id="send-reason"
-      >Hits per Send must be a whole number from <span data-field="hits-min">{1}</span> to
-      <span data-field="hits-max">{fmtCount(BURST_HITS_MAX)}</span></span
+      >Hits per Send must be a whole number from <span data-field="hits-min">{1}</span> to&nbsp;<span data-field="hits-max"
+        >{fmtCount(BURST_HITS_MAX)}</span
+      ></span
     >
   {/if}
 
@@ -117,7 +120,7 @@
     </span>
     <span class="readout-item time">
       <span class="time-value" data-field="virtual-time" data-ms={virtualMs}>{fmtDuration(virtualMs)}</span>
-      simulated{#if untilSettled !== 'off'}{' · playing until every node has it'}{/if}{#if flight !== 'none'}{' · packets in flight'}{/if}
+      simulated{#if bounded}{' · playing until every node has it'}{/if}{#if inFlight}{' · packets in flight'}{/if}
     </span>
   </div>
 </div>

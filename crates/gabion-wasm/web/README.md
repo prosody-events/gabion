@@ -365,6 +365,31 @@ Automated checks, run on every preset after a walk by Step:
 - A8: the wording scan (rule 1) and the clock-time scan (rule 2).
 - A9: a digit scan outside `[data-field]` elements (rule 7).
 
+The story, motion and page checks the test titles name:
+
+- A10: every visible text is set in the three self-hosted faces, loaded before the first render, and every request stays on the page's own origin.
+- A12: measure, minimum type size and the 4 px leading grid.
+- A13: cause before effect in every held preset: no count rises before a beam into it lands, relays leave after wave 1, the clock waits while a wave is held, and every applied snapshot is the engine's.
+- A16: counts equal `window_total`, fit their disc, and keep 4.5:1 on the fill and on the empty inside.
+- A17: a Send's feedback in the frame of the press, and its run, which ends one heartbeat period after its last landing.
+- A18: the stage heading in all its forms, with template ids, the countdown, the over-admission clause, the hops and repairs only.
+- A19: one live region, no claim said twice across the heading, the narration and the decision text, and at most two narration lines.
+- A20: the vocabulary, the title "Gabion rate limiter" and "rate limit" in the first viewport.
+- A21: keyboard: Space, → and Escape act only from the page itself.
+- A22: reachability and space: the one-row header from 1100 px, the ring radius, and Send in view.
+- A40: the Rate limiting walkthrough on the stage, state by state.
+- A46: the one time model: a rejected Send runs no time, a paused Send runs until settled or its cap, and the readout says while a run bounds it.
+- A48: Zone partition over-admits on local views, and the heading says so.
+- A49: one next action per state: one filled control when the line says Next, none in a Wait or a Watch, never disabled, quoted verbatim by the line, in view with it.
+- A50: a disabled control says why beside it.
+- A51: affordance: actions are buttons, the ink fill only on the next action, the disc preview of every control that names a node.
+- A52: the skip link focuses the next action, which the action line describes, and nothing focusable sits in the live region.
+- A54: a wait shows a meter on the action line that never falls.
+- A55: Propagation's Send stops before each wave, and Step flies wave 1 alone, then the relays, then reaches the window's edge.
+- A56: a goal never begins a clause with a control's verb or quotes a control's label.
+- A57: the sliding-window act paces itself: Send is the next action again only in a new bucket.
+- A59: typing in Hits per Send never moves the next action; a committed invalid value does.
+
 `tests/audit.spec.ts` automates them, in ten projects, and checks each preset a second time with `data-theme` forcing the other theme. It saves a full-page PNG per project, preset and theme to `audit-shots/`. `tests/motion.spec.ts` checks rule 29 with motion on and saves Propagation's two waves, paused mid-flight, as `propagation-wave1.png` and `propagation-wave2.png`.
 
 The visual audit reads those PNGs for: alignment, spacing rhythm, type

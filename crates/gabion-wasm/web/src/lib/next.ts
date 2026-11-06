@@ -1,17 +1,23 @@
 // The one next action in every state of every scenario (design language,
 // "The next action"): a pure function of the run, which the caption's action
-// line names verbatim and whose control alone is filled. The scenarios'
-// stories move through acts in `observe`, the one place a run's act changes;
-// `nextAction` reads the act and the run's state; `goal` is the act's
-// declarative sentence above the line; `progress` is a wait's meter.
+// line names verbatim and whose control alone is filled. Each scenario's story
+// is a value of its own type, moved through its acts in `observe`, the one
+// place a story changes; `nextAction` reads it and the run's state; `goal` is
+// the act's declarative sentence above the line; `progress` is a wait's meter.
+// Each story's acts are decided by a switch of their own with no default, so
+// an act cannot go without an action, a goal or a move.
 
 import { blurb, type Blurb } from './format';
 import type { Admission, Lag } from './sim/types';
 
-/** What a run is: how long it plays on its own. `'settled'` plays until every
+/** How a command's bounded run plays on its own: `'settled'` until every
  *  node that waiting can reach has the hits and their acknowledgements have
  *  flown; `'per-wave'` (Propagation's Send) also stops before each wave. */
-export type UntilSettled = 'off' | 'settled' | 'per-wave';
+export type UntilSettled = 'settled' | 'per-wave';
+
+/** What time does: paused, playing freely, paused where a bounded run hit its
+ *  cap, or a bounded run (playing, or halted before a wave Step flies). */
+export type Clock = 'paused' | 'playing' | 'capped' | UntilSettled;
 
 /** A wave the engine holds: none, held unflown until Step, flying, or frozen
  *  mid-flight by Pause. */
@@ -24,7 +30,7 @@ export type Control = 'play' | 'step' | 'send';
 export type WaitReason = 'starting' | 'run' | 'window' | 'bucket' | 'oldest-bucket';
 
 /** A story-only action: a button in the action line. */
-export type InlineAction =
+type InlineAction =
   | { readonly kind: 'select'; readonly node: number; readonly zone: number }
   | { readonly kind: 'use-hits'; readonly hits: number };
 
@@ -41,48 +47,61 @@ export type PresetId =
   | 'no-zone'
   | 'sandbox';
 
-/** The one next action. */
+/** The scenarios told by watching them. */
+type WatchedPreset = 'overload' | 'loss' | 'gateway-failure' | 'gateway-cut' | 'steady' | 'no-zone';
+
+/** The one next action. A repair carries the heading's label, so it names a
+ *  control that is on screen. */
 export type NextAction =
   | { readonly kind: 'press'; readonly control: Control }
   | { readonly kind: 'inline'; readonly action: InlineAction }
-  | { readonly kind: 'repair' }
+  | { readonly kind: 'repair'; readonly label: Blurb }
   | { readonly kind: 'go'; readonly to: PresetId }
   | { readonly kind: 'edit' }
   | { readonly kind: 'wait'; readonly reason: WaitReason }
-  | { readonly kind: 'watch'; readonly next: PresetId };
+  | { readonly kind: 'watch'; readonly what: WatchedPreset; readonly next: PresetId };
 
-/** Each scenario's story: the acts it moves through. Gateway failure and
- *  Gateway cut are watched until their stories are told step by step. */
-export type Story = 'rate-limiting' | 'propagation' | 'partition' | 'watch' | 'sandbox';
-
-/** Where a run stands in its story. Rate limiting: `open`, `filling` (an
- *  admitted Send), `refused`, `reopened`, `sliding-refused`, `drained`, `done`.
- *  Propagation: `open`, `sent`, `done`. Zone partition: `open`, `far-side`
- *  (one side refused), `repair` (both refused), `counted` (reconnected),
- *  `done`. */
-export type Act =
-  | 'open'
-  | 'filling'
-  | 'refused'
-  | 'reopened'
-  | 'sliding-refused'
-  | 'drained'
-  | 'done'
-  | 'sent'
-  | 'far-side'
-  | 'repair'
-  | 'counted';
-
-/** A run's place in its story: its act, a zone bitmask (Rate limiting: zones
- *  with an admitted Send; Zone partition: bit 0 the near side refused, bit 1
- *  the cut zone refused) and the bucket of the last admitted Send. */
-export interface Progress {
-  readonly act: Act;
+/** Rate limiting: `open`, `filling` (an admitted Send), `refused`,
+ *  `reopened`, `sliding-refused`, `drained`, `done`. `zones` is a bitmask of
+ *  the zones with an admitted Send; `sendBucket` the bucket of the last
+ *  admitted Send. */
+export interface RateLimiting {
+  readonly kind: 'rate-limiting';
+  readonly next: PresetId;
+  readonly act: 'open' | 'filling' | 'refused' | 'reopened' | 'sliding-refused' | 'drained' | 'done';
   readonly zones: number;
-  readonly sendBucket: number;
+  readonly sendBucket: number | null;
 }
 
-export const START: Progress = { act: 'open', zones: 0, sendBucket: -1 };
+/** Propagation: `open`, `sent` (an admitted Send), `done` (the window
+ *  emptied). */
+export interface Propagation {
+  readonly kind: 'propagation';
+  readonly next: PresetId;
+  readonly act: 'open' | 'sent' | 'done';
+}
+
+/** A side of Zone partition's cut: the zones that can hear each other, or
+ *  the zone cut off. */
+type Side = 'near' | 'cut';
+
+/** Zone partition: `open`, `far-side` (one side refused), `repair` (both
+ *  refused), `counted` (reconnected, `both` saying whether both sides had
+ *  refused first) and `done` (the window emptied). */
+type Partition =
+  | { readonly kind: 'partition'; readonly next: PresetId; readonly act: 'open' | 'repair' }
+  | { readonly kind: 'partition'; readonly next: PresetId; readonly act: 'far-side'; readonly refused: Side }
+  | { readonly kind: 'partition'; readonly next: PresetId; readonly act: 'counted' | 'done'; readonly both: boolean };
+
+/** A scenario told by watching it. */
+interface Watched {
+  readonly kind: 'watch';
+  readonly watched: WatchedPreset;
+  readonly next: PresetId;
+}
+
+/** Each scenario's story, as it stands: a preset declares its opening. */
+export type Story = RateLimiting | Propagation | Partition | Watched | { readonly kind: 'sandbox' };
 
 /** What one applied snapshot tells a story. */
 export interface Observation {
@@ -97,70 +116,103 @@ export interface Observation {
   readonly cutZone: number | null;
 }
 
-/** The act `p` moves to on observation `o`: the one place a run's act moves. */
-export function observe(p: Progress, story: Story, o: Observation): Progress {
-  const d = o.decided;
-  const admitted = d?.admission.kind === 'Admitted';
-  // A request heavier than the limit is refused for its weight, not by the
-  // window: it moves no story.
-  const refused = d?.admission.kind === 'Rejected' && d.admission.reopens.kind === 'In';
-  const opens = o.nextSend?.kind === 'Admitted';
-  switch (story) {
+/** What a decided Send means to a story: admitted, refused by the window, or
+ *  neither (no Send, or a request heavier than the limit, which is refused for
+ *  its weight and moves no story). */
+type Verdict = 'admitted' | 'refused' | null;
+
+const verdictOf = (o: Observation): Verdict => {
+  const a = o.decided?.admission;
+  if (a?.kind === 'Admitted') return 'admitted';
+  return a?.kind === 'Rejected' && a.reopens.kind === 'In' ? 'refused' : null;
+};
+
+/** The story `s` moves to on observation `o`: the one place a story moves. */
+export function observe(s: Story, o: Observation): Story {
+  switch (s.kind) {
     case 'rate-limiting':
-      switch (p.act) {
-        case 'open':
-        case 'filling':
-          if (admitted) return { act: 'filling', zones: p.zones | (1 << d!.zone), sendBucket: o.bucket };
-          return refused ? { ...p, act: 'refused' } : p;
-        case 'refused':
-          return opens ? { ...p, act: 'reopened' } : p;
-        case 'reopened':
-          if (admitted) return { ...p, sendBucket: o.bucket };
-          return refused ? { ...p, act: 'sliding-refused' } : p;
-        case 'sliding-refused':
-          return opens ? { ...p, act: 'drained' } : p;
-        case 'drained':
-          return admitted ? { ...p, act: 'done' } : p;
-        default:
-          return p;
-      }
+      return observeRate(s, o);
     case 'propagation':
-      if (p.act === 'open' && admitted) return { ...p, act: 'sent' };
-      return p.act === 'sent' && o.oracle === 0 ? { ...p, act: 'done' } : p;
-    case 'partition': {
-      if (p.act === 'done') return p;
-      if (p.act === 'counted') return o.oracle === 0 ? { ...p, act: 'done' } : p;
-      if (o.cuts === 0) return { ...p, act: 'counted' };
-      const zones = refused ? p.zones | (d!.zone === o.cutZone ? 2 : 1) : p.zones;
-      return { ...p, zones, act: zones === 3 ? 'repair' : zones === 0 ? 'open' : 'far-side' };
-    }
+      return observePropagation(s, o);
+    case 'partition':
+      return observePartition(s, o);
     case 'watch':
     case 'sandbox':
-      return p;
+      return s;
+  }
+}
+
+function observeRate(s: RateLimiting, o: Observation): RateLimiting {
+  const verdict = verdictOf(o);
+  const opens = o.nextSend?.kind === 'Admitted';
+  switch (s.act) {
+    case 'open':
+    case 'filling':
+      if (verdict === 'admitted') return { ...s, act: 'filling', zones: s.zones | (1 << o.decided!.zone), sendBucket: o.bucket };
+      return verdict === 'refused' ? { ...s, act: 'refused' } : s;
+    case 'refused':
+      return opens ? { ...s, act: 'reopened' } : s;
+    case 'reopened':
+      if (verdict === 'admitted') return { ...s, sendBucket: o.bucket };
+      return verdict === 'refused' ? { ...s, act: 'sliding-refused' } : s;
+    case 'sliding-refused':
+      return opens ? { ...s, act: 'drained' } : s;
+    case 'drained':
+      return verdict === 'admitted' ? { ...s, act: 'done' } : s;
+    case 'done':
+      return s;
+  }
+}
+
+function observePropagation(s: Propagation, o: Observation): Propagation {
+  switch (s.act) {
+    case 'open':
+      return verdictOf(o) === 'admitted' ? { ...s, act: 'sent' } : s;
+    case 'sent':
+      return o.oracle === 0 ? { ...s, act: 'done' } : s;
+    case 'done':
+      return s;
+  }
+}
+
+function observePartition(s: Partition, o: Observation): Partition {
+  const { next } = s;
+  switch (s.act) {
+    case 'done':
+      return s;
+    case 'counted':
+      return o.oracle === 0 ? { ...s, act: 'done' } : s;
+    case 'open':
+    case 'far-side':
+    case 'repair': {
+      if (o.cuts === 0) return { kind: 'partition', next, act: 'counted', both: s.act === 'repair' };
+      if (verdictOf(o) !== 'refused') return s;
+      const side: Side = o.decided!.zone === o.cutZone ? 'cut' : 'near';
+      if (s.act === 'open') return { kind: 'partition', next, act: 'far-side', refused: side };
+      return s.act === 'far-side' && s.refused !== side ? { kind: 'partition', next, act: 'repair' } : s;
+    }
   }
 }
 
 /** Everything the next action, the goal and a wait's meter read. */
 export interface RunView {
   readonly story: Story;
-  readonly next: PresetId | null;
-  readonly progress: Progress;
   /** The selected node, and its zone. */
   readonly selected: number;
   readonly selectedZone: number;
   readonly nodes: readonly { readonly id: number; readonly zone: number; readonly lag: Lag }[];
-  /** The selected node's decision on its next Send, and its non-empty
-   *  buckets. */
+  /** The selected node's decision on its next Send, its count and its
+   *  non-empty buckets. */
   readonly nextSend: Admission | undefined;
+  readonly subjectCount: number;
   readonly subjectStrata: number;
   /** Whether the selected node is at its limit. */
   readonly subjectAtLimit: boolean;
-  readonly cuts: number;
   readonly cutZone: number | null;
-  readonly untilSettled: UntilSettled;
+  /** The repair the heading offers, by its label, or null. */
+  readonly repair: Blurb | null;
+  readonly clock: Clock;
   readonly flight: Flight;
-  readonly playing: boolean;
-  readonly capped: boolean;
   readonly busy: boolean;
   /** Hits per Send: committed and valid, committed and invalid, or being
    *  typed. */
@@ -184,13 +236,26 @@ export interface RunView {
 /** The one next action in the state `v` describes. */
 export function nextAction(v: RunView): NextAction {
   if (v.hits === 'editing') return { kind: 'edit' };
-  if (v.busy) return { kind: 'wait', reason: 'starting' };
+  if (v.busy) return wait('starting');
   const never = v.lastDecision?.kind === 'Rejected' && v.lastDecision.reopens.kind === 'Never';
   if (v.hits === 'invalid' || never) return { kind: 'inline', action: { kind: 'use-hits', hits: v.burstHits } };
-  if (v.flight === 'frozen' || v.capped) return press('play');
+  if (v.flight === 'frozen' || v.clock === 'capped') return press('play');
   if (v.flight === 'waiting') return press('step');
-  if (v.untilSettled !== 'off' || v.flight === 'flying') return wait('run');
-  return storyAction(v);
+  if (v.clock === 'settled' || v.clock === 'per-wave' || v.flight === 'flying') return wait('run');
+  const playing = v.clock === 'playing';
+  const s = v.story;
+  switch (s.kind) {
+    case 'rate-limiting':
+      return rateAction(v, s, playing);
+    case 'propagation':
+      return propagationAction(s);
+    case 'partition':
+      return partitionAction(v, s, playing);
+    case 'watch':
+      return playing ? { kind: 'watch', what: s.watched, next: s.next } : press('play');
+    case 'sandbox':
+      return press('send');
+  }
 }
 
 /** The action that names `control`. */
@@ -198,85 +263,84 @@ const press = (control: Control): NextAction => ({ kind: 'press', control });
 /** The wait for `reason`. */
 const wait = (reason: WaitReason): NextAction => ({ kind: 'wait', reason });
 
-/** The action the story's current act wants, once nothing runs. */
-function storyAction(v: RunView): NextAction {
-  const { act } = v.progress;
-  switch (v.story) {
-    case 'rate-limiting':
-      switch (act) {
-        case 'open':
-        case 'filling':
-          return selectNextZone(v) ?? press('send');
-        case 'refused':
-          return v.playing ? wait('window') : press('play');
-        case 'reopened':
-          if (v.progress.sendBucket !== v.bucketNow) return press('send');
-          return v.playing ? wait('bucket') : press('play');
-        case 'sliding-refused':
-          if (!v.playing) return press('play');
-          return wait(v.subjectStrata >= 2 ? 'oldest-bucket' : 'window');
-        case 'drained':
-          return press('send');
-        default:
-          return v.next === null ? press('send') : { kind: 'go', to: v.next };
-      }
-    case 'propagation':
-      if (act === 'open') return press('send');
-      if (act === 'sent') return press('step');
-      return v.next === null ? press('send') : { kind: 'go', to: v.next };
-    case 'partition':
-      switch (act) {
-        case 'open':
-          return press('send');
-        case 'far-side':
-          return selectOtherSide(v) ?? press('send');
-        case 'repair':
-          return { kind: 'repair' };
-        case 'counted':
-          return v.playing ? wait('window') : press('play');
-        default:
-          return v.next === null ? press('send') : { kind: 'go', to: v.next };
-      }
-    case 'watch':
-      return v.playing && v.next !== null ? { kind: 'watch', next: v.next } : press('play');
-    case 'sandbox':
+function rateAction(v: RunView, s: RateLimiting, playing: boolean): NextAction {
+  switch (s.act) {
+    case 'open':
+    case 'filling':
+      return selectNextZone(v, s.zones) ?? press('send');
+    case 'refused':
+      return playing ? wait('window') : press('play');
+    case 'reopened':
+      if (s.sendBucket !== v.bucketNow) return press('send');
+      return playing ? wait('bucket') : press('play');
+    case 'sliding-refused':
+      if (!playing) return press('play');
+      return wait(v.subjectStrata >= 2 ? 'oldest-bucket' : 'window');
+    case 'drained':
       return press('send');
+    case 'done':
+      return { kind: 'go', to: s.next };
+  }
+}
+
+function propagationAction(s: Propagation): NextAction {
+  switch (s.act) {
+    case 'open':
+      return press('send');
+    case 'sent':
+      return press('step');
+    case 'done':
+      return { kind: 'go', to: s.next };
+  }
+}
+
+function partitionAction(v: RunView, s: Partition, playing: boolean): NextAction {
+  switch (s.act) {
+    case 'open':
+      return press('send');
+    case 'far-side':
+      return selectOtherSide(v, s.refused) ?? press('send');
+    case 'repair':
+      // The heading offers the repair once no relay is left to land; until
+      // then the run is what to wait for.
+      if (v.repair !== null) return { kind: 'repair', label: v.repair };
+      return v.nodes.some((n) => n.lag.kind === 'Behind') ? wait('run') : press('send');
+    case 'counted':
+      return playing ? wait('window') : press('play');
+    case 'done':
+      return { kind: 'go', to: s.next };
   }
 }
 
 /** In Rate limiting, once the selected node's zone has an admitted Send: the
- *  lowest live node of the next zone, in zone order, that has none. */
-function selectNextZone(v: RunView): NextAction | null {
-  if ((v.progress.zones & (1 << v.selectedZone)) === 0) return null;
-  for (let zone = 0; zone < v.zoneCount; zone++) {
-    if ((v.progress.zones & (1 << zone)) !== 0) continue;
-    const node = lowest(v, (z) => z === zone);
-    if (node !== null) return { kind: 'inline', action: { kind: 'select', node: node.id, zone } };
-  }
-  return null;
-}
-
-/** In Zone partition, once one side has refused: the lowest live node of the
- *  side that has not, while the selection is on the side that has. */
-function selectOtherSide(v: RunView): NextAction | null {
-  const cut = v.cutZone;
-  if (cut === null) return null;
-  const wantCut = (v.progress.zones & 1) !== 0;
-  if ((v.selectedZone === cut) === wantCut) return null;
-  const node = lowest(v, (z) => (z === cut) === wantCut);
+ *  first live node, in zone order, of a zone that has none. */
+function selectNextZone(v: RunView, zones: number): NextAction | null {
+  if ((zones & (1 << v.selectedZone)) === 0) return null;
+  const node = first(v, (zone) => (zones & (1 << zone)) === 0);
   return node === null ? null : { kind: 'inline', action: { kind: 'select', node: node.id, zone: node.zone } };
 }
 
-/** The lowest live node whose zone passes `inZone`. */
-function lowest(v: RunView, inZone: (zone: number) => boolean): { id: number; zone: number } | null {
-  let best: { id: number; zone: number } | null = null;
-  for (const n of v.nodes) if (inZone(n.zone) && (best === null || n.id < best.id)) best = n;
-  return best;
+/** In Zone partition, once side `refused` has refused: the first live node
+ *  of the other side, while the selection is on the side that refused. */
+function selectOtherSide(v: RunView, refused: Side): NextAction | null {
+  const cut = v.cutZone;
+  if (cut === null) return null;
+  const wantCut = refused === 'near';
+  if ((v.selectedZone === cut) === wantCut) return null;
+  const node = first(v, (zone) => (zone === cut) === wantCut);
+  return node === null ? null : { kind: 'inline', action: { kind: 'select', node: node.id, zone: node.zone } };
 }
 
-/** Whether the run's story has been told: Sandbox has none to tell. */
-export const storyDone = (v: Pick<RunView, 'story' | 'progress'>): boolean =>
-  v.story === 'sandbox' || v.progress.act === 'done';
+/** The first live node, in zone order and then by id, whose zone passes
+ *  `inZone`. */
+function first(v: RunView, inZone: (zone: number) => boolean): { id: number; zone: number } | null {
+  let best: { id: number; zone: number } | null = null;
+  for (const n of v.nodes) {
+    if (!inZone(n.zone)) continue;
+    if (best === null || n.zone < best.zone || (n.zone === best.zone && n.id < best.id)) best = n;
+  }
+  return best;
+}
 
 /** Where a wait started: its reason, the simulated instant and the reopening
  *  the selected node then waited for. Replaced only when the reason changes. */
@@ -319,48 +383,64 @@ const clamp01 = (x: number): number => Math.min(Math.max(x, 0), 1);
 /** The act's goal: what it is for, declaratively. It never begins a clause
  *  with a verb a control could carry, and never quotes a control's label, so
  *  it cannot contradict the action line beneath it. */
-export function goal(v: RunView, scenario: string): Blurb {
-  const s = v.selected;
-  const seconds = v.windowMs / 1000;
-  switch (v.story) {
+export function goal(v: RunView): Blurb {
+  const s = v.story;
+  switch (s.kind) {
     case 'rate-limiting':
-      switch (v.progress.act) {
-        case 'open':
-        case 'filling':
-          return v.subjectAtLimit
-            ? blurb`Every node now sees the limit, so node ${s} decides on its own whether the next request fits.`
-            : blurb`The limit of ${v.limit} hits per ${seconds} s is shared by every node in all ${v.zoneCount} zones, and each request carries ${v.sendHits} hits.`;
-        case 'refused':
-          return blurb`A hit counts for ${seconds} s. When the oldest hits leave the window, node ${s} admits again.`;
-        case 'done':
-          return ['That is the limit: one window, counted on every node, and each node decides alone.'];
-        default:
-          return ['The window slides one second at a time, so the oldest hits leave first and room opens one bucket at a time.'];
-      }
+      return rateGoal(v, s);
     case 'propagation':
-      return v.progress.act === 'done'
+      return s.act === 'done'
         ? ['Hits count only inside the window: every node stopped counting them at the same instant, with no packet.']
         : ['Far from the limit, a node keeps a small change until its next heartbeat, then two waves of packets carry it.'];
     case 'partition':
-      switch (v.progress.act) {
-        case 'repair':
-        case 'counted':
-          return blurb`The cluster let ${v.oracle} hits through a limit of ${v.limit}; once the zone is back, every node counts them.`;
-        case 'done':
-          return ['A cut costs a rate limiter its limit: each side admitted on what it could hear.'];
-        default:
-          return ['The last zone is cut off, so each side decides on what it can hear, and each side can reach the limit on its own.'];
-      }
+      return partitionGoal(v, s);
+    case 'watch':
+      return watchGoal(v, s.watched);
     case 'sandbox':
       return ['Nothing here is scripted: requests, nodes and cuts are yours to try.'];
-    case 'watch':
-      return watchGoal(v, scenario);
   }
 }
 
-/** The goal of a scenario told by watching it, by its name. */
-function watchGoal(v: RunView, scenario: string): Blurb {
-  switch (scenario) {
+function rateGoal(v: RunView, s: RateLimiting): Blurb {
+  const seconds = v.windowMs / 1000;
+  switch (s.act) {
+    case 'open':
+    case 'filling':
+      return v.subjectAtLimit
+        ? blurb`Every node now sees the limit, so node ${v.selected} decides on its own whether the next request fits.`
+        : blurb`The limit of ${v.limit} hits per ${seconds} s is shared by every node in all ${v.zoneCount} zones, and each request carries ${v.sendHits} hits.`;
+    case 'refused':
+      return blurb`A hit counts for ${seconds} s. When the oldest hits leave the window, node ${v.selected} admits again.`;
+    case 'reopened':
+    case 'sliding-refused':
+    case 'drained':
+      return ['The window slides one second at a time, so the oldest hits leave first and room opens one bucket at a time.'];
+    case 'done':
+      return ['That is the limit: one window, counted on every node, and each node decides alone.'];
+  }
+}
+
+function partitionGoal(v: RunView, s: Partition): Blurb {
+  switch (s.act) {
+    case 'open':
+    case 'far-side':
+      return ['The last zone is cut off, so each side decides on what it can hear, and each side can reach the limit on its own.'];
+    case 'repair':
+      return blurb`The cluster let ${v.oracle} hits through a limit of ${v.limit}; once the zone is back, every node counts them.`;
+    case 'counted':
+      return s.both
+        ? blurb`The cluster let ${v.oracle} hits through a limit of ${v.limit}; once the zone is back, every node counts them.`
+        : blurb`The zone is back before both sides refused, so every node now counts the ${v.oracle} hits the cluster let through.`;
+    case 'done':
+      return s.both
+        ? ['A cut costs a rate limiter its limit: each side admitted on what it could hear.']
+        : ['One window is counted on every node again; a cut costs the limit only while each side reaches it on its own.'];
+  }
+}
+
+/** The goal of a scenario told by watching it. */
+function watchGoal(v: RunView, watched: WatchedPreset): Blurb {
+  switch (watched) {
     case 'overload':
       return ['Requests arrive faster than the limit allows; counts update as the engine computes them.'];
     case 'loss':
@@ -371,7 +451,7 @@ function watchGoal(v: RunView, scenario: string): Blurb {
       return ['With no zone set, every node sends to every peer directly.'];
     case 'gateway-failure':
       return blurb`node ${v.selected}'s gateway into the next zone is silenced, so node ${v.selected} waits for an answer that never comes, then picks another gateway.`;
-    default:
+    case 'gateway-cut':
       return blurb`node ${v.selected}'s gateway into the next zone hears its zone but cannot reach it, so it answers that it cannot relay, and node ${v.selected} picks another gateway.`;
   }
 }
@@ -390,8 +470,8 @@ export const GOES_TO: Readonly<Record<PresetId, string>> = {
   sandbox: 'a cluster that is yours to drive',
 };
 
-/** What a watch state watches, by scenario. */
-export const WATCHES: Readonly<Partial<Record<PresetId, string>>> = {
+/** What a watch state watches, by the scenario watched. */
+export const WATCHES: Readonly<Record<WatchedPreset, string>> = {
   overload: 'admitted hits hold at the limit; the rest are rejected',
   loss: 'lost packets are resent until every node has the hits',
   steady: 'the share of data bytes that cross a zone, against its two lines',
@@ -417,23 +497,21 @@ export function waitClause(reason: WaitReason, subject: number): Blurb {
 }
 
 /** What follows a press's label on the action line: the press's consequence
- *  where the story names one. */
+ *  where the story names one. Step flies wave `wave` while a wave is held or
+ *  some node is still behind, and otherwise runs to the window's edge. */
 export function pressClause(v: RunView, control: Control, wave: number): Blurb {
+  const s = v.story;
   switch (control) {
     case 'play':
-      if (v.story === 'rate-limiting' && (v.progress.act === 'refused' || v.progress.act === 'sliding-refused')) {
-        return [' and the window starts to slide'];
-      }
-      if (v.story === 'partition' && v.progress.act === 'counted') {
-        return blurb` and every node counts ${v.oracle} until the window empties`;
-      }
+      if (s.kind === 'rate-limiting' && (s.act === 'refused' || s.act === 'sliding-refused')) return [' and the window starts to slide'];
+      if (s.kind === 'partition' && s.act === 'counted') return blurb` and every node counts ${v.oracle} until the window empties`;
       return [];
     case 'step':
-      if (v.flight === 'waiting') return wave <= 1 ? blurb` to send wave ${1}` : wave === 2 ? blurb` for wave ${2}, the relays` : blurb` for wave ${wave}`;
-      return v.story === 'propagation' ? [" to reach the window's edge"] : [' to the next event'];
+      if (v.flight !== 'waiting' && v.nodes.every((n) => n.lag.kind !== 'Behind')) return [" to reach the window's edge"];
+      return wave <= 1 ? blurb` to send wave ${1}` : wave === 2 ? blurb` for wave ${2}, the relays` : blurb` for wave ${wave}`;
     case 'send':
-      return v.story === 'rate-limiting' && v.progress.act === 'drained'
-        ? blurb` · node ${v.selected} admits while it still counts ${v.oracle}`
+      return s.kind === 'rate-limiting' && s.act === 'drained' && v.subjectCount > 0
+        ? blurb` · node ${v.selected} admits while it still counts ${v.subjectCount}`
         : [];
   }
 }

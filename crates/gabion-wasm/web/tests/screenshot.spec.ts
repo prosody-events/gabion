@@ -186,7 +186,7 @@ test('a click off the discs keeps the selection', async ({ page }) => {
 
 // Removing the selected node moves the selection to the scenario's fallback:
 // node 0's zone's lowest live node. The truth keeps the departed node's hits
-// until they leave the window (C29).
+// until they leave the window.
 test("removing the selected node selects the scenario's fallback", async ({ page }) => {
   await boot(page);
   await loadPreset(page, 'Sandbox');
@@ -580,7 +580,7 @@ test('a Send that flushes at once draws its packets as it sends', async ({ page 
 
 // Zone partition: zone c is cut off at load. A Send at node 0 reaches zones a
 // and b and never zone c, until Heal reconnects it; a node that joins zone c
-// is cut off with it (C29).
+// is cut off with it.
 test('zone partition splits zone c off until healed', async ({ page }) => {
   await boot(page);
   await loadPreset(page, 'Zone partition');

@@ -494,7 +494,7 @@
     align-content: flex-start;
     gap: var(--gap-xs) var(--gap-md);
     margin: 0;
-    padding: var(--gap-sm) 0 0;
+    padding: var(--gap-sm) 0 var(--gap-xs);
     list-style: none;
     font-size: var(--font-size-caption);
     line-height: 1.25;

@@ -193,8 +193,9 @@
       />
     </div>
     <p class="hint" id="burst-hits-hint" class:bad={!hitsValid}>
-      a whole number from <span data-field="hits-min">{1}</span> to
-      <span data-field="hits-max">{fmtCount(BURST_HITS_MAX)}</span>
+      a whole number from <span data-field="hits-min">{1}</span> to&nbsp;<span data-field="hits-max"
+        >{fmtCount(BURST_HITS_MAX)}</span
+      >
     </p>
     <button class="btn-secondary restart" title="keeps your settings" onclick={onRestart}>Restart {active?.label ?? ''}</button>
   </section>
@@ -218,7 +219,7 @@
         aria-describedby="knob-zones-hint"
       />
       <span class="hint" id="knob-zones-hint" class:bad={!zonesValid}
-        >a whole number from <span data-field="zones-min">{1}</span> to <span data-field="zones-max">{zoneCap}</span></span
+        >a whole number from <span data-field="zones-min">{1}</span> to&nbsp;<span data-field="zones-max">{zoneCap}</span></span
       >
     </div>
     <div class="knob" class:changed={changed.has('zone_mode')}>
@@ -257,8 +258,9 @@
         aria-describedby="knob-limit-hint"
       />
       <span class="hint" id="knob-limit-hint" class:bad={!limitValid}
-        >a whole number from <span data-field="limit-min">{1}</span> to
-        <span data-field="limit-max">{fmtCount(RULE_LIMIT_MAX)}</span></span
+        >a whole number from <span data-field="limit-min">{1}</span> to&nbsp;<span data-field="limit-max"
+          >{fmtCount(RULE_LIMIT_MAX)}</span
+        ></span
       >
     </div>
     <div class="tune-apply">
@@ -299,10 +301,10 @@
       {#each gateways as gateway (gateway.id)}
         {@const zone = zoneLabel(zones[gateway.zone].name)}
         <button class="btn-secondary action" onclick={() => onSilence(gateway.id)} {...names(gateway.id)}>
-          <Icon name="silence" />Silence node <span data-field="node">{gateway.id}</span>
+          <Icon name="silence" /><span>Silence node <span data-field="node">{gateway.id}</span></span>
         </button>
         <button class="btn-secondary action" onclick={() => onCutFromZone(gateway.id, gateway.zone)} {...names(gateway.id)}>
-          <Icon name="cut" />Cut node <span data-field="node">{gateway.id}</span> off from {zone}
+          <Icon name="cut" /><span>Cut node <span data-field="node">{gateway.id}</span> off from {zone}</span>
         </button>
       {/each}
     {/if}
@@ -449,6 +451,7 @@
     padding: 0 var(--gap-md);
     font-size: var(--font-size-caption);
     text-align: left;
+    text-wrap: balance;
   }
 
   .with-reason {
