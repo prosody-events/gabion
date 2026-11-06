@@ -378,7 +378,7 @@ where
 
     /// One request arrives: the load balancer picks a running pod, the pod
     /// admits against its aggregate exactly as `SharedLimiter::decide`
-    /// does (`crates/server/src/lib.rs`: reject unless `RuleSpec::admits`,
+    /// does (`crates/server/src/lib.rs`: reject iff `total + hits > limit`,
     /// otherwise `GossipClient::record` the hit), and the next arrival of
     /// the key is scheduled.
     fn request(&mut self, key: u32) {
@@ -397,9 +397,15 @@ where
         };
         let now_millis = self.world.now_millis();
         let bucket = self.keys.bucket_of(now_millis);
-        if !running.store.admits(key, now_millis) {
+        let limit = self.keys.limit;
+        if running
+            .store
+            .window_total(key, now_millis)
+            .saturating_add(1)
+            > limit
+        {
             self.count(k, measuring, |c| c.rejected += 1);
-            if self.oracle.truth_window_total(key, bucket) < self.keys.limit {
+            if self.oracle.truth_window_total(key, bucket) < limit {
                 self.count(k, measuring, |c| c.false_rejects += 1);
             }
             return;
