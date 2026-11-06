@@ -3,6 +3,6 @@
 
 interface Window {
   /** The live simulation, set after every build: the design audit's and the
-   *  console's handle on the engine (`sim.snapshot(id)`). */
+   *  console's handle on the engine (`sim.snapshot(inspect, watch)`). */
   sim?: import('./lib/sim/sim').Sim;
 }
