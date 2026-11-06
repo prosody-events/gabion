@@ -360,38 +360,76 @@ fn error_budget_and_gateway_counters_surface_in_snapshot() {
     });
 }
 
-/// The windowed oracle is the sum of every node's locally-originated *live*
-/// cells: a gossiped replica never inflates it (one origin → counted once), and
-/// it decays to zero as the window slides past the only bucket — the behaviour
-/// a monotonic accumulator could not show.
+/// The windowed oracle sums each origin's fullest in-window copy: a gossiped
+/// replica never inflates it (one origin, counted once), a stale replica on a
+/// node read first never stands in for its origin's fuller cell, and it decays
+/// to zero as the window slides past the only bucket — the behaviour a
+/// monotonic accumulator could not show. A node cut off from the cell dates
+/// its lag from the origin's update, which every replica carries.
 #[test]
 fn oracle_total_is_windowed_and_counts_each_origin_once() {
     let config = SimConfig {
         rule_window_ms: 2_000,
         rule_bucket_ms: 1_000,
-        ..test_config(2)
+        ..test_config(3)
     };
     with_engine(config, |tx| async move {
-        submit(&tx, 0, WATCHED_KEY, 9).await;
+        for peer in [0, 1] {
+            set_link(&tx, peer, 2, LinkPolicyKind::Block).await;
+            set_link(&tx, 2, peer, LinkPolicyKind::Block).await;
+        }
+        submit(&tx, 1, WATCHED_KEY, 9).await;
         assert_eq!(
             snapshot(&tx).await.oracle_total,
             9,
             "the windowed oracle counts the fresh burst at its origin"
         );
 
-        // Spread it so node 1 holds a remote replica of node 0's cell.
+        // Spread it so node 0 holds a remote replica of node 1's cell.
         for _ in 0..5 {
             step(&tx, 100).await;
         }
         let converged = snapshot(&tx).await;
-        assert!(
-            converged.nodes.iter().all(|n| n.window_total == 9),
-            "both nodes hold the cell"
+        let views = |snap: &ClusterState| -> Vec<(u64, Lag)> {
+            snap.nodes.iter().map(|n| (n.window_total, n.lag)).collect()
+        };
+        assert_eq!(
+            views(&converged),
+            [
+                (9, Lag::CaughtUp),
+                (9, Lag::CaughtUp),
+                (
+                    0,
+                    Lag::Stranded {
+                        missing_for_ms: 500
+                    }
+                )
+            ],
+            "nodes 0 and 1 hold the cell; node 2 has lacked it since node 1 recorded it at 0 ms, \
+             the date node 0's replica carries too"
         );
         assert_eq!(
             converged.oracle_total, 9,
-            "the replica on node 1 is not local, so the oracle still counts the hit once at its \
+            "the replica on node 0 is not local, so the oracle still counts the hit once at its \
              single origin"
+        );
+
+        // More hits at the origin, before its next heartbeat: node 0, read
+        // first, holds a stale replica of the cell node 1 holds in full.
+        submit(&tx, 1, WATCHED_KEY, 4).await;
+        let stale = snapshot(&tx).await;
+        assert_eq!(
+            views(&stale),
+            [
+                (9, Lag::Behind { missing_for_ms: 0 }),
+                (13, Lag::CaughtUp),
+                (0, Lag::Stranded { missing_for_ms: 0 })
+            ],
+            "{stale:?}"
+        );
+        assert_eq!(
+            stale.oracle_total, 13,
+            "the origin's fuller cell, not the stale replica read before it"
         );
 
         // Step well past the 2 s window so the only bucket ages out everywhere.

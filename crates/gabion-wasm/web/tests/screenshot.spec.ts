@@ -530,10 +530,13 @@ test('the window knob updates its bucket-count readout and rebuilds', async ({ p
   });
   await expect(page.locator('label[for="knob-window"] .val')).toHaveText('5 s · 5 buckets');
 
-  // Apply it. The rebuild left a healthy cluster of the same size, no errors.
+  // Apply it. The rebuild left a healthy cluster of the same size, no errors,
+  // and the Strata draws the rebuilt window: 5 buckets plus the one scrolling
+  // in under "now".
   await page.getByRole('button', { name: 'Rebuild cluster' }).click();
   await expect(page.locator('.overlay')).toHaveCount(0);
   await expect(page.locator(COUNTS)).toHaveCount(NODES);
+  await expect(page.locator('.strata .strip .track .bar-cell')).toHaveCount(6);
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
@@ -626,6 +629,54 @@ test.describe('on a 2× display', () => {
         ],
       });
   });
+});
+
+// Against the overload preset's low limit a burst crosses its node's error
+// budget, so the Send flushes at once: its packets leave in the Send's own
+// batch, and the stage draws each as a beam as it is sent, not a Step later.
+// Paused, so no feed or Step adds a packet of its own.
+test('a Send that flushes at once draws its packets as it sends', async ({ page }) => {
+  await boot(page);
+  await page.getByRole('button', { name: 'Sustained overload' }).click();
+  await expect(view(page, 0)).toHaveText('0');
+
+  type Route = { src: number; dst: number };
+  type Log = { sent: Route[]; drawn: Route[] };
+  await page.evaluate(() => {
+    const log = window as unknown as Log;
+    log.sent = [];
+    log.drawn = [];
+    const sim = window.sim!;
+    const submit = sim.submitRequest.bind(sim);
+    sim.submitRequest = async (...args) => {
+      const batch = await submit(...args);
+      for (const { kind } of batch.events) {
+        if (kind.type === 'PacketSent' || kind.type === 'PacketDropped') log.sent.push({ src: kind.src, dst: kind.dst });
+      }
+      return batch;
+    };
+    type Push = (path: unknown, start: number, src: number, dst: number, flags: number) => void;
+    const pool = document.querySelector<HTMLCanvasElement & { beams?: { push: Push } }>('.stage canvas')?.beams;
+    if (pool === undefined) throw new Error('the stage publishes no beam pool');
+    const push = pool.push.bind(pool);
+    pool.push = (path, start, src, dst, flags) => {
+      log.drawn.push({ src, dst });
+      push(path, start, src, dst, flags);
+    };
+  });
+
+  await page.getByLabel('Node', { exact: true }).selectOption('0');
+  await page.locator('.rail').getByRole('button', { name: 'Send burst' }).click();
+  await expect(view(page, 0)).toHaveText(BURST_HITS);
+  const routes = (): Promise<{ sent: string[]; drawn: string[] }> =>
+    page.evaluate(() => {
+      const { sent, drawn } = window as unknown as Log;
+      const name = ({ src, dst }: Route): string => `node ${src} to node ${dst}`;
+      return { sent: sent.map(name).sort(), drawn: drawn.map(name).sort() };
+    });
+  const { sent } = await routes();
+  expect(sent.length, 'the burst flushed packets in its own batch').toBeGreaterThan(0);
+  await expect.poll(async () => (await routes()).drawn, { message: 'the beams drawn are the packets sent' }).toEqual(sent);
 });
 
 // The zone-partition scenario cuts the last zone off from the rest, bursts both

@@ -1288,39 +1288,18 @@ impl EngineState {
             rule == spec.fingerprint && kh == key && in_window(bucket)
         };
 
-        // Every origin's own in-window cells of the watched key: what every
-        // node's replicas are held against. Each hit is recorded once at its
-        // origin (`merge_remote` preserves the wire origin, so a forwarded
-        // replica is never local on a non-origin holder), so their sum, the
-        // ground-truth windowed total, counts each hit exactly once. Each dump
-        // is dropped before the next is taken: a node's store holds a replica
-        // of every origin's cells, so keeping every dump would hold N stores
-        // at once. No virtual time passes between the passes.
+        // Every origin's in-window cells of the watched key, each the fullest
+        // copy a live node holds and the nodes holding it at that count. Only
+        // an origin counts its own hits, so while it lives the fullest copy is
+        // its own; once it has gone, its cells live on in the survivors'
+        // replicas until they leave the window, and still count against the
+        // limit. Each hit is thus counted once, and the sum is the
+        // ground-truth windowed total. Every copy at a count carries the date
+        // its origin gave that count, since a replica keeps the wire's. Each
+        // dump is dropped before the next is taken: a node's store holds a
+        // replica of every origin's cells, so keeping every dump would hold N
+        // stores at once.
         let mut origins: Vec<OriginCell> = Vec::new();
-        for handle in &self.nodes {
-            let own = handle.identity.node_id.0;
-            let dump = cell_dump(&handle.admin_tx).await;
-            for cell in dump.iter().flat_map(|d| &d.cells) {
-                if cell.origin_node_id == Some(own)
-                    && watched(cell.rule_fingerprint, cell.key_hash, cell.bucket)
-                {
-                    origins.push(OriginCell {
-                        node_id: own,
-                        bucket: cell.bucket,
-                        count: cell.count,
-                        updated_ms: cell.last_update_millis,
-                        holders: NodeSet::EMPTY,
-                    });
-                }
-            }
-        }
-        origins.sort_unstable_by_key(|cell| (cell.node_id, cell.bucket.0));
-
-        // Which nodes hold each origin cell at its origin's count. A departed
-        // origin's cells live on in the survivors' replicas until they leave
-        // the window, and still count against the limit, so each is the
-        // fullest replica a live node holds, held by the nodes at that count
-        // and dated by the earliest of their updates.
         let mut inspected_cells = None;
         for (pos, handle) in self.nodes.iter().enumerate() {
             let dump = cell_dump(&handle.admin_tx).await;
@@ -1331,8 +1310,7 @@ impl EngineState {
                 if !watched(cell.rule_fingerprint, cell.key_hash, cell.bucket) {
                     continue;
                 }
-                let departed = !self.node_id_index.contains_key(&origin);
-                let replica = OriginCell {
+                let copy = OriginCell {
                     node_id: origin,
                     bucket: cell.bucket,
                     count: cell.count,
@@ -1342,21 +1320,18 @@ impl EngineState {
                 let at = origins
                     .binary_search_by_key(&(origin, cell.bucket.0), |c| (c.node_id, c.bucket.0));
                 let held = match at {
-                    Ok(i) if departed && cell.count > origins[i].count => {
-                        origins[i] = replica;
+                    Ok(i) if cell.count > origins[i].count => {
+                        origins[i] = copy;
                         &mut origins[i]
                     }
-                    Ok(i) if cell.count >= origins[i].count => &mut origins[i],
-                    Err(i) if departed => {
-                        origins.insert(i, replica);
+                    Ok(i) if cell.count == origins[i].count => &mut origins[i],
+                    Ok(_) => continue,
+                    Err(i) => {
+                        origins.insert(i, copy);
                         &mut origins[i]
                     }
-                    Ok(_) | Err(_) => continue,
                 };
                 held.holders.insert(pos);
-                if departed {
-                    held.updated_ms = held.updated_ms.min(cell.last_update_millis);
-                }
             }
             if inspect == Some(handle.id) {
                 inspected_cells = dump
@@ -1566,9 +1541,9 @@ struct OriginCell {
     node_id: u128,
     bucket: BucketEpoch,
     count: u64,
-    /// When the origin last recorded into it, in virtual ms.
+    /// When its origin last recorded into it, in virtual ms.
     updated_ms: u64,
-    /// The positions that hold it at its origin's count.
+    /// The positions that hold it at its count.
     holders: NodeSet,
 }
 
