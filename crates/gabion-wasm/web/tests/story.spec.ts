@@ -283,13 +283,15 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
   // A18: the heading opens on rl-0; every Send's spreading (rl-1) ends in
   // agreement, with the badge (rl-2, two hops: the flush and the relays) or
   // the countdown (rl-3) where the selected node now refuses; the window's
-  // sliding shows the counts it leaves (rl-5) or an empty window (rl-4).
+  // sliding shows the counts it leaves (rl-5) or an empty window (rl-4). Once
+  // Play runs the clock, a spreading can agree in the frame hits leave the
+  // window, which drops the badge (rl-5); the paused Sends' cannot.
   const templates = await page.evaluate(() => (window as unknown as { templates: [string, string][] }).templates);
   console.log(`${info.project.name}: ${templates.map(([id]) => id).join(' ')}`);
   const ids = templates.map(([id]) => id).filter((id) => id !== '');
-  expect(ids[0], 'the heading at load').toBe('rl-0');
+  expect(ids.slice(0, 7), 'the heading at load and over the first three Sends').toEqual(['rl-0', 'rl-1', 'rl-2', 'rl-1', 'rl-2', 'rl-1', 'rl-2']);
   for (const [i, id] of ids.entries()) {
-    if (id === 'rl-1' && i + 1 < ids.length) expect(['rl-2', 'rl-3'], `after ${ids.slice(0, i + 2).join(' ')}`).toContain(ids[i + 1]);
+    if (id === 'rl-1' && i + 1 < ids.length) expect(['rl-2', 'rl-3', 'rl-5'], `after ${ids.slice(0, i + 2).join(' ')}`).toContain(ids[i + 1]);
   }
   // How many Sends the playing clock admits before the refusal depends on the
   // runner's pace, so each is counted as the walk saw it decided.

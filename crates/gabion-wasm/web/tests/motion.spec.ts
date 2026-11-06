@@ -501,7 +501,7 @@ test('Play runs at the chosen speed in every scenario, never waiting for a packe
 // The slow speed the fade is checked at.
 const SLOW = 0.2;
 
-test('a line fades over one simulated second: Speed scales it, Pause freezes it', async ({ page }, info) => {
+test('a line fades over one simulated second, and Speed scales it', async ({ page }) => {
   test.setTimeout(180_000);
   await openOnFakeClock(page);
   await loadPreset(page, 'Rate limiting');
@@ -554,8 +554,14 @@ test('a line fades over one simulated second: Speed scales it, Pause freezes it'
   console.log(`a line's life: ${full.toFixed(0)} ms at 1×, ${fifth.toFixed(0)} ms at ${SLOW}×, ${(fifth / full).toFixed(2)} times as long`);
   expect(Math.abs(full - FADE_MS), 'a line at 1× lives the fade').toBeLessThanOrEqual(2 * FRAME_MS);
   expect(Math.abs(fifth - FADE_MS / SLOW), `a line at ${SLOW}× lives the fade over the speed`).toBeLessThanOrEqual(2 * FRAME_MS);
-  await page.clock.resume();
+});
 
+// Its own test, so a fault that also cuts a line's life short still meets
+// these checks.
+test('Pause holds the lines still, each at its ink times its fade left, under the labels', async ({ page }, info) => {
+  test.setTimeout(60_000);
+  await open(page);
+  await loadPreset(page, 'Rate limiting');
   // Paused mid-fade, the lines hold still: their opacities, the pool and the
   // stage's pixels. The watcher pauses the first frame a line of node 2's
   // Send is half faded, after the rings' sweeps (a quarter second of the
