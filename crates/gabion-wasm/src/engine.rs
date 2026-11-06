@@ -24,9 +24,10 @@
 //! halves. The open half fires what is due while the router holds every packet
 //! sent; the close half delivers them and reads the counters of the nodes it
 //! touched. An admitted request runs one sub-step at its own instant, so its
-//! eager flush is delivered before the command returns. Only stepping by event
-//! leaves a sub-step open, between its halves, and every command that is
-//! carried out, `Snapshot` aside, closes it first.
+//! eager flush is delivered before the command returns, unless the request
+//! asked to stop before a wave. Only a command run by event leaves a sub-step
+//! open, between its halves, and every command that is carried out,
+//! `Snapshot` aside, closes it first.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -311,11 +312,13 @@ pub enum Command {
     /// A request of `hits` for `key` at node `node`, at the current virtual
     /// time. The node decides it first, from its own count table; an admitted
     /// request is recorded, and its eager-flush packets are delivered at the
-    /// same instant before the reply.
+    /// same instant before the reply, or, with `until` a
+    /// [`StepUntil::Event`], held, as stepping by event holds a wave.
     SubmitRequest {
         node: u32,
         key: KeyHash,
         hits: NonZeroU64,
+        until: StepUntil,
         reply: oneshot::Sender<Result<EventBatch, EngineError>>,
     },
     /// Install a directed link policy between two nodes.
@@ -396,9 +399,10 @@ async fn engine_loop(
                 node,
                 key,
                 hits,
+                until,
                 reply,
             } => {
-                let _ = reply.send(state.submit_request(node, key, hits).await);
+                let _ = reply.send(state.submit_request(node, key, hits, until).await);
             }
             Command::SetLinkPolicy {
                 src,
@@ -753,6 +757,12 @@ impl EngineState {
         self.substeps += 1;
         self.hold();
         self.fire(at).await;
+        self.drain_wave().await
+    }
+
+    /// Let the rounds the open sub-step started run, and drain their events.
+    /// Whether they sent or lost a packet that carries cells: a wave.
+    async fn drain_wave(&mut self) -> bool {
         self.drain_pending().await;
         let before = self.outbox.len();
         self.drain_log();
@@ -790,12 +800,15 @@ impl EngineState {
     /// Node `node` decides a request of `hits` for `key` from its own count
     /// table, as the adapters decide. A rejected request is counted and
     /// nothing else happens. An admitted one is recorded in one sub-step at
-    /// this instant, so its eager-flush packets land before this returns.
+    /// this instant, so its eager-flush packets land before this returns;
+    /// with `until` a [`StepUntil::Event`], a flush that sent a wave is held
+    /// instead, the sub-step left open.
     async fn submit_request(
         &mut self,
         node: u32,
         key: KeyHash,
         hits: NonZeroU64,
+        until: StepUntil,
     ) -> Result<EventBatch, EngineError> {
         let pos = position_of(&self.nodes, node).ok_or(EngineError::UnknownNode { id: node })?;
         self.close_sub_step().await;
@@ -822,8 +835,7 @@ impl EngineState {
             Admission::Admitted { .. } => {
                 // One sub-step at this instant: the eager flush's threshold
                 // round runs on the runtime's next turn with delivery
-                // deferred, and lands before the command returns, as a step's
-                // sub-step does.
+                // deferred, and lands as a step's sub-step does.
                 self.hold();
                 self.touched.insert(pos);
                 let recorded = self.nodes[pos]
@@ -845,9 +857,10 @@ impl EngineState {
                 // flush's threshold round runs on the runtime's next turn, so
                 // the drain puts its packets in this batch, after the decision.
                 self.outbox.push(decided);
-                self.drain_pending().await;
-                self.drain_log();
-                self.close_sub_step().await;
+                let wave = self.drain_wave().await;
+                if !(wave && matches!(until, StepUntil::Event { .. })) {
+                    self.close_sub_step().await;
+                }
                 let handle = &mut self.nodes[pos];
                 handle.admitted_hits = handle.admitted_hits.saturating_add(hits);
                 self.admitted_hits = self.admitted_hits.saturating_add(hits);

@@ -306,7 +306,7 @@ fn a_departed_origins_hits_count_while_survivors_hold_them() {
         assert_eq!((snap.oracle_total, snap.next_expiry_ms), (0, None));
         assert_eq!(views(&snap), [0; 11]);
         state
-            .submit_request(1, KeyHash(7), hits(25))
+            .submit_request(1, KeyHash(7), hits(25), StepUntil::Time)
             .await
             .expect("a live node");
         settle(&mut state).await;

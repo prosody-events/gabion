@@ -385,7 +385,7 @@ fn a_stopped_runtime_reports_no_decision() {
         state.nodes[0].join.abort();
         state.drain_pending().await;
         let refused = state
-            .submit_request(0, KeyHash(WATCHED_KEY), hits(25))
+            .submit_request(0, KeyHash(WATCHED_KEY), hits(25), StepUntil::Time)
             .await;
         assert!(matches!(refused, Err(EngineError::Gossip { node: 0, .. })));
         assert!(

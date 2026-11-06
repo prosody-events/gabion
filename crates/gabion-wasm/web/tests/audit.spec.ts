@@ -23,7 +23,7 @@ import {
   type QuadPath,
   type Spot,
 } from '../src/lib/stage/layout';
-import { MARK, RING_BEHIND, RING_CAUGHT_UP, type GlyphTable } from '../src/lib/stage/renderer';
+import { MARK, RING_BEHIND, RING_CAUGHT_UP, STOP_BAR, type BeamPool, type GlyphTable } from '../src/lib/stage/renderer';
 import { VESSEL_SCALE } from '../src/lib/limit';
 import { zoneAt } from '../src/lib/format';
 import { PRESETS } from '../src/lib/presets';
@@ -55,6 +55,11 @@ const STEPS = 4;
 // The rule window every preset runs with (`SimConfig::default`, which no preset
 // overrides).
 const WINDOW_MS = 10_000;
+// How long the stage's corner pixel may take to read the theme's background,
+// in wall ms. Each read is a page screenshot, which on a loaded runner has
+// taken over 5 s by itself, so the default poll timed out before its first
+// read returned; the deadline covers the screenshot, not a wait.
+const PIXEL_MS = 30_000;
 
 type Findings = Record<'A1' | 'A2' | 'A3' | 'A7' | 'A8' | 'A9', string[]>;
 
@@ -187,6 +192,7 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
       await expect
         .poll(() => stagePixel(page, canvas), {
           message: `${where}: the stage does not draw readTheme().bg (A7)`,
+          timeout: PIXEL_MS,
         })
         .toBe(colours.bg);
       await checkTooltips(page, where);
@@ -1408,6 +1414,49 @@ test("every drawn beam carries its packet's kind, tier and fate", async ({ page 
   ]);
 });
 
+// -- A lost packet's bar ------------------------------------------------------------
+
+// A lost packet's line stops partway, at its bar, which never stands against a
+// zone's title (rule 19): a gateway's packet across its zone passes the title
+// at the ring's centre, where a bar half way along reads as a glyph of it. A
+// route always has room either side of the centre; a node's name beside a short
+// chord may leave none, so names are kept clear where the route allows, not
+// checked here.
+test("a lost packet's bar stands clear of every zone's title", async ({ page }, info) => {
+  test.skip(info.project.name.endsWith('-dark'), 'geometry, the same in either theme');
+  await open(page);
+  for (const name of ['Gateway failure', 'Gateway cut']) {
+    await loadPreset(page, name);
+    const bars = new Set<string>();
+    const against = new Set<string>();
+    const check = async (): Promise<void> => {
+      const { lines, labels } = await page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { beams: BeamPool }, dropped) => {
+        const p = c.beams;
+        const lines: { route: number[]; stop: number; src: number; dst: number }[] = [];
+        for (let i = 0; i < p.len; i++) {
+          if ((p.flags[i] & dropped) !== 0) lines.push({ route: [...p.route.subarray(i * 6, i * 6 + 6)], stop: p.stop[i], src: p.src[i], dst: p.dst[i] });
+        }
+        const labels = JSON.parse(c.dataset.labelBoxes ?? '[]') as { text: string; x: number; y: number; w: number; h: number }[];
+        return { lines, labels: labels.filter((l) => l.text.startsWith('zone ')) };
+      }, DROPPED);
+      for (const { route: [fx, fy, cx, cy, tx, ty], stop, src, dst } of lines) {
+        const at = pointOn({ from: { x: fx, y: fy }, control: { x: cx, y: cy }, to: { x: tx, y: ty } }, stop, { x: 0, y: 0 });
+        const bar = `node ${src} to node ${dst}, its bar at ${stop}`;
+        bars.add(bar);
+        for (const l of labels) {
+          const nx = Math.max(l.x, Math.min(at.x, l.x + l.w));
+          const ny = Math.max(l.y, Math.min(at.y, l.y + l.h));
+          if (Math.hypot(at.x - nx, at.y - ny) <= STOP_BAR / 2 + 1) against.add(`${bar} stands against "${l.text}"`);
+        }
+      }
+    };
+    for (let i = 0; i < 2; i++) await period(page, check);
+    console.log(`${name}: checked ${bars.size} lost packet bar(s)`);
+    expect(bars.size, `${name}: a lost packet was drawn`).toBeGreaterThan(0);
+    expect([...against], name).toEqual([]);
+  }
+});
+
 // -- The stage's labels, laid out once per layout -------------------------------
 
 test('a paused stage lays its labels out once, not per snapshot', async ({ page }, info) => {
@@ -1456,7 +1505,7 @@ async function logPackets(page: Page): Promise<void> {
     const step = sim.step.bind(sim);
     sim.step = async (ms: number, until?: StepUntil) => record(await step(ms, until));
     const submit = sim.submitRequest.bind(sim);
-    sim.submitRequest = async (node: number, key: number, hits: number) => record(await submit(node, key, hits));
+    sim.submitRequest = async (...args: Parameters<typeof submit>) => record(await submit(...args));
   });
 }
 
@@ -1524,11 +1573,12 @@ test('runs go quiet after agreement', async ({ page }, info) => {
   await open(page);
   await setSpeed(page, 4);
 
-  // Propagation: after the relays land, only the acknowledgements fly, each at
-  // its node's next heartbeat, so the period after that sends nothing at all.
+  // Propagation: after the relays land, only the acknowledgements are drawn,
+  // each at its node's next heartbeat, so the period after that sends nothing
+  // at all.
   await loadPreset(page, 'Propagation');
   await logPackets(page);
-  // Propagation's Send stops before its first wave; Steps fly the waves.
+  // Propagation's Send stops before its first wave; Steps draw the waves.
   await send(page, 0);
   await step(page);
   await stepUntil(page, () => agreed(page), 4, 'Propagation agreed');
@@ -1565,7 +1615,7 @@ test('runs go quiet after agreement', async ({ page }, info) => {
 });
 
 // A46: one time model. A refused Send runs no time; an admitted Send's run
-// stops by itself one period after its last landing, its acknowledgements
+// stops by itself one period after its last wave, its acknowledgements
 // sent, so the period of Play after it sends nothing; in Zone partition it
 // stops at the cut zone, long before its cap.
 test('a Send runs only the time it needs (A46)', async ({ page }, info) => {

@@ -208,7 +208,7 @@ test('the stage heading states the cluster', async ({ page }) => {
 });
 
 // Sandbox: a Send runs its waves and pauses itself, every node agreeing; a
-// Send the reader pauses at once is then flown by Step one wave at a time. The
+// Send the reader pauses at once is then drawn by Step one wave at a time. The
 // Strata honesty invariant (Σ over the rendered slots equals the node's count)
 // holds throughout, and with no feed the hits age out to quiet.
 test('a Send runs its waves and pauses itself; Step after Send goes one wave at a time', async ({ page }) => {
@@ -443,7 +443,9 @@ test('the window knob updates its bucket-count readout and rebuilds', async ({ p
 // limit and reject the rest — the "why gabion exists" story, and the one
 // scenario that surfaces the Aggregate-vs-Limit chart.
 test('sustained overload rejects what passes the limit', async ({ page }) => {
-
+  // About 20 s alone, each Step deciding the feed's requests one by one: the
+  // default 30 s left too little room on a loaded runner.
+  test.setTimeout(90_000);
   await boot(page);
 
   await page.getByRole('button', { name: 'Sustained overload' }).click();
@@ -554,8 +556,8 @@ test('a Send that flushes at once draws its packets as it sends', async ({ page 
       return batch;
     };
     const submit = sim.submitRequest.bind(sim);
-    sim.submitRequest = async (node, key, hits) => {
-      const batch = await submit(node, key, hits);
+    sim.submitRequest = async (node, key, hits, until) => {
+      const batch = await submit(node, key, hits, until);
       // The reader's Send, not one of the feed's one-hit requests.
       if (hits > 1) log.send = routesOf(batch);
       return record(batch);

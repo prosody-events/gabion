@@ -20,8 +20,8 @@ export const BEAM_CLEARANCE = 0.35;
 /** The two tier strokes, in px: inside a zone and across zones. */
 export const IN_WIDTH = 1.5;
 export const CROSS_WIDTH = 3;
-/** How long a line takes to fade from full ink to nothing, in simulated ms
- *  (owner: 1.0 s). */
+/** How long a line takes to fade from full ink to nothing: one second of
+ *  simulated time. */
 export const FADE_MS = 1000;
 /** The beam pool's flag bits: across zones, a control packet (no cells), a
  *  relay, lost. */

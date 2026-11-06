@@ -5,7 +5,7 @@ import type { ClusterState } from '../src/lib/sim/types';
 import { CONTROL, CROSS, DROPPED, FADE_MS, RELAY } from '../src/lib/stage/layout';
 import { BOUNCE_MS, RING_CAUGHT_UP, type BeamPool, type GlyphTable } from '../src/lib/stage/renderer';
 import { BEAM_ALPHA, FADED_ALPHA } from '../src/lib/theme';
-import { PERIOD_MS, WATCH, refusal, send, sendButton, setRange, setSpeed, step, still, virtualMs } from './drive';
+import { PERIOD_MS, WATCH, recordData, refusal, send, sendButton, setRange, setSpeed, step, still, virtualMs } from './drive';
 import { sourceOf } from './sourcemap';
 
 // The packets in motion (README "Tests"), run once at 1440 px in the light
@@ -31,6 +31,8 @@ const FRAME_MS = 16;
 const RUN_MS = 100;
 // The longest one tick of Pixi's ticker advances, ms (its `maxElapsedMS`).
 const MAX_TICK_MS = 100;
+// The Hits per Send every scenario opens with.
+const BURST = 25;
 
 /** The page's engine, snapshotted, with node `inspect`'s rows. */
 const snapshot = (page: Page, inspect: number | null = null): Promise<ClusterState> =>
@@ -214,12 +216,15 @@ async function installCausality(page: Page): Promise<void> {
         push(path, sent, src, dst, flags);
       };
     }
-    const sim = window.sim as unknown as { submitRequest: (n: number, k: number, h: number) => Promise<{ events: { kind: { type: string; node?: number; admission?: { kind: string } } }[] }>; causal?: boolean };
+    const sim = window.sim as unknown as {
+      submitRequest: (...args: unknown[]) => Promise<{ events: { kind: { type: string; node?: number; admission?: { kind: string } } }[] }>;
+      causal?: boolean;
+    };
     if (sim.causal !== true) {
       sim.causal = true;
       const submit = sim.submitRequest.bind(sim);
-      sim.submitRequest = async (n, k, h) => {
-        const batch = await submit(n, k, h);
+      sim.submitRequest = async (...args) => {
+        const batch = await submit(...args);
         for (const { kind } of batch.events) {
           if (kind.type === 'Decided' && kind.admission?.kind === 'Admitted') w.causality.credit.set(kind.node!, w.causality.frame);
         }
@@ -384,23 +389,7 @@ test("Step draws Propagation's waves one at a time, each with its counts", async
   await loadPreset(page, 'Propagation');
   await setSpeed(page, 1);
   await installCausality(page);
-  await page.evaluate(() => {
-    const w = window as unknown as { pushed: { src: number; dst: number; flags: number }[] };
-    w.pushed = [];
-    const p = (document.querySelector('.stage canvas') as Canvas).beams;
-    const push = p.push.bind(p);
-    p.push = (path, sent, src, dst, flags) => {
-      w.pushed.push({ src, dst, flags });
-      push(path, sent, src, dst, flags);
-    };
-  });
-  const data = async (): Promise<{ src: number; dst: number; flags: number }[]> =>
-    page.evaluate((control) => {
-      const w = window as unknown as { pushed: { src: number; dst: number; flags: number }[] };
-      const drawn = w.pushed.filter((b) => (b.flags & control) === 0);
-      w.pushed = [];
-      return drawn;
-    }, BITS.CONTROL);
+  const data = await recordData(page);
   const view = (node: number) => page.locator(`.node-table tr[data-node="${node}"] [data-field="view"]`);
   const pane = page.locator('.stage-pane');
   const stage = page.locator('.stage');
@@ -462,6 +451,30 @@ test("Step draws Propagation's waves one at a time, each with its counts", async
 
 // The page's time Play runs for in each scenario.
 const PACE_MS = 2000;
+
+// Owner Q16 holds for a Send that flushes at once too: at a limit of 100 the
+// error budget is one hit, so the Send's own wave leaves in its own batch, and
+// Propagation's Send still stops before it, and Step draws it with its counts.
+test("Propagation's Send stops before its wave when it flushes at once", async ({ page }) => {
+  await open(page);
+  await loadPreset(page, 'Propagation');
+  await rebuildAtLimit(page, 100);
+  const data = await recordData(page);
+  const pane = page.locator('.stage-pane');
+  const before = await snapshot(page);
+  await send(page, 0);
+  await expect(pane).toHaveAttribute('data-clock', 'before-wave');
+  expect(await data(), 'the Send drew none of its wave').toEqual([]);
+  const plus = (id: number, from: ClusterState): number => (from.nodes.find((n) => n.id === id)?.window_total ?? Number.NaN) + BURST;
+  const held = await snapshot(page);
+  expect(held.nodes.map((n) => n.window_total), 'only node 0 counted the Send').toEqual(before.nodes.map((n) => (n.id === 0 ? plus(0, before) : n.window_total)));
+  await step(page);
+  const wave = await data();
+  expect(wave.length, "Step drew node 0's wave: its zone and one gateway per other zone").toBe(5);
+  expect(wave.every((b) => b.src === 0 && (b.flags & RELAY) === 0), 'Step: node 0, no relay').toBe(true);
+  const reached = await snapshot(page);
+  for (const { dst } of wave) expect(reached.nodes.find((n) => n.id === dst)?.window_total, `node ${dst} counted the Send`).toBe(plus(dst, before));
+});
 
 test('Play runs at the chosen speed in every scenario, never waiting for a packet', async ({ page }) => {
   test.setTimeout(240_000);
@@ -659,6 +672,7 @@ const PER_FRAME = {
     '#tangentAt',
     '#arrowhead',
     '#stopBar',
+    '#dropStop',
     '#tickRings',
     '#tickRefusal',
     '#syncNode',

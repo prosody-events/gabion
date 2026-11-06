@@ -1,6 +1,7 @@
 //! Stepping by event stops before each wave lands, with the wave held until
 //! the next engine call, and at the window's edge; an admitted send's eager
-//! flush lands before the submit returns.
+//! flush lands before the submit returns, unless the send asked to stop by
+//! event.
 
 use super::super::{SubStep, first_heartbeat};
 use super::*;
@@ -73,6 +74,45 @@ fn a_sends_eager_flush_lands_before_the_submit_returns() {
             "the relays have not landed"
         );
         assert!(matches!(state.sub_step, SubStep::Open(_)));
+        state
+    });
+}
+
+/// A send by event holds its eager flush as stepping by event holds a wave:
+/// its packets are in the batch, only the sender has counted the hits, and the
+/// next command delivers them to the nodes the flush reached.
+#[test]
+fn a_send_by_event_holds_its_eager_flush_until_the_next_command() {
+    with_state(rate_limiting(), |mut state| async move {
+        ready(&mut state).await;
+        let at = state.virtual_ms;
+        let submitted = state
+            .submit_request(0, KeyHash(WATCHED_KEY), hits(25), EVENT)
+            .await
+            .expect("a live node");
+        let own = packets(&submitted.events, PacketKind::Own);
+        assert_eq!(own.len(), 5, "{own:?}");
+        assert!(matches!(state.sub_step, SubStep::Open(_)));
+        assert_eq!(cell_nodes(&submitted.events), BTreeSet::from([0]));
+        let snap = state.snapshot(None, WATCH).await;
+        for node in &snap.nodes {
+            let want = if node.id == 0 { 25 } else { 0 };
+            assert_eq!(node.window_total, want, "held: node {}", node.id);
+        }
+
+        let delivered = state.step(0, StepUntil::Time).await;
+        assert_eq!(delivered.virtual_ms, at);
+        assert!(matches!(state.sub_step, SubStep::Closed));
+        assert_eq!(cell_nodes(&delivered.events), destinations(&own));
+        let snap = state.snapshot(None, WATCH).await;
+        for node in &snap.nodes {
+            let want = if node.id == 0 || destinations(&own).contains(&node.id) {
+                25
+            } else {
+                0
+            };
+            assert_eq!(node.window_total, want, "delivered: node {}", node.id);
+        }
         state
     });
 }

@@ -67,18 +67,23 @@ impl Sim {
     /// time. Resolves to the [`crate::event::EventBatch`] it produced: the
     /// node's decision first, then, when admitted, its cell events and any
     /// eager-flush packets, delivered at the same instant before it resolves,
-    /// with the receivers' cell events. Throws for zero hits.
+    /// with the receivers' cell events; with `until` (a [`StepUntil`], as
+    /// [`Sim::step`] takes it) `{ Event: { key } }`, a flush's wave is held
+    /// until the next command instead. Throws for zero hits.
     pub async fn submit_request(
         &self,
         node: u32,
         key_id: u64,
         hits: u64,
+        until: JsValue,
     ) -> Result<JsValue, JsValue> {
+        let until: StepUntil = serde_wasm_bindgen::from_value(until)?;
         let (reply, rx) = oneshot::channel();
         self.send(Command::SubmitRequest {
             node,
             key: KeyHash(u128::from(key_id)),
             hits: nonzero_hits(hits)?,
+            until,
             reply,
         })
         .await?;

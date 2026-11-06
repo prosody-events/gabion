@@ -190,6 +190,9 @@
 
   // The narration: the page's one live region.
   let narration = $state.raw<Blurb>([]);
+  // The rebuilt run's sentence, which says it stands at its start: the first
+  // snapshot that moves time replaces it while it is still told.
+  let atStart: Blurb | null = null;
 
   // Hits per Send as typed, as last committed, whether that is valid, and
   // whether it is being typed.
@@ -343,7 +346,7 @@
         if (staged !== undefined) next.knobs = { ...staged };
         if (old !== null) {
           await keep(old);
-          narration = say.rebuilt(preset.label, discarded(old));
+          narration = atStart = say.rebuilt(preset.label, discarded(old));
         }
         adopt(next);
         if (old === null) narration = idleOf(next);
@@ -459,6 +462,7 @@
       cutZone,
     });
     decided = null;
+    if (narration === atStart && snap.virtual_ms !== before.virtual_ms) narration = idleOf(r);
     const agreed = snap.nodes.every((n) => n.lag.kind === 'CaughtUp');
     if (!agreed) badge = null;
     else if (armed && snap.oracle_total > 0) {
@@ -696,13 +700,16 @@
   /** Send a request of Hits per Send at the selected node, at the current
    *  virtual time. The node decides it in the frame of the press: a refusal
    *  plays in its vessel and runs no time; an admitted request's eager flush
-   *  is drawn with its receivers' counts in the frame of the press. */
+   *  is drawn with its receivers' counts in the frame of the press, except
+   *  that Propagation's paused run stops before it, as before every wave. */
   const sendBurst = (): Promise<void> =>
     command(async (r) => {
       const node = r.selected;
       const hits = r.hits;
       const before = r.cluster.nodes.find((n) => n.id === node);
-      const batch = await r.sim.submitRequest(node, WATCHED_KEY, hits);
+      const mode: UntilSettled = r.story.kind === 'propagation' ? 'per-wave' : 'settled';
+      const perWave = mode === 'per-wave' && time.kind !== 'playing';
+      const batch = await r.sim.submitRequest(node, WATCHED_KEY, hits, perWave ? EVENT : 'Time');
       const event = batch.events.find((e) => e.kind.type === 'Decided');
       if (event === undefined || event.kind.type !== 'Decided') return;
       const admission = event.kind.admission;
@@ -730,8 +737,12 @@
       awaitingNode = eager ? null : node;
       told = eager ? say.admittedEager(node, hits, admission.total_before, limit) : say.admittedWaiting(node, hits, limit, r.config.target_err_bps);
       narration = told;
-      runOn(r, r.story.kind === 'propagation' ? 'per-wave' : 'settled');
-      await meet(r, batch);
+      runOn(r, mode);
+      // Only a wave the engine was asked to hold: a Pause pressed while the
+      // Send was decided must not claim one it already delivered.
+      const t = time;
+      if (perWave && eager && t.kind === 'per-wave') await stopBefore(r, t, batch);
+      else await meet(r, batch);
     });
 
   /** The nodes whose admitted hits fill the window, for the rejection, when
@@ -834,9 +845,11 @@
     });
   }
 
-  /** The reader's Pause: time stops, and a bounded run ends. */
+  /** The reader's Pause: time stops, and a bounded run ends. A run stopped
+   *  before a wave stays there, since its engine still holds the wave: only
+   *  Step, Play or a command sends it. */
   function pause(): void {
-    setTime(PAUSED);
+    if (time.kind !== 'before-wave') setTime(PAUSED);
   }
 
   function toggle(): void {
@@ -850,7 +863,7 @@
    *  the window, or one heartbeat period when neither is coming. */
   async function stepOnce(): Promise<void> {
     if (busy) return;
-    if (time.kind !== 'before-wave') pause();
+    pause();
     await exec(async (r) => {
       const t = time;
       if (t.kind === 'before-wave') {
@@ -863,8 +876,9 @@
       const delta = expiry === undefined ? tickMs : expiry - r.cluster.virtual_ms;
       const batch = await r.sim.step(delta, EVENT);
       if (waves(batch) === 0) {
-        if (expiry === undefined && r.cluster.oracle_total === 0) narration = say.NOTHING_WAITING;
         await meet(r, batch);
+        // A feed always has hits to send, whatever this instant's window holds.
+        if (r.preset.traffic === undefined && expiry === undefined && r.cluster.oracle_total === 0) narration = say.NOTHING_WAITING;
         return;
       }
       // Stopped before the wave: draw it at once, with its counts.

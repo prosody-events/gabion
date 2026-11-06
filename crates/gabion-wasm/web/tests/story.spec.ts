@@ -1,9 +1,9 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
 import type { ClusterState } from '../src/lib/sim/types';
 import type { GlyphTable } from '../src/lib/stage/renderer';
-import { CONTROL, CROSS, RELAY, STRATA_MIN_INNER } from '../src/lib/stage/layout';
+import { CROSS, RELAY, STRATA_MIN_INNER } from '../src/lib/stage/layout';
 import { readTheme } from '../src/lib/theme';
-import { WATCH, pauseIfPlaying, sendButton, setRange, setSpeed, still } from './drive';
+import { WATCH, pauseIfPlaying, recordData, sendButton, setRange, setSpeed, step, still } from './drive';
 import { WATCHES } from '../src/lib/next';
 import { PRESETS, presetById } from '../src/lib/presets';
 import { COMMANDS, clauses } from './next-actions';
@@ -338,23 +338,7 @@ test('Propagation stops before each wave and Step draws it (A55)', async ({ page
   test.setTimeout(120_000);
   await open(page);
   await loadPreset(page, 'Propagation');
-  await page.evaluate(() => {
-    const w = window as unknown as { pushed: { src: number; dst: number; flags: number }[] };
-    w.pushed = [];
-    const p = (document.querySelector('.stage canvas') as HTMLCanvasElement & { beams: { push: (...a: unknown[]) => void } }).beams;
-    const push = p.push.bind(p);
-    p.push = (path, start, src, dst, flags) => {
-      w.pushed.push({ src: src as number, dst: dst as number, flags: flags as number });
-      push(path, start, src, dst, flags);
-    };
-  });
-  const data = (): Promise<{ src: number; dst: number; flags: number }[]> =>
-    page.evaluate((control) => {
-      const w = window as unknown as { pushed: { src: number; dst: number; flags: number }[] };
-      const out = w.pushed.filter((b) => (b.flags & control) === 0);
-      w.pushed = [];
-      return out;
-    }, CONTROL);
+  const data = await recordData(page);
   const where = info.project.name;
   expect(await checkState(page, `${where}: load`)).toMatch(/^Send/);
   // (1) Until the run pauses before wave 1, the line waits and fills nothing:
@@ -654,6 +638,42 @@ test('a rebuild that fails keeps the running cluster, and the active scenario is
   await expect(page.locator('.stage canvas')).toBeVisible();
   await sendButton(page).click();
   await expect.poll(async () => (await snapshot(page)).oracle_total).toBe(50);
+});
+
+// A rebuild that fails while Propagation's run stands before a wave keeps the
+// wave for Step: its engine still holds it, so the page never claims a plain
+// pause over it.
+test('a rebuild that fails over a held wave keeps it for Step (A6, A55)', async ({ page }, info) => {
+  test.skip(info.project.name !== 'audit-1440-light', 'the rebuild, checked once');
+  await open(page);
+  await loadPreset(page, 'Propagation');
+  await primary(page).click();
+  await untilNext(page, 'wave 1 held');
+  const pane = page.locator('.stage-pane');
+  await expect(pane).toHaveAttribute('data-clock', 'before-wave');
+  await page.evaluate(() => {
+    (window.sim!.constructor as unknown as { create: () => Promise<never> }).create = () => Promise.reject(new Error('the test refused the build.'));
+  });
+  await page.getByRole('button', { name: 'Restart Propagation' }).click();
+  await expect(page.getByText(/could not be rebuilt, so the running one stays/)).toBeVisible();
+  await expect(pane).toHaveAttribute('data-clock', 'before-wave');
+  expect(await checkState(page, 'wave 1 held, after the failed rebuild')).toBe('Step');
+});
+
+// A Step moves time, so the narration stops saying the run is paused at its
+// start, and a scenario with a feed never hears that nothing is waiting, even
+// at a Step whose window is still empty: the feed always has hits to send.
+test('a Step in a fed scenario retires the start sentence and never says nothing waits', async ({ page }, info) => {
+  test.skip(info.project.name !== 'audit-1440-light', 'the narration, checked once');
+  await open(page);
+  await loadPreset(page, 'Sustained overload');
+  const narration = page.locator('.narration');
+  await expect(narration).toHaveText('Paused at the start of Sustained overload');
+  for (let i = 0; i < 3; i++) {
+    await step(page);
+    await expect(narration, `after Step ${i + 1}`).not.toContainText('Paused at the start');
+    await expect(narration, `after Step ${i + 1}`).not.toContainText('nothing is waiting');
+  }
 });
 
 test('the next step is reachable from the keyboard (A52, A21)', async ({ page }, info) => {

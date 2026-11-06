@@ -116,6 +116,7 @@ async fn submit(tx: &mpsc::Sender<Command>, node: u32, key: u128, n: u64) -> Eve
         node,
         key: KeyHash(key),
         hits: hits(n),
+        until: StepUntil::Time,
         reply,
     })
     .await
@@ -293,7 +294,10 @@ fn error_budget_and_gateway_counters_surface_in_snapshot() {
         ..zoned(12, 3)
     };
     with_state(config, |mut state| async move {
-        state.submit_request(0, KeyHash(0), hits(7)).await.unwrap();
+        state
+            .submit_request(0, KeyHash(0), hits(7), StepUntil::Time)
+            .await
+            .unwrap();
         let origin = state.snapshot(None, WATCH).await.nodes.swap_remove(0);
         assert_eq!(origin.id, 0);
         assert!(
@@ -304,7 +308,10 @@ fn error_budget_and_gateway_counters_surface_in_snapshot() {
         warm(&mut state).await;
         let g = gateway_of(&state, 0, 1).await;
         silence(&mut state, g).await;
-        state.submit_request(0, KeyHash(0), hits(1)).await.unwrap();
+        state
+            .submit_request(0, KeyHash(0), hits(1), StepUntil::Time)
+            .await
+            .unwrap();
         state.step(T_U / 2 + T, StepUntil::Time).await;
 
         // Checkpoint A, the peer mirror: the rows the page shows are the rows
@@ -1035,7 +1042,7 @@ fn decisions(events: &[Event]) -> Vec<(u32, Admission)> {
 /// and return the batch.
 async fn send(state: &mut EngineState, node: u32, n: u64) -> EventBatch {
     state
-        .submit_request(node, KeyHash(WATCHED_KEY), hits(n))
+        .submit_request(node, KeyHash(WATCHED_KEY), hits(n), StepUntil::Time)
         .await
         .expect("a live node")
 }
@@ -1713,7 +1720,12 @@ fn full_round_at_max_nodes_drops_nothing_under_pass() {
         for &node in &ids {
             for key in 0..34 {
                 state
-                    .submit_request(node, KeyHash(u128::from(node) << 8 | key), hits(1))
+                    .submit_request(
+                        node,
+                        KeyHash(u128::from(node) << 8 | key),
+                        hits(1),
+                        StepUntil::Time,
+                    )
                     .await
                     .unwrap();
             }

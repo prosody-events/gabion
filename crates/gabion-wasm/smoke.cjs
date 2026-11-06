@@ -8,8 +8,8 @@ async function main() {
   const sim = new wasm.Sim(config);
   console.log("Sim constructed");
 
-  console.log("submit_request(0, 1, 5)...");
-  const batch = await sim.submit_request(0, 1n, 5n);
+  console.log("submit_request(0, 1, 5, Time)...");
+  const batch = await sim.submit_request(0, 1n, 5n, "Time");
   console.log("submit batch:", JSON.stringify(batch));
 
   console.log("step(500)...");

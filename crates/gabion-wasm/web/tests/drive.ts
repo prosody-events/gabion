@@ -1,13 +1,14 @@
 // Driving the page the way a reader does, shared by the specs: one Step at a
 // time, Steps by the heartbeat period, Steps until a condition holds (with
 // deadlines in simulated time), a selection through the keyboard grid, a Send
-// that returns once its run has ended, and a refused Send's band, frame by
-// frame.
+// that returns once its run has ended, a refused Send's band, frame by frame,
+// and the data lines the stage draws.
 
 import { expect, type Locator, type Page } from '@playwright/test';
 import { WATCHED_KEY } from '../src/lib/presets';
 import type { Watch } from '../src/lib/sim/types';
-import type { GlyphTable } from '../src/lib/stage/renderer';
+import { CONTROL } from '../src/lib/stage/layout';
+import type { BeamPool, GlyphTable } from '../src/lib/stage/renderer';
 import timings from './phase-timings.json' with { type: 'json' };
 
 /** What the specs' snapshots read: the watched key, deciding the default Send
@@ -207,4 +208,29 @@ export async function refusal(page: Page, node: number, where: string, relayout 
     if (cap !== null) expect(f.bottom, `${where}: the band never reaches the count`).toBeLessThanOrEqual(-cap / 2);
   }
   return frames;
+}
+
+/** A line the stage drew: its ends and flags. */
+export type Drawn = { src: number; dst: number; flags: number };
+
+/** Record every line the stage draws from now on. The function returned takes
+ *  the data lines drawn since its last call. */
+export async function recordData(page: Page): Promise<() => Promise<Drawn[]>> {
+  await page.evaluate(() => {
+    const w = window as unknown as { pushed: Drawn[] };
+    w.pushed = [];
+    const p = (document.querySelector('.stage canvas') as HTMLCanvasElement & { beams: BeamPool }).beams;
+    const push = p.push.bind(p);
+    p.push = (path, sent, src, dst, flags) => {
+      w.pushed.push({ src, dst, flags });
+      push(path, sent, src, dst, flags);
+    };
+  });
+  return () =>
+    page.evaluate((control) => {
+      const w = window as unknown as { pushed: Drawn[] };
+      const drawn = w.pushed.filter((b) => (b.flags & control) === 0);
+      w.pushed = [];
+      return drawn;
+    }, CONTROL);
 }

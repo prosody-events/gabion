@@ -39,11 +39,12 @@ runs as one sub-step at that instant, delivered before the command returns.
 `step` with `{ Event: { key } }` stops between the halves of the first sub-step
 that sends a wave of packets that carry cells, the wave held until the next
 command, or at the instant some node's window of `key` drops a bucket that
-holds hits. The truth counts a departed
-node's hits as long as a survivor still holds them. The snapshot reports each node's windowed view, per-bucket counts,
-lag (caught up, behind, or stranded where waiting cannot help), its one-hit
-decision and next heartbeat; heal and every joiner use the scenario's own
-network, its loss included.
+holds hits; `submit_request` with it holds an eager flush's wave the same way.
+The truth counts a departed node's hits as long as a survivor still holds them.
+The snapshot reports each node's windowed view, per-bucket counts, lag (caught
+up, behind, or stranded where waiting cannot help), its one-hit decision and
+next heartbeat; heal and every joiner use the scenario's own network, its loss
+included.
 
 ## Zones
 
@@ -93,13 +94,13 @@ plays each virtual second as the page does with node 0 inspected, 60 frames of
 const m = await import('/wasm/gabion_wasm.js'); await m.default();
 const N = 100;
 const sim = new m.Sim({ nodes: N, zones: 3, rule_limit: 1000000 });
-for (const n of [0, 3, 6, 9]) await sim.submit_request(n, 1n, 10n);
+for (const n of [0, 3, 6, 9]) await sim.submit_request(n, 1n, 10n, 'Time');
 const out = []; let hit = 0;
 for (let s = 0; s < 5; s++) {
   let step = 0, snap = 0;
   for (let f = 1; f <= 60; f++) {
     const v = s * 1000 + Math.round((f * 1000) / 60);
-    while (hit < Math.floor((v * 3) / 1000)) await sim.submit_request(hit++ % N, 1n, 1n);
+    while (hit < Math.floor((v * 3) / 1000)) await sim.submit_request(hit++ % N, 1n, 1n, 'Time');
     let t = performance.now(); await sim.step_to(BigInt(v)); step += performance.now() - t;
     t = performance.now(); await sim.snapshot(0, 1n, 25n); snap += performance.now() - t;
   }

@@ -45,7 +45,9 @@ arrowhead just outside the receiver's ring, 6 px and muted inside a zone, 9 px
 in the foreground colour across zones. A control packet (header-only acks and
 probes, gap reports, sweep requests) is a 1 px muted line ending in a dot. A
 lost packet is the line to half its route ending in a stop bar, never a head,
-so it cannot read as delivered. Dashed strokes are not used.
+so it cannot read as delivered; where half way meets a label or a disc (a
+gateway's packet across its ring passes the zone title), the bar moves along
+the route to clear them. Dashed strokes are not used.
 
 A line is drawn the instant its packet is sent, which in the engine's virtual
 time is also the instant it is delivered, so it appears in the frame its
@@ -369,7 +371,7 @@ The story, motion and page checks the test titles name:
 - A12: measure, minimum type size and the 4 px leading grid.
 - A13: cause and effect in one frame in every preset: no count rises in a frame before a line into it appears or its own request is admitted.
 - A16: counts equal `window_total`, fit their disc, and keep 4.5:1 on the fill and on the empty inside.
-- A17: a Send's feedback in the frame of the press, and its run, which ends one heartbeat period after its last landing.
+- A17: a Send's feedback in the frame of the press, and its run, which ends one heartbeat period after its last wave.
 - A18: the stage heading in all its forms, with template ids, the countdown, the over-admission clause, the hops and repairs only.
 - A19: one live region, no claim said twice across the heading, the narration and the decision text, and at most two narration lines.
 - A20: the vocabulary, the title "Gabion rate limiter" and "rate limit" in the first viewport.
@@ -383,7 +385,7 @@ The story, motion and page checks the test titles name:
 - A51: affordance: actions are buttons, the ink fill only on the next action, the disc preview of every control that names a node.
 - A52: the skip link focuses the next action, which the action line describes, and nothing focusable sits in the live region.
 - A54: a wait shows a meter on the action line that never falls.
-- A55: Propagation's Send stops before each wave, and Step draws wave 1 alone, then the relays, then reaches the window's edge.
+- A55: Propagation's Send stops before each wave, one that flushes at once included, and Step draws wave 1 alone, then the relays, then reaches the window's edge.
 - A56: a goal never begins a clause with a control's verb or quotes a control's label.
 - A57: the sliding-window act paces itself: Send is the next action again only in a new bucket.
 - A59: typing in Hits per Send never moves the next action; a committed invalid value does.

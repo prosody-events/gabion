@@ -95,11 +95,15 @@ const SWEEP_SEGMENTS = 32;
 const MAX_STAGE_NODES = 128;
 const MAX_BUCKETS = 32;
 
-// A lost packet dies partway across: a half-line ending in a stop bar, told by
-// shape and by the muted colour, never by a fainter alpha: every line peaks at
-// `BEAM_ALPHA`.
-const DROP_FRACTION = 0.5;
-const STOP_BAR = 12;
+// A lost packet dies partway across: a line ending in a stop bar, told by shape
+// and by the muted colour, never by a fainter alpha: every line peaks at
+// `BEAM_ALPHA`. The bar stands half way along the route, or, where that meets a
+// label or a disc (a gateway's packet across its ring passes the zone title at
+// the ring's centre), at the first stop further out either way clear of both,
+// `LABEL_SPACING` from a label as names keep from each other, else the stop
+// furthest from any label.
+const DROP_STOPS = [0.5, 0.42, 0.58, 0.34, 0.66, 0.26, 0.74] as const;
+export const STOP_BAR = 12;
 // Segments a route is drawn in.
 const ROUTE_SEGMENTS = 8;
 // A data line's arrowhead, length and half width, px: across zones in the
@@ -256,6 +260,9 @@ export class BeamPool {
   readonly src = new Int32Array(BEAM_CAPACITY);
   readonly dst = new Int32Array(BEAM_CAPACITY);
   readonly flags = new Uint8Array(BEAM_CAPACITY);
+  /** Where a lost packet's line stops, as a route position: its bar. Float64,
+   *  so the audit reads the position drawn, not a rounded copy. */
+  readonly stop = new Float64Array(BEAM_CAPACITY);
   /** Each line's opacity as drawn; NaN until its first fade pass. Float64, so
    *  a pass compares the value it computes, not a rounded copy. */
   readonly alpha = new Float64Array(BEAM_CAPACITY);
@@ -292,6 +299,7 @@ export class BeamPool {
       this.src[i] = this.src[last];
       this.dst[i] = this.dst[last];
       this.flags[i] = this.flags[last];
+      this.stop[i] = this.stop[last];
       this.alpha[i] = this.alpha[last];
     }
     this.len = last;
@@ -403,6 +411,8 @@ export class StageRenderer {
   readonly #bySlot: (NodeGfx | undefined)[] = new Array(MAX_STAGE_NODES).fill(undefined);
   readonly #freeSlots: number[] = [];
   #titles: Text[] = [];
+  // The names' boxes as last laid out, which a lost packet's bar keeps clear of.
+  #labelBoxes: readonly LabelBox[] = [];
   #layout: StageLayout | null = null;
   #zoneNames: readonly string[] = [];
   #cluster: ClusterState | null = null;
@@ -556,6 +566,8 @@ export class StageRenderer {
     this.#drawGuides();
     if (resized || this.#sweepRadius !== (layout.spots[0]?.r ?? 0)) this.#drawSweep();
     this.#placeRoles();
+    // The names first: a lost packet's bar keeps clear of them.
+    this.#placeLabels();
     // A line keeps its packet's ends: re-routed between their new places, so
     // a paused moment survives a resize.
     const pool = this.#pool;
@@ -567,7 +579,6 @@ export class StageRenderer {
         this.#drop(i);
       }
     }
-    this.#placeLabels();
     const dataset = this.#app.canvas.dataset;
     dataset.centre = JSON.stringify(layout.centre);
     dataset.rings = JSON.stringify(layout.rings);
@@ -721,13 +732,13 @@ export class StageRenderer {
   setTheme(theme: Theme): void {
     this.#theme = theme;
     this.#restyle();
-    for (let i = 0; i < this.#pool.len; i++) this.#drawLine(i);
     this.#app.renderer.background.color = theme.bg;
     this.#drawGuides();
     this.#drawSweep();
     for (const gfx of this.#nodes.values()) this.#drawNode(gfx);
     this.#placeRoles();
     this.#placeLabels();
+    for (let i = 0; i < this.#pool.len; i++) this.#drawLine(i);
     if (this.#cluster !== null) this.#syncAll(this.#cluster);
   }
 
@@ -1189,6 +1200,7 @@ export class StageRenderer {
   #placeLabels(): void {
     const layout = this.#layout;
     const boxes: LabelBox[] = [];
+    this.#labelBoxes = boxes;
     if (layout === null) {
       this.#app.canvas.dataset.labelBoxes = '[]';
       return;
@@ -1321,8 +1333,8 @@ export class StageRenderer {
   /** Draw line `i` into its Graphics, once: its route from the sender to a
    *  head just outside the receiver's ring. Data ends in an arrowhead, across
    *  zones in the foreground colour and inside one smaller and muted; a
-   *  control packet in a dot on a 1 px line; a lost packet stops at
-   *  `DROP_FRACTION` with a bar and no head. The stroke stops at the head's
+   *  control packet in a dot on a 1 px line; a lost packet stops at its
+   *  `#dropStop` with a bar and no head. The stroke stops at the head's
    *  base, so no part of the line is inked twice. */
   #drawLine(i: number): void {
     const pool = this.#pool;
@@ -1341,8 +1353,10 @@ export class StageRenderer {
     const g = this.#lines[i];
     g.clear();
     if ((flags & DROPPED) !== 0) {
-      this.#route(g, DROP_FRACTION);
-      this.#stopBar(g, DROP_FRACTION);
+      const stop = this.#dropStop();
+      pool.stop[i] = stop;
+      this.#route(g, stop);
+      this.#stopBar(g, stop);
       g.stroke(control ? this.#controlStroke : cross ? this.#lostStroke : this.#inStroke);
     } else {
       const reach = (this.#nodes.get(pool.dst[i])?.radius ?? 0) + RING_REACH + HEAD_GAP;
@@ -1525,6 +1539,41 @@ export class StageRenderer {
       .lineTo(bx - uy * half, by + ux * half)
       .lineTo(bx + uy * half, by - ux * half)
       .closePath();
+  }
+
+  /** Where on the current route a lost packet's bar stands: of the
+   *  `DROP_STOPS` clear of every disc's ring, the first `LABEL_SPACING` from
+   *  every label, else the one furthest from any label; half way when none
+   *  clears the discs. */
+  #dropStop(): number {
+    const at = this.#at;
+    const spots = this.#layout?.spots;
+    const boxes = this.#labelBoxes;
+    let best: number = DROP_STOPS[0];
+    let room = Number.NEGATIVE_INFINITY;
+    for (let s = 0; s < DROP_STOPS.length; s++) {
+      const stop = DROP_STOPS[s];
+      pointOn(this.#path, stop, at);
+      let clear = true;
+      for (let n = 0; clear && spots !== undefined && n < spots.length; n++) {
+        const spot = spots[n];
+        clear = Math.hypot(at.x - spot.x, at.y - spot.y) > spot.r + RING_REACH + STOP_BAR / 2;
+      }
+      if (!clear) continue;
+      let near = Number.POSITIVE_INFINITY;
+      for (let b = 0; b < boxes.length; b++) {
+        const box = boxes[b];
+        const nx = Math.max(box.x, Math.min(at.x, box.x + box.w));
+        const ny = Math.max(box.y, Math.min(at.y, box.y + box.h));
+        near = Math.min(near, Math.hypot(at.x - nx, at.y - ny) - STOP_BAR / 2);
+      }
+      if (near > LABEL_SPACING) return stop;
+      if (near > room) {
+        room = near;
+        best = stop;
+      }
+    }
+    return best;
   }
 
   /** Add a bar across the route at position `head`: where a lost packet died. */

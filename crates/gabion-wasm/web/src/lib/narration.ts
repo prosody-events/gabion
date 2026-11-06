@@ -22,7 +22,7 @@ export function idle(subject: number, gateways: readonly GatewayName[], onScale:
 
 /** An admitted request whose hits left at once: an eager flush. */
 export function admittedEager(node: number, hits: number, before: number, limit: number): Blurb {
-  return blurb`node ${node} admitted ${hits} ${noun(hits, 'hit')}: ${before} + ${hits} is within the limit of ${limit}. It decided alone, then told its zone and one node in each other zone at once.`;
+  return blurb`node ${node} admitted ${hits} ${noun(hits, 'hit')}: ${before} + ${hits} is within the limit of ${limit}. It decided alone, and tells its zone and one node in each other zone at once.`;
 }
 
 /** An admitted request too small to send at once: it waits for the node's
