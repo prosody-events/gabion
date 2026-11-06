@@ -2,7 +2,7 @@
   import { onMount, untrack } from 'svelte';
   import { blurb, zoneLabel, type Blurb } from '../format';
   import type { ClusterState, EventBatch } from '../sim/types';
-  import { StageRenderer, labelExtent, type Roles, type Trail } from '../stage/renderer';
+  import { StageRenderer, labelExtent, type Finish, type Landing, type Roles, type Trail } from '../stage/renderer';
   import {
     CROSS_WIDTH,
     IN_WIDTH,
@@ -122,20 +122,20 @@
   let annotation = $state.raw<Blurb>([]);
 
   /** Draw `batch`'s packets as beams that leave `delay` ms of presentation
-   *  clock from now, and read its annotation; with `hold`, call `onLanded`
+   *  clock from now, and read its annotation; with `'held'`, call `onLanded`
    *  once they have all landed. False when no renderer exists yet: then
    *  nothing will land, and the caller delivers at once. */
-  export function show(batch: EventBatch, delay: number, hold: boolean): boolean {
+  export function show(batch: EventBatch, delay: number, landing: Landing): boolean {
     annotation = annotate(batch) ?? annotation;
     if (!ready || renderer === null) return false;
-    renderer.show(batch.events, delay, hold);
+    renderer.show(batch.events, delay, landing);
     return true;
   }
 
   /** Let the clock run, though paused, until every beam shown has landed; with
-   *  `fast`, within a fixed short wall time. */
-  export function finish(fast: boolean): void {
-    renderer?.finish(fast);
+   *  `'fast'`, within a fixed short wall time. */
+  export function finish(pace: Finish): void {
+    renderer?.finish(pace);
   }
 
   /** Drop the landed routes: every command starts a fresh picture. */

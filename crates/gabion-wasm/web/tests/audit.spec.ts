@@ -5,7 +5,11 @@ import { CARRIES_CELLS, missingFor, type ClusterState, type EventBatch, type Pac
 import {
   ARC_GAP,
   ARC_WIDTH,
+  CONTROL,
+  CROSS,
   DIAMOND_SCALE,
+  DROPPED,
+  RELAY,
   R_MAX,
   beamPath,
   pointOn,
@@ -735,7 +739,8 @@ function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number
   // A7 canvas pairs (graphics 3:1, text 4.5:1): the stage draws on `readTheme().bg`
   // and the charts on the detail rail's panel, so each is checked on its own
   // surface, a translucent mark composited over it first. Marks drawn faded as
-  // context for a selection (`FADED_ALPHA`) are exempt by name (the README's Beams paragraph); the ring
+  // context for a selection (`FADED_ALPHA`) and landed routes (`LANDED_ALPHA`)
+  // are exempt by name (the README's Beams paragraph); the ring
   // guides repeat what position and the ring title say (structure, not data) and
   // are exempt too.
   const check = (surface: Rgba, where: string, pairs: [string, Rgba, number][]): void => {
@@ -1094,38 +1099,21 @@ test("every drawn beam carries its packet's kind, tier and fate", async ({ page 
   await open(page);
   await loadPreset(page, 'Sandbox');
 
-  // The flag bits the stage's beam pool packs, and what each packet should
-  // wear, written out here from the packet kinds rather than read from the
-  // renderer: an acknowledgement or a sweep request is a dot, a relay is
-  // marked so its gateway's beams stay the selected origin's.
-  const CROSS = 1;
-  const CONTROL = 2;
-  const RELAY = 4;
-  const DROPPED = 8;
+  // What each packet should wear, derived here from the packet kinds rather
+  // than read from the renderer's `kindFlags`: an acknowledgement or a sweep
+  // request is a dot, a relay is marked so its gateway's beams stay the
+  // selected origin's.
   const KIND: Record<PacketKind, number> = { Ack: CONTROL, SweepRequest: CONTROL, Own: 0, Relay: RELAY, Sweep: 0 };
-  type Packet = { src: number; dst: number; kind: PacketKind; tier: Tier; dropped: boolean };
   type Beam = { src: number; dst: number; flags: number };
-  type Log = { packets: Packet[]; beams: Beam[] };
+  type Log = { beams: Beam[] };
 
-  // Record the packets of every Step the page takes, as the engine reports them,
-  // and every beam the stage draws, as it enters the beam pool, so a beam that
-  // has already landed and gone is still counted.
+  // Record the packets the engine reports, and every beam the stage draws, as
+  // it enters the beam pool, so a beam that has already landed and gone is
+  // still counted.
+  await logPackets(page);
   await page.evaluate(() => {
     const log = window as unknown as Log;
-    log.packets = [];
     log.beams = [];
-    const sim = window.sim!;
-    const step = sim.step.bind(sim);
-    sim.step = async (ms: number, until?: StepUntil) => {
-      const batch = await step(ms, until);
-      for (const { kind } of batch.events) {
-        if (kind.type === 'PacketSent' || kind.type === 'PacketDropped') {
-          const { src, dst, tier } = kind;
-          log.packets.push({ src, dst, kind: kind.kind, tier, dropped: kind.type === 'PacketDropped' });
-        }
-      }
-      return batch;
-    };
     type Push = (path: unknown, start: number, src: number, dst: number, flags: number) => void;
     const pool = document.querySelector<HTMLCanvasElement & { beams?: { push: Push } }>('.stage canvas')?.beams;
     if (pool === undefined) throw new Error('the stage publishes no beam pool');
@@ -1136,19 +1124,20 @@ test("every drawn beam carries its packet's kind, tier and fate", async ({ page 
     };
   });
 
+  // The packets and beams logged since the last call, taken at once, so no
+  // async tail lands between the two.
+  const take = (): Promise<{ packets: Packet[]; beams: Beam[] }> =>
+    page.evaluate(() => {
+      const w = window as unknown as Log & { packets: Packet[] };
+      return { packets: w.packets.splice(0), beams: w.beams.splice(0) };
+    });
+
   // One Step: the beams it drew are its packets, one beam each, each with its
   // packet's flags. Returns the kinds of the packets drawn.
   const checkStep = async (): Promise<PacketKind[]> => {
-    await page.evaluate(() => {
-      const log = window as unknown as Log;
-      log.packets = [];
-      log.beams = [];
-    });
+    await take();
     await step(page);
-    const { packets, beams } = await page.evaluate(() => {
-      const { packets, beams } = window as unknown as Log;
-      return { packets, beams };
-    });
+    const { packets, beams } = await take();
     const route = ({ src, dst, flags }: Beam): string => `node ${src} to node ${dst} with flags ${flags}`;
     const sent = packets.map((p) =>
       route({

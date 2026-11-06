@@ -2,7 +2,8 @@
 // rings set evenly on a larger circle around an empty centre. The renderer, the
 // node grid, the pointer hit test and the audit all read it from here, so a
 // node's disc, its label, its keyboard cell and its beams share one address.
-// Everything is screen-size, so labels never scale with the stage.
+// Everything is screen-size, so labels never scale with the stage. It also
+// holds the beam encoding the pool packs and the audit reads.
 
 /** A ring's radius as a share of half the gap between neighbouring ring
  *  centres: the largest value that keeps every cross-zone beam clear of a third
@@ -18,6 +19,16 @@ export const BEAM_CLEARANCE = 0.35;
 /** The two tier strokes, in px: inside a zone and across zones. */
 export const IN_WIDTH = 1.5;
 export const CROSS_WIDTH = 3;
+/** A beam's flight on the stage's presentation clock, ms: wall time at 1×,
+ *  eased so it reads as cause then effect. */
+export const BEAM_FLIGHT_MS = 520;
+/** The beam pool's flag bits: across zones, a control packet (no cells), a
+ *  relay, lost, landed. */
+export const CROSS = 1;
+export const CONTROL = 2;
+export const RELAY = 4;
+export const DROPPED = 8;
+export const LANDED = 16;
 /** The gap between a disc and its label, in px: clear of the origin's thick ring. */
 export const LABEL_GAP = 12;
 /** A node's cell arc: its gap outside the disc and its stroke width, px. */

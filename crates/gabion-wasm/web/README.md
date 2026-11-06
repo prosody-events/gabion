@@ -57,7 +57,8 @@ are drawn at a quarter of their alpha. `FADED_ALPHA` and `LANDED_ALPHA` are the
 marks the contrast audit exempts, by name. The renderer keeps every beam in a
 pre-sized pool and draws into one `Graphics` per mark style, and only when
 something changed or a beam is in flight, so a frame allocates nothing of its
-own.
+own. Each beam in the pool packs its flags (`layout.ts`): `CROSS` 1, `CONTROL`
+2, `RELAY` 4, `DROPPED` 8 and `LANDED` 16.
 
 **Arcs.** A node's arc sweeps its view as a share of the true total, with butt
 caps, and stays at least a twelfth of a ring open (`ARC_NOTCH`) until the node
@@ -150,8 +151,9 @@ rest show one Send's hits leaving the window. Every preset declares its
 instance as `uplot`, which the audit reads to check every mark lies inside its
 plot; the stage canvas carries `beams`, the renderer's beam pool (`clock`,
 `redraws`, `inFlight`, `due`, and the `push` and `land` the audit wraps to see
-each beam enter and land); and `.stage-pane[data-held]` is the sequence number
-of the wave held in flight, "0" when none is.
+each beam enter and land) and `beamGfx`, the Graphics the beams are drawn into
+(read to check how a landed route is drawn); and `.stage-pane[data-held]` is
+the sequence number of the wave held in flight, "0" when none is.
 
 ## Layout
 

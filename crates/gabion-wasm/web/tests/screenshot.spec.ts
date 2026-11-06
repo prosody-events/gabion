@@ -1,6 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 import { CARRIES_CELLS, missingFor, type AnswerState, type ClusterState, type EventBatch } from '../src/lib/sim/types';
-import { WATCH, setSpeed, stepUntil } from './drive';
+import { CONTROL } from '../src/lib/stage/layout';
+import { WATCH, setRange, setSpeed, stepUntil, virtualMs } from './drive';
 
 // Every node holds the default preset's settled seed at load.
 const SEED_TOTAL = '50';
@@ -9,7 +10,7 @@ const NODES = 12;
 // or the rail's Send submits (a stage click *selects*, it does not send).
 const BURST_HITS = '25';
 // A node's count after one Send on top of the seed.
-const SENT_TOTAL = '75';
+const SENT_TOTAL = String(Number(SEED_TOTAL) + Number(BURST_HITS));
 
 // Every node is read from the page's own DOM: its grid cell (`gridcell`) for
 // geometry and its "Show as table" row for numbers, because the canvas is opaque
@@ -52,12 +53,6 @@ async function boot(page: Page): Promise<void> {
 /** Parse a printed count ("1,234"). */
 const num = (text: string | null): number => Number((text ?? '0').replace(/,/g, ''));
 
-/** The transport bar's virtual-time readout, in seconds ("5.0 s" or "200 ms"). */
-async function virtualSeconds(page: Page): Promise<number> {
-  const text = (await page.locator('[data-field="virtual-time"]').textContent()) ?? '0 ms';
-  return text.endsWith(' ms') ? Number.parseFloat(text) / 1000 : Number.parseFloat(text);
-}
-
 /** The page's engine, snapshotted, with node `inspect`'s rows. */
 const snapshot = (page: Page, inspect: number | null = null): Promise<ClusterState> =>
   page.evaluate(([id, watch]) => window.sim!.snapshot(id, watch), [inspect, WATCH] as const);
@@ -75,12 +70,6 @@ async function deselect(page: Page): Promise<void> {
   const box = await page.locator('.stage').boundingBox();
   if (box === null) throw new Error('the stage has no box');
   await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-}
-
-/** How many of the table's node views are currently non-zero. */
-async function nonZeroCount(page: Page): Promise<number> {
-  const counts = await page.locator(COUNTS).allTextContents();
-  return counts.filter((t) => num(t) > 0).length;
 }
 
 // One end-to-end check that doubles as the visual-quality screenshot source:
@@ -296,9 +285,9 @@ test('the Strata keeps a fixed column count as the window scrolls', async ({ pag
 
   // Drive virtual time past several bucket boundaries (the window scrolls).
   // The column count must not move — no insert, no re-distribution.
-  const from = await virtualSeconds(page);
+  const from = await virtualMs(page);
   await page.getByRole('button', { name: 'Play' }).click();
-  await expect.poll(async () => virtualSeconds(page), { timeout: 15_000 }).toBeGreaterThan(from + 4);
+  await expect.poll(async () => virtualMs(page), { timeout: 15_000 }).toBeGreaterThan(from + 4000);
   await page.getByRole('button', { name: 'Pause' }).click();
   await expect(cells).toHaveCount(11);
 });
@@ -332,16 +321,6 @@ test('adding a node joins it live and it catches up by gossip', async ({ page })
 
   await boot(page);
 
-  // The cluster opens with the seed on every node; played, it keeps it, so the
-  // newcomer joins a cluster with something to catch up on.
-  await page.getByRole('button', { name: 'Play' }).click();
-  await expect
-    .poll(async () => nonZeroCount(page), {
-      timeout: 15_000,
-      message: 'the cluster was not carrying traffic before the add',
-    })
-    .toBe(NODES);
-  await page.getByRole('button', { name: 'Pause' }).click();
   // The dashboard before the join: the share, agreement and disagreement charts
   // over the elapsed window. Pair with `dash-after-add` to eyeball that the join
   // threads through this same window — the time axis keeps running, no restart
@@ -361,16 +340,9 @@ test('adding a node joins it live and it catches up by gossip', async ({ page })
   // `dash-before-add`, proving the join did not reset the charts.
   await dashboard.screenshot({ path: 'screenshots/dash-after-add.png' });
 
-  // Play on: the newcomer catches up from zero by anti-entropy — the survivors
-  // push it their cells until its view climbs to match the living cluster.
-  await page.getByRole('button', { name: 'Play' }).click();
-  await expect
-    .poll(async () => num(await view(page, 12).textContent()), {
-      timeout: 15_000,
-      message: 'the newcomer did not catch up by gossip',
-    })
-    .toBeGreaterThan(0);
-  await page.getByRole('button', { name: 'Pause' }).click();
+  // Step on: the newcomer catches up from zero by anti-entropy, the survivors'
+  // join sweep bringing it the seed.
+  await stepUntil(page, async () => (await view(page, 12).textContent()) === SEED_TOTAL, 6, 'the newcomer caught up by gossip');
   await page.screenshot({ path: 'screenshots/ring-node-added-caughtup.png' });
 
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
@@ -458,12 +430,7 @@ test('a rebuild knob stages, keeps the section open, and applies on Rebuild', as
   const rebuild = page.getByRole('button', { name: 'Rebuild cluster' });
   await expect(rebuild).toBeDisabled();
 
-  // A range input can't be `fill`ed: set the value and fire `input` so Svelte's
-  // bind reads it. With the new model there is no `change`-to-rebuild.
-  await page.getByLabel('Packet loss').evaluate((el: HTMLInputElement) => {
-    el.value = '0.5';
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-  });
+  await setRange(page.getByLabel('Packet loss'), 0.5);
 
   // The readout updated and the knob is marked staged; the section stayed open
   // and no rebuild fired (no overlay, Rebuild now enabled).
@@ -507,10 +474,7 @@ test('the window knob updates its bucket-count readout and rebuilds', async ({ p
 
   // Move the window to 5 s → 5 buckets. The readout updates immediately (the
   // staged value), before any rebuild.
-  await page.locator('#knob-window').evaluate((el: HTMLInputElement) => {
-    el.value = '5000';
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-  });
+  await setRange(page.locator('#knob-window'), 5000);
   await expect(page.locator('label[for="knob-window"] .val')).toHaveText('5 s · 5 buckets');
 
   // Apply it. The rebuild left a healthy cluster of the same size, no errors,
@@ -626,7 +590,7 @@ test('a Send that flushes at once draws its packets as it sends', async ({ page 
 
   type Route = { src: number; dst: number; data: boolean };
   type Log = { sent: Route[]; drawn: Route[] };
-  await page.evaluate((carries) => {
+  await page.evaluate(({ carries, control }) => {
     const log = window as unknown as Log;
     log.sent = [];
     log.drawn = [];
@@ -648,10 +612,10 @@ test('a Send that flushes at once draws its packets as it sends', async ({ page 
     if (pool === undefined) throw new Error('the stage publishes no beam pool');
     const push = pool.push.bind(pool);
     pool.push = (path, start, src, dst, flags) => {
-      log.drawn.push({ src, dst, data: (flags & 2) === 0 });
+      log.drawn.push({ src, dst, data: (flags & control) === 0 });
       push(path, start, src, dst, flags);
     };
-  }, CARRIES_CELLS);
+  }, { carries: CARRIES_CELLS, control: CONTROL });
 
   await page.getByLabel('Node', { exact: true }).selectOption('0');
   await page.locator('.rail').getByRole('button', { name: 'Send burst' }).click();
@@ -668,9 +632,9 @@ test('a Send that flushes at once draws its packets as it sends', async ({ page 
 
   // Played on, the feed's eager flushes and the steps' waves: the data beams
   // drawn are the data packets sent.
-  const from = await virtualSeconds(page);
+  const from = await virtualMs(page);
   await page.getByRole('button', { name: 'Play' }).click();
-  await expect.poll(async () => virtualSeconds(page), { timeout: 30_000 }).toBeGreaterThan(from + 6);
+  await expect.poll(async () => virtualMs(page), { timeout: 30_000 }).toBeGreaterThan(from + 6000);
   await page.getByRole('button', { name: 'Pause' }).click();
   const data = await page.evaluate(() => {
     const { sent, drawn } = window as unknown as Log;
@@ -737,11 +701,6 @@ test('the node inspector renders every detail section', async ({ page }) => {
   page.on('pageerror', (err) => pageErrors.push(err.message));
 
   await boot(page);
-
-  // Play a little, so the targets and counters carry live values.
-  await page.getByRole('button', { name: 'Play' }).click();
-  await expect.poll(async () => nonZeroCount(page), { timeout: 15_000 }).toBe(NODES);
-  await page.getByRole('button', { name: 'Pause' }).click();
 
   await clickNode(page, 0);
   const inspector = page.locator('.inspector');

@@ -1,5 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 import type { ClusterState } from '../src/lib/sim/types';
+import { BEAM_FLIGHT_MS, CONTROL, CROSS, DROPPED, LANDED, RELAY } from '../src/lib/stage/layout';
+import type { BeamPool } from '../src/lib/stage/renderer';
 import { PERIOD_MS, WATCH, setSpeed, step, virtualMs } from './drive';
 import { sourceOf } from './sourcemap';
 
@@ -12,11 +14,8 @@ import { sourceOf } from './sourcemap';
 // in simulated time where one is meant, and wall times are printed, never
 // asserted beyond bounds only a broken mechanism can miss.
 
-// The flag bits the stage's beam pool packs, written out here.
-const BITS = { CROSS: 1, CONTROL: 2, RELAY: 4, DROPPED: 8, LANDED: 16 } as const;
-const { CROSS, RELAY } = BITS;
-// The renderer's flight time on the presentation clock.
-const BEAM_FLIGHT_MS = 520;
+// The flag bits the stage's beam pool packs, passed into the page's functions.
+const BITS = { CROSS, CONTROL, RELAY, DROPPED, LANDED } as const;
 // The animation frames the allocation audit samples.
 const FRAMES = 300;
 
@@ -70,23 +69,8 @@ async function still(page: Page): Promise<void> {
   await expect.poll(() => pool(page, (c) => c.beams.inFlight), { timeout: 30_000 }).toBe(0);
 }
 
-/** What the page publishes on its beam pool, as the tests read it. */
-interface Pool {
-  len: number;
-  clock: number;
-  redraws: number;
-  inFlight: number;
-  due: number | null;
-  start: Float64Array;
-  src: Int32Array;
-  dst: Int32Array;
-  flags: Uint8Array;
-  push: (path: unknown, start: number, src: number, dst: number, flags: number) => void;
-  land: (i: number) => void;
-}
-
 /** The stage's canvas, with the beam pool it publishes. */
-type Canvas = HTMLCanvasElement & { beams: Pool };
+type Canvas = HTMLCanvasElement & { beams: BeamPool };
 
 /** Evaluate `read` against the stage's canvas in the page. */
 function pool<T>(page: Page, read: (c: Canvas) => T): Promise<T> {
@@ -120,6 +104,8 @@ interface Causality {
   checked: number;
   /** Holds seen. */
   holds: number;
+  /** Count rises a landed packet accounted for. */
+  rises: number;
 }
 
 /** Install the causality log in the page, or reset it: idempotent per beam
@@ -134,13 +120,14 @@ async function installCausality(page: Page): Promise<void> {
       violations: string[];
       checked: number;
       holds: number;
+      rises: number;
       inflight: number;
       lastStart: number | null;
       landed: Set<number>;
       credit: Set<number>;
       counts: Map<number, number>;
     };
-    type P = Pool & { causal?: boolean };
+    type P = BeamPool & { causal?: boolean };
     const w = window as unknown as { causality: Log; causalObserver?: boolean };
     const readCounts = (): Map<number, number> => {
       const counts = new Map<number, number>();
@@ -154,6 +141,7 @@ async function installCausality(page: Page): Promise<void> {
       violations: [],
       checked: 0,
       holds: 0,
+      rises: 0,
       inflight: 0,
       lastStart: null,
       landed: new Set(),
@@ -208,12 +196,10 @@ async function installCausality(page: Page): Promise<void> {
       for (const [node, count] of counts) {
         const before = log.counts.get(node);
         if (before === undefined || count <= before) continue;
-        if (log.landed.has(node) || log.credit.has(node)) {
-          log.landed.delete(node);
-          log.credit.delete(node);
-        } else {
-          log.violations.push(`(a) node ${node} rose from ${before} to ${count} before a beam into it landed`);
-        }
+        const byPacket = log.landed.delete(node);
+        const byRequest = log.credit.delete(node);
+        if (byPacket) log.rises += 1;
+        else if (!byRequest) log.violations.push(`(a) node ${node} rose from ${before} to ${count} before a beam into it landed`);
       }
       log.counts = counts;
     }).observe(document.querySelector('.node-table')!, { subtree: true, childList: true, characterData: true });
@@ -223,6 +209,12 @@ async function installCausality(page: Page): Promise<void> {
     const sample = (): void => {
       const now = { held: pane.dataset.held ?? '0', ms: readout.dataset.ms ?? '' };
       const log = w.causality;
+      // A delivered wave's counts are on the page by now (the snapshot applies
+      // before `held` clears): a credit it left unused must not excuse a later rise.
+      if (now.held === '0' && last.held !== '0') {
+        log.landed.clear();
+        log.credit.clear();
+      }
       if (now.held !== '0' && now.held === last.held && now.ms !== last.ms) {
         log.violations.push(`(c) simulated time moved from ${last.ms} to ${now.ms} while wave ${now.held} was held`);
       }
@@ -253,8 +245,8 @@ async function installCausality(page: Page): Promise<void> {
 /** What the causality log has found so far. */
 const readCausality = (page: Page): Promise<Causality> =>
   page.evaluate(() => {
-    const { violations, checked, holds } = (window as unknown as { causality: Causality }).causality;
-    return { violations, checked, holds };
+    const { violations, checked, holds, rises } = (window as unknown as { causality: Causality }).causality;
+    return { violations, checked, holds, rises };
   });
 
 /** Play at `speed` until simulated time has advanced `ms` past where it stood,
@@ -283,9 +275,10 @@ test('every held preset changes each count only when its packet lands', async ({
     await railSend(page, 0);
     await playFor(page, 4, 2000, 60_000);
     const found = await readCausality(page);
-    console.log(`${name}: ${found.holds} hold(s), ${found.checked} checked, ${Date.now() - wall} ms of wall time`);
+    console.log(`${name}: ${found.holds} hold(s), ${found.checked} checked, ${found.rises} rise(s), ${Date.now() - wall} ms of wall time`);
     expect(found.violations, name).toEqual([]);
     expect(found.checked, `${name}: no held wave was compared with the engine`).toBeGreaterThanOrEqual(1);
+    expect(found.rises, `${name}: no count rose by a landed packet`).toBeGreaterThanOrEqual(1);
   }
 
   // Steady state at limit 100: ε is 1, so the one-hit feed flushes at once
@@ -296,9 +289,10 @@ test('every held preset changes each count only when its packet lands', async ({
   const wall = Date.now();
   await playFor(page, 4, 10_000, 90_000);
   const found = await readCausality(page);
-  console.log(`Steady state at limit 100: ${found.holds} hold(s), ${found.checked} checked, ${Date.now() - wall} ms`);
+  console.log(`Steady state at limit 100: ${found.holds} hold(s), ${found.checked} checked, ${found.rises} rise(s), ${Date.now() - wall} ms`);
   expect(found.violations, 'Steady state at limit 100').toEqual([]);
   expect(found.checked, 'Steady state at limit 100: too few holds compared').toBeGreaterThanOrEqual(3);
+  expect(found.rises, 'Steady state at limit 100: no count rose by a landed packet').toBeGreaterThanOrEqual(1);
 });
 
 // -- A Send's eager flush, past the emit floor ------------------------------------
@@ -357,7 +351,7 @@ for (const speed of [1, 0.1]) {
       }, BITS.CONTROL);
     await railSend(page, 0);
     await expect(page.locator('.node-table tr[data-node="0"] [data-field="view"]')).toHaveText('75');
-    await data();
+    expect(await data(), "Propagation's Send stopped before its first wave").toEqual([]);
     const gateways = ((await snapshot(page, 0)).inspected?.peers ?? [])
       .filter((p) => p.role === 'gateway')
       .map((p) => p.id);
@@ -412,7 +406,7 @@ test('flights scale with speed and Pause freezes them', async ({ page }, info) =
       const w = window as unknown as { lives: number[]; born: Map<string, number> };
       w.lives = [];
       w.born = new Map();
-      const p = (document.querySelector('.stage canvas') as HTMLCanvasElement & { beams: Pool & { timed?: boolean } }).beams;
+      const p = (document.querySelector('.stage canvas') as HTMLCanvasElement & { beams: BeamPool & { timed?: boolean } }).beams;
       if (p.timed === true) return;
       p.timed = true;
       const push = p.push.bind(p);
@@ -533,17 +527,17 @@ test('the stage allocates nothing per frame', async ({ page }) => {
   await page.getByRole('button', { name: 'Pause' }).click();
 
   // Each sample's top frame, mapped through the bundle's hidden source map.
-  type Node = {
+  type ProfileNode = {
     id: number;
     callFrame: { url: string; lineNumber: number; columnNumber: number; functionName: string };
-    children: Node[];
+    children: ProfileNode[];
   };
-  const byId = new Map<number, Node>();
-  const index = (node: Node): void => {
+  const byId = new Map<number, ProfileNode>();
+  const index = (node: ProfileNode): void => {
     byId.set(node.id, node);
     for (const child of node.children) index(child);
   };
-  index(profile.head as Node);
+  index(profile.head as ProfileNode);
   const sizes = new Map<number, number>();
   for (const sample of profile.samples) {
     if (byId.get(sample.nodeId)?.callFrame.functionName !== 'boxDoubles') continue;
@@ -553,6 +547,7 @@ test('the stage allocates nothing per frame', async ({ page }) => {
   expect(boxed, "a boxed double's size was measured").toBeGreaterThan(0);
   const stage = new Map<string, number>();
   let app = 0;
+  let own = 0;
   let objects = 0;
   for (const sample of profile.samples) {
     const frame = byId.get(sample.nodeId)?.callFrame;
@@ -560,18 +555,20 @@ test('the stage allocates nothing per frame', async ({ page }) => {
     if (frame === undefined || file === undefined) continue;
     app += 1;
     const source = sourceOf(`dist/assets/${file}.map`, frame.lineNumber, frame.columnNumber);
+    if (source !== null && !source.includes('node_modules')) own += 1;
     if (source === null || !source.includes('src/lib/stage/') || sample.size === boxed) continue;
     objects += 1;
     const where = `${frame.functionName || '(anonymous)'} in ${source}, ${sample.size} bytes`;
     stage.set(where, (stage.get(where) ?? 0) + 1);
   }
   console.log(
-    `${profile.samples.length} samples, ${app} in the app's bundle, ${objects} in src/lib/stage/ other than ` +
+    `${profile.samples.length} samples, ${app} in the app's bundle, ${own} in the page's own code, ${objects} in src/lib/stage/ other than ` +
       `boxed doubles (${boxed} bytes): ${JSON.stringify([...stage])}`,
   );
   // What remains are the engine's one-off allocations (a function's feedback,
   // an aligned box): far fewer than one per frame. Code that builds an object
   // per frame, or per beam, makes at least one each frame.
+  expect(own, "the source map resolved no sample to the page's own code").toBeGreaterThan(0);
   expect(objects, 'objects the stage allocated over the played frames').toBeLessThan(FRAMES);
 });
 
@@ -625,6 +622,14 @@ for (const reducedMotion of ['no-preference', 'reduce'] as const) {
       await still(page);
       expect(await landed(), "both waves' routes stay").toBe(11);
       expect(await pool(page, (c) => c.beams.len), 'nothing but the landed routes').toBe(11);
+      // Every mark drawn is a landed route's: a stroke 1 px wide at no more than
+      // C11's 0.15 alpha, with no head (heads and dots are fills).
+      type Marks = { context: { instructions: { action: string; data: { style: { width?: number; alpha: number } } }[] } };
+      const marks = await page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { beamGfx: Marks[] }) =>
+        c.beamGfx.flatMap((g) => g.context.instructions.map(({ action, data }) => ({ action, width: data.style.width, alpha: data.style.alpha }))),
+      );
+      expect(marks.length, 'the landed routes are drawn').toBeGreaterThan(0);
+      expect(marks.filter((m) => m.action !== 'stroke' || m.width !== 1 || m.alpha > 0.15), 'a landed route drawn other than 1 px and quiet').toEqual([]);
 
       const redraws = await pool(page, (c) => c.beams.redraws);
       await frames(page, 60);

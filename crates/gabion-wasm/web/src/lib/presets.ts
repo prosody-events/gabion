@@ -80,8 +80,8 @@ const BACKGROUND_RATE_PER_SEC = 3;
  *  rejects the rest. */
 const OVERLOAD_RATE_PER_SEC = 80;
 
-/** Gateway cut's trickle at node 0 (hits/sec): one hit per 500 ms period, so
- *  node 0 keeps sending data its cut gateway answers with "cannot relay". */
+/** Gateway cut's trickle at node 0 (hits/sec), so node 0 keeps sending data
+ *  its cut gateway answers with "cannot relay". */
 const TRICKLE_RATE_PER_SEC = 2;
 
 /** The most heartbeat periods `warm` and `settle` step: best effort, so a lossy
@@ -153,8 +153,8 @@ export interface Preset {
   readonly pacing: Pacing;
   /** The node the scenario opens with selected, so its gateways show on load. */
   readonly select?: number;
-  /** A feed the play loop and Step drive: Steady state, No zone configured and
-   *  Sustained overload, whose subject is traffic, and Gateway cut's trickle. */
+  /** A feed the play loop and Step drive, where traffic is the subject (the
+   *  module header names them). */
   readonly traffic?: SustainedTraffic;
   /** Surfaces the Aggregate-vs-Limit dashboard panel. Only legible when the
    *  scenario drives the aggregate toward a *low* limit (the overload preset):
@@ -233,7 +233,7 @@ const settle = (sim: Sim, c: SimConfig): Promise<void> => quiet(sim, c, () => tr
 function noGateway(zone: number): never {
   throw new Error(
     `node ${ORIGIN} found no gateway into zone ${String.fromCharCode(97 + zone)} while the cluster warmed up, ` +
-      `so the gateway scenario cannot start. A zone needs at least one live node node ${ORIGIN} can hear; ` +
+      `so the gateway scenario cannot start. A zone needs at least one live node that node ${ORIGIN} can hear; ` +
       'rebuild with more nodes or fewer zones.',
   );
 }

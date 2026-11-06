@@ -33,10 +33,16 @@ import { BEAM_ALPHA, FADED_ALPHA, LANDED_ALPHA, type Theme } from '../theme';
 import {
   ARC_GAP,
   ARC_WIDTH,
+  BEAM_FLIGHT_MS,
+  CONTROL,
+  CROSS,
   CROSS_WIDTH,
   DIAMOND_SCALE,
+  DROPPED,
   IN_WIDTH,
   LABEL_GAP,
+  LANDED,
+  RELAY,
   beamPath,
   pointOn,
   type Point,
@@ -53,10 +59,6 @@ const CONVERGED_EPSILON = 0.001;
 // one hit short of the total still shows a notch (design rule 17).
 const ARC_NOTCH = 1 / 12;
 
-// Presentation-clock flight time of a gossip packet beam: wall time at 1×.
-// Eased so the beam accelerates off the source and decelerates into the
-// target: motion that reads as cause then effect.
-const BEAM_FLIGHT_MS = 520;
 // The wall time a command's fast-forward of the waves in flight takes, at any
 // speed.
 const LAND_FAST_MS = 150;
@@ -99,13 +101,6 @@ const EXIT_MS = 340;
 const GLIDE_MS = 520;
 const ENTER_SCALE = 0.25;
 
-// Beam flag bits.
-const CROSS = 1;
-const CONTROL = 2;
-const RELAY = 4;
-const DROPPED = 8;
-const LANDED = 16;
-
 /** Each packet kind's flags: a kind that carries no cells is a dot, and a
  *  relay is the origin's own when its gateway sends it. Read from
  *  `CARRIES_CELLS`, the mirror of `PacketKind::carries_cells`, and exhaustive
@@ -128,6 +123,12 @@ const STYLES = 7;
  *  command (`'keep'`, presets with no feed, so a Send's waves read as a
  *  diagram), or dropped at once (`'drop'`, where a feed sends all the time). */
 export type Trail = 'keep' | 'drop';
+/** Whether the page waits on a batch's landing: `'held'` calls `onLanded` once
+ *  its beams have all landed (after one flight, even if none is drawn). */
+export type Landing = 'held' | 'free';
+/** How a paused clock runs to its bound: at the speed, or within
+ *  `LAND_FAST_MS` of wall time. */
+export type Finish = 'at-speed' | 'fast';
 
 /** The selected origin's marks: the origin itself and each gateway into a
  *  remote zone, `suspect` once its peer has left something unanswered. */
@@ -181,7 +182,7 @@ interface NodeGfx {
  *  the pool stays dense and nothing is allocated. Published on the canvas as
  *  `beams`, where the audit wraps `push` and `land` to see each beam enter and
  *  land, and reads `clock`, `redraws`, `inFlight` and `due`. */
-class BeamPool {
+export class BeamPool {
   len = 0;
   /** The presentation clock, ms: every `start` is on it. */
   clock = 0;
@@ -200,8 +201,9 @@ class BeamPool {
   push(path: QuadPath, start: number, src: number, dst: number, flags: number): void {
     let i = this.len;
     if (i === BEAM_CAPACITY) {
+      // Full: the oldest landed route makes room; with none, the beam is dropped.
+      if (this.inFlight === this.len) return;
       i = this.#oldestLanded();
-      if (i < 0) return;
     } else {
       this.len += 1;
     }
@@ -245,8 +247,9 @@ class BeamPool {
     this.inFlight = 0;
   }
 
-  /** The landed route that started first, or -1 with none: the one a full pool
-   *  overwrites. A scan, paid only when the pool is full. */
+  /** The landed route that started first: the one a full pool overwrites.
+   *  Called only with at least one landed route; a scan, paid only when the
+   *  pool is full. */
   #oldestLanded(): number {
     let oldest = -1;
     for (let i = 0; i < this.len; i++) {
@@ -306,7 +309,8 @@ export class StageRenderer {
 
   // The presentation clock's drive: whether it runs freely (playing), how
   // fast, and the bound it may still run to while paused (`finish`), at the
-  // rate a fast-forward needs (0 when none).
+  // rate a fast-forward to it needs (0 when none; read only while the clock is
+  // short of the bound).
   #running = false;
   #speed = 1;
   #until = 0;
@@ -346,9 +350,9 @@ export class StageRenderer {
     }
     this.#restyle();
     this.#app.ticker.add(this.#tick, this);
-    // The beam pool, read by the design audit as Chart.svelte's `uplot` is: set
-    // once, so a frame pays nothing.
-    Object.assign(this.#app.canvas, { beams: this.#pool });
+    // The beam pool and the Graphics it is drawn into, read by the design audit
+    // as Chart.svelte's `uplot` is: set once, so a frame pays nothing.
+    Object.assign(this.#app.canvas, { beams: this.#pool, beamGfx: this.#beamGfx });
   }
 
   /** Build the renderer and attach its canvas to `container`. Async because
@@ -462,9 +466,9 @@ export class StageRenderer {
   }
 
   /** Draw the packets of `events` as beams that leave `delay` ms of
-   *  presentation clock from now. With `hold`, call `onLanded` once they have
-   *  all landed (after one flight, even if none is drawn). */
-  show(events: readonly SimEvent[], delay: number, hold: boolean): void {
+   *  presentation clock from now. With `'held'`, call `onLanded` once they
+   *  have all landed (after one flight, even if none is drawn). */
+  show(events: readonly SimEvent[], delay: number, landing: Landing): void {
     const start = this.#pool.clock + delay;
     let drawn = false;
     for (let i = 0; i < events.length; i++) {
@@ -476,18 +480,19 @@ export class StageRenderer {
       if (kind.type === 'PacketDropped') flags |= DROPPED;
       drawn = this.#beam(kind.src, kind.dst, flags, start) || drawn;
     }
-    if (!drawn && !hold) return;
+    if (!drawn && landing === 'free') return;
     const end = start + BEAM_FLIGHT_MS;
     if (end > this.#flightEnd) this.#flightEnd = end;
-    if (hold) this.#pool.due = Math.max(this.#pool.due ?? 0, end);
+    if (landing === 'held') this.#pool.due = Math.max(this.#pool.due ?? 0, end);
     this.#dirty = true;
   }
 
   /** Let the clock run, though paused, until every beam shown has landed:
-   *  at the speed with `fast` false, or within `LAND_FAST_MS` of wall time. */
-  finish(fast: boolean): void {
+   *  at the speed (`'at-speed'`) or within `LAND_FAST_MS` of wall time
+   *  (`'fast'`). */
+  finish(pace: Finish): void {
     this.#until = this.#flightEnd;
-    this.#fastRate = fast ? (this.#until - this.#pool.clock) / LAND_FAST_MS : 0;
+    this.#fastRate = pace === 'fast' ? (this.#until - this.#pool.clock) / LAND_FAST_MS : 0;
   }
 
   /** Drop every landed route: each command starts a fresh picture. */
@@ -851,7 +856,6 @@ export class StageRenderer {
     const rate = before < this.#until ? Math.max(this.#speed, this.#fastRate) : this.#speed;
     if (this.#running) pool.clock += ticker.deltaMS * rate;
     else if (before < this.#until) pool.clock = Math.min(this.#until, before + ticker.deltaMS * rate);
-    if (pool.clock >= this.#until) this.#fastRate = 0;
     if (this.#dirty || (pool.clock !== before && pool.inFlight > 0)) this.#drawBeams();
     if (pool.due !== null && pool.clock >= pool.due) {
       pool.due = null;

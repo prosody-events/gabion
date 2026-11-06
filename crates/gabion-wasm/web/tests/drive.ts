@@ -2,7 +2,7 @@
 // time, Steps by the heartbeat period, and Steps until a condition holds, with
 // deadlines in simulated time.
 
-import type { Page } from '@playwright/test';
+import type { Locator, Page } from '@playwright/test';
 import { WATCHED_KEY } from '../src/lib/presets';
 import type { Watch } from '../src/lib/sim/types';
 import timings from './phase-timings.json' with { type: 'json' };
@@ -77,10 +77,14 @@ export async function stepUntil(
   }
 }
 
-/** Set the playback speed slider (a range input can't be `fill`ed). */
-export async function setSpeed(page: Page, value: number): Promise<void> {
-  await page.getByLabel('Playback speed').evaluate((el: HTMLInputElement, v: number) => {
+/** Set range input `range` to `value`: a range input can't be `fill`ed, so set
+ *  it and fire `input`. */
+export async function setRange(range: Locator, value: number): Promise<void> {
+  await range.evaluate((el: HTMLInputElement, v: number) => {
     el.value = String(v);
     el.dispatchEvent(new Event('input', { bubbles: true }));
   }, value);
 }
+
+/** Set the playback speed slider. */
+export const setSpeed = (page: Page, value: number): Promise<void> => setRange(page.getByLabel('Playback speed'), value);

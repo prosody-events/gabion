@@ -4,7 +4,8 @@
 
 import { readFileSync } from 'node:fs';
 
-/** One generated line's segments: generated column, then source index. */
+/** One generated line's segments: generated column, then source index (-1
+ *  where unmapped). */
 type Line = { column: number; source: number }[];
 
 const maps = new Map<string, { sources: string[]; lines: Line[] }>();
@@ -37,10 +38,9 @@ function decode(mappings: string): Line[] {
         shift = 0;
       }
       column += fields[0];
-      if (fields.length >= 4) {
-        source += fields[1];
-        line.push({ column, source });
-      }
+      // A one-field segment maps nothing: the code from it on has no source.
+      if (fields.length >= 4) source += fields[1];
+      line.push({ column, source: fields.length >= 4 ? source : -1 });
     }
     lines.push(line);
   }

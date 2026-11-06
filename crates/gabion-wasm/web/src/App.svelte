@@ -421,8 +421,8 @@
    *  once while paused), and its snapshot applied. */
   async function meet(s: Sim, batch: EventBatch, delay: number): Promise<void> {
     if (activePreset.pacing === 'held' && isWave(batch)) return hold(s, batch, delay);
-    stage?.show(batch, delay, false);
-    if (!playing) stage?.finish(false);
+    stage?.show(batch, delay, 'free');
+    if (!playing) stage?.finish('at-speed');
     await refresh(s);
   }
 
@@ -436,8 +436,8 @@
     const h: Held = { seq: ++holds, landed: promise, land: resolve };
     held = h;
     floorUntil = batch.virtual_ms + floorMs;
-    const drawn = stage?.show(batch, delay, true) ?? false;
-    if (!playing) stage?.finish(false);
+    const drawn = stage?.show(batch, delay, 'held') ?? false;
+    if (!playing) stage?.finish('at-speed');
     if (!drawn) await deliver(h);
   }
 
@@ -448,7 +448,7 @@
     const s = sim;
     if (held !== h || s === null) return;
     const batch = await s.step(0);
-    stage?.show(batch, 0, false);
+    stage?.show(batch, 0, 'free');
     await refresh(s);
     held = null;
   }
@@ -467,7 +467,7 @@
     const h = held;
     if (h === null) return;
     if (stage) {
-      stage.finish(true);
+      stage.finish('fast');
       await h.landed;
     }
     await deliver(h);
@@ -508,7 +508,7 @@
       if (node === null) continue;
       const batch = await s.submitRequest(node, WATCHED_KEY, 1);
       if (activePreset.pacing === 'live') {
-        stage?.show(batch, 0, false);
+        stage?.show(batch, 0, 'free');
       } else if (isWave(batch)) {
         await hold(s, batch, 0);
         return true;
@@ -641,7 +641,7 @@
     pause();
     await run(async (s) => {
       if (held !== null) {
-        stage?.finish(false);
+        stage?.finish('at-speed');
         return;
       }
       if (await feed(s)) return;

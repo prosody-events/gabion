@@ -6,7 +6,8 @@ import { defineConfig } from '@playwright/test';
 // boots and gossips in a browser. `audit.spec.ts` is the automated design audit
 // (README "Design rules"), run at five widths in each theme with motion reduced.
 // `motion.spec.ts` checks the waves in motion, cause before effect, once at
-// 1440 px in the light theme with motion on.
+// 1440 px in the light theme with motion on (its landed-routes test also with
+// motion reduced).
 const audits = [1440, 1280, 1100, 768, 400].flatMap((width) =>
   (['light', 'dark'] as const).map((colorScheme) => ({
     name: `audit-${width}-${colorScheme}`,
