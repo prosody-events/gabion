@@ -317,9 +317,22 @@ test('back-to-back Sends each flush at once, past the emit floor', async ({ page
     };
   });
   // Clicked back to back: each Send fast-forwards the one before past its
-  // relays, so it meets no emit floor, whatever the click cadence.
+  // relays, so it meets no emit floor, whatever the click cadence. At a tenth
+  // of the speed a wave flown at the speed takes at least `slowFlightMs` of
+  // wall time (the presentation clock never outruns the wall), and three of
+  // the Sends each land the wave before theirs, so the four flush within two
+  // such flights only when each fast-forward ran fast.
+  await setSpeed(page, 0.1);
+  const slowFlightMs = BEAM_FLIGHT_MS / 0.1;
+  const clicked = Date.now();
   for (const node of [0, 1, 2, 2]) await railSend(page, node);
-  await expect.poll(() => page.evaluate(() => (window as unknown as { own: number[] }).own.length)).toBe(4);
+  await expect
+    .poll(() => page.evaluate(() => (window as unknown as { own: number[] }).own.length), {
+      message: 'the four Sends flushed within two flights at a tenth of the speed',
+      timeout: Math.max(0, clicked + 2 * slowFlightMs - Date.now()),
+    })
+    .toBe(4);
+  console.log(`four back-to-back Sends flushed in ${Date.now() - clicked} ms`);
   await still(page);
   expect(await page.evaluate(() => (window as unknown as { own: number[] }).own), 'Own packets per Send').toEqual([5, 5, 5, 5]);
   expect((await readCausality(page)).violations).toEqual([]);

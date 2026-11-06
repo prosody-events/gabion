@@ -726,6 +726,9 @@ test('the node inspector renders every detail section', async ({ page }) => {
   await expect(inspector.locator('tr.remote')).toHaveCount(2);
   await expect(inspector.locator('tr.counters')).toBeVisible();
   await expect(inspector.locator('tr.budget')).toBeVisible();
+  // Each remote row renders in full, not as its "no gateway yet" placeholder:
+  // Propagation opens warmed, node 0's gateway into each other zone found.
+  await expect(inspector.locator('tr.remote [data-field="gateway"]'), 'a gateway per remote zone').toHaveCount(2);
 
   // Identity: the collapsed footer with its hex preview, and the cells held.
   const identity = inspector.locator('details.identity');
