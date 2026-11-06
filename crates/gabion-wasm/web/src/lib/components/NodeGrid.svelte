@@ -2,7 +2,7 @@
   import { fmtCount, fmtDuration, noun, zoneLabel } from '../format';
   import type { Roles } from '../stage/renderer';
   import { HIT_MIN, type StageLayout } from '../stage/layout';
-  import type { ClusterState } from '../sim/types';
+  import { missingFor, type ClusterState } from '../sim/types';
 
   // The stage's text and keyboard alternative. The canvas is opaque to assistive
   // tech and to test tooling, so every node also exists here as a grid cell laid
@@ -77,9 +77,9 @@
           id: spot.id,
           zone: spot.zone,
           zoneName: zoneLabel(cluster.zones[spot.zone].name),
-          view: node.aggregate_total,
-          behind: Math.max(cluster.oracle_total - node.aggregate_total, 0),
-          missingFor: node.missing_for_ms,
+          view: node.window_total,
+          behind: Math.max(cluster.oracle_total - node.window_total, 0),
+          missingFor: missingFor(node.lag),
           gatewayFor: node.gateway_for,
           role,
           x: spot.x,

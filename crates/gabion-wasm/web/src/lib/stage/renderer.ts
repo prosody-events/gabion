@@ -19,7 +19,7 @@
 import { gsap } from 'gsap';
 import { Application, CanvasTextMetrics, Container, Graphics, Text, TextStyle } from 'pixi.js';
 import { zoneLabel } from '../format';
-import type { ClusterState, PacketKind, SimEvent } from '../sim/types';
+import { CARRIES_CELLS, type ClusterState, type PacketKind, type SimEvent } from '../sim/types';
 import { BEAM_ALPHA, FADED_ALPHA, type Theme } from '../theme';
 import {
   ARC_GAP,
@@ -92,15 +92,18 @@ const CONTROL = 2;
 const RELAY = 4;
 const DROPPED = 8;
 
-/** Each packet kind's flags: a control packet is a dot, a relay is the
- *  origin's own when its gateway sends it. Exhaustive, so a new kind is a type
- *  error until it is classed here, as `PacketKind::carries_cells` is in Rust. */
+/** Each packet kind's flags: a kind that carries no cells is a dot, and a
+ *  relay is the origin's own when its gateway sends it. Built from
+ *  `CARRIES_CELLS`, the mirror of `PacketKind::carries_cells`, and exhaustive,
+ *  so a new kind is a type error until it is classed. */
+const kindFlags = (kind: PacketKind): number =>
+  (CARRIES_CELLS[kind] ? 0 : CONTROL) | (kind === 'Relay' ? RELAY : 0);
 const KIND_FLAGS: Record<PacketKind, number> = {
-  Ack: CONTROL,
-  SweepRequest: CONTROL,
-  Own: 0,
-  Relay: RELAY,
-  Sweep: 0,
+  Ack: kindFlags('Ack'),
+  SweepRequest: kindFlags('SweepRequest'),
+  Own: kindFlags('Own'),
+  Relay: kindFlags('Relay'),
+  Sweep: kindFlags('Sweep'),
 };
 
 // Beam mark styles; each has a full and a faded Graphics (`style * 2 + faded`).
@@ -244,7 +247,7 @@ export class StageRenderer {
   // Whether the beam Graphics currently hold marks, so the always-on ticker
   // issues exactly one final clear when the pool drains and does nothing after.
   #beamsActive = false;
-  #lastTick = -1;
+  #lastMs = -1;
   #lastDisagreement = 0;
   // Delivered beams that landed since the last frame, coalesced so each disc
   // pulses at most once per frame: without this, several arrivals in one frame
@@ -356,15 +359,15 @@ export class StageRenderer {
    *  convergence. */
   setCluster(state: ClusterState | null): void {
     if (state === null) return;
-    // A tick that runs backward means the session was reset (a fresh sim starts
-    // at tick 0). Tear down transient state, killing in-flight beams before
+    // Time that runs backward means the session was reset (a fresh sim starts
+    // at 0). Tear down transient state, killing in-flight beams before
     // touching node graphics, so a stale tween can't animate a disc being
     // reconciled.
-    if (state.tick < this.#lastTick) {
+    if (state.virtual_ms < this.#lastMs) {
       this.#clearBeams();
       this.#lastDisagreement = 0;
     }
-    this.#lastTick = state.tick;
+    this.#lastMs = state.virtual_ms;
     this.#cluster = state;
     this.#drawArcs(state);
 
@@ -374,8 +377,8 @@ export class StageRenderer {
     let max = 0;
     let min = state.nodes.length === 0 ? 0 : Number.POSITIVE_INFINITY;
     for (const node of state.nodes) {
-      if (node.aggregate_total > max) max = node.aggregate_total;
-      if (node.aggregate_total < min) min = node.aggregate_total;
+      if (node.window_total > max) max = node.window_total;
+      if (node.window_total < min) min = node.window_total;
     }
     const disagreement = max - min;
     if (this.#lastDisagreement > 0 && disagreement === 0 && state.oracle_total > 0) {
@@ -595,7 +598,7 @@ export class StageRenderer {
     const oracle = Math.max(state.oracle_total, 1);
     for (const node of state.nodes) {
       const gfx = this.#nodes.get(node.id);
-      if (gfx !== undefined) this.#drawArc(gfx, node.aggregate_total / oracle);
+      if (gfx !== undefined) this.#drawArc(gfx, node.window_total / oracle);
     }
   }
 

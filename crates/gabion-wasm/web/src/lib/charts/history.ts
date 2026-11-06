@@ -11,7 +11,7 @@
 
 import type { ClusterState } from '../sim/types';
 
-/** Rolling-window depth: at the visualizer's tick rate, 600 samples is
+/** Rolling-window depth: at the visualizer's frame rate, 600 samples is
  *  comfortably past convergence. */
 export const HISTORY_CAP = 600;
 
@@ -39,14 +39,15 @@ export interface Mark {
   own: ReadonlyMap<number, number>;
 }
 
+/** The snapshot fields one sample reads. */
+export type Sample = Pick<ClusterState, 'virtual_ms' | 'nodes' | 'zones' | 'bytes_by_tier' | 'oracle_total'>;
+
 /** The session's start: nothing sent yet. */
 const SESSION_START: Mark = { t: 0, inData: 0, crossData: 0, own: new Map() };
 
 export class ChartHistory {
   /** x-axis: virtual milliseconds since the session began. */
   readonly times: number[] = [];
-  /** Engine tick at each sample, so "converged in N rounds" can name the round. */
-  readonly ticks: number[] = [];
   /** Ground-truth cluster total, the line every node chases. */
   readonly oracle: number[] = [];
   /** max − min of every node's view: the disagreement that decays to zero. */
@@ -59,6 +60,13 @@ export class ChartHistory {
   readonly zoneMin: (number | null)[][] = [];
   readonly zoneMax: (number | null)[][] = [];
   readonly zoneSpread: (number | null)[][] = [];
+  // The columns every sample extends and the oldest drop shortens, listed once
+  // so neither allocates the list, and each zone's least and most informed
+  // view, reused across samples.
+  readonly #scalars: unknown[][] = [this.times, this.oracle, this.disagreement, this.share];
+  readonly #zoneColumns = [this.zoneMin, this.zoneMax, this.zoneSpread];
+  readonly #min: number[] = [];
+  readonly #max: number[] = [];
   /** Per-node columns keyed by stable id, insertion-ordered. Keying by id (not
    *  rank) is what lets a join or leave thread through the existing window
    *  instead of restarting it: a join appends a back-filled column, a leave
@@ -100,7 +108,7 @@ export class ChartHistory {
    *  does not reset: `push` reshapes in place, which is the whole point: the
    *  time axis survives a join or leave. */
   reset(windowMs: number): void {
-    for (const column of [this.times, this.ticks, this.oracle, this.disagreement, this.share]) {
+    for (const column of this.#scalars) {
       column.length = 0;
     }
     this.zoneMin.length = 0;
@@ -114,20 +122,24 @@ export class ChartHistory {
   /** Append one sample from a fresh snapshot, deriving the disagreement, the
    *  per-zone spread and the share. Drops the oldest sample once the window is
    *  full so memory and redraw cost stay bounded. */
-  push(snap: ClusterState): void {
+  push(snap: Sample): void {
     const sampleIdx = this.times.length;
     const zones = snap.zones.length;
     while (this.zoneMin.length < zones) {
-      for (const columns of [this.zoneMin, this.zoneMax, this.zoneSpread]) {
+      for (const columns of this.#zoneColumns) {
         columns.push(new Array<number | null>(sampleIdx).fill(null));
       }
     }
-    const min = new Array<number>(zones).fill(Number.POSITIVE_INFINITY);
-    const max = new Array<number>(zones).fill(-1);
+    const min = this.#min;
+    const max = this.#max;
+    min.length = zones;
+    max.length = zones;
+    min.fill(Number.POSITIVE_INFINITY);
+    max.fill(-1);
     let low = Number.POSITIVE_INFINITY;
     let high = -1;
     for (const node of snap.nodes) {
-      const total = node.aggregate_total;
+      const total = node.window_total;
       min[node.zone] = Math.min(min[node.zone], total);
       max[node.zone] = Math.max(max[node.zone], total);
       low = Math.min(low, total);
@@ -156,22 +168,11 @@ export class ChartHistory {
 
     this.#commit(snap);
     this.times.push(snap.virtual_ms);
-    this.ticks.push(snap.tick);
     this.oracle.push(snap.oracle_total);
     this.disagreement.push(high < 0 ? 0 : high - low);
     this.share.push(this.#shareOf(snap));
 
     if (this.times.length > HISTORY_CAP) this.#dropOldest();
-  }
-
-  /** The round at which the cluster first agreed (disagreement hit zero on a
-   *  real total), or `null` if it has not converged yet. The seeded burst lands
-   *  at tick 0, so this tick *is* the round count. */
-  convergedRound(): number | null {
-    for (let i = 0; i < this.disagreement.length; i++) {
-      if (this.disagreement[i] === 0 && this.oracle[i] > 0) return this.ticks[i];
-    }
-    return null;
   }
 
   /** The mark the window ending at `t` is measured from: the newest mark at or
@@ -187,7 +188,7 @@ export class ChartHistory {
 
   /** σ: the share of the data bytes sent in the window ending at `snap` that
    *  crossed zones, or `null` when none were sent. */
-  #shareOf(snap: ClusterState): number | null {
+  #shareOf(snap: Sample): number | null {
     const start = this.windowStart(snap.virtual_ms);
     const cross = snap.bytes_by_tier.cross_zone.data - start.crossData;
     const total = cross + snap.bytes_by_tier.in_zone.data - start.inData;
@@ -198,7 +199,7 @@ export class ChartHistory {
    *  time has passed since the newest kept mark (measured from that kept mark,
    *  never from the snapshot before, so a fast frame rate cannot hold the ring
    *  at one mark), and drop the marks no window can start from any more. */
-  #commit(snap: ClusterState): void {
+  #commit(snap: Sample): void {
     const marks = this.#marks;
     const t = snap.virtual_ms;
     const last = marks.at(-1);
@@ -215,10 +216,10 @@ export class ChartHistory {
   }
 
   #dropOldest(): void {
-    for (const column of [this.times, this.ticks, this.oracle, this.disagreement, this.share]) {
+    for (const column of this.#scalars) {
       column.shift();
     }
-    for (const columns of [this.zoneMin, this.zoneMax, this.zoneSpread]) {
+    for (const columns of this.#zoneColumns) {
       for (const column of columns) column.shift();
     }
     for (const [id, col] of this.#columns) {

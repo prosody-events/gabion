@@ -10,8 +10,8 @@
 //     **hex strings** ("0x…"), serialized by `crate::hex`.
 //   • `Option::None` crosses as `undefined` (serde-wasm-bindgen's default), so
 //     every Option field is typed `T | undefined`, never `T | null`.
-//   • u64 counts and timestamps — `virtual_ms`, `tick`, `count`,
-//     `aggregate_total`, `oracle_total`, … — cross as JS **numbers**.
+//   • u64 counts and timestamps — `virtual_ms`, `count`, `window_total`,
+//     `oracle_total`, … — cross as JS **numbers**.
 //     serde-wasm-bindgen's `serialize_large_number_types_as_bigints` defaults
 //     to `false`, so any u64 within 2^53 is a plain number. The visualizer's
 //     hit volumes stay far below that, so `number` is exact here. If a future
@@ -55,12 +55,57 @@ export type LinkPolicyKind =
 /** Mirror of `crate::event::PacketKind`, read from the packet's header. */
 export type PacketKind = 'Ack' | 'Own' | 'Relay' | 'Sweep' | 'SweepRequest';
 
+/** Mirror of `PacketKind::carries_cells`: whether a kind streams cells (data)
+ *  rather than controlling the streams. */
+export const CARRIES_CELLS: Record<PacketKind, boolean> = {
+  Own: true,
+  Relay: true,
+  Sweep: true,
+  Ack: false,
+  SweepRequest: false,
+};
+
+/** Mirror of `crate::engine::StepUntil`: where a step stops. `'Event'` stops
+ *  before a wave of data packets lands, or where admitted hits leave the
+ *  window. */
+export type StepUntil = 'Time' | 'Event';
+
+/** Mirror of `crate::engine::Watch`: the key a snapshot reads, and the weight
+ *  of the request its inspected node's `next_send` decides. */
+export interface Watch {
+  key: number;
+  probe_hits: number;
+}
+
+/** Mirror of `crate::event::Reopens`: when a rejected request would be
+ *  admitted if sent again. */
+export type Reopens = { kind: 'In'; ms: number } | { kind: 'Never' };
+
+/** Mirror of `crate::event::Admission`: a node's decision on a whole request. */
+export type Admission =
+  | { kind: 'Admitted'; total_before: number }
+  | { kind: 'Rejected'; total: number; reopens: Reopens };
+
+/** Mirror of `crate::event::Lag`: whether a node holds every in-window change,
+ *  and if not, whether waiting can help (`Behind`) or not (`Stranded`). */
+export type Lag =
+  | { kind: 'CaughtUp' }
+  | { kind: 'Behind'; missing_for_ms: number }
+  | { kind: 'Stranded'; missing_for_ms: number };
+
+/** How long a lagging node has lacked its oldest missing change; absent while
+ *  it is caught up. */
+export function missingFor(lag: Lag): number | undefined {
+  return lag.kind === 'CaughtUp' ? undefined : lag.missing_for_ms;
+}
+
 /** Mirror of `crate::event::Tier`: whether a packet stayed inside its sender's
  *  zone, by placement. */
 export type Tier = 'InZone' | 'CrossZone';
 
 /** Mirror of `crate::event::EventKind` (serde-tagged by `type`). */
 export type EventKind =
+  | { type: 'Decided'; node: number; hits: number; admission: Admission }
   | { type: 'Tick'; node: number }
   | { type: 'ThresholdFire'; node: number }
   | { type: 'PacketSent'; src: number; dst: number; bytes: number; kind: PacketKind; tier: Tier }
@@ -73,16 +118,14 @@ export type EventKind =
 
 /** Mirror of `crate::event::Event`. */
 export interface SimEvent {
-  tick: number;
   virtual_ms: number;
   kind: EventKind;
 }
 
-/** Mirror of `crate::event::EventBatch` — the result of one step / submit. */
+/** Mirror of `crate::event::EventBatch` — the result of one engine command. */
 export interface EventBatch {
   events: SimEvent[];
   virtual_ms: number;
-  tick: number;
 }
 
 // -- Snapshot ---------------------------------------------------------------
@@ -148,9 +191,9 @@ export interface StoreStats {
 /** Mirror of `crate::event::NodeState`. `id` is the node's stable identity (see
  *  the Rust module note): assigned once, never reused, so it survives other
  *  nodes joining and leaving and has gaps once a member has been removed. The
- *  counters mirror the runtime's `AdminSnapshot`; `gateway_for`,
- *  `own_data_bytes` and `missing_for_ms` the engine counts; and `store_stats` mirrors its
- *  `CellStoreStats`. */
+ *  counters mirror the runtime's `AdminSnapshot`; the window, decision, lag,
+ *  heartbeat and hit fields the engine reads or counts; and `store_stats`
+ *  mirrors its `CellStoreStats`. */
 export interface NodeState {
   id: number;
   /** The zone the node is placed in. */
@@ -160,7 +203,18 @@ export interface NodeState {
   node_id: Hex;
   /** Incarnation — bumped on restart; always 1 in the sim. */
   incarnation: number;
-  aggregate_total: number;
+  /** gabion's `window_total` of the watched key on this node's own count
+   *  table: the number its admission reads. */
+  window_total: number;
+  /** The decision a one-hit request would get here now: `Rejected` exactly
+   *  while the node is at its limit. */
+  brim: Admission;
+  lag: Lag;
+  /** The next instant this node's heartbeat fires, in virtual ms. */
+  next_heartbeat_ms: number;
+  /** Hits this node admitted, and rejected, since it joined. */
+  admitted_hits: number;
+  rejected_hits: number;
   /** Heartbeat rounds the runtime has run. */
   rounds_heartbeat: number;
   /** Gateways replaced because they went unanswered or said they cannot relay. */
@@ -179,10 +233,6 @@ export interface NodeState {
   /** Bytes of the node's own-stream packets it has sent since it joined,
    *  delivered or lost. */
   own_data_bytes: number;
-  /** How long ago the origin of the oldest change the node lacks last updated
-   *  that change's cell: a lower bound on how long it has been behind.
-   *  Absent while it holds every change. */
-  missing_for_ms: number | undefined;
   /** Per-rule error budget ε at the most recent request; pending crossing it
    *  triggers an eager (threshold) flush. 0 until a request is seen. */
   error_budget: number;
@@ -195,6 +245,9 @@ export interface Inspected {
   id: number;
   cells: CellView[];
   peers: PeerView[];
+  /** The decision this node would make now on a request of the watch's
+   *  `probe_hits`. */
+  next_send: Admission;
 }
 
 /** Mirror of `crate::event::ZoneView`: a zone and its live members. */
@@ -221,7 +274,6 @@ export interface BytesByTier {
  *  ground truth. */
 export interface ClusterState {
   virtual_ms: number;
-  tick: number;
   nodes: NodeState[];
   /** The rows of the node the snapshot was taken inspecting; absent when none
    *  was, or it is not live. */
@@ -229,9 +281,23 @@ export interface ClusterState {
   /** Every zone in index order, with its live members. */
   zones: ZoneView[];
   bytes_by_tier: BytesByTier;
+  /** The watched key's hits in the window, summed over every node's own
+   *  cells. */
   oracle_total: number;
-  /** The bucket epoch the watched rule sits in at `virtual_ms`, from the CRDT's
-   *  `RuleDescriptor::current_epoch`. The Strata right-anchors its fixed-width
-   *  grid on this epoch rather than recomputing the boundary in TS. */
+  /** `oracle_total` by live bucket, oldest first; its length is the window's
+   *  bucket count. */
+  oracle_buckets: number[];
+  /** Every node's count in each live bucket, oldest first, row by row in
+   *  `nodes` order. */
+  window_buckets: number[];
+  /** Hits the cluster admitted, and rejected, since the session began. */
+  admitted_hits: number;
+  rejected_hits: number;
+  /** The next instant admitted hits leave the window; absent when none are in
+   *  it. */
+  next_expiry_ms: number | undefined;
+  /** The bucket epoch the watched rule sits in at `virtual_ms`, from
+   *  `RuleSpec::bucket_at`. The Strata right-anchors its fixed-width grid on
+   *  this epoch rather than recomputing the boundary in TS. */
   bucket_epoch_now: number;
 }

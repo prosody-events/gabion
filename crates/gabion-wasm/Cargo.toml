@@ -33,6 +33,7 @@ wasm-bindgen-futures.workspace = true
 serde-wasm-bindgen.workspace = true
 
 [dev-dependencies]
+quickcheck.workspace = true
 serde_json.workspace = true
 
 # wasm-pack's release build runs wasm-opt `-Oz` (aggressive size) over the whole

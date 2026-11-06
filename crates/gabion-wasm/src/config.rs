@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use gabion::crdt::{RuleDescriptor, ValidStorageConfig};
 use gabion::defaults;
-use gabion::rules::{EnforcementMode, RuleDef, RuleError, RuleTable};
+use gabion::rules::{EnforcementMode, RuleDef, RuleError, RuleSpec, RuleTable};
 use gabion::settings::{Setting, SettingError, Settings};
 use gabion::zone::ZoneName;
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,17 @@ pub const MAX_NODES: usize = 256;
 /// Most zones the visualizer places nodes in; production regions usually have
 /// three to six.
 pub const MAX_ZONES: usize = 6;
+
+/// Keys each node's count table holds at once without crowding. The
+/// visualizer watches one key; the table keeps one cell per key per live
+/// bucket plus the one emerging, times `SLACK`. A fifth key live at the same
+/// moment can crowd the table, and its hits then go uncounted there: the
+/// library's `aggregate_full` drop, which gabion counts and logs.
+pub const AGGREGATE_KEYS: u32 = 4;
+
+/// Headroom over each exact working set, absorbing churn and the bucket just
+/// emerging under "now": the one knob for every size [`SimConfig`] derives.
+const SLACK: u32 = 2;
 
 /// Zone index `i` is `ZONE_NAMES[i]`.
 pub const ZONE_NAMES: [&str; MAX_ZONES] =
@@ -127,11 +138,13 @@ pub struct ValidSimConfig {
     /// Every node's settings, before its gossip bind and static peers.
     pub(crate) settings: Settings,
     pub(crate) storage: ValidStorageConfig,
+    /// Every node's count table, sized for [`AGGREGATE_KEYS`] keys rather
+    /// than for the cell store's every replica.
+    pub(crate) aggregate: ValidStorageConfig,
     /// The watched rule, which every node interns at construction.
     pub(crate) rules: RuleTable,
-    /// That rule as the cell store holds it: its fingerprint, limit and
-    /// epoch math.
-    pub(crate) rule: RuleDescriptor,
+    /// That rule as admission reads it: its fingerprint, limit and window.
+    pub(crate) spec: RuleSpec,
     /// Every zone's name, parsed and hashed once.
     pub(crate) zone_names: Box<[ZoneName]>,
 }
@@ -155,6 +168,7 @@ impl SimConfig {
         }
         let settings = self.settings()?;
         let (_, storage) = settings.validate()?;
+        let (_, aggregate) = self.aggregate_settings(&settings)?.validate()?;
         let rule = RuleDef {
             name: "watched",
             domain: "viz",
@@ -165,8 +179,10 @@ impl SimConfig {
             mode: EnforcementMode::Enforce,
         }
         .build(&storage.cardinality)?;
-        let descriptor = rule.descriptor();
         let rules = RuleTable::new(Box::new([rule]), storage.rule_dictionary_capacity())?;
+        // The table was built from a one-element array on the line above, so
+        // it holds exactly one rule: a constant shape, like `ZONE_NAMES`.
+        let spec = rules.rules()[0].spec();
         // The input is the compile-time `ZONE_NAMES` table, the
         // constant-input exception CLAUDE.md allows (as for `stable_hasher`'s
         // secret); `built_in_zone_names_are_valid_and_hash_apart` pins it.
@@ -178,10 +194,35 @@ impl SimConfig {
             config: self,
             settings,
             storage,
+            aggregate,
             rules,
-            rule: descriptor,
+            spec,
             zone_names,
         })
+    }
+
+    /// Each origin's cells of one key: its live buckets plus the one emerging.
+    fn per_origin(&self) -> u32 {
+        RuleDescriptor {
+            window_millis: self.rule_window_ms,
+            bucket_millis: self.rule_bucket_ms,
+            ..RuleDescriptor::default()
+        }
+        .live_buckets()
+            + 1
+    }
+
+    /// The node settings with the cell budget of one count table:
+    /// [`AGGREGATE_KEYS`] keys of [`Self::per_origin`] cells, times [`SLACK`].
+    /// Built from the cell store's settings, the table would hold a slot per
+    /// replica of every origin, 1 MiB a node.
+    fn aggregate_settings(&self, node: &Settings) -> Result<Settings, ConfigError> {
+        let cells = AGGREGATE_KEYS
+            .saturating_mul(self.per_origin())
+            .saturating_mul(SLACK);
+        let mut settings = node.clone();
+        settings.apply(Setting::StorageMaxCells, &cells.to_string())?;
+        Ok(settings)
     }
 
     /// The node settings for this session: the controls' gossip tuning and
@@ -209,24 +250,13 @@ impl SimConfig {
     /// eviction; if a probe ever fills the store, raise `SLACK` here — the
     /// one place — not a scattered floor.
     pub fn settings(&self) -> Result<Settings, ConfigError> {
-        // Headroom over the exact working set, absorbing churn and the bucket
-        // just emerging under "now". One knob for the whole sizing.
-        const SLACK: u32 = 2;
         // The ceiling the cluster can grow to (see the doc note) — not
         // `self.nodes`, which is only the *initial* member count.
         let ceiling = MAX_NODES as u32;
-        // Each origin contributes its `live_buckets` cells plus the one
-        // emerging. A node holds a replica of every origin's set, so the cell
-        // store scales with `ceiling × per_origin`.
-        let live_buckets = RuleDescriptor {
-            window_millis: self.rule_window_ms,
-            bucket_millis: self.rule_bucket_ms,
-            ..RuleDescriptor::default()
-        }
-        .live_buckets();
-        let per_origin = live_buckets + 1;
+        // A node holds a replica of every origin's set, so the cell store
+        // scales with `ceiling × per_origin`.
         let cross_node = ceiling
-            .saturating_mul(per_origin)
+            .saturating_mul(self.per_origin())
             .saturating_mul(SLACK)
             .max(SLACK);
         let mut settings = Settings::default();

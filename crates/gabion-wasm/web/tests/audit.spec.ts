@@ -1,7 +1,7 @@
 import { inflateSync } from 'node:zlib';
 import { expect, test, type Locator, type Page } from '@playwright/test';
 import { ChartHistory } from '../src/lib/charts/history';
-import type { ClusterState, PacketKind, Tier } from '../src/lib/sim/types';
+import { missingFor, type ClusterState, type PacketKind, type Tier } from '../src/lib/sim/types';
 import {
   ARC_GAP,
   ARC_WIDTH,
@@ -14,6 +14,7 @@ import {
   type Spot,
 } from '../src/lib/stage/layout';
 import { BAND_ALPHA, BEAM_ALPHA, readTheme, type Theme } from '../src/lib/theme';
+import { WATCH, step, stepUntil } from './drive';
 
 // The automated half of the audit checklist in `../README.md` ("Design rules"):
 // A1 to A9. Each audit project fixes a width and a colour scheme; the main test
@@ -46,20 +47,12 @@ const duration = (ms: number): string => {
 // -- Page helpers --------------------------------------------------------------
 
 const cell = (page: Page, id: number): Locator => page.locator(`[role="gridcell"][data-node="${id}"]`);
-const tick = (page: Page): Locator => page.locator('[data-field="tick"]');
 const field = (page: Page, name: string): Locator => page.locator(`[data-field="${name}"]`);
 
 /** The page's engine, snapshotted: every node's state, or with `inspect` that
  *  node's rows too. */
 const snapshot = (page: Page, inspect: number | null = null): Promise<ClusterState> =>
-  page.evaluate((id) => window.sim!.snapshot(id), inspect);
-
-/** One Step, returning once its snapshot is on the page (the tick readout moved). */
-async function step(page: Page): Promise<void> {
-  const before = Number(await tick(page).textContent());
-  await page.getByRole('button', { name: 'Step forward one tick' }).click();
-  await expect(tick(page)).toHaveText(String(before + 1));
-}
+  page.evaluate(([id, watch]) => window.sim!.snapshot(id, watch), [inspect, WATCH] as const);
 
 /** Load the page, wait for the stage, and open the rail where it folds away. */
 async function open(page: Page): Promise<Locator> {
@@ -130,9 +123,6 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
   for (const name of names) {
     await loadPreset(page, name);
     await expect(canvas).toBeVisible();
-    // The gateway presets warm up before they open, so the tick after load is
-    // read, not assumed.
-    const loaded = Number(await tick(page).textContent());
     // Sandbox opens empty: a burst by hand at node 0 gives its converged pass
     // something to converge on, with no feed to make it nondeterministic.
     if (name === 'Sandbox') await page.locator('.rail').getByRole('button', { name: 'Send burst' }).click();
@@ -142,9 +132,9 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
       await step(page);
       series.push(await snapshot(page));
     }
-    await expect(tick(page), 'tick advanced by STEPS from its value after load').toHaveText(
-      String(loaded + STEPS),
-    );
+    const advanced = series.slice(1).map((snap, i) => snap.virtual_ms - series[i].virtual_ms);
+    expect(new Set(advanced).size, `${name}: every Step advanced simulated time alike`).toBe(1);
+    expect(advanced[0], `${name}: a Step advanced simulated time`).toBeGreaterThan(0);
     converged += await page.locator('.headline.converged').count();
     charted += await page.locator('.plot').count();
     inspected += await page.locator('.inspector').count();
@@ -243,7 +233,8 @@ async function checkTooltips(page: Page, where: string): Promise<void> {
     if (tip === null) continue;
     // A4, rule 12: a node that lacks a change says how long, at least.
     const id = Number(await text(tooltip.locator('[data-field="node"]')));
-    const missing = (await snapshot(page)).nodes.find((n) => n.id === id)?.missing_for_ms;
+    const node = (await snapshot(page)).nodes.find((n) => n.id === id);
+    const missing = node === undefined ? undefined : missingFor(node.lag);
     const printed = tooltip.locator('[data-field="missing-for"]');
     if (missing === undefined) await expect(printed, `${where}: node ${id} lacks nothing`).toHaveCount(0);
     else await expect(printed, `${where}: node ${id} not caught up`).toHaveText(duration(missing));
@@ -317,8 +308,8 @@ function predictions(series: ClusterState[]): { zones: number; nozone: number } 
 }
 
 /** The spread of the views of `nodes`: most informed minus least. */
-const spread = (nodes: { aggregate_total: number }[]): number =>
-  Math.max(...nodes.map((n) => n.aggregate_total)) - Math.min(...nodes.map((n) => n.aggregate_total));
+const spread = (nodes: { window_total: number }[]): number =>
+  Math.max(...nodes.map((n) => n.window_total)) - Math.min(...nodes.map((n) => n.window_total));
 
 const text = async (locator: Locator): Promise<string> => ((await locator.textContent()) ?? '').trim();
 
@@ -344,7 +335,7 @@ async function checkData(page: Page, name: string, series: ClusterState[]): Prom
   // node has lacked a change, at least, as a censored "≥".
   let longest: number | undefined;
   for (const node of nodes) {
-    const t = node.missing_for_ms;
+    const t = missingFor(node.lag);
     if (t !== undefined && (longest === undefined || t > longest)) longest = t;
   }
   const hero = page.locator('.headline [data-field="missing-for"]');
@@ -366,10 +357,10 @@ async function checkData(page: Page, name: string, series: ClusterState[]): Prom
   for (const node of nodes) {
     const row = page.locator(`.node-table tr[data-node="${node.id}"]`);
     await expect(row.locator('[data-field="view"]'), `${where}: node ${node.id} view`).toHaveText(
-      int(node.aggregate_total),
+      int(node.window_total),
     );
     await expect(row.locator('[data-field="behind"]'), `${where}: node ${node.id} behind`).toHaveText(
-      int(Math.max(oracle - node.aggregate_total, 0)),
+      int(Math.max(oracle - node.window_total, 0)),
     );
     const want = gatewayFor.get(node.id) ?? 0;
     const printed = row.locator('[data-field="gateway-for"]');
@@ -898,12 +889,10 @@ test('the share window holds at any snapshot rate', async ({}, info) => {
       crossData += stepMs * cross;
       history.push({
         virtual_ms: t,
-        tick: Math.floor(t / 500),
         nodes: [],
         zones: [{ name: 'zone-a', live: 0 }],
         bytes_by_tier: { in_zone: { data: inData, control: 0 }, cross_zone: { data: crossData, control: 0 } },
         oracle_total: 0,
-        bucket_epoch_now: 0,
       });
     }
     expect(history.share.at(-1), `σ at ${stepMs} ms snapshots`).toBeCloseTo(0.1, 9);
@@ -1025,46 +1014,48 @@ test('stage geometry holds for every zone count', async ({ page }, info) => {
 
     // Every beam the renderer drew bends through the centre exactly when its
     // nodes' zones differ. The zones come from the grid rows, the engine's
-    // truth, never from the renderer's own flags. A Step can reflow the page and
-    // move the stage's centre, so only the beams a Step drew are read, against
-    // the centre the renderer published throughout it; a Step that moved the
-    // centre is stepped past.
-    const drawn = (since: number) =>
-      page.locator('.stage canvas').evaluate(
-        (
-          c: HTMLCanvasElement & {
-            beams?: { len: number; start: Float64Array; src: Int32Array; dst: Int32Array; route: Float32Array };
-          },
-          since: number,
-        ) => {
-          const pool = c.beams;
-          if (pool === undefined) throw new Error('the stage publishes no beam pool');
-          const beams = Array.from({ length: pool.len }, (_, i) => ({
-            start: pool.start[i],
-            src: pool.src[i],
-            dst: pool.dst[i],
-            route: Array.from(pool.route.subarray(i * 6, i * 6 + 6)),
-          }));
-          return { centre: c.dataset.centre ?? '', beams: beams.filter((b) => b.start >= since) };
-        },
-        since,
-      );
+    // truth, never from the renderer's own flags. Each beam is recorded as it
+    // enters the pool, with its route and the centre the renderer published at
+    // that moment, so neither a beam that has already faded nor a Step that
+    // reflowed the stage can hide or skew one.
+    type Drawn = { src: number; dst: number; route: number[]; centre: string };
+    await page.locator('.stage canvas').evaluate((c: HTMLCanvasElement) => {
+      type Push = (path: QuadPath, start: number, src: number, dst: number, flags: number) => void;
+      const canvas = c as HTMLCanvasElement & {
+        beams?: { push: Push; recorded?: boolean };
+        drawn?: Drawn[];
+      };
+      const pool = canvas.beams;
+      if (pool === undefined) throw new Error('the stage publishes no beam pool');
+      canvas.drawn = [];
+      if (pool.recorded === true) return;
+      pool.recorded = true;
+      const push = pool.push.bind(pool);
+      pool.push = (path, start, src, dst, flags) => {
+        const { from, control, to } = path;
+        canvas.drawn?.push({
+          src,
+          dst,
+          route: [from.x, from.y, control.x, control.y, to.x, to.y],
+          centre: canvas.dataset.centre ?? '',
+        });
+        push(path, start, src, dst, flags);
+      };
+    });
+    const drawn = (): Promise<Drawn[]> =>
+      page
+        .locator('.stage canvas')
+        .evaluate((c: HTMLCanvasElement & { drawn?: Drawn[] }) => c.drawn ?? []);
     const zoneOf = new Map(spots.map((s) => [s.id, s.zone]));
     const crosses = (b: { src: number; dst: number }): boolean => zoneOf.get(b.src) !== zoneOf.get(b.dst);
-    let beams: { src: number; dst: number; route: number[] }[] = [];
-    let centre: Point = stage.centre;
-    for (let i = 0; i < 10 && !beams.some(crosses); i++) {
-      const before = await page
-        .locator('.stage canvas')
-        .evaluate((c: HTMLCanvasElement) => ({ centre: c.dataset.centre ?? '', since: performance.now() }));
-      await step(page);
-      const after = await drawn(before.since);
-      beams = after.centre === before.centre ? after.beams : [];
-      centre = JSON.parse(after.centre) as Point;
-    }
-    expect(beams.some(crosses), `${where}: a Step drew a cross-zone beam`).toBe(true);
+    // Forty Steps are twenty seconds of simulated time, two windows of the
+    // scenario's feed of 3 hits/s: a deadline in simulated time, not in wall
+    // time.
+    await stepUntil(page, async () => (await drawn()).some(crosses), 40, `${where}: a Step drew a cross-zone beam`);
+    const beams = await drawn();
     for (const b of beams) {
       const [fx, fy, cx, cy, tx, ty] = b.route;
+      const centre = JSON.parse(b.centre) as Point;
       const want = crosses(b) ? centre : { x: (fx + tx) / 2, y: (fy + ty) / 2 };
       expect(
         Math.hypot(cx - want.x, cy - want.y),

@@ -4,7 +4,7 @@
 // boundary results with the contracts declared in `types.ts`.
 
 import init, { Sim as WasmSim, default_config, max_zones } from '../../wasm/gabion_wasm.js';
-import type { ClusterState, EventBatch, LinkPolicyKind, SimConfig } from './types';
+import type { ClusterState, EventBatch, LinkPolicyKind, SimConfig, StepUntil, Watch } from './types';
 
 let initPromise: Promise<unknown> | null = null;
 
@@ -25,10 +25,10 @@ let boundaryChecked = false;
 function assertBoundary(batch: EventBatch): void {
   if (boundaryChecked) return;
   boundaryChecked = true;
-  if (typeof batch.virtual_ms !== 'number' || typeof batch.tick !== 'number') {
+  if (typeof batch.virtual_ms !== 'number') {
     throw new TypeError(
       `wasm boundary contract broken: expected u64 fields as JS numbers, got ` +
-        `virtual_ms=${typeof batch.virtual_ms}, tick=${typeof batch.tick}. ` +
+        `virtual_ms=${typeof batch.virtual_ms}. ` +
         `Update web/src/lib/sim/types.ts (and the serializer in the Rust crate).`,
     );
   }
@@ -72,16 +72,19 @@ export class Sim {
     return max_zones();
   }
 
-  /** Inject `hits` requests for `key` at `node`, at the current virtual time. */
+  /** A request of `hits` for `key` at `node`, at the current virtual time: the
+   *  node decides it first (the batch's `Decided` event), and an admitted
+   *  request's eager-flush packets land at the next engine call. */
   async submitRequest(node: number, key: number, hits: number): Promise<EventBatch> {
     const batch = (await this.#inner.submit_request(node, BigInt(key), BigInt(hits))) as EventBatch;
     assertBoundary(batch);
     return batch;
   }
 
-  /** Advance virtual time by `deltaMs`, resolving to the events produced. */
-  async step(deltaMs: number): Promise<EventBatch> {
-    const batch = (await this.#inner.step(BigInt(deltaMs))) as EventBatch;
+  /** Advance virtual time by at most `deltaMs`, stopping where `until` says,
+   *  resolving to the events produced. */
+  async step(deltaMs: number, until: StepUntil = 'Time'): Promise<EventBatch> {
+    const batch = (await this.#inner.step(BigInt(deltaMs), until)) as EventBatch;
     assertBoundary(batch);
     return batch;
   }
@@ -93,10 +96,14 @@ export class Sim {
     return batch;
   }
 
-  /** Pull every node's state for a re-render, with the cells and peer rows of
-   *  node `inspect` alone. */
-  async snapshot(inspect: number | null): Promise<ClusterState> {
-    return (await this.#inner.snapshot(inspect)) as ClusterState;
+  /** Pull every node's state of `watch.key` for a re-render, with the cells,
+   *  peer rows and next-send decision of node `inspect` alone. */
+  async snapshot(inspect: number | null, watch: Watch): Promise<ClusterState> {
+    return (await this.#inner.snapshot(
+      inspect,
+      BigInt(watch.key),
+      BigInt(watch.probe_hits),
+    )) as ClusterState;
   }
 
   /** Install a directed link policy between two nodes. */
@@ -120,7 +127,8 @@ export class Sim {
     this.#cut = null;
   }
 
-  /** Restore every directed link to lossless `Pass`. */
+  /** Restore the configured network on every link, the scenario's loss
+   *  included. */
   async heal(): Promise<void> {
     await this.#inner.heal();
     this.#blocked.clear();

@@ -4,10 +4,10 @@
 //! array position): the id is assigned once when the node joins and never
 //! reused, so it survives other nodes joining and leaving without renumbering.
 //! Ids therefore have gaps once a node has been removed — a gap *is* the honest
-//! record that a member left. Every [`Event`] carries the `tick` and
-//! `virtual_ms` at which the engine observed it, so the frontend can place it
-//! on a shared timeline and scrub. `u128` identifiers serialize as hex strings
-//! (see `crate::hex`).
+//! record that a member left. Every [`Event`] carries the `virtual_ms` at
+//! which the engine observed it, so the frontend can place it on a shared
+//! timeline and scrub. `u128` identifiers serialize as hex strings (see
+//! `crate::hex`).
 
 use gabion::gossip::{AnswerState, Role};
 use gabion::wire::{CellPayload, Payload};
@@ -19,8 +19,6 @@ use crate::hex::{option_u128_hex, u128_hex};
 /// `{ "type": … }`-tagged payload so the frontend can switch on it directly.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Event {
-    /// Gossip-tick index (`virtual_ms / tick_interval_ms`) the event fell in.
-    pub tick: u64,
     /// Virtual time, in milliseconds since the session began.
     pub virtual_ms: u64,
     pub kind: EventKind,
@@ -29,17 +27,25 @@ pub struct Event {
 /// The event payloads. Cell events mirror the CRDT `DeltaSink` /
 /// `ExpirationSink` rows; packet events come from the logging transport;
 /// tick, threshold and gateway events come from diffing each runtime's
-/// counters.
+/// counters; a decision comes from the request's node.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "type")]
 pub enum EventKind {
+    /// `node` decided a request of `hits` against its own count table: the
+    /// first event of every request's batch.
+    Decided {
+        node: u32,
+        hits: u64,
+        admission: Admission,
+    },
     /// A heartbeat round ran on `node`.
     Tick { node: u32 },
     /// A threshold round ran on `node`.
     ThresholdFire { node: u32 },
-    /// `src` enqueued a packet of `kind` bound for `dst`; it will be
-    /// delivered. `tier` is by placement, never by the zone either node
-    /// reports.
+    /// `src` enqueued a packet of `kind` bound for `dst`, and the router
+    /// accepted it: it lands at the end of its sub-step, which may be the
+    /// next engine call. `tier` is by placement, never by the zone either
+    /// node reports.
     PacketSent {
         src: u32,
         dst: u32,
@@ -113,7 +119,7 @@ impl PacketKind {
     /// Whether the kind streams cells (data) rather than controlling the
     /// streams (control). Classed by kind alone, so a closing packet or an
     /// empty sweep page counts as data even when it holds no cell.
-    fn carries_cells(self) -> bool {
+    pub(crate) fn carries_cells(self) -> bool {
         match self {
             Self::Own | Self::Relay | Self::Sweep => true,
             Self::Ack | Self::SweepRequest => false,
@@ -151,15 +157,56 @@ impl Tier {
     }
 }
 
-/// The events produced by one `step` / `submit_request` / `step_to` call,
-/// plus the virtual time the engine reached.
+/// The events one engine command produced, plus the virtual time the engine
+/// reached. A command that returns no batch leaves its events for the next.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct EventBatch {
     pub events: Vec<Event>,
     /// Virtual time after this batch, in milliseconds.
     pub virtual_ms: u64,
-    /// Gossip-tick index after this batch.
-    pub tick: u64,
+}
+
+/// A node's decision on a request, made whole by its weight against the
+/// node's own window, as gabion's adapters decide.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind")]
+pub enum Admission {
+    /// Counted: the window held `total_before`, and the request fits under
+    /// the limit on top of it.
+    Admitted { total_before: u64 },
+    /// Refused whole, counted nowhere: the window holds `total`, and the
+    /// request would pass the limit.
+    Rejected { total: u64, reopens: Reopens },
+}
+
+/// When a rejected request would be admitted if sent again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind")]
+pub enum Reopens {
+    /// In `ms`, once enough of the window's oldest hits leave it.
+    In { ms: u64 },
+    /// Never: the request alone is heavier than the limit (`hits > limit`).
+    Never,
+}
+
+/// Whether a node holds every in-window change the cluster has made.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind")]
+pub enum Lag {
+    CaughtUp,
+    /// It lacks a change that some holder can still reach it with, over
+    /// links that do not block: waiting can help. `missing_for_ms` is how
+    /// long ago the origin of the oldest change it lacks last updated that
+    /// change's cell, a lower bound on how long it has been behind.
+    Behind {
+        missing_for_ms: u64,
+    },
+    /// No node that holds a change it lacks has a path of links into it that
+    /// do not block, so waiting cannot help. `missing_for_ms` as for
+    /// `Behind`.
+    Stranded {
+        missing_for_ms: u64,
+    },
 }
 
 /// Per-node cluster state, pulled every frame. Only the inspected node's cells
@@ -168,7 +215,6 @@ pub struct EventBatch {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ClusterState {
     pub virtual_ms: u64,
-    pub tick: u64,
     pub nodes: Vec<NodeState>,
     /// The inspected node's rows; `None` when no node is inspected or the
     /// inspected id is not live.
@@ -179,15 +225,29 @@ pub struct ClusterState {
     /// or lost, by tier and class.
     pub bytes_by_tier: BytesByTier,
     /// The ground-truth cluster total for the watched key — the
-    /// simulator-only oracle the convergence fan races toward. Summed across
-    /// every node's locally-originated *live* cells, so it is independent of
-    /// how far gossip has propagated and decays with the window as buckets
-    /// age out (it is not a monotonic accumulator).
+    /// simulator-only oracle the convergence fan races toward. Summed over
+    /// every origin's own cells of the watched key whose bucket lies in the
+    /// window, so it is independent of how far gossip has propagated and
+    /// drops a bucket at the instant every node's `window_total` does.
     pub oracle_total: u64,
-    /// The bucket epoch the watched rule sits in at `virtual_ms`, straight from
-    /// `RuleDescriptor::current_epoch` — so the Strata renders the CRDT's
-    /// window layout rather than recomputing it. Rule-global in v1 (one
-    /// watched rule); moves per-rule in the v1.1 multi-rule shape.
+    /// `oracle_total` by live bucket, oldest first: one entry per bucket of
+    /// the window.
+    pub oracle_buckets: Vec<u64>,
+    /// Every node's count of the watched key in each live bucket, oldest
+    /// first, row by row in `nodes` order: `nodes.len() × oracle_buckets.len()`
+    /// entries.
+    pub window_buckets: Vec<u64>,
+    /// Hits the cluster admitted since the session began, never decremented,
+    /// so a removal cannot make it fall.
+    pub admitted_hits: u64,
+    /// Hits the cluster rejected since the session began, likewise.
+    pub rejected_hits: u64,
+    /// The next instant admitted hits leave the window, if any are in it.
+    pub next_expiry_ms: Option<u64>,
+    /// The bucket epoch the watched rule sits in at `virtual_ms`, straight
+    /// from `RuleSpec::bucket_at` — so the Strata renders the CRDT's window
+    /// layout rather than recomputing it. Rule-global in v1 (one watched
+    /// rule); moves per-rule in the v1.1 multi-rule shape.
     pub bucket_epoch_now: u32,
 }
 
@@ -199,6 +259,9 @@ pub struct Inspected {
     pub id: u32,
     pub cells: Vec<CellView>,
     pub peers: Vec<PeerView>,
+    /// The decision this node would make now on a request of the watched
+    /// probe's weight.
+    pub next_send: Admission,
 }
 
 /// One zone and how many live nodes are placed in it.
@@ -240,8 +303,8 @@ impl BytesByTier {
 }
 
 /// One node's view at snapshot time. The counters mirror the runtime's
-/// [`AdminSnapshot`](gabion::gossip::AdminSnapshot); `gateway_for`,
-/// `own_data_bytes` and `missing_for_ms` the engine counts; and `store_stats`
+/// [`AdminSnapshot`](gabion::gossip::AdminSnapshot); the window, decision,
+/// lag, heartbeat and hit fields the engine reads or counts; and `store_stats`
 /// mirrors its [`CellStoreStats`](gabion::crdt::CellStoreStats). The node
 /// inspector renders them directly: see `GossipTargets.svelte` and
 /// `NodeInspector.svelte` in `web/src/lib/components`.
@@ -260,9 +323,21 @@ pub struct NodeState {
     /// stale alias. Always 1 in the sim (no restart path), shown to teach the
     /// concept.
     pub incarnation: u32,
-    /// This node's cluster-aggregate total across all cells (what its local
-    /// admission decision reads).
-    pub aggregate_total: u64,
+    /// gabion's `window_total` of the watched key on this node's own count
+    /// table: the number its admission reads.
+    pub window_total: u64,
+    /// The decision a one-hit request would get here now: `Rejected` exactly
+    /// while the node is at its limit.
+    pub brim: Admission,
+    /// Whether the node holds every in-window change, and if not, whether
+    /// waiting can help.
+    pub lag: Lag,
+    /// The next instant this node's heartbeat fires, in virtual ms.
+    pub next_heartbeat_ms: u64,
+    /// Hits this node admitted since it joined.
+    pub admitted_hits: u64,
+    /// Hits this node rejected since it joined.
+    pub rejected_hits: u64,
     /// Heartbeat rounds this runtime has run.
     pub rounds_heartbeat: u64,
     /// Gateways replaced because they went unanswered for `suspect_after` or
@@ -282,10 +357,6 @@ pub struct NodeState {
     /// Bytes of the node's own-stream (`Own`) packets it has sent since it
     /// joined, delivered or lost.
     pub own_data_bytes: u64,
-    /// How long ago the origin of the oldest change this node does not yet
-    /// hold last updated that change's cell: a lower bound on how long the
-    /// node has been behind. `None` while it holds every change.
-    pub missing_for_ms: Option<u64>,
     /// The per-rule error budget ε at the most recent request: a rule's pending
     /// hits crossing it triggers an eager (threshold) flush. `0` until seen.
     pub error_budget: u64,

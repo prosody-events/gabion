@@ -16,13 +16,24 @@ use tokio::runtime::Builder;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::LocalSet;
 
-use super::{Command, EngineError, EngineState, LinkPolicyKind, VIZ_ROUTER_CAPACITY, run_engine};
+use super::{Command, EngineError, EngineState, LinkPolicyKind, StepUntil, Watch, run_engine};
 use crate::config::{MAX_NODES, SimConfig, ZoneMode};
 use crate::event::{
-    CellView, ClusterState, Event, EventBatch, EventKind, Inspected, PacketKind, PeerView, Tier,
+    Admission, CellView, ClusterState, Event, EventBatch, EventKind, Inspected, Lag, PacketKind,
+    PeerView, Reopens, Tier,
 };
 
+mod admission;
+mod deferral;
+mod phases;
+mod window;
+
 const WATCHED_KEY: u128 = 0x1;
+/// The snapshot's watch: the watched key, decided for one hit.
+const WATCH: Watch = Watch {
+    key: WATCHED_KEY,
+    probe_hits: 1,
+};
 
 /// The heartbeat interval of [`test_config`].
 const T: u64 = 100;
@@ -79,7 +90,13 @@ where
 
 async fn step(tx: &mpsc::Sender<Command>, delta_ms: u64) -> EventBatch {
     let (reply, rx) = oneshot::channel();
-    tx.send(Command::Step { delta_ms, reply }).await.unwrap();
+    tx.send(Command::Step {
+        delta_ms,
+        until: StepUntil::Time,
+        reply,
+    })
+    .await
+    .unwrap();
     rx.await.unwrap()
 }
 
@@ -102,7 +119,13 @@ async fn snapshot(tx: &mpsc::Sender<Command>) -> ClusterState {
 
 async fn snapshot_inspecting(tx: &mpsc::Sender<Command>, inspect: Option<u32>) -> ClusterState {
     let (reply, rx) = oneshot::channel();
-    tx.send(Command::Snapshot { inspect, reply }).await.unwrap();
+    tx.send(Command::Snapshot {
+        inspect,
+        watch: WATCH,
+        reply,
+    })
+    .await
+    .unwrap();
     rx.await.unwrap()
 }
 
@@ -145,25 +168,26 @@ fn node_ids(state: &ClusterState) -> Vec<u32> {
     state.nodes.iter().map(|n| n.id).collect()
 }
 
-/// A spawned engine survives many `step` commands, with the gossip
-/// tick index and per-node `rounds_heartbeat` accumulating monotonically.
+/// A spawned engine survives many `step` commands, and every node runs one
+/// heartbeat per period at its own phase: every phase is under `T`, so each
+/// node has exactly 25 due instants in `(0, 2500]`.
 #[test]
-fn engine_accumulates_ticks_across_many_steps() {
+fn every_node_runs_one_heartbeat_per_period() {
     with_engine(test_config(2), |tx| async move {
-        let mut last_tick = 0;
         for _ in 0..5 {
-            let batch = step(&tx, 500).await; // 5 ticks at 100 ms each
-            assert!(batch.tick >= last_tick, "tick index must not go backward");
-            last_tick = batch.tick;
+            step(&tx, 500).await;
         }
-        assert_eq!(last_tick, 25, "2500 ms at 100 ms/tick is 25 ticks");
-
         let state = snapshot(&tx).await;
         assert_eq!(state.nodes.len(), 2);
         assert_eq!(state.virtual_ms, 2_500);
         assert!(
-            state.nodes.iter().all(|n| n.rounds_heartbeat > 0),
-            "every runtime should have fired heartbeat ticks"
+            state.nodes.iter().all(|n| n.rounds_heartbeat == 25),
+            "25 heartbeats each: {:?}",
+            state
+                .nodes
+                .iter()
+                .map(|n| n.rounds_heartbeat)
+                .collect::<Vec<_>>()
         );
     });
 }
@@ -187,7 +211,7 @@ fn submit_creates_and_gossips_a_cell() {
         // The submitting node sees the cell immediately as a local origin.
         let before = snapshot(&tx).await;
         assert_eq!(before.oracle_total, 5);
-        assert_eq!(before.nodes[0].aggregate_total, 5);
+        assert_eq!(before.nodes[0].window_total, 5);
         assert!(
             inspect(&tx, 0)
                 .await
@@ -198,9 +222,7 @@ fn submit_creates_and_gossips_a_cell() {
         );
 
         // Drive gossip forward and gather every event across the whole stream
-        // (the submit batch plus every step). The runtime's first interval
-        // tick fires at t=0, so propagation can begin during the submit call
-        // itself — we assert on the cumulative stream, not on one batch.
+        // (the submit batch plus every step).
         let mut all_events = submit_batch.events;
         for _ in 0..10 {
             all_events.extend(step(&tx, 100).await.events);
@@ -223,7 +245,7 @@ fn submit_creates_and_gossips_a_cell() {
         let after = snapshot(&tx).await;
         assert_eq!(after.oracle_total, 5);
         assert!(
-            after.nodes.iter().all(|n| n.aggregate_total == 5),
+            after.nodes.iter().all(|n| n.window_total == 5),
             "both nodes converge on the oracle total"
         );
         // Node 1's copy is a remote (non-local) cell.
@@ -250,7 +272,7 @@ fn error_budget_and_gateway_counters_surface_in_snapshot() {
     };
     with_state(config, |mut state| async move {
         state.submit_request(0, 0, 7).await.unwrap();
-        let origin = state.snapshot(None).await.nodes.swap_remove(0);
+        let origin = state.snapshot(None, WATCH).await.nodes.swap_remove(0);
         assert_eq!(origin.id, 0);
         assert!(
             origin.error_budget > 0,
@@ -259,13 +281,13 @@ fn error_budget_and_gateway_counters_surface_in_snapshot() {
 
         warm(&mut state).await;
         let g = gateway_of(&state, 0, 1).await;
-        silence(&mut state, g);
+        silence(&mut state, g).await;
         state.submit_request(0, 0, 1).await.unwrap();
-        state.step(T_U / 2 + T).await;
+        state.step(T_U / 2 + T, StepUntil::Time).await;
 
         // Checkpoint A, the peer mirror: the rows the page shows are the rows
         // the runtime reports, read at the same virtual instant.
-        let snap = state.snapshot(Some(0)).await;
+        let snap = state.snapshot(Some(0), WATCH).await;
         let direct = super::admin_snapshot(&state.nodes[0].admin_tx)
             .await
             .expect("node 0 runs");
@@ -287,8 +309,8 @@ fn error_budget_and_gateway_counters_surface_in_snapshot() {
 
         // Checkpoint B, the counter mirror: each node's counters are the
         // library's own fields.
-        state.step(T_U + 3 * T).await;
-        let snap = state.snapshot(None).await;
+        state.step(T_U + 3 * T, StepUntil::Time).await;
+        let snap = state.snapshot(None, WATCH).await;
         for (node, handle) in snap.nodes.iter().zip(&state.nodes) {
             let c = super::counters(&handle.admin_tx).await.expect("runs");
             assert_eq!(node.gateway_failovers, c.gateway_failovers);
@@ -328,7 +350,7 @@ fn oracle_total_is_windowed_and_counts_each_origin_once() {
         }
         let converged = snapshot(&tx).await;
         assert!(
-            converged.nodes.iter().all(|n| n.aggregate_total == 9),
+            converged.nodes.iter().all(|n| n.window_total == 9),
             "both nodes hold the cell"
         );
         assert_eq!(
@@ -347,7 +369,7 @@ fn oracle_total_is_windowed_and_counts_each_origin_once() {
             "the windowed oracle decays to zero as the bucket expires"
         );
         assert!(
-            aged.nodes.iter().all(|n| n.aggregate_total == 0),
+            aged.nodes.iter().all(|n| n.window_total == 0),
             "node views age out in lockstep with the oracle"
         );
     });
@@ -378,9 +400,9 @@ fn partition_blocks_then_heal_converges() {
         assert!(saw_drop, "blocked link must produce dropped-packet events");
 
         let partitioned = snapshot(&tx).await;
-        assert_eq!(partitioned.nodes[0].aggregate_total, 7);
+        assert_eq!(partitioned.nodes[0].window_total, 7);
         assert_eq!(
-            partitioned.nodes[1].aggregate_total, 0,
+            partitioned.nodes[1].window_total, 0,
             "node 1 is isolated and learns nothing"
         );
 
@@ -393,30 +415,31 @@ fn partition_blocks_then_heal_converges() {
 
         let healed = snapshot(&tx).await;
         assert!(
-            healed.nodes.iter().all(|n| n.aggregate_total == 7),
+            healed.nodes.iter().all(|n| n.window_total == 7),
             "convergence after heal"
         );
     });
 }
 
-/// `missing_for_ms` dates the oldest change a node lacks from its origin
-/// cell's last update: a lower count in a cell it holds counts as missing,
-/// a cell it never received counts too, and the older of the two wins.
+/// `lag` dates the oldest change a node lacks from its origin cell's last
+/// update: a lower count in a cell it holds counts as missing, a cell it
+/// never received counts too, and the older of the two wins. Both directions
+/// are blocked, so the lagging node is stranded.
 #[test]
-fn missing_for_dates_the_oldest_change_a_node_lacks() {
+fn lag_dates_the_oldest_change_a_node_lacks() {
+    use Lag::{CaughtUp, Stranded};
     with_engine(test_config(2), |tx| async move {
-        let missing = |state: &ClusterState| -> Vec<Option<u64>> {
-            state.nodes.iter().map(|n| n.missing_for_ms).collect()
-        };
+        let missing =
+            |state: &ClusterState| -> Vec<Lag> { state.nodes.iter().map(|n| n.lag).collect() };
         submit(&tx, 0, WATCHED_KEY, 7).await;
         for _ in 0..5 {
             step(&tx, T).await;
         }
         let caught_up = snapshot(&tx).await;
-        assert!(caught_up.nodes.iter().all(|n| n.aggregate_total == 7));
+        assert!(caught_up.nodes.iter().all(|n| n.window_total == 7));
         assert_eq!(
             missing(&caught_up),
-            [None, None],
+            [CaughtUp, CaughtUp],
             "both nodes hold the 7 hits"
         );
 
@@ -430,12 +453,17 @@ fn missing_for_dates_the_oldest_change_a_node_lacks() {
         let lower = snapshot(&tx).await;
         assert_eq!(lower.virtual_ms, 900);
         assert_eq!(
-            lower.nodes[1].aggregate_total, 7,
+            lower.nodes[1].window_total, 7,
             "node 1 holds the cell at 7 of 10"
         );
         assert_eq!(
             missing(&lower),
-            [None, Some(400)],
+            [
+                CaughtUp,
+                Stranded {
+                    missing_for_ms: 400
+                }
+            ],
             "the cell was last updated at 500 ms"
         );
 
@@ -451,7 +479,12 @@ fn missing_for_dates_the_oldest_change_a_node_lacks() {
         assert_eq!(absent.virtual_ms, 1_500);
         assert_eq!(
             missing(&absent),
-            [None, Some(1_000)],
+            [
+                CaughtUp,
+                Stranded {
+                    missing_for_ms: 1_000
+                }
+            ],
             "the change at 500 ms is the oldest"
         );
 
@@ -461,10 +494,10 @@ fn missing_for_dates_the_oldest_change_a_node_lacks() {
             step(&tx, T).await;
         }
         let healed = snapshot(&tx).await;
-        assert!(healed.nodes.iter().all(|n| n.aggregate_total == 12));
+        assert!(healed.nodes.iter().all(|n| n.window_total == 12));
         assert_eq!(
             missing(&healed),
-            [None, None],
+            [CaughtUp, CaughtUp],
             "node 1 caught up after the heal"
         );
 
@@ -481,7 +514,12 @@ fn missing_for_dates_the_oldest_change_a_node_lacks() {
         assert_eq!(only_absent.virtual_ms, 2_800);
         assert_eq!(
             missing(&only_absent),
-            [None, Some(300)],
+            [
+                CaughtUp,
+                Stranded {
+                    missing_for_ms: 300
+                }
+            ],
             "node 1 lacks only the cell made at 2500 ms"
         );
     });
@@ -576,7 +614,7 @@ fn added_node_catches_up_by_gossip() {
         let before = snapshot(&tx).await;
         assert_eq!(node_ids(&before), vec![0, 1, 2]);
         assert!(
-            before.nodes.iter().all(|n| n.aggregate_total == 50),
+            before.nodes.iter().all(|n| n.window_total == 50),
             "cluster converged before the add"
         );
 
@@ -589,7 +627,7 @@ fn added_node_catches_up_by_gossip() {
             "ids are stable; the newcomer is 3, not a renumber"
         );
         let newcomer = joined.nodes.iter().find(|n| n.id == 3).unwrap();
-        assert_eq!(newcomer.aggregate_total, 0, "the newcomer starts cold");
+        assert_eq!(newcomer.window_total, 0, "the newcomer starts cold");
 
         // Drive gossip; the newcomer catches up to the settled total.
         for _ in 0..15 {
@@ -597,12 +635,12 @@ fn added_node_catches_up_by_gossip() {
         }
         let after = snapshot(&tx).await;
         assert!(
-            after.nodes.iter().all(|n| n.aggregate_total == 50),
+            after.nodes.iter().all(|n| n.window_total == 50),
             "every node, the newcomer included, converges on 50: {:?}",
             after
                 .nodes
                 .iter()
-                .map(|n| (n.id, n.aggregate_total))
+                .map(|n| (n.id, n.window_total))
                 .collect::<Vec<_>>(),
         );
     });
@@ -628,7 +666,7 @@ fn removed_node_leaves_and_survivors_keep_converging() {
             "node 1 left; 0 and 2 keep their ids (a gap, not a renumber)"
         );
         assert!(
-            removed.nodes.iter().all(|n| n.aggregate_total == 50),
+            removed.nodes.iter().all(|n| n.window_total == 50),
             "survivors still hold the converged total"
         );
 
@@ -642,12 +680,12 @@ fn removed_node_leaves_and_survivors_keep_converging() {
         assert_eq!(after.oracle_total, 60);
         assert_eq!(node_ids(&after), vec![0, 2]);
         assert!(
-            after.nodes.iter().all(|n| n.aggregate_total == 60),
+            after.nodes.iter().all(|n| n.window_total == 60),
             "the two survivors converge on 60: {:?}",
             after
                 .nodes
                 .iter()
-                .map(|n| (n.id, n.aggregate_total))
+                .map(|n| (n.id, n.window_total))
                 .collect::<Vec<_>>(),
         );
     });
@@ -713,7 +751,7 @@ fn one_heartbeat_reaches_the_zone_and_one_gateway_per_remote_zone() {
         let mut zones: Vec<u8> = state
             .nodes
             .iter()
-            .filter(|n| n.aggregate_total > 0)
+            .filter(|n| n.window_total > 0)
             .map(|n| n.zone)
             .collect();
         zones.sort_unstable();
@@ -724,18 +762,22 @@ fn one_heartbeat_reaches_the_zone_and_one_gateway_per_remote_zone() {
         warm(&mut state).await;
         state.submit_request(0, WATCHED_KEY, 5).await.unwrap();
         assert_eq!(
-            known(&state.snapshot(None).await),
+            known(&state.snapshot(None, WATCH).await),
             [0],
             "the submit alone gossips nothing"
         );
-        state.step(T).await;
+        state.step(T, StepUntil::Time).await;
         assert_eq!(
-            known(&state.snapshot(None).await),
+            known(&state.snapshot(None, WATCH).await),
             [0, 0, 0, 0, 1, 2],
             "the zone's four nodes and one gateway in each other zone"
         );
-        state.step(T).await;
-        assert_eq!(known(&state.snapshot(None).await).len(), 12, "the relays");
+        state.step(T, StepUntil::Time).await;
+        assert_eq!(
+            known(&state.snapshot(None, WATCH).await).len(),
+            12,
+            "the relays"
+        );
         state
     });
 }
@@ -771,7 +813,123 @@ fn zoned(nodes: usize, zones: usize) -> SimConfig {
 /// One second of heartbeats, enough for every peer to be heard and every role
 /// to settle.
 async fn warm(state: &mut EngineState) -> Vec<Event> {
-    state.step(1_000).await.events
+    state.step(1_000, StepUntil::Time).await.events
+}
+
+/// The heartbeat period of the scenarios the page tells: 500 ms.
+const P: u64 = 500;
+
+/// The default scenario's cluster: twelve nodes in three zones, a 500 ms
+/// heartbeat, and a limit of 100 hits per 10 s window of 1 s buckets.
+fn rate_limiting() -> SimConfig {
+    SimConfig {
+        tick_interval_ms: P,
+        rule_window_ms: 10_000,
+        rule_limit: 100,
+        ..zoned(12, 3)
+    }
+}
+
+/// [`rate_limiting`] with the limit far away (1,000,000), so a send of tens
+/// of hits waits for its node's heartbeat instead of flushing at once.
+fn propagation() -> SimConfig {
+    SimConfig {
+        rule_limit: 1_000_000,
+        ..rate_limiting()
+    }
+}
+
+/// A snapshot watch of the watched key, deciding `probe_hits` for the
+/// inspected node.
+fn watch(probe_hits: u64) -> Watch {
+    Watch {
+        key: WATCHED_KEY,
+        probe_hits,
+    }
+}
+
+/// Step one period at a time until a period passes with no packet sent or
+/// lost, and return every event. Panics after 40 periods with the count.
+async fn settle(state: &mut EngineState) -> Vec<Event> {
+    let period = state.config.tick_interval_ms;
+    let mut events = Vec::new();
+    for _ in 0..40 {
+        let batch = state.step(period, StepUntil::Time).await.events;
+        let quiet = !batch.iter().any(|e| {
+            matches!(
+                e.kind,
+                EventKind::PacketSent { .. } | EventKind::PacketDropped { .. }
+            )
+        });
+        events.extend(batch);
+        if quiet {
+            return events;
+        }
+    }
+    panic!("the cluster did not go quiet within 40 periods");
+}
+
+/// The nodes whose count of a cell was created or raised in `events`.
+fn cell_nodes(events: &[Event]) -> BTreeSet<u32> {
+    events
+        .iter()
+        .filter_map(|e| match e.kind {
+            EventKind::CellCreated { node, .. } | EventKind::CellUpdated { node, .. } => Some(node),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every node's decision on its requests in `events`, in order.
+fn decisions(events: &[Event]) -> Vec<(u32, Admission)> {
+    events
+        .iter()
+        .filter_map(|e| match e.kind {
+            EventKind::Decided {
+                node, admission, ..
+            } => Some((node, admission)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Submit `hits` at `node`, which must be a live node, and return the batch.
+async fn send(state: &mut EngineState, node: u32, hits: u64) -> EventBatch {
+    state
+        .submit_request(node, WATCHED_KEY, hits)
+        .await
+        .expect("a live node and at least one hit")
+}
+
+/// The ids of the live nodes placed in `zone`.
+fn members(state: &EngineState, zone: u8) -> Vec<u32> {
+    state
+        .nodes
+        .iter()
+        .filter(|n| n.zone == zone)
+        .map(|n| n.id)
+        .collect()
+}
+
+/// Block every link between zone `zone` and the rest, both ways.
+async fn cut_zone(state: &mut EngineState, zone: u8) {
+    let (inside, outside): (Vec<_>, Vec<_>) = state
+        .nodes
+        .iter()
+        .map(|n| (n.id, n.zone))
+        .partition(|&(_, z)| z == zone);
+    for &(a, _) in &inside {
+        for &(b, _) in &outside {
+            state
+                .set_link_policy(a, b, LinkPolicyKind::Block)
+                .await
+                .unwrap();
+            state
+                .set_link_policy(b, a, LinkPolicyKind::Block)
+                .await
+                .unwrap();
+        }
+    }
 }
 
 /// The zone node `id` is placed in, as the snapshot reports it.
@@ -806,18 +964,24 @@ async fn peers_of(state: &EngineState, id: u32) -> Vec<PeerView> {
 
 async fn inspected(state: &EngineState, id: u32) -> Inspected {
     state
-        .snapshot(Some(id))
+        .snapshot(Some(id), WATCH)
         .await
         .inspected
         .expect("a live node")
 }
 
 /// Cut `g` off from every other live node, in both directions.
-fn silence(state: &mut EngineState, g: u32) {
+async fn silence(state: &mut EngineState, g: u32) {
     let ids: Vec<u32> = state.nodes.iter().map(|n| n.id).collect();
     for x in ids.into_iter().filter(|&x| x != g) {
-        state.set_link_policy(g, x, LinkPolicyKind::Block).unwrap();
-        state.set_link_policy(x, g, LinkPolicyKind::Block).unwrap();
+        state
+            .set_link_policy(g, x, LinkPolicyKind::Block)
+            .await
+            .unwrap();
+        state
+            .set_link_policy(x, g, LinkPolicyKind::Block)
+            .await
+            .unwrap();
     }
 }
 
@@ -927,8 +1091,8 @@ fn gateway_for_counts_the_origins_routing_through_each_node() {
         // failover, not a cached row.
         let g = gateway_of(&state, 0, 1).await;
         state.remove_node(g).await.unwrap();
-        state.step(3 * T).await;
-        let snap = state.snapshot(None).await;
+        state.step(3 * T, StepUntil::Time).await;
+        let snap = state.snapshot(None, WATCH).await;
         let mut want = BTreeMap::new();
         for node in &snap.nodes {
             for peer in peers_of(&state, node.id).await {
@@ -964,8 +1128,8 @@ fn zones_come_from_config_not_address() {
     with_state(zoned(12, 3), |mut state| async move {
         warm(&mut state).await;
         state.submit_request(0, WATCHED_KEY, 5).await.unwrap();
-        let events = state.step(T).await.events;
-        let snap = state.snapshot(None).await;
+        let events = state.step(T, StepUntil::Time).await.events;
+        let snap = state.snapshot(None, WATCH).await;
 
         let own = sent(&events, 0, PacketKind::Own);
         assert_eq!(
@@ -1002,7 +1166,7 @@ fn relay_follows_one_prompt_interval_after_the_gateway_hears() {
         warm(&mut state).await;
         let g = gateway_of(&state, 0, 1).await;
         state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
-        let events = state.step(2 * T).await.events;
+        let events = state.step(2 * T, StepUntil::Time).await.events;
 
         let t_send = sent(&events, 0, PacketKind::Own)
             .iter()
@@ -1019,7 +1183,7 @@ fn relay_follows_one_prompt_interval_after_the_gateway_hears() {
                 _ => None,
             })
             .expect("the gateway receives it");
-        let snap = state.snapshot(None).await;
+        let snap = state.snapshot(None, WATCH).await;
         let relays = sent(&events, g, PacketKind::Relay);
         assert_eq!(relays.len(), 3, "to the gateway's three zone peers");
         for (dst, _, at) in relays {
@@ -1038,11 +1202,11 @@ fn silent_gateway_fails_over_within_suspect_after() {
         warm(&mut state).await;
         let g = gateway_of(&state, 0, 1).await;
         let t_s = state.virtual_ms;
-        silence(&mut state, g);
+        silence(&mut state, g).await;
         state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
         let mut events = Vec::new();
         while state.virtual_ms < t_s + T_U + 3 * T + 2 * F_R + T {
-            events.extend(state.step(T).await.events);
+            events.extend(state.step(T, StepUntil::Time).await.events);
         }
         let (at, to) = failover(&events, 0, 1, g).expect("a failover");
         assert!(
@@ -1052,10 +1216,10 @@ fn silent_gateway_fails_over_within_suspect_after() {
         let to = to.expect("a replacement gateway");
         assert_ne!(to, g);
 
-        state.step(3 * T).await;
-        let snap = state.snapshot(None).await;
+        state.step(3 * T, StepUntil::Time).await;
+        let snap = state.snapshot(None, WATCH).await;
         for node in snap.nodes.iter().filter(|n| n.zone == 1 && n.id != g) {
-            assert_eq!(node.aggregate_total, snap.oracle_total, "node {}", node.id);
+            assert_eq!(node.window_total, snap.oracle_total, "node {}", node.id);
         }
         assert_eq!(snap.nodes[0].gateway_failovers, 1);
         assert_eq!(zone_of(&snap, to), 1);
@@ -1080,7 +1244,10 @@ fn one_way_cut_is_repaired_by_the_backstop() {
             .map(|n| n.id)
             .collect();
         for &m in &members {
-            state.set_link_policy(g, m, LinkPolicyKind::Block).unwrap();
+            state
+                .set_link_policy(g, m, LinkPolicyKind::Block)
+                .await
+                .unwrap();
         }
         let t_cut = state.virtual_ms;
         let mut deadline = t_cut + T_U + 10 * T;
@@ -1090,7 +1257,10 @@ fn one_way_cut_is_repaired_by_the_backstop() {
             if !failed_over {
                 state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
             }
-            let events = state.step(T.min(deadline - state.virtual_ms)).await.events;
+            let events = state
+                .step(T.min(deadline - state.virtual_ms), StepUntil::Time)
+                .await
+                .events;
             failed_over |= failover(&events, 0, 1, g).is_some();
             if t1.is_none() {
                 t1 = events.iter().find_map(|e| match e.kind {
@@ -1109,9 +1279,9 @@ fn one_way_cut_is_repaired_by_the_backstop() {
         assert!(failed_over, "the origin left the gateway that cannot relay");
         let t1 = t1.expect("the cut swallowed a relay, but none was dropped");
         assert_eq!(state.virtual_ms, t1 + T_U + 3 * T + 2 * F_R);
-        let snap = state.snapshot(None).await;
+        let snap = state.snapshot(None, WATCH).await;
         for node in snap.nodes.iter().filter(|n| n.zone == 1) {
-            assert_eq!(node.aggregate_total, snap.oracle_total, "node {}", node.id);
+            assert_eq!(node.window_total, snap.oracle_total, "node {}", node.id);
         }
         state
     });
@@ -1128,7 +1298,7 @@ fn one_way_cut_is_repaired_by_the_backstop() {
 fn zone_partition_heals_to_exact_counts() {
     with_state(zoned(5, 3), |mut state| async move {
         let mut all = warm(&mut state).await;
-        let lone = state.snapshot(None).await.zones[2].live;
+        let lone = state.snapshot(None, WATCH).await.zones[2].live;
         assert_eq!(lone, 1, "zone c's gateway has no replacement");
         let cut: Vec<u32> = state
             .nodes
@@ -1144,8 +1314,14 @@ fn zone_partition_heals_to_exact_counts() {
             .collect();
         for &a in &cut {
             for &b in &rest {
-                state.set_link_policy(a, b, LinkPolicyKind::Block).unwrap();
-                state.set_link_policy(b, a, LinkPolicyKind::Block).unwrap();
+                state
+                    .set_link_policy(a, b, LinkPolicyKind::Block)
+                    .await
+                    .unwrap();
+                state
+                    .set_link_policy(b, a, LinkPolicyKind::Block)
+                    .await
+                    .unwrap();
             }
         }
         all.extend(
@@ -1162,30 +1338,30 @@ fn zone_partition_heals_to_exact_counts() {
                 .unwrap()
                 .events,
         );
-        all.extend(state.step(3_000).await.events);
-        for node in &state.snapshot(None).await.nodes {
+        all.extend(state.step(3_000, StepUntil::Time).await.events);
+        for node in &state.snapshot(None, WATCH).await.nodes {
             let side = if node.zone == 2 { 4 } else { 3 };
             assert_eq!(
-                node.aggregate_total, side,
+                node.window_total, side,
                 "node {} sees only its side of the cut",
                 node.id
             );
         }
-        state.heal();
-        all.extend(state.step(3 * T).await.events);
-        let snap = state.snapshot(None).await;
+        state.heal().await;
+        all.extend(state.step(3 * T, StepUntil::Time).await.events);
+        let snap = state.snapshot(None, WATCH).await;
         // Pinned to the 3 + 4 hits submitted, not to counts the cells derive,
         // so a hit lost at its origin or an oracle that sums replicas fails.
         assert_eq!(snap.oracle_total, 7, "the oracle counts both sides once");
         for node in &snap.nodes {
-            assert_eq!(node.aggregate_total, 7, "node {} sees both sides", node.id);
+            assert_eq!(node.window_total, 7, "node {} sees both sides", node.id);
         }
         let mut cells = Vec::new();
         for node in &snap.nodes {
             cells.push((node.id, cells_of(&state, node.id).await));
         }
 
-        let rule = state.rule.fingerprint;
+        let rule = state.spec.fingerprint;
         let buckets: BTreeSet<u32> = cells
             .iter()
             .flat_map(|(_, cells)| cells)
@@ -1237,7 +1413,7 @@ fn unset_zone_mode_runs_as_one_zone() {
                     .events,
             );
         }
-        let events = state.step(T).await.events;
+        let events = state.step(T, StepUntil::Time).await.events;
         all.extend(events.iter().cloned());
         for node in 0..12 {
             let own = sent(&events, node, PacketKind::Own);
@@ -1250,7 +1426,7 @@ fn unset_zone_mode_runs_as_one_zone() {
             let cross = own.iter().filter(|p| p.1 == Tier::CrossZone).count();
             assert_eq!(cross, 8, "node {node}: eight peers are in other zones");
         }
-        let snap = state.snapshot(None).await;
+        let snap = state.snapshot(None, WATCH).await;
         for node in 0..12 {
             assert!(
                 peers_of(&state, node)
@@ -1275,7 +1451,7 @@ fn gateway_events_fetch_snapshots_only_on_role_change() {
         let substeps = state.substeps;
         for _ in 0..10 {
             state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
-            state.step(T).await;
+            state.step(T, StepUntil::Time).await;
         }
         assert_eq!(
             state.gateway_fetches, 0,
@@ -1284,7 +1460,7 @@ fn gateway_events_fetch_snapshots_only_on_role_change() {
         let quiet_substeps = state.substeps - substeps;
 
         let g = gateway_of(&state, 0, 1).await;
-        silence(&mut state, g);
+        silence(&mut state, g).await;
         state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
         let t_s = state.virtual_ms;
         let mut events = Vec::new();
@@ -1293,7 +1469,7 @@ fn gateway_events_fetch_snapshots_only_on_role_change() {
                 state.virtual_ms <= t_s + T_U + 5 * T,
                 "no failover reported"
             );
-            events.extend(state.step(T).await.events);
+            events.extend(state.step(T, StepUntil::Time).await.events);
         }
         assert!(state.gateway_fetches >= 1);
         eprintln!(
@@ -1311,7 +1487,7 @@ fn gateway_events_fetch_snapshots_only_on_role_change() {
 fn joiner_goes_to_the_zone_it_asks_or_the_smallest() {
     with_state(zoned(5, 3), |mut state| async move {
         let live = |snap: &ClusterState| snap.zones.iter().map(|z| z.live).collect::<Vec<_>>();
-        let snap = state.snapshot(None).await;
+        let snap = state.snapshot(None, WATCH).await;
         assert_eq!(live(&snap), [2, 2, 1], "placement is node i mod 3");
         let names: Vec<_> = snap.zones.iter().map(|z| z.name).collect();
         assert_eq!(names, ["zone-a", "zone-b", "zone-c"]);
@@ -1320,7 +1496,7 @@ fn joiner_goes_to_the_zone_it_asks_or_the_smallest() {
         // there.
         for (ask, lands) in [(None, 2), (None, 0), (Some(0), 0)] {
             state.add_node(ask).await.expect("the node joins");
-            let snap = state.snapshot(None).await;
+            let snap = state.snapshot(None, WATCH).await;
             let joiner = snap.nodes.last().expect("a joiner");
             assert_eq!(joiner.zone, lands, "asked for {ask:?}");
         }
@@ -1343,7 +1519,7 @@ fn joiner_goes_to_the_zone_it_asks_or_the_smallest() {
             refused.err()
         );
         state.add_node(None).await.expect("the node joins");
-        let snap = state.snapshot(None).await;
+        let snap = state.snapshot(None, WATCH).await;
         assert_eq!(
             snap.nodes.last().map(|n| n.id),
             Some(8),
@@ -1390,9 +1566,12 @@ fn last_member_leaving_a_zone_reports_its_gateway_gone() {
         // Silencing origin 0's gateway into zone b fails it over, which moves
         // its roles and diffs it again.
         let g = gateway_of(&state, 0, 1).await;
-        silence(&mut state, g);
+        silence(&mut state, g).await;
         state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
-        let later = state.step(T_U + 3 * T + 2 * F_R + T).await.events;
+        let later = state
+            .step(T_U + 3 * T + 2 * F_R + T, StepUntil::Time)
+            .await
+            .events;
         assert!(failover(&later, 0, 1, g).is_some(), "origin 0 fails over");
         assert_eq!(
             gateway_moves(&later, 2),
@@ -1403,32 +1582,35 @@ fn last_member_leaving_a_zone_reports_its_gateway_gone() {
     });
 }
 
-/// A quiet cluster costs one sub-step per heartbeat: once the acks and join
-/// sweeps a count set off are done, no prompt ticker stays armed.
+/// A quiet cluster costs one sub-step per distinct heartbeat phase: once the
+/// acks and join sweeps a count set off are done, no prompt ticker stays
+/// armed. Ids 0 to 11 have twelve distinct phases at `T` = 100 (0, 61, 23,
+/// 85, 47, 9, 70, 32, 94, 56, 18 and 79 ms), so each period takes twelve.
 #[test]
-fn quiet_cluster_takes_one_substep_per_heartbeat() {
+fn quiet_cluster_takes_one_substep_per_phase() {
     with_state(test_config(12), |mut state| async move {
         state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
-        state.step(500).await;
+        state.step(500, StepUntil::Time).await;
         assert!(
             state.substeps > 5,
             "the count armed prompt rounds: {}",
             state.substeps
         );
-        // One heartbeat per step: a ticker left armed adds a sub-step per floor
+        // One period per step: a ticker left armed adds a sub-step per floor
         // and fails the count before its full inbox can block `step`.
         state.substeps = 0;
-        for heartbeats in 1..=10 {
-            state.step(100).await;
-            assert_eq!(state.substeps, heartbeats);
+        for periods in 1..=10 {
+            state.step(100, StepUntil::Time).await;
+            assert_eq!(state.substeps, 12 * periods);
         }
         state
     });
 }
 
-/// A full heartbeat at `MAX_NODES`, every node sending every peer two own
-/// packets (34 cells at 33 a packet), fits every node's inbound queue: no
-/// packet is dropped.
+/// A full period at `MAX_NODES`, every node sending every peer its own frame
+/// (34 cells, two packets at 33 a packet) while first contact adds each
+/// peer's greeting and sweep request, fits every node's inbound queue: no
+/// packet is dropped, and every node sent every peer both packets.
 #[test]
 fn full_round_at_max_nodes_drops_nothing_under_pass() {
     let config = SimConfig {
@@ -1436,6 +1618,7 @@ fn full_round_at_max_nodes_drops_nothing_under_pass() {
         ..test_config(MAX_NODES)
     };
     with_state(config, |mut state| async move {
+        let started = std::time::Instant::now();
         let ids: Vec<u32> = state.nodes.iter().map(|n| n.id).collect();
         for &node in &ids {
             for key in 0..34 {
@@ -1445,16 +1628,30 @@ fn full_round_at_max_nodes_drops_nothing_under_pass() {
                     .unwrap();
             }
         }
-        let batch = state.step(100).await;
-        let count =
-            |pick: fn(&EventKind) -> bool| batch.events.iter().filter(|e| pick(&e.kind)).count();
-        let dropped = count(|kind| matches!(kind, EventKind::PacketDropped { .. }));
-        let delivered = count(|kind| matches!(kind, EventKind::PacketDelivered { .. }));
-        assert_eq!(dropped, 0);
-        assert_eq!(
-            delivered,
-            MAX_NODES * VIZ_ROUTER_CAPACITY,
-            "every node received two packets from every peer"
+        let batch = state.step(T, StepUntil::Time).await;
+        let mut own: BTreeMap<(u32, u32), usize> = BTreeMap::new();
+        let mut dropped = 0;
+        for event in &batch.events {
+            match event.kind {
+                EventKind::PacketSent {
+                    src,
+                    dst,
+                    kind: PacketKind::Own,
+                    ..
+                } => *own.entry((src, dst)).or_default() += 1,
+                EventKind::PacketDropped { .. } => dropped += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(dropped, 0, "an inbound queue overflowed");
+        assert_eq!(own.len(), MAX_NODES * (MAX_NODES - 1), "every ordered pair");
+        assert!(
+            own.values().all(|&packets| packets >= 2),
+            "every node sent every peer its whole frame"
+        );
+        eprintln!(
+            "a full period at {MAX_NODES} nodes took {:?} of wall time",
+            started.elapsed()
         );
         state
     });
@@ -1465,7 +1662,6 @@ fn full_round_at_max_nodes_drops_nothing_under_pass() {
 #[test]
 fn events_serialize_with_hex_identifiers() {
     let event = crate::event::Event {
-        tick: 3,
         virtual_ms: 300,
         kind: EventKind::CellCreated {
             node: 1,
@@ -1479,6 +1675,22 @@ fn events_serialize_with_hex_identifiers() {
     assert_eq!(json["kind"]["type"], "CellCreated");
     assert_eq!(json["kind"]["rule"], "000000000000c0fedeadbeefbabef00d");
     assert_eq!(json["kind"]["key"], "00000000000000000000000000000001");
+
+    let decided = crate::event::Event {
+        virtual_ms: 300,
+        kind: EventKind::Decided {
+            node: 2,
+            hits: 150,
+            admission: Admission::Rejected {
+                total: 0,
+                reopens: Reopens::Never,
+            },
+        },
+    };
+    let json = serde_json::to_value(&decided).unwrap();
+    assert_eq!(json["kind"]["type"], "Decided");
+    assert_eq!(json["kind"]["admission"]["kind"], "Rejected");
+    assert_eq!(json["kind"]["admission"]["reopens"]["kind"], "Never");
 }
 
 /// The derived per-node sizing (`SimConfig::settings`) is anchored on
@@ -1585,12 +1797,12 @@ fn moderate_cluster_runtime_honors_the_shrunk_sizing() {
         // window.
         assert_eq!(state.oracle_total, 40);
         assert!(
-            state.nodes.iter().all(|n| n.aggregate_total == 40),
+            state.nodes.iter().all(|n| n.window_total == 40),
             "every node converges on 40: {:?}",
             state
                 .nodes
                 .iter()
-                .map(|n| (n.id, n.aggregate_total))
+                .map(|n| (n.id, n.window_total))
                 .collect::<Vec<_>>(),
         );
     });
@@ -1670,12 +1882,12 @@ fn second_burst_after_expiry_still_ages_out() {
         }
         let after_first = snapshot(&tx).await;
         assert!(
-            after_first.nodes.iter().all(|n| n.aggregate_total == 0),
+            after_first.nodes.iter().all(|n| n.window_total == 0),
             "first burst must age out everywhere: {:?}",
             after_first
                 .nodes
                 .iter()
-                .map(|n| n.aggregate_total)
+                .map(|n| n.window_total)
                 .collect::<Vec<_>>(),
         );
 
@@ -1686,7 +1898,7 @@ fn second_burst_after_expiry_still_ages_out() {
             after_second_submit
                 .nodes
                 .iter()
-                .any(|n| n.aggregate_total == 25),
+                .any(|n| n.window_total == 25),
             "second burst must register on its origin"
         );
 
@@ -1696,12 +1908,12 @@ fn second_burst_after_expiry_still_ages_out() {
         }
         let aged = snapshot(&tx).await;
         assert!(
-            aged.nodes.iter().all(|n| n.aggregate_total == 0),
+            aged.nodes.iter().all(|n| n.window_total == 0),
             "second burst must age out in the 10 s window like the first — a non-zero total here \
              means it was stored under the default 60 s descriptor: {:?}",
             aged.nodes
                 .iter()
-                .map(|n| n.aggregate_total)
+                .map(|n| n.window_total)
                 .collect::<Vec<_>>(),
         );
     });
@@ -1714,8 +1926,14 @@ fn second_burst_after_expiry_still_ages_out() {
 #[test]
 fn a_departed_gateway_is_reported_gone_while_its_zone_lives_on() {
     with_state(zoned(4, 2), |mut state| async move {
-        state.set_link_policy(0, 3, LinkPolicyKind::Block).unwrap();
-        state.set_link_policy(3, 0, LinkPolicyKind::Block).unwrap();
+        state
+            .set_link_policy(0, 3, LinkPolicyKind::Block)
+            .await
+            .unwrap();
+        state
+            .set_link_policy(3, 0, LinkPolicyKind::Block)
+            .await
+            .unwrap();
         warm(&mut state).await;
         assert_eq!(gateway_of(&state, 0, 1).await, 1);
         let mut users = Vec::new();
@@ -1741,7 +1959,7 @@ fn snapshot_carries_only_the_inspected_nodes_rows() {
     with_state(zoned(6, 3), |mut state| async move {
         state.submit_request(4, WATCHED_KEY, 3).await.unwrap();
         warm(&mut state).await;
-        let snap = state.snapshot(Some(4)).await;
+        let snap = state.snapshot(Some(4), WATCH).await;
         let rows = snap.inspected.expect("node 4 is live");
         assert_eq!(rows.id, 4);
         let peers: BTreeSet<_> = rows.peers.iter().filter_map(|p| p.id).collect();
@@ -1755,10 +1973,10 @@ fn snapshot_carries_only_the_inspected_nodes_rows() {
             !replica.is_empty() && replica.iter().all(|c| !c.is_local && c.origin == Some(4)),
             "node 0 holds node 4's cell as a replica: {replica:?}"
         );
-        assert!(state.snapshot(None).await.inspected.is_none());
+        assert!(state.snapshot(None, WATCH).await.inspected.is_none());
         state.remove_node(4).await.unwrap();
         assert!(
-            state.snapshot(Some(4)).await.inspected.is_none(),
+            state.snapshot(Some(4), WATCH).await.inspected.is_none(),
             "a departed node has no rows"
         );
         state

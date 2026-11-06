@@ -8,7 +8,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
 
-use gabion::crdt::{BucketEpoch, DeltaSink, ExpirationSink, KeyHash};
+use gabion::aggregate::{Aggregate, AggregateTable};
+use gabion::crdt::{DeltaSink, ExpirationSink, ValidStorageConfig};
 use gabion::gossip::AggregateStore;
 use gabion::gossip::GossipTransport;
 use gabion::gossip::sim::{SimRouter, SimTransport};
@@ -37,43 +38,38 @@ pub struct Member {
 /// already-running transports resolve against the live map.
 pub type AddressBook = Rc<RefCell<HashMap<SocketAddr, Member>>>;
 
-/// Downstream aggregate store that doubles as the cluster-aggregate read
-/// surface (like the adapters' aggregate table) and the cell-event source.
-/// Each `apply` folds the rows into a per-key total and emits a
-/// `CellCreated` / `CellUpdated` / `CellExpired` event per row.
+/// A node's count table, gabion's own [`Aggregate`]: the table admission's
+/// `window_total` reads. Every `apply` goes to it first; then one
+/// `CellCreated` / `CellUpdated` / `CellExpired` event per row goes to the log.
 pub struct EventEmittingAggregateStore {
     node: u32,
     log: EventLog,
-    inner: RefCell<HashMap<(u128, KeyHash, BucketEpoch), u64>>,
+    inner: Aggregate,
 }
 
 impl EventEmittingAggregateStore {
-    pub fn new(node: u32, log: EventLog) -> Self {
+    pub fn new(node: u32, log: EventLog, storage: &ValidStorageConfig) -> Self {
         Self {
             node,
             log,
-            inner: RefCell::new(HashMap::new()),
+            inner: Aggregate::new(storage),
         }
     }
 
-    /// This node's cluster-aggregate total across all cells — what its local
-    /// admission decision reads.
-    pub fn total(&self) -> u64 {
-        self.inner.borrow().values().copied().sum()
+    /// The table this node admits against.
+    pub fn table(&self) -> AggregateTable<'_> {
+        self.inner.table()
     }
 }
 
 impl AggregateStore for EventEmittingAggregateStore {
     fn apply(&self, deltas: &DeltaSink, expirations: &ExpirationSink) {
-        let mut map = self.inner.borrow_mut();
+        self.inner.apply(deltas, expirations);
         let mut log = self.log.borrow_mut();
         for i in 0..deltas.len() {
             let key = &deltas.keys[i];
-            let delta: u64 = deltas.deltas[i].into();
             let previous: u64 = deltas.previous[i].into();
             let current: u64 = deltas.current[i].into();
-            *map.entry((key.rule_fingerprint, key.key_hash, key.bucket))
-                .or_insert(0) += delta;
             // Previous stored count zero ⇒ this is the cell's first sighting
             // on this node; anything else is a count rising on a known cell.
             let event = if previous == 0 {
@@ -95,16 +91,7 @@ impl AggregateStore for EventEmittingAggregateStore {
             };
             log.push(event);
         }
-        for i in 0..expirations.len() {
-            let key = &expirations.keys[i];
-            let last: u64 = expirations.last_counts[i].into();
-            let entry = map
-                .entry((key.rule_fingerprint, key.key_hash, key.bucket))
-                .or_insert(0);
-            *entry = entry.saturating_sub(last);
-            if *entry == 0 {
-                map.remove(&(key.rule_fingerprint, key.key_hash, key.bucket));
-            }
+        for key in expirations.keys.iter().take(expirations.len()) {
             log.push(EventKind::CellExpired {
                 node: self.node,
                 rule: key.rule_fingerprint,

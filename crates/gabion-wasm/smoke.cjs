@@ -13,19 +13,18 @@ async function main() {
   console.log("submit batch:", JSON.stringify(batch));
 
   console.log("step(500)...");
-  const stepBatch = await sim.step(500n);
+  const stepBatch = await sim.step(500n, "Time");
   console.log(
     "step -> events:", stepBatch.events.length,
     "virtual_ms:", stepBatch.virtual_ms,
-    "tick:", stepBatch.tick,
   );
 
-  console.log("snapshot()...");
-  const snap = await sim.snapshot();
+  console.log("snapshot(null, 1, 1)...");
+  const snap = await sim.snapshot(null, 1n, 1n);
   console.log(
     "snapshot -> nodes:", snap.nodes.length,
     "oracle_total:", snap.oracle_total,
-    "aggregates:", snap.nodes.map((n) => n.aggregate_total),
+    "windows:", snap.nodes.map((n) => n.window_total),
   );
 
   await sim.shutdown();

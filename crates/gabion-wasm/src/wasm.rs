@@ -27,7 +27,7 @@ use tokio::sync::{mpsc, oneshot};
 use wasm_bindgen::prelude::*;
 
 use crate::config::{MAX_ZONES, SimConfig};
-use crate::engine::{Command, LinkPolicyKind, run_engine};
+use crate::engine::{Command, LinkPolicyKind, StepUntil, Watch, run_engine};
 
 /// A live simulation the page drives. Holds the sender end of the engine's
 /// command channel; every method round-trips one command and awaits its reply.
@@ -60,9 +60,11 @@ impl Sim {
         Ok(Sim { cmd_tx })
     }
 
-    /// Inject `hits` requests for `key_id` at `node`, at the current virtual
-    /// time. Resolves to the [`crate::event::EventBatch`] the injection
-    /// produced (the cell create/update events plus the reached virtual time).
+    /// A request of `hits` for `key_id` at `node`, at the current virtual
+    /// time. Resolves to the [`crate::event::EventBatch`] it produced: the
+    /// node's decision first, then, when admitted, its cell events and any
+    /// eager-flush packets, which land at the next command. Throws for zero
+    /// hits.
     pub async fn submit_request(
         &self,
         node: u32,
@@ -111,10 +113,10 @@ impl Sim {
         Ok(())
     }
 
-    /// Restore every directed link to lossless `Pass` — undo any partition or
-    /// per-link drop policy across the whole cluster. Engine-driven: it sweeps
-    /// the *live* link set in one round-trip, so it stays correct after nodes
-    /// have joined or left (the caller no longer tracks the node count).
+    /// Restore the configured network, uniform loss included, on every
+    /// directed link — undo any partition or per-link policy across the whole
+    /// cluster. Engine-driven: it sweeps the *live* link set in one
+    /// round-trip, so it stays correct after nodes have joined or left.
     pub async fn heal(&self) -> Result<(), JsValue> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::Heal { reply }).await?;
@@ -151,10 +153,18 @@ impl Sim {
         to_js(&batch)
     }
 
-    /// Advance virtual time by `delta_ms`, resolving to the events produced.
-    pub async fn step(&self, delta_ms: u64) -> Result<JsValue, JsValue> {
+    /// Advance virtual time by at most `delta_ms`, stopping where `until`
+    /// (`"Time"` or `"Event"`, a [`StepUntil`]) says, resolving to the events
+    /// produced.
+    pub async fn step(&self, delta_ms: u64, until: JsValue) -> Result<JsValue, JsValue> {
+        let until: StepUntil = serde_wasm_bindgen::from_value(until)?;
         let (reply, rx) = oneshot::channel();
-        self.send(Command::Step { delta_ms, reply }).await?;
+        self.send(Command::Step {
+            delta_ms,
+            until,
+            reply,
+        })
+        .await?;
         let batch = rx.await.map_err(|_| engine_gone())?;
         to_js(&batch)
     }
@@ -167,11 +177,26 @@ impl Sim {
         to_js(&batch)
     }
 
-    /// Pull every node's state for a re-render, with the cells and peer rows
-    /// of the node with stable id `inspect` alone.
-    pub async fn snapshot(&self, inspect: Option<u32>) -> Result<JsValue, JsValue> {
+    /// Pull every node's state of key `key_id` for a re-render, with the
+    /// cells and peer rows of the node with stable id `inspect` alone, and
+    /// that node's decision on a request of `probe_hits`.
+    pub async fn snapshot(
+        &self,
+        inspect: Option<u32>,
+        key_id: u64,
+        probe_hits: u64,
+    ) -> Result<JsValue, JsValue> {
         let (reply, rx) = oneshot::channel();
-        self.send(Command::Snapshot { inspect, reply }).await?;
+        let watch = Watch {
+            key: key_id.into(),
+            probe_hits,
+        };
+        self.send(Command::Snapshot {
+            inspect,
+            watch,
+            reply,
+        })
+        .await?;
         let state = rx.await.map_err(|_| engine_gone())?;
         to_js(&state)
     }

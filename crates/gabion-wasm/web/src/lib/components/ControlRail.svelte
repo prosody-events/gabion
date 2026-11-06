@@ -1,6 +1,6 @@
 <script lang="ts">
   import { type Knobs, type Preset } from '../presets';
-  import { visibleBuckets } from '../buckets';
+  import { nominalBuckets } from '../buckets';
   import { fmtCount, zoneLabel, type Blurb } from '../format';
   import type { Roles } from '../stage/renderer';
   import type { SimConfig, ZoneView } from '../sim/types';
@@ -92,7 +92,7 @@
   // *staged* slider value, while the inspector strip reflects the *applied*
   // engine; the knob's "changed" cue flags exactly that gap.
   const windowSec = $derived(Math.round(knobs.rule_window_ms / 1000));
-  const windowBuckets = $derived(visibleBuckets(knobs.rule_window_ms, bucketMs));
+  const windowBuckets = $derived(nominalBuckets(knobs.rule_window_ms, bucketMs));
   const zoneCap = $derived(Math.min(maxZones, knobs.nodes));
 
   // The zones a network action can name: those with members.

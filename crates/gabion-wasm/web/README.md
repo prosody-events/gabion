@@ -203,7 +203,7 @@ study dashboard. A rule that assumes the study's data model says "N/A" and why.
 9. One notation per context, fixed significant figures, singular units (A2).
 10. Honest scale, axes fitted to the data (visual audit).
 11. Zero gets its own treatment, never symlog (visual audit).
-12. Censored values marked "≥": a node that lacks a change reads "not caught up (≥ t)" in its tooltip, and the headline's badge gives the largest t, where t is the time since the oldest missing change's cell was last updated at its origin (the engine's `missing_for_ms`). That update is no earlier than the change itself, so t never overstates how long the node has been behind (A4).
+12. Censored values marked "≥": a node that lacks a change reads "not caught up (≥ t)" in its tooltip, and the headline's badge gives the largest t, where t is the time since the oldest missing change's cell was last updated at its origin (the engine's `lag`, `Behind` or `Stranded`, with its `missing_for_ms`). That update is no earlier than the change itself, so t never overstates how long the node has been behind (A4).
 13. Tie band: N/A, the UI makes no comparisons.
 14. Status sentence and specific empty states (A4).
 15. The reference is drawn first, muted and labelled (visual audit).

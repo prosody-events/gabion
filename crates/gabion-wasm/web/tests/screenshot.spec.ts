@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
-import type { AnswerState } from '../src/lib/sim/types';
+import { missingFor, type AnswerState, type ClusterState } from '../src/lib/sim/types';
+import { WATCH, step, stepUntil } from './drive';
 
 const SEED_TOTAL = '50';
 const NODES = 12;
@@ -60,13 +61,9 @@ async function virtualSeconds(page: Page): Promise<number> {
   return text.endsWith(' ms') ? Number.parseFloat(text) / 1000 : Number.parseFloat(text);
 }
 
-/** One Step, returning once its snapshot is on the page (the tick readout moved). */
-async function step(page: Page): Promise<void> {
-  const tick = page.locator('[data-field="tick"]');
-  const before = num(await tick.textContent());
-  await page.getByRole('button', { name: 'Step forward one tick' }).click();
-  await expect(tick).toHaveText(String(before + 1));
-}
+/** The page's engine, snapshotted, with node `inspect`'s rows. */
+const snapshot = (page: Page, inspect: number | null = null): Promise<ClusterState> =>
+  page.evaluate(([id, watch]) => window.sim!.snapshot(id, watch), [inspect, WATCH] as const);
 
 /** Click the middle of node `id`'s disc. The grid cell has no pointer events, so
  *  the click reaches the stage's own hit test, as a user's would. */
@@ -145,7 +142,7 @@ test('boots, gossips the burst out, and keeps gossiping past the window', async 
 
   // Reset tears the engine down and rebuilds: back to a single seeded node.
   // Guards both the bootstrap shutdown path (a leak otherwise piles up an engine
-  // per click) and the renderer's reset-on-tick-regress beam teardown.
+  // per click) and the renderer's reset-on-time-regress beam teardown.
   await page.getByRole('button', { name: 'Reset' }).click();
   await expect
     .poll(
@@ -269,19 +266,15 @@ test('Sandbox: inject, Step it out to convergence, then age out to quiet', async
   // It has not spread yet — a different node is still empty.
   await expect(view(page, 6)).toHaveText('0');
 
-  // Step gossips the cell out: the next heartbeat sends it to the zone and a
-  // gateway in each other zone, whose relays follow, so within a handful of
-  // ticks every node agrees on the injected total.
-  for (let i = 0; i < 12; i++) await step(page);
-  await expect
-    .poll(
-      async () => {
-        const counts = await page.locator(COUNTS).allTextContents();
-        return counts.filter((t) => t.trim() === BURST_HITS).length;
-      },
-      { timeout: 10_000, message: 'the cell did not gossip out to every node under Step' },
-    )
-    .toBe(NODES);
+  // Step gossips the cell out: node 0's next heartbeat sends it to the zone and
+  // a gateway in each other zone, whose relays follow, so within a handful of
+  // heartbeats every node agrees on the injected total.
+  await stepUntil(
+    page,
+    async () => (await page.locator(COUNTS).allTextContents()).every((t) => t.trim() === BURST_HITS),
+    12,
+    'the cell gossiped out to every node under Step',
+  );
 
   // Advance past the 10 s window: with no feed to replenish it, the bucket ages
   // out everywhere, the Σ strip empties, and the cluster falls quiet.
@@ -300,18 +293,18 @@ test('Sandbox: inject, Step it out to convergence, then age out to quiet', async
 // fixed for the whole session and never grows, shrinks, or stretches as virtual
 // time advances — the regression behind the old "bars stretch / overlap / scroll
 // off screen" report (a variable slot count re-distributing `flex:1` widths).
-// Default window is 10 s → liveBuckets 10 → 12 columns (the 11-bucket window plus
-// the emerging bucket scrolling in under "now"). Select the seeded node, then
+// Default window is 10 s → liveBuckets 10 → 11 columns (the 10-bucket window
+// admission counts plus the emerging bucket scrolling in under "now"). Select the seeded node, then
 // drive time forward and confirm the column count is pinned throughout.
 test('the Strata keeps a fixed column count as the window scrolls', async ({ page }) => {
   await boot(page);
 
   await clickNode(page, 0);
 
-  // One key (the watched key) → one strip; its track holds liveBuckets + 2 = 12
+  // One key (the watched key) → one strip; its track holds liveBuckets + 1 = 11
   // fixed-width columns from the first render.
   const cells = page.locator('.strata .strip .track .bar-cell');
-  await expect(cells).toHaveCount(12);
+  await expect(cells).toHaveCount(11);
 
   // Drive virtual time well past several bucket boundaries (the window scrolls,
   // the background feed keeps the strip populated). The column count must not
@@ -320,7 +313,7 @@ test('the Strata keeps a fixed column count as the window scrolls', async ({ pag
   await page.getByRole('button', { name: 'Play' }).click();
   await expect.poll(async () => virtualSeconds(page), { timeout: 15_000 }).toBeGreaterThan(6);
   await page.getByRole('button', { name: 'Pause' }).click();
-  await expect(cells).toHaveCount(12);
+  await expect(cells).toHaveCount(11);
 });
 
 // The control rail is the keyboard/AT-accessible equivalent of click-a-node:
@@ -522,17 +515,17 @@ test('the window knob updates its bucket-count readout and rebuilds', async ({ p
   await page.getByText('Tune the cluster').click();
   // The stepper's ceiling is the engine's `max_zones` (six), below the twelve nodes.
   await expect(page.locator('#knob-zones')).toHaveAttribute('max', '6');
-  // Default window is 10 s → 11 buckets (10 nominal + the partial oldest bucket
-  // the engine retains; see `buckets.ts`).
-  await expect(page.locator('label[for="knob-window"] .val')).toHaveText('10 s · 11 buckets');
+  // Default window is 10 s → 10 buckets, the ones admission counts (see
+  // `buckets.ts`).
+  await expect(page.locator('label[for="knob-window"] .val')).toHaveText('10 s · 10 buckets');
 
-  // Move the window to 5 s → 6 buckets. The readout updates immediately (the
+  // Move the window to 5 s → 5 buckets. The readout updates immediately (the
   // staged value), before any rebuild.
   await page.locator('#knob-window').evaluate((el: HTMLInputElement) => {
     el.value = '5000';
     el.dispatchEvent(new Event('input', { bubbles: true }));
   });
-  await expect(page.locator('label[for="knob-window"] .val')).toHaveText('5 s · 6 buckets');
+  await expect(page.locator('label[for="knob-window"] .val')).toHaveText('5 s · 5 buckets');
 
   // Apply it. The rebuild left a healthy cluster of the same size, no errors.
   await page.getByRole('button', { name: 'Rebuild cluster' }).click();
@@ -542,10 +535,10 @@ test('the window knob updates its bucket-count readout and rebuilds', async ({ p
 });
 
 // The sustained-overload scenario feeds the cluster at a steady rate against a
-// low limit (400). Played, the aggregate every node converges on climbs past the
-// limit into the REJECTING band — the "why gabion exists" story, and the one
+// low limit (400). Stepped, the nodes admit hits until their window holds the
+// limit and reject the rest — the "why gabion exists" story, and the one
 // scenario that surfaces the Aggregate-vs-Limit chart.
-test('sustained overload climbs the aggregate past the limit', async ({ page }) => {
+test('sustained overload rejects what passes the limit', async ({ page }) => {
   const pageErrors: string[] = [];
   page.on('pageerror', (err) => pageErrors.push(err.message));
 
@@ -577,16 +570,12 @@ test('sustained overload climbs the aggregate past the limit', async ({ page }) 
     )
     .toEqual({ 'one fill from the plot top to the limit': true, 'ends at the limit line': true });
 
-  await page.getByRole('button', { name: 'Play' }).click();
-  // The watched node's view (the aggregate it converges on) climbs past the
-  // limit of 400 as the steady feed accumulates cluster-wide.
-  await expect
-    .poll(async () => num(await view(page, 0).textContent()), {
-      timeout: 15_000,
-      message: 'aggregate did not climb past the limit under sustained load',
-    })
-    .toBeGreaterThan(400);
-  await page.getByRole('button', { name: 'Pause' }).click();
+  // The feed offers 40 hits a Step, so the window fills to the limit of 400
+  // within a dozen Steps and the next requests are rejected; a node rejects
+  // only once its own window holds the limit, so the cluster has admitted at
+  // least that many by then.
+  await stepUntil(page, async () => (await snapshot(page)).rejected_hits > 0, 40, 'a node rejected a request');
+  expect((await snapshot(page)).admitted_hits, 'the window filled before any rejection').toBeGreaterThanOrEqual(400);
   await page.screenshot({ path: 'screenshots/ring-overload.png' });
   // A dashboard-only frame, large enough to eyeball that the REJECTING band
   // (the shaded regime above the dashed limit line) actually reads against the
@@ -651,15 +640,14 @@ test('zone partition splits zone c off until healed', async ({ page }) => {
   // Node 0 (zone a) burst 50 and node 2 (zone c) burst 50. While the cut holds
   // node 1 (zone b) hears only node 0's burst and node 5 (zone c) only node 2's,
   // so both sit well under the 100 the whole cluster holds.
-  for (let i = 0; i < 6; i++) await step(page);
-  await expect.poll(async () => num(await view(page, 1).textContent())).toBeGreaterThanOrEqual(50);
+  await stepUntil(page, async () => num(await view(page, 1).textContent()) >= 50, 12, 'zone b heard zone a');
   expect(num(await view(page, 1).textContent()), 'zone b should not have zone c burst').toBeLessThan(100);
   expect(num(await view(page, 5).textContent()), 'zone c should not have zone a burst').toBeLessThan(100);
   // Rule 12: before Heal the headline says how long a node has lacked the other
   // side's changes, at least, as a censored "≥": the longest any node reports,
   // which is more than nothing and no more than the run so far.
-  const cut = await page.evaluate(() => window.sim!.snapshot(null));
-  const longest = Math.max(...cut.nodes.map((n) => n.missing_for_ms ?? -1));
+  const cut = await snapshot(page);
+  const longest = Math.max(...cut.nodes.map((n) => missingFor(n.lag) ?? -1));
   expect(longest, 'a node across the cut lacks a change it cannot hear').toBeGreaterThan(0);
   expect(longest, 'the bound never exceeds the run').toBeLessThanOrEqual(cut.virtual_ms);
   const printed = longest < 999.5 ? `${Math.round(longest)} ms` : `${(longest / 1000).toFixed(1)} s`;
@@ -670,17 +658,17 @@ test('zone partition splits zone c off until healed', async ({ page }) => {
   // rather than cold-restart. Both now hold both bursts.
   await heal.click();
   await expect(page.locator('[data-field="status-cut"]')).toHaveText('0');
-  for (let i = 0; i < 8; i++) await step(page);
-  await expect
-    .poll(async () => num(await view(page, 1).textContent()), { message: 'zone b did not reconcile' })
-    .toBeGreaterThanOrEqual(100);
-  await expect
-    .poll(async () => num(await view(page, 5).textContent()), { message: 'zone c did not reconcile' })
-    .toBeGreaterThanOrEqual(100);
+  await stepUntil(
+    page,
+    async () =>
+      num(await view(page, 1).textContent()) >= 100 && num(await view(page, 5).textContent()) >= 100,
+    16,
+    'zones b and c reconciled',
+  );
   // Healed, a node lacks at most the feed's latest hits, which are younger than
   // anything the cut held back.
-  const healed = await page.evaluate(() => window.sim!.snapshot(null));
-  const after = Math.max(...healed.nodes.map((n) => n.missing_for_ms ?? -1));
+  const healed = await snapshot(page);
+  const after = Math.max(...healed.nodes.map((n) => missingFor(n.lag) ?? -1));
   expect(after, 'the heal delivered what the cut held back').toBeLessThan(longest);
   await page.screenshot({ path: 'screenshots/ring-healed.png' });
 });
@@ -745,10 +733,10 @@ test('the node inspector renders every detail section', async ({ page }) => {
 
 // Two orthogonal states on independent channels. Convergence: a fresh node lags
 // the origin, then catches up (deterministic on Sandbox — no background feed).
-// Admission: on the low-limit overload preset the aggregate climbs past the
-// limit, recoloring the headline and showing the honest "over limit" pill
-// (the visualizer counts past the cap; it never claims to have rejected).
-test('the inspector shows convergence lag and the over-limit state', async ({ page }) => {
+// Admission: on the low-limit overload preset a node's window fills to the
+// limit, so it rejects even one more hit: the headline recolors and the "at
+// limit" pill appears.
+test('the inspector shows convergence lag and the at-limit state', async ({ page }) => {
   await boot(page);
 
   // --- Convergence channel, on Sandbox ---
@@ -762,21 +750,21 @@ test('the inspector shows convergence lag and the over-limit state', async ({ pa
   await clickNode(page, 6);
   await expect(page.locator('.inspector .convergence .badge')).toContainText('lagging');
   // Step until it catches up by gossip.
-  for (let i = 0; i < 12; i++) await step(page);
-  await expect(page.locator('.inspector .convergence .badge')).toContainText('caught up');
+  const badge = page.locator('.inspector .convergence .badge');
+  await stepUntil(page, async () => ((await badge.textContent()) ?? '').includes('caught up'), 12, 'node 6 caught up');
 
   // --- Admission channel, on the overload preset ---
   await page.getByRole('button', { name: 'Sustained overload' }).click();
-  await setSpeed(page, 4);
-  await page.getByRole('button', { name: 'Play' }).click();
-  await expect
-    .poll(async () => num(await view(page, 0).textContent()), { timeout: 15_000 })
-    .toBeGreaterThan(400);
-  await page.getByRole('button', { name: 'Pause' }).click();
+  await stepUntil(
+    page,
+    async () => (await snapshot(page)).nodes[0].brim.kind === 'Rejected',
+    40,
+    "node 0's window holds the limit",
+  );
   await clickNode(page, 0);
-  // The headline recolors (the `.over` class) and the over-limit pill appears.
+  // The headline recolors (the `.over` class) and the at-limit pill appears.
   await expect(page.locator('.inspector .hl-value.over')).toBeVisible();
-  await expect(page.locator('.inspector .pill')).toContainText('over limit');
+  await expect(page.locator('.inspector .pill')).toContainText('at limit');
 
   // The pill sits at the panel's right edge; its tooltip must grow inward, not
   // clip against the inspector's overflow box (it is right-aligned for exactly
@@ -809,8 +797,7 @@ test('the inspector shows gateways per remote zone and the error budget', async 
   // Step until both remote rows name a gateway, at most ten Steps.
   const named = async (): Promise<boolean> =>
     (await inspector.locator('tr.remote [data-field="gateway"]').count()) === 2;
-  for (let i = 0; i < 10 && !(await named()); i++) await step(page);
-  await expect(inspector.locator('tr.remote [data-field="gateway"]')).toHaveCount(2);
+  await stepUntil(page, named, 10, 'both remote rows name a gateway');
 
   await expect(inspector.locator('tr.own-zone')).toContainText('zone a');
   await expect(inspector.locator('tr.own-zone [data-field="members"]')).toHaveText('4');
@@ -821,12 +808,9 @@ test('the inspector shows gateways per remote zone and the error budget', async 
 
   // Each row names the runtime's own gateway for that zone, and that node sits
   // in the zone.
-  const gateways = await page.evaluate(async () => {
-    const snap = await window.sim!.snapshot(0);
-    return (snap.inspected?.peers ?? [])
-      .filter((p) => p.role === 'gateway')
-      .map((p) => ({ zone: p.zone, id: p.id }));
-  });
+  const gateways = ((await snapshot(page, 0)).inspected?.peers ?? [])
+    .filter((p) => p.role === 'gateway')
+    .map((p) => ({ zone: p.zone, id: p.id }));
   for (const zone of [1, 2]) {
     const row = inspector.locator(`tr.remote[data-zone="${zone}"]`);
     const id = Number(await row.locator('[data-field="gateway"]').textContent());
@@ -886,10 +870,9 @@ test('gateway failure fails over and the zone catches up', async ({ page }) => {
   const row = inspector.locator('tr.remote[data-zone="1"] td');
   const answers = new Set<AnswerState>();
   const checkRow = async (): Promise<void> => {
-    const answer = await page.evaluate(async () => {
-      const snap = await window.sim!.snapshot(0);
-      return snap.inspected?.peers.find((p) => p.role === 'gateway' && p.zone === 1)?.answer;
-    });
+    const answer = (await snapshot(page, 0)).inspected?.peers.find(
+      (p) => p.role === 'gateway' && p.zone === 1,
+    )?.answer;
     if (answer === undefined) return;
     const [glyph, label] = shown[answer];
     const text = ((await row.textContent()) ?? '').replace(/\s+/g, ' ').trim();
@@ -910,14 +893,16 @@ test('gateway failure fails over and the zone catches up', async ({ page }) => {
   expect([1, 4, 7, 10], `the annotation's origin, node ${origin}, is outside zone b`).not.toContain(Number(origin));
   await expect(gateway).not.toHaveText(String(g));
 
-  // Six more Steps: every zone b node but the silenced one is caught up, and the
+  // Step until every zone b node but the silenced one is caught up; the
   // silenced one is not.
-  for (let i = 0; i < 6; i++) await step(page);
   const behind = (id: number) =>
     page.locator(`.node-table tr[data-node="${id}"] [data-field="behind"]`);
-  for (const id of [1, 4, 7, 10].filter((id) => id !== g)) {
-    await expect(behind(id), `node ${id} in zone b`).toHaveText('0');
-  }
+  const zoneB = [1, 4, 7, 10].filter((id) => id !== g);
+  const caughtUp = async (): Promise<boolean> => {
+    for (const id of zoneB) if ((await behind(id).textContent())?.trim() !== '0') return false;
+    return true;
+  };
+  await stepUntil(page, caughtUp, 12, 'zone b caught up through its new gateway');
   expect(num(await behind(g).textContent()), 'the silenced gateway hears nothing').toBeGreaterThan(0);
 
   // The silenced node is still inspectable.

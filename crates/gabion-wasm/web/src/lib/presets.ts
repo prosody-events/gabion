@@ -196,7 +196,7 @@ async function warmUntilGateway(
 ): Promise<number> {
   for (let tick = 0; tick < WARM_TICKS_MAX; tick++) {
     await sim.step(tickMs);
-    const peers = (await sim.snapshot(origin)).inspected?.peers ?? [];
+    const peers = (await sim.snapshot(origin, { key: WATCHED_KEY, probe_hits: 1 })).inspected?.peers ?? [];
     const gateway = peers.find((p) => p.role === 'gateway' && p.zone === zone)?.id;
     if (gateway !== undefined) return gateway;
   }
@@ -234,11 +234,11 @@ export const PRESETS: readonly Preset[] = [
     id: 'overload',
     label: 'Sustained overload',
     blurb: () =>
-      blurb`Steady traffic floods the cluster against a low limit. Play to watch the aggregate climb past it and stay in the rejecting band.`,
-    // A low limit so the aggregate crosses it within seconds; the default
-    // budget then keeps ε well under 1, so eager flushing tracks the climb
-    // tightly. The uncapped feed plateaus at ≈ rate·window ≈ 800 — twice the
-    // limit — once expiry balances injection, so it sits in the band perpetually.
+      blurb`Steady traffic floods the cluster against a low limit. Play to watch each node admit hits up to the limit and reject the rest.`,
+    // A low limit so the window fills within seconds; ε is then 1, so eager
+    // flushing keeps every node's view close behind the truth. The feed offers
+    // ≈ rate·window ≈ 800 hits a window, twice the limit, so once the window
+    // fills each node admits what expiry frees and rejects the rest.
     config: { nodes: NODES, zones: ZONES, rule_limit: 400 },
     traffic: { rate_per_sec: OVERLOAD_RATE_PER_SEC },
     showsLimitChart: true,
@@ -312,9 +312,10 @@ export const PRESETS: readonly Preset[] = [
     id: 'sandbox',
     label: 'Sandbox',
     blurb: () =>
-      blurb`A blank, quiet cluster with no background traffic. Click a node (or send a burst), then step to gossip the change out one round at a time. You drive every tick.`,
+      blurb`A blank, quiet cluster with no background traffic. Click a node (or send a burst), then step to gossip the change out one round at a time. You drive every heartbeat.`,
     // No traffic feed and an empty seed: the cluster starts silent and the user
-    // drives every hit by hand, advancing one gossip tick at a time with Step.
+    // drives every hit by hand, advancing one heartbeat period at a time with
+    // Step.
     // The narrative limit (not the low default) so the eager threshold flush
     // never fires: a single burst then spreads only on Step, at the next
     // heartbeat, which is the whole point of this scenario.

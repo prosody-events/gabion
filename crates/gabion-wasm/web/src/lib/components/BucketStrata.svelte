@@ -32,6 +32,7 @@
     windowMs,
     bucketMs,
     limit,
+    atLimit,
   }: {
     cells: CellView[];
     /** The bucket epoch "now" sits in (`RuleDescriptor::current_epoch`). */
@@ -40,8 +41,8 @@
      *  scroll offset. `(virtual_ms mod bucket_ms) / bucket_ms`, computed by the
      *  caller so this component needn't know the bucket size. */
     epochFraction: number;
-    /** `RuleDescriptor::live_buckets()` (nominal `ceil(window / bucket)`). The
-     *  window holds `liveBuckets + 1` buckets; one more emerging bucket is
+    /** `RuleSpec::live_buckets` (nominal `ceil(window / bucket)`): the window
+     *  admission counts holds these buckets; one more emerging bucket is
      *  rendered so a fresh empty bucket can scroll in under "now". */
     liveBuckets: number;
     /** The rule window in ms — labels the trailing edge of the axis ("Ns ago"). */
@@ -51,6 +52,9 @@
      *  time-to-expiry — a number that honestly ticks toward 0 each step. */
     bucketMs: number;
     limit: number;
+    /** The node's decision on one more hit is a rejection: its window holds
+     *  the limit. */
+    atLimit: boolean;
   } = $props();
 
   // The trailing edge of the visible window, in whole seconds, for the axis
@@ -66,10 +70,10 @@
   // the track sits un-translated until the real width arrives.
   let viewportWidth = $state(0);
 
-  // The window shows `liveBuckets + 1` buckets [oldest, currentEpoch]; the track
+  // The window shows `liveBuckets` buckets [oldest, currentEpoch]; the track
   // carries one more (`currentEpoch + 1`, the bucket forming just off the right
   // edge) so it has something to scroll in.
-  const visibleCols = $derived(Math.max(liveBuckets + 1, 1));
+  const visibleCols = $derived(Math.max(liveBuckets, 1));
   const colCount = $derived(visibleCols + 1);
   const colW = $derived(viewportWidth > 0 ? viewportWidth / visibleCols : 0);
   const oldest = $derived(currentEpoch - (visibleCols - 1));
@@ -95,7 +99,7 @@
   // Bin the live cells by key into the rendered epoch range [oldest, oldest +
   // colCount). Cells outside the range are dropped (not clipped to the edge), so
   // Σ — summed over the in-window buckets [oldest, currentEpoch] — equals this
-  // node's windowed aggregate for the key. The emerging `currentEpoch + 1` column
+  // node's `window_total` for the key. The emerging `currentEpoch + 1` column
   // is excluded from Σ (it is always empty in any case — no cell is dated to the
   // future).
   const strips = $derived.by((): Strip[] => {
@@ -142,14 +146,14 @@
     return (count / max) * 100;
   }
 
-  /** Seconds until `epoch` ages off the trailing edge. The engine keeps a bucket
-   *  while `bucket + liveBuckets >= currentEpoch`, so it leaves the window the
-   *  instant the continuous current (`currentEpoch + epochFraction`) reaches
-   *  `epoch + liveBuckets + 1`. Uses the raw, unclamped `epochFraction` (not the
+  /** Seconds until `epoch` ages off the trailing edge. Admission counts a
+   *  bucket while `bucket + liveBuckets > currentEpoch`, so it leaves the window
+   *  the instant the continuous current (`currentEpoch + epochFraction`) reaches
+   *  `epoch + liveBuckets`. Uses the raw, unclamped `epochFraction` (not the
    *  reduced-motion `fraction`) so the readout is an honest sub-second countdown
    *  rather than a per-bucket snap. */
   function tteSeconds(epoch: number): number {
-    const epochsLeft = epoch + liveBuckets + 1 - currentEpoch - epochFraction;
+    const epochsLeft = epoch + liveBuckets - currentEpoch - epochFraction;
     return Math.max(0, (epochsLeft * bucketMs) / 1000);
   }
 
@@ -192,7 +196,7 @@
               <span class="tte" data-field="tte">ages out in {fmtDuration(tteSeconds(strip.oldestActiveEpoch) * 1000)}</span>
             {/if}
           </span>
-          <span class="sigma" class:over={strip.sigma >= limit}>
+          <span class="sigma" class:over={atLimit}>
             Σ <span class="sigma-value" data-field="sigma">{fmtCount(strip.sigma)}</span>
             <span class="sigma-sep">/</span>
             <span data-field="limit">{fmtCount(limit)}</span>

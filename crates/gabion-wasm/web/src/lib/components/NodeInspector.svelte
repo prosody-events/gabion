@@ -40,15 +40,14 @@
     children?: Snippet;
   } = $props();
 
-  // `aggregate ≤ oracle` always (a node's cells are a subset of cluster
-  // origins), so lag ≥ 0. `hasTotal` gates the badge so a fresh node never
-  // flashes a false "caught up".
+  // `view ≤ oracle` always (a node's cells are a subset of cluster origins), so
+  // lag ≥ 0. `hasTotal` gates the badge so a fresh node never flashes a false
+  // "caught up".
   const hasTotal = $derived(oracleTotal > 0);
-  const lag = $derived(Math.max(oracleTotal - node.aggregate_total, 0));
-  // Admission state: a *fact about this node's windowed total*, not a claim that
-  // the visualizer rejected anything (the sim records unconditionally so the
-  // count can climb past the limit; production admission is what would reject).
-  const overLimit = $derived(ruleLimit > 0 && node.aggregate_total >= ruleLimit);
+  const lag = $derived(Math.max(oracleTotal - node.window_total, 0));
+  // At its limit: the engine's own decision on one more hit, not a comparison
+  // made here.
+  const overLimit = $derived(node.brim.kind === 'Rejected');
 
   /** Shorten a 32-nibble hex id for display; the full value stays in the
    *  identity footer. Mirrors the Strata's key shortening. */
@@ -66,7 +65,7 @@
   <div class="convergence">
     <div class="headline">
       <span class="hl-label">This node's view</span>
-      <span class="hl-value" class:over={overLimit} data-field="view">{fmtCount(node.aggregate_total)}</span>
+      <span class="hl-value" class:over={overLimit} data-field="view">{fmtCount(node.window_total)}</span>
       <span class="hl-refs">
         of <span data-field="true-total">{fmtCount(oracleTotal)}</span> true
         <span class="dot-sep">·</span>
@@ -85,9 +84,9 @@
         <span class="pill">
           <InfoTip
             align="right"
-            text="This node's windowed total is at or above the rule limit. In production, admission rejects new hits for this key until the window decays back below the limit — the visualizer keeps counting so you can watch it cross."
+            text="This node's window holds the limit, so it rejects every request until the oldest hits leave the window."
           >
-            over limit
+            at limit
           </InfoTip>
         </span>
       {/if}

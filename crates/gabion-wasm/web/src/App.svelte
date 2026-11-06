@@ -11,6 +11,7 @@
     type PeerView,
     type SimConfig,
     type SimEvent,
+    type Watch,
   } from './lib/sim/types';
   import type { Roles } from './lib/stage/renderer';
   import { ChartHistory } from './lib/charts/history';
@@ -74,9 +75,17 @@
   // 1 000 000 limit), so a burst spreads only by lazy heartbeat — raising it (or
   // dropping the rule limit) far enough trips an eager flush, itself worth seeing.
   let burstHits = $state(25);
-  // One gossip tick = the active cluster's gossip interval, so a Sandbox Step
-  // advances exactly one heartbeat round and the invariant holds at any tick
-  // setting. `0` only before the first build seeds `appliedKnobs`, when nothing
+  // What every snapshot reads: the watched key, and the weight of the next Send
+  // its inspected node decides. Derived, so a frame reuses one object. Hits per
+  // Send is unvalidated, so anything but a whole number of 1 or more probes one
+  // hit rather than throwing at `BigInt`.
+  const watch = $derived<Watch>({
+    key: WATCHED_KEY,
+    probe_hits: Number.isSafeInteger(burstHits) && burstHits > 0 ? burstHits : 1,
+  });
+  // One Step = the active cluster's heartbeat period, so a Sandbox Step runs
+  // every node's heartbeat exactly once, each at its own phase, at any
+  // interval. `0` only before the first build seeds `appliedKnobs`, when nothing
   // steps. See `appliedKnobs`.
   const tickMs = $derived(appliedKnobs?.tick_interval_ms ?? 0);
   // Cap one advance so a backgrounded tab resuming rAF can't leap seconds of
@@ -93,7 +102,6 @@
   let events: SimEvent[] = $state([]);
   let playing = $state(false);
   let speed = $state(1);
-  let tick = $state(0);
   let virtualMs = $state(0);
   // Node pairs with a link cut, from the sim's own record of its link policies.
   let cutLinks = $state(0);
@@ -269,7 +277,7 @@
       appliedKnobs = { ...k };
       // The selection and the cluster it names arrive together, so the effect
       // that drops a selection no live node has never sees one without the other.
-      const snap = await fresh.snapshot(preset.select ?? null);
+      const snap = await fresh.snapshot(preset.select ?? null, watch);
       selectedId = preset.select ?? null;
       applySnapshot(snap);
       // Adopted only once built, so the rail's `aria-current` marks a finished
@@ -299,7 +307,6 @@
   function applySnapshot(snap: ClusterState): void {
     cluster = snap;
     if (snap.inspected !== undefined && snap.inspected.id === selectedId) inspected = snap.inspected;
-    tick = snap.tick;
     virtualMs = snap.virtual_ms;
     cutLinks = sim?.cutLinks() ?? 0;
     history.push(snap);
@@ -328,10 +335,11 @@
   }
 
   /** Drive the active preset's sustained feed for a `deltaMs` advance (a no-op
-   *  for presets without one). The hits land at the current virtual time,
-   *  *before* the step that gossips them, so a hit and its propagation animate
-   *  in the same frame. Submit batches are dropped — they carry no packets; the
-   *  following step's batch carries the beams the feed's eager flush triggers. */
+   *  for presets without one): many clients each sending a one-hit request,
+   *  which its node admits or rejects. The requests land at the current virtual
+   *  time, *before* the step that gossips them, so a hit and its propagation
+   *  animate in the same frame. The submit batches, eager-flush packets
+   *  included, are not drawn; the following step delivers those packets. */
   async function injectTraffic(deltaMs: number): Promise<void> {
     const traffic = activePreset.traffic;
     if (traffic === undefined || sim === null || cluster === null) return;
@@ -344,17 +352,12 @@
     // Spread by global hit index so the per-node split is chunk-independent;
     // the round-robin runs over *ranks* (positions in the live node list) and
     // resolves each to that node's stable id, since the engine addresses nodes
-    // by id. Group into one submit per node touched this advance.
+    // by id.
     const liveNodes = cluster.nodes;
-    const perNode = new Map<number, number>();
     for (let i = 0; i < hits; i++) {
-      const id = liveNodes[(trafficInjected + i) % count].id;
-      perNode.set(id, (perNode.get(id) ?? 0) + 1);
+      await sim.submitRequest(liveNodes[(trafficInjected + i) % count].id, WATCHED_KEY, 1);
     }
     trafficInjected += hits;
-    for (const [id, n] of perNode) {
-      await sim.submitRequest(id, WATCHED_KEY, n);
-    }
   }
 
   async function advance(deltaMs: number): Promise<void> {
@@ -362,7 +365,7 @@
     try {
       await injectTraffic(deltaMs);
       showEvents(await sim.step(deltaMs));
-      applySnapshot(await sim.snapshot(selectedId));
+      applySnapshot(await sim.snapshot(selectedId, watch));
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
       pause();
@@ -376,7 +379,7 @@
     if (sim === null) return;
     try {
       await command(sim);
-      applySnapshot(await sim.snapshot(selectedId));
+      applySnapshot(await sim.snapshot(selectedId, watch));
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
       pause();
@@ -391,7 +394,7 @@
     if (sim === null) return;
     try {
       showEvents(await sim.submitRequest(node, WATCHED_KEY, burstHits));
-      if (!playing) applySnapshot(await sim.snapshot(selectedId));
+      if (!playing) applySnapshot(await sim.snapshot(selectedId, watch));
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
       pause();
@@ -403,7 +406,7 @@
   async function select(id: number): Promise<void> {
     if (sim === null) return;
     try {
-      const snap = await sim.snapshot(id);
+      const snap = await sim.snapshot(id, watch);
       selectedId = id;
       inspected = snap.inspected ?? null;
       cluster = snap;
@@ -435,9 +438,10 @@
   const cutGatewayFromZone = (g: number, zone: number): Promise<void> =>
     act((s) => s.cutFromZone(g, split(zone)[0].filter((id) => id !== g)));
 
-  /** Restore every link to lossless `Pass` — undo a cut. Pure, like a burst: it
-   *  opens the links but moves no counts until the next tick gossips, so the
-   *  user plays/steps to watch the cluster reconcile. */
+  /** Restore the scenario's own network, its loss included — undo a cut.
+   *  Pure, like a burst: it opens the links but moves no counts until the next
+   *  heartbeat gossips, so the user plays/steps to watch the cluster
+   *  reconcile. */
   const heal = (): Promise<void> => act((s) => s.heal());
 
   /** Spawn a fresh cold-start node into zone `zone` of the live cluster — no
@@ -611,7 +615,7 @@
           />
         </div>
         <div class="detail-rail">
-          <HeadlineMetric {cluster} {history} version={chartVersion} />
+          <HeadlineMetric {cluster} />
           <div class="rail-body">
             {#if selectedNode !== null && selectedRows !== null}
               <NodeInspector
@@ -635,6 +639,7 @@
                   windowMs={appliedKnobs.rule_window_ms}
                   bucketMs={defaults.rule_bucket_ms}
                   limit={appliedKnobs.rule_limit}
+                  atLimit={selectedNode.brim.kind === 'Rejected'}
                 />
               </NodeInspector>
             {:else}
@@ -662,7 +667,6 @@
       {playing}
       busy={loading}
       bind:speed
-      {tick}
       {virtualMs}
       onToggle={toggle}
       onStep={() => void stepOnce()}

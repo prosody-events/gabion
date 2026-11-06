@@ -7,7 +7,6 @@
     playing,
     busy,
     speed = $bindable(),
-    tick,
     virtualMs,
     onToggle,
     onStep,
@@ -17,7 +16,6 @@
     /** A rebuild is running: the controls wait for it. */
     busy: boolean;
     speed: number;
-    tick: number;
     virtualMs: number;
     onToggle: () => void;
     onStep: () => void;
@@ -35,7 +33,7 @@
   >
     {playing ? '❚❚ Pause' : '▶ Play'}
   </button>
-  <button onclick={onStep} disabled={playing || busy} aria-label="Step forward one tick"> ▸❙ Step </button>
+  <button onclick={onStep} disabled={playing || busy} aria-label="Step one heartbeat"> ▸❙ Step </button>
   <button onclick={onReset} disabled={busy} aria-label="Reset to start"> ↺ Reset </button>
 
   <label class="speed">
@@ -46,12 +44,8 @@
 
   <div class="readout">
     <span class="readout-item">
-      <span class="readout-label">tick</span>
-      <span class="readout-value" data-field="tick">{tick}</span>
-    </span>
-    <span class="readout-item">
       <span class="readout-label">virtual time</span>
-      <span class="readout-value" data-field="virtual-time">{fmtDuration(virtualMs)}</span>
+      <span class="readout-value" data-field="virtual-time" data-ms={virtualMs}>{fmtDuration(virtualMs)}</span>
     </span>
   </div>
 </div>

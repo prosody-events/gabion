@@ -21,9 +21,27 @@ which advances virtual time and fires gossip ticks from the engine — touching 
 `tokio::time`. The runtime asks for two tickers, the heartbeat and the
 prompt-round pacer; each rides its own bounded `mpsc` (not a `watch`, which
 coalesces) so every fired tick is delivered exactly once and replay stays
-deterministic. The engine steps to the next heartbeat, or one relay floor when
-a node's prompt ticker is armed (it has resends, gap reports or sweeps
-waiting), so a quiet cluster costs one step per heartbeat.
+deterministic. Each node heartbeats at its own fixed phase, a pure function of
+its id spread across the period, as production's unrelated process starts
+spread theirs. The engine steps to the next due instant: a node's heartbeat, or
+one relay floor after a node armed its prompt ticker (it has relays, resends,
+gap reports or sweeps waiting). A quiet cluster costs one sub-step per distinct
+phase, and each sub-step reads the counters of, and drains for, only the nodes
+it touched.
+
+## Admission and held waves
+
+Each node decides every request from its own count table: gabion's
+`window_total` on its `Aggregate` and `RuleSpec::admits`, the comparison the
+server and nginx make. A rejected request is counted, per node and for the
+cluster, and never recorded. An admitted one is recorded, and the packets of
+its eager flush stay held, as a sub-step's do, until the next command, so no
+count changes before its packet lands. `step` with `"Event"` stops before a
+wave of packets that carry cells lands, or at the instant admitted hits leave
+the window. The snapshot reports each node's windowed view, per-bucket counts,
+lag (caught up, behind, or stranded where waiting cannot help), its one-hit
+decision and next heartbeat; heal and every joiner use the scenario's own
+network, its loss included.
 
 ## Zones
 
@@ -39,8 +57,8 @@ waiting), so a quiet cluster costs one step per heartbeat.
   is own, relay and sweep packets; control is acks, probes and their answers,
   gap reports and sweep requests.
 - `GatewayChanged` comes from each runtime's own gateway rows: the engine reads
-  every node's counters each sub-step and fetches a snapshot only for a node
-  whose role count moved. A removal moves no role, so the removal itself
+  the counters of every node a sub-step touched and fetches a snapshot only for
+  a node whose role count moved. A removal moves no role, so the removal itself
   re-reads every survivor whose gateway the departed node was, and reports the
   gateway gone, or replaced, as that survivor's runtime now has it.
 - `gateway_for` counts, per node, the origins whose runtime routes into its zone
@@ -51,11 +69,16 @@ waiting), so a quiet cluster costs one step per heartbeat.
 
 ## Node ceiling
 
-The page caps live nodes at `MAX_LIVE_NODES` = 100 in `web/src/App.svelte`. A
-183-node cluster (the `prod-peak` pod count, in 3 zones) plays a warm virtual
-second in about 205 ms, inside the 250 ms budget, but its first second, which
-includes cold start, takes about 380 ms, and the warm margin of about 45 ms on
-the machine below is too thin to assume for slower ones, so the cap stays.
+The page caps live nodes at `MAX_LIVE_NODES` = 100 in `web/src/App.svelte`. At
+100 nodes in 3 zones a warm virtual second plays in about 215 ms, inside the
+250 ms budget, and its first second, which includes cold start, in about
+255 ms. A 183-node cluster (the `prod-peak` pod count) takes about 405 ms a
+warm second, over the budget, so the cap stays. Per-node heartbeat phases cost
+the steps little (about 9 ms a second at 100 nodes, 17 ms at 183): a quiet
+sub-step drains and reads only the nodes it touched. The snapshot carries more
+per node than it did (the windowed view and its buckets, the one-hit decision,
+the lag and the hit counters), about 12 % more a frame at 100 nodes; most of
+every second is snapshots.
 
 To reproduce, build the release wasm (`cd web && pnpm run build:wasm`), serve
 `web/src` (`python3 -m http.server 8000 --directory web/src`), open it in
@@ -66,44 +89,53 @@ plays each virtual second as the page does with node 0 inspected, 60 frames of
 
 ```js
 const m = await import('/wasm/gabion_wasm.js'); await m.default();
-const sim = new m.Sim({ nodes: 183, zones: 3, rule_limit: 1000000 });
+const N = 100;
+const sim = new m.Sim({ nodes: N, zones: 3, rule_limit: 1000000 });
 for (const n of [0, 3, 6, 9]) await sim.submit_request(n, 1n, 10n);
 const out = []; let hit = 0;
 for (let s = 0; s < 5; s++) {
   let step = 0, snap = 0;
   for (let f = 1; f <= 60; f++) {
     const v = s * 1000 + Math.round((f * 1000) / 60);
-    while (hit < Math.floor((v * 3) / 1000)) await sim.submit_request(hit++ % 183, 1n, 1n);
+    while (hit < Math.floor((v * 3) / 1000)) await sim.submit_request(hit++ % N, 1n, 1n);
     let t = performance.now(); await sim.step_to(BigInt(v)); step += performance.now() - t;
-    t = performance.now(); await sim.snapshot(0); snap += performance.now() - t;
+    t = performance.now(); await sim.snapshot(0, 1n, 25n); snap += performance.now() - t;
   }
   out.push({ second: s, step, snap, total: step + snap });
 }
 await sim.shutdown(); out;
 ```
 
-Measured on 2026-11-03: Apple M2 Pro, macOS 26.7.1, headless Chromium 145.0.7632.6
+Measured on 2026-11-05: Apple M2 Pro, headless Chromium 156.0.8078.4
 (Playwright), release wasm. Wall time in ms per virtual second, two runs; the
-first second includes cold start.
+first second includes cold start. The previous engine (lockstep heartbeats, no
+admission), built from the parent commit and measured in the same session, gave
+185 to 194 ms a warm second at 100 nodes and 352 to 370 ms at 183.
 
-| second | steps (run 1) | snapshots (run 1) | total (run 1) | total (run 2) |
-|---|---|---|---|---|
-| 0 | 183 | 211 | 394 | 382 |
-| 1 | 13 | 199 | 212 | 208 |
-| 2 | 14 | 199 | 212 | 206 |
-| 3 | 13 | 191 | 204 | 204 |
-| 4 | 12 | 190 | 204 | 204 |
+| nodes | second | steps (run 1) | snapshots (run 1) | total (run 1) | total (run 2) |
+|---|---|---|---|---|---|
+| 100 | 0 | 56 | 205 | 261 | 253 |
+| 100 | 1 | 9 | 204 | 213 | 209 |
+| 100 | 2 | 9 | 208 | 217 | 211 |
+| 100 | 3 | 9 | 209 | 218 | 211 |
+| 100 | 4 | 10 | 208 | 218 | 212 |
+| 183 | 0 | 196 | 404 | 600 | 540 |
+| 183 | 1 | 18 | 397 | 415 | 396 |
+| 183 | 2 | 18 | 389 | 407 | 398 |
+| 183 | 3 | 16 | 392 | 408 | 409 |
+| 183 | 4 | 19 | 402 | 421 | 405 |
 
-A snapshot takes about 3 ms at 183 nodes, because it carries every node's
-scalar state but the cells and peer rows of the inspected node alone; with no
-node inspected (`snapshot()`) a warm second totals about 193 ms. Carrying every
-node's cells and all 183 × 182 peer rows instead took about 35 ms a snapshot,
-2,000 ms a second.
+In the same session, a quiet 60 s `step` took 25 to 33 ms at 12 nodes and 109
+to 135 ms at 48 (3 zones, 500 ms heartbeat), and a 48-node Steady state played
+at 4× (3 one-hit requests a second, 67 ms of virtual time a frame) spent a
+median 1.9 ms of engine time a frame (95th percentile 2.3 ms): submits, step
+and snapshot.
 
 ## Layout
 
 - `engine.rs` — the single long-lived engine task: builds the cluster, owns the
-  runtimes, and turns commands into virtual-time advances + tick fires.
+  runtimes, and turns commands into virtual-time advances + heartbeat and
+  prompt fires.
 - `clock.rs` — `ManualClock` / `ManualTicker` (the wasm time source).
 - `shims.rs` — `EventEmittingAggregateStore` + `LoggingSimTransport` turn the
   runtime's existing push surfaces into a typed event log; the transport tags
