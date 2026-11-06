@@ -477,13 +477,13 @@ def verdict_from_label(body):
     return None
 
 # ================================================================= CHECKS
-def run_state_checks(S, vp, theme):
-    """A1, A2, A3, A8, C4 for each of the 6 metrics at this viewport and theme."""
+def run_state_checks(S, vp, theme, var):
+    """A1, A2, A3, A8, C4 for each of the 6 metrics at this viewport, theme and variant."""
     S.pg.evaluate(JS_HELPERS)
     base = len(S.logs)
     for metric in METRICS6:
-        scope = f'{vp}px/{theme}/{metric}'
-        S.params(metric=metric, rope='0.05', regime='', arm='')
+        scope = f'{vp}px/{theme}/{var}/{metric}'
+        S.params(variant=var, metric=metric, rope='0.05', regime='', arm='')
         S.pg.evaluate(JS_HELPERS)
         o = S.pg.evaluate(JS_SCAN)
         newlogs = S.logs[base:]; base = len(S.logs)
@@ -1459,10 +1459,12 @@ def main():
         S = Session(pw, base)
         try:
             if any(want(p) for p in ('A1', 'A2', 'A3', 'A8', 'C4')):
+                # every variant in one theme: a variant changes the rows (names, sub-labels), a theme only the colours
                 for vp in VIEWPORTS:
                     for th in THEMES:
                         S.open(vp, th)
-                        try: safe(run_state_checks, S, vp, th)
+                        try:
+                            for var in (VARIANTS if th == 'light' else VARIANTS[:1]): safe(run_state_checks, S, vp, th, var)
                         finally: S.close()
                         step(f'state checks {vp}/{th}')
             if any(want(p) for p in ('A4', 'C1', 'C3', 'C4', 'A5')):
