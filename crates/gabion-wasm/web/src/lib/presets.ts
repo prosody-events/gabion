@@ -59,7 +59,7 @@ const ZONES = 3;
 const BURST = 50;
 
 /** The node the one-Send presets seed, select on load and read the gateways of. */
-const ORIGIN = 0;
+export const ORIGIN = 0;
 
 /** The pods in the production peak the Steady blurb compares with. */
 const PROD_PEAK = 183;

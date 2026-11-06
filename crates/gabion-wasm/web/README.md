@@ -330,8 +330,9 @@ and Pause freezes it, pool, clock and pixels, with the beams in flight painted
 over the labels; the heartbeat readout; the allocations of the stage's
 per-frame functions, every one tracked by the heap profiler in a browser that
 only interprets and mapped to its source through the hidden source maps: after
-three warm stretches, a stretch of 300 played frames in which they allocate
-nothing but boxed doubles, the engine's own; and the landed routes, with motion
+three warm stretches, a stretch of 300 played frames of Packet loss, its
+origin selected and its gateways' relays drawn, in which they allocate nothing
+but boxed doubles, the engine's own; and the landed routes, with motion
 on and reduced, painted under the labels. The checks of how long a flight or a
 heartbeat takes to watch, of the back-to-back Sends and of the allocations run
 the page on Playwright's fake clock, so they hold on any machine.

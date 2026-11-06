@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { expect, test, type Page } from '@playwright/test';
+import { ORIGIN } from '../src/lib/presets';
 import type { ClusterState } from '../src/lib/sim/types';
 import { BEAM_FLIGHT_MS, CONTROL, CROSS, DROPPED, LANDED, RELAY } from '../src/lib/stage/layout';
 import type { BeamPool } from '../src/lib/stage/renderer';
@@ -689,11 +690,16 @@ test('the stage allocates nothing per frame', async ({ playwright, baseURL, view
     await openOnFakeClock(page);
     await stopClock(page);
     // Packet loss: no feed, so landed routes stay; loss draws stop bars;
-    // resends keep waves coming, and a Send each stretch starts more.
+    // resends keep waves coming, and a Send each stretch starts more. Its
+    // origin selected, so the beams are drawn as the origin's own or faded
+    // context, and its gateways' relays are told apart from other beams.
     await loadPreset(page, 'Packet loss');
+    const inspector = page.getByRole('region', { name: `Node ${ORIGIN} inspector` });
+    await page.locator(`[role="gridcell"][data-node="${ORIGIN}"]`).press('Enter');
+    await expect(inspector).toBeVisible();
     await page.getByRole('button', { name: 'Play' }).click();
     const stretch = async (): Promise<void> => {
-      await railSend(page, 0);
+      await railSend(page, ORIGIN);
       await page.clock.runFor(FRAMES * FRAME_MS);
     };
     for (let warm = 0; warm < WARM_STRETCHES; warm++) await stretch();
@@ -719,10 +725,24 @@ test('the stage allocates nothing per frame', async ({ playwright, baseURL, view
     await stretch();
     const redraws = (await pool(page, (c) => c.beams.redraws)) - redrawsFrom;
     await cdp.send('HeapProfiler.stopTrackingHeapObjects', { reportProgress: false });
-    const snapshot = JSON.parse(chunks.join('')) as TrackedSnapshot;
+    const tracked = JSON.parse(chunks.join('')) as TrackedSnapshot;
+    // The landed routes the tracked stretch drew that are relays sent by the
+    // origin's gateways: the beams only a selected origin's roles single out.
+    await expect(inspector, 'the origin stayed selected').toBeVisible();
+    const gateways = (await snapshot(page, ORIGIN)).inspected!.peers.flatMap((p) =>
+      p.role === 'gateway' && p.id !== undefined ? [p.id] : [],
+    );
+    const gatewayRelays = await page.locator('.stage canvas').evaluate(
+      (c: Canvas, [relay, ids]) => {
+        let n = 0;
+        for (let i = 0; i < c.beams.len; i++) if ((c.beams.flags[i] & relay) !== 0 && ids.includes(c.beams.src[i])) n += 1;
+        return n;
+      },
+      [RELAY, gateways] as const,
+    );
 
     const box = { count: 0, size: 0 };
-    for (const a of allocations(snapshot)) {
+    for (const a of allocations(tracked)) {
       if (a.name !== 'boxDoubles') continue;
       box.count += a.count;
       box.size += a.size;
@@ -731,7 +751,7 @@ test('the stage allocates nothing per frame', async ({ playwright, baseURL, view
     let count = 0;
     let over = 0;
     const where: [string, number][] = [];
-    for (const a of allocations(snapshot)) {
+    for (const a of allocations(tracked)) {
       const bundle = a.script.match(/\/assets\/([^/?#]+\.js)$/)?.[1];
       if (a.count === 0 || bundle === undefined || a.line === 0) continue;
       // The function's opening line in its source.
@@ -751,6 +771,7 @@ test('the stage allocates nothing per frame', async ({ playwright, baseURL, view
     );
     expect(boxed, "a boxed double's size was measured").toBeGreaterThan(0);
     expect(redraws, 'the beam layer redrew while the waves flew').toBeGreaterThan(0);
+    expect(gatewayRelays, "the stretch drew a relay from one of the selected origin's gateways").toBeGreaterThan(0);
     expect(count, 'the source map placed no allocation in the per-frame functions').toBeGreaterThan(0);
     expect(over, `bytes over boxed doubles in the per-frame functions over ${FRAMES} frames`).toBe(0);
   } finally {
