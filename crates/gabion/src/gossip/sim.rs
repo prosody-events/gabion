@@ -72,6 +72,14 @@ struct SimRouterInner {
     held: RefCell<Vec<(mpsc::OwnedPermit<SimPacket>, SimPacket)>>,
 }
 
+/// Proof that a [`SimRouter`] is deferring delivery: only
+/// [`SimRouter::begin_deferred`] makes one, and only
+/// [`SimRouter::release_deferred`], which consumes it, stops deferring. Not
+/// `Clone`, so one deferral has one holder.
+#[derive(Debug)]
+#[must_use = "a dropped deferral holds every later packet: release it"]
+pub struct Deferral(());
+
 /// In-memory packet router shared by all sim runtimes in one process.
 /// Cheap to clone — internally an `Rc<SimRouterInner>`.
 #[derive(Clone)]
@@ -129,19 +137,45 @@ impl SimRouter {
     }
 
     /// Drop the sender registered at `addr`, the symmetric inverse of
-    /// [`SimRouter::bind`]; returns whether one was bound. Sim/test-only — it
-    /// lets a simulation remove a node at runtime without leaving a dead sender
-    /// in the routing table (otherwise the map would accumulate one stale entry
-    /// per removal). After unbinding, sends to `addr` see no receiver and land
-    /// on the floor, exactly as production UDP to a departed peer does.
+    /// [`SimRouter::bind`], and forget every link policy, drop counter and
+    /// delivery count that names it; returns whether one was bound.
+    /// Sim/test-only — it lets a simulation remove a node at runtime without
+    /// leaving its entries behind, so the maps stay sized by the live links
+    /// however many nodes come and go. After unbinding, sends to `addr` see
+    /// no receiver and land on the floor, exactly as production UDP to a
+    /// departed peer does.
     pub fn unbind(&self, addr: SocketAddr) -> bool {
+        let elsewhere = |&(src, dst): &(SocketAddr, SocketAddr)| src != addr && dst != addr;
+        self.inner
+            .policies
+            .borrow_mut()
+            .retain(|link, _| elsewhere(link));
+        self.inner
+            .drop_counters
+            .borrow_mut()
+            .retain(|link, _| elsewhere(link));
+        self.inner.received_counts.borrow_mut().remove(&addr);
         self.inner.senders.borrow_mut().remove(&addr).is_some()
     }
 
-    /// Install a per-(src, dst) link policy. Default is [`LinkPolicy::Pass`].
+    /// Install a per-(src, dst) link policy. Default is [`LinkPolicy::Pass`],
+    /// which is stored as no entry at all, so a healed network holds none.
     pub fn set_link_policy(&self, src: SocketAddr, dst: SocketAddr, policy: LinkPolicy) {
-        self.inner.policies.borrow_mut().insert((src, dst), policy);
+        let mut policies = self.inner.policies.borrow_mut();
+        match policy {
+            LinkPolicy::Pass => policies.remove(&(src, dst)),
+            _ => policies.insert((src, dst), policy),
+        };
         self.inner.drop_counters.borrow_mut().remove(&(src, dst));
+    }
+
+    /// The link policies and the per-link drop counters held, for tests that
+    /// bound the router's memory by the live links.
+    pub fn link_entries(&self) -> (usize, usize) {
+        (
+            self.inner.policies.borrow().len(),
+            self.inner.drop_counters.borrow().len(),
+        )
     }
 
     /// Look up the policy for `(src, dst)`. Mutates the counter for
@@ -207,11 +241,15 @@ impl SimRouter {
 
     /// Begin deferring delivery: subsequent `try_send_to` calls buffer their
     /// packets instead of delivering them, so every node decides its gossip
-    /// against this round's state before any packet lands. Pair with
-    /// [`SimRouter::release_deferred`]. Opt-in — only the wasm step driver arms
-    /// it, to give one step one gossip round of fidelity.
-    pub fn begin_deferred(&self) {
+    /// against this round's state before any packet lands. The returned
+    /// [`Deferral`] is the only way to stop: hand it to
+    /// [`SimRouter::release_deferred`], so whoever holds it knows the router
+    /// is deferring. Opt-in — only the wasm step driver arms it, to give one
+    /// step one gossip round of fidelity.
+    pub fn begin_deferred(&self) -> Deferral {
+        debug_assert!(!self.is_deferring(), "one deferral at a time");
         self.inner.deferring.set(true);
+        Deferral(())
     }
 
     /// Deliver every packet buffered since [`SimRouter::begin_deferred`], in
@@ -221,7 +259,7 @@ impl SimRouter {
     /// `received_count` diff the wasm logging shim reads is unaffected. A
     /// permit's send only enqueues and wakes its receiver, so the borrow it
     /// runs under is never re-entered.
-    pub fn release_deferred(&self) {
+    pub fn release_deferred(&self, Deferral(()): Deferral) {
         self.inner.deferring.set(false);
         let mut held = self.inner.held.borrow_mut();
         for (permit, packet) in held.drain(..) {

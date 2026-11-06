@@ -12,6 +12,7 @@
 use gabion::gossip::{AnswerState, Role};
 use gabion::wire::{CellPayload, Payload};
 use serde::Serialize;
+use std::num::NonZeroU64;
 
 use crate::hex::{option_u128_hex, u128_hex};
 
@@ -35,7 +36,7 @@ pub enum EventKind {
     /// it by kind: a batch may open with an earlier wave's packets landing.
     Decided {
         node: u32,
-        hits: u64,
+        hits: NonZeroU64,
         admission: Admission,
     },
     /// A heartbeat round ran on `node`.
@@ -227,7 +228,8 @@ pub struct ClusterState {
     /// The ground-truth cluster total for the watched key — the
     /// simulator-only oracle the convergence fan races toward. Summed over
     /// every origin's own cells of the watched key whose bucket lies in the
-    /// window, so it is independent of how far gossip has propagated and
+    /// window, a departed origin's as the fullest replica a live node still
+    /// holds, so it is independent of how far gossip has propagated and
     /// drops a bucket at the instant every node's `window_total` does.
     pub oracle_total: u64,
     /// `oracle_total` by live bucket, oldest first: one entry per bucket of
@@ -237,12 +239,13 @@ pub struct ClusterState {
     /// first, row by row in `nodes` order: `nodes.len() × oracle_buckets.len()`
     /// entries.
     pub window_buckets: Vec<u64>,
-    /// Hits the cluster admitted since the session began, never decremented,
-    /// so a removal cannot make it fall.
+    /// Hits the cluster admitted since the session began, of every key, never
+    /// decremented, so a removal cannot make it fall.
     pub admitted_hits: u64,
     /// Hits the cluster rejected since the session began, likewise.
     pub rejected_hits: u64,
-    /// The next instant admitted hits leave the window, if any are in it.
+    /// The next instant some node's window of the watched key drops a bucket
+    /// that holds hits, if any node's window holds some.
     pub next_expiry_ms: Option<u64>,
     /// The bucket epoch the watched rule sits in at `virtual_ms`, straight
     /// from `RuleSpec::bucket_at` — so the Strata renders the CRDT's window
@@ -335,9 +338,9 @@ pub struct NodeState {
     pub lag: Lag,
     /// The next instant this node's heartbeat fires, in virtual ms.
     pub next_heartbeat_ms: u64,
-    /// Hits this node admitted since it joined.
+    /// Hits this node admitted since it joined, of every key.
     pub admitted_hits: u64,
-    /// Hits this node rejected since it joined.
+    /// Hits this node rejected since it joined, of every key.
     pub rejected_hits: u64,
     /// Heartbeat rounds this runtime has run.
     pub rounds_heartbeat: u64,

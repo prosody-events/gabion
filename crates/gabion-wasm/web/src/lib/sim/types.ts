@@ -65,10 +65,10 @@ export const CARRIES_CELLS: Readonly<Record<PacketKind, boolean>> = {
   SweepRequest: false,
 };
 
-/** Mirror of `crate::engine::StepUntil`: where a step stops. `'Event'` stops
- *  before a wave of data packets lands, or where admitted hits leave the
- *  window. */
-export type StepUntil = 'Time' | 'Event';
+/** Mirror of `crate::engine::StepUntil`: where a step stops. `Event` stops
+ *  before a wave of data packets lands, or where some node's window of `key`
+ *  drops a bucket that holds hits. */
+export type StepUntil = 'Time' | { Event: { key: number } };
 
 /** Mirror of `crate::engine::Watch`: the key a snapshot reads, and the weight
  *  of the request its inspected node's `next_send` decides. Crosses inbound as
@@ -213,7 +213,7 @@ export interface NodeState {
   lag: Lag;
   /** The next instant this node's heartbeat fires, in virtual ms. */
   next_heartbeat_ms: number;
-  /** Hits this node admitted, and rejected, since it joined. */
+  /** Hits this node admitted, and rejected, since it joined, of every key. */
   admitted_hits: number;
   rejected_hits: number;
   /** Heartbeat rounds the runtime has run. */
@@ -282,8 +282,8 @@ export interface ClusterState {
   /** Every zone in index order, with its live members. */
   zones: ZoneView[];
   bytes_by_tier: BytesByTier;
-  /** The watched key's hits in the window, summed over every node's own
-   *  cells. */
+  /** The watched key's hits in the window, summed over every origin's own
+   *  cells, a departed origin's as the fullest replica a live node holds. */
   oracle_total: number;
   /** `oracle_total` by live bucket, oldest first; its length is the window's
    *  bucket count. */
@@ -291,11 +291,12 @@ export interface ClusterState {
   /** Every node's count in each live bucket, oldest first, row by row in
    *  `nodes` order. */
   window_buckets: number[];
-  /** Hits the cluster admitted, and rejected, since the session began. */
+  /** Hits the cluster admitted, and rejected, since the session began, of
+   *  every key. */
   admitted_hits: number;
   rejected_hits: number;
-  /** The next instant admitted hits leave the window; absent when none are in
-   *  it. */
+  /** The next instant some node's window of the watched key drops a bucket
+   *  that holds hits; absent when no node's window holds any. */
   next_expiry_ms: number | undefined;
   /** The bucket epoch the watched rule sits in at `virtual_ms`, from
    *  `RuleSpec::bucket_at`. The Strata right-anchors its fixed-width grid on

@@ -157,8 +157,8 @@ impl Sim {
     }
 
     /// Advance virtual time by at most `delta_ms`, stopping where `until`
-    /// (`"Time"` or `"Event"`, a [`StepUntil`]) says, resolving to the events
-    /// produced.
+    /// (`"Time"` or `{ Event: { key } }`, a [`StepUntil`]) says, resolving to
+    /// the events produced.
     pub async fn step(&self, delta_ms: u64, until: JsValue) -> Result<JsValue, JsValue> {
         let until: StepUntil = serde_wasm_bindgen::from_value(until)?;
         let (reply, rx) = oneshot::channel();

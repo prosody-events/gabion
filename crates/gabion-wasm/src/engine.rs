@@ -20,13 +20,13 @@
 //! **Sub-steps.** Time moves from one due instant to the next: a node's
 //! heartbeat (each node at its own fixed phase), one emit floor after a node
 //! armed its prompt ticker, or, stepping by [`StepUntil::Event`], the instant
-//! admitted hits leave the window. A sub-step has two halves. The open half
-//! fires what is due while the router holds every packet sent; the close half
-//! delivers them and reads the counters of the nodes it touched. An admitted
-//! request opens a sub-step too, so its eager-flush packets are held. Between
-//! the halves the sub-step is open, and every command that is carried out,
-//! `Snapshot` aside, closes it first, so no count changes before its packet
-//! lands.
+//! some node's window drops a bucket that holds hits. A sub-step has two
+//! halves. The open half fires what is due while the router holds every packet
+//! sent; the close half delivers them and reads the counters of the nodes it
+//! touched. An admitted request opens a sub-step too, so its eager-flush
+//! packets are held. Between the halves the sub-step is open, and every command
+//! that is carried out, `Snapshot` aside, closes it first, so no count changes
+//! before its packet lands.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -39,7 +39,7 @@ use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gabion::aggregate::AggregateTable;
 use gabion::crdt::{BucketEpoch, CellStore, KeyHash, NodeId, NodeIdentity, ValidStorageConfig};
 use gabion::discovery::{Peer, PeerEvent};
-use gabion::gossip::sim::{LinkPolicy, SimRouter};
+use gabion::gossip::sim::{Deferral, LinkPolicy, SimRouter};
 use gabion::gossip::{
     AdminCommand, AdminSnapshot, CellDumpSnapshot, GossipClient, GossipCounters, GossipError,
     GossipRuntime, PeerZone, Role,
@@ -47,7 +47,7 @@ use gabion::gossip::{
 use gabion::rules::{RuleSpec, RuleTable};
 use gabion::settings::{SettingError, Settings};
 use gabion::zone::{ZoneHash, ZoneName};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, LocalSet};
 
@@ -113,8 +113,17 @@ pub enum StepUntil {
     Time,
     /// At the first of: the requested instant; right after a sub-step's fired
     /// rounds sent a packet that carries cells, before it lands, with the
-    /// sub-step left open; or the instant admitted hits leave the window.
-    Event,
+    /// sub-step left open; or the instant some node's window of `key` drops
+    /// a bucket that holds hits.
+    Event {
+        #[serde(deserialize_with = "key_from_u64")]
+        key: KeyHash,
+    },
+}
+
+/// A key as the page names it, a safe integer.
+fn key_from_u64<'de, D: Deserializer<'de>>(de: D) -> Result<KeyHash, D::Error> {
+    u64::deserialize(de).map(|key| KeyHash(u128::from(key)))
 }
 
 /// The key the snapshot watches, and the weight of the request its
@@ -125,14 +134,15 @@ pub struct Watch {
     pub probe_hits: NonZeroU64,
 }
 
-/// Whether a sub-step's packets are still held. `Open` exactly while the
-/// router defers delivery: only [`EngineState::open_sub_step`] and an admitted
-/// request begin deferring, and only [`EngineState::close_sub_step`], which
-/// every command that is carried out calls first, releases.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Whether a sub-step's packets are still held. `Open` holds the router's
+/// [`Deferral`], so it is open exactly while the router defers delivery:
+/// [`EngineState::hold`] alone opens it, and
+/// [`EngineState::close_sub_step`], which every command that is carried out
+/// calls first, alone releases it.
+#[derive(Debug)]
 enum SubStep {
     Closed,
-    Open,
+    Open(Deferral),
 }
 
 /// Words of a [`NodeSet`].
@@ -471,9 +481,9 @@ struct NodeHandle {
     prompt_due: Option<u64>,
     /// The positions whose link into this node blocks.
     blocked_from: NodeSet,
-    /// Hits this node admitted since it joined.
+    /// Hits this node admitted since it joined, of every key.
     admitted_hits: u64,
-    /// Hits this node rejected since it joined.
+    /// Hits this node rejected since it joined, of every key.
     rejected_hits: u64,
 }
 
@@ -522,13 +532,10 @@ struct EngineState {
     touched: NodeSet,
     /// Events drained and stamped, waiting for the next batch.
     outbox: Vec<Event>,
-    /// Hits the cluster admitted, and rejected, since the session began.
+    /// Hits the cluster admitted, and rejected, since the session began, of
+    /// every key.
     admitted_hits: u64,
     rejected_hits: u64,
-    /// Admitted hits by bucket, one slot per live bucket, each stamped with
-    /// the bucket it counts; a slot whose stamp is out of the window counts
-    /// nothing. Allocated once.
-    admitted_by_bucket: Box<[(BucketEpoch, u64)]>,
     /// Bytes every sender put on the wire, drained from the log.
     bytes_by_tier: BytesByTier,
     /// Admin snapshots the gateway diff has fetched: one per node whose roles
@@ -559,7 +566,6 @@ impl EngineState {
         let now: SharedNow = Rc::new(Cell::new(0));
 
         let initial_nodes = config.nodes;
-        let live_buckets = spec.live_buckets.get() as usize;
         let mut state = Self {
             config,
             settings,
@@ -582,7 +588,6 @@ impl EngineState {
             outbox: Vec::new(),
             admitted_hits: 0,
             rejected_hits: 0,
-            admitted_by_bucket: vec![(BucketEpoch::default(), 0); live_buckets].into_boxed_slice(),
             bytes_by_tier: BytesByTier::default(),
             gateway_fetches: 0,
             counter_reads: 0,
@@ -746,8 +751,7 @@ impl EngineState {
         self.virtual_ms = at;
         self.now.set(at);
         self.substeps += 1;
-        self.router.begin_deferred();
-        self.sub_step = SubStep::Open;
+        self.hold();
         self.fire(at).await;
         self.drain_pending().await;
         let before = self.outbox.len();
@@ -760,18 +764,27 @@ impl EngineState {
         })
     }
 
+    /// Open a sub-step: the router holds every packet sent until
+    /// [`EngineState::close_sub_step`]. Called only with the sub-step closed.
+    fn hold(&mut self) {
+        debug_assert!(
+            matches!(self.sub_step, SubStep::Closed),
+            "one sub-step at a time"
+        );
+        self.sub_step = SubStep::Open(self.router.begin_deferred());
+    }
+
     /// The close half: deliver the held packets at the current instant, let
     /// the receivers merge them, and read the touched nodes' counters. No
     /// time passes. A no-op while no sub-step is open.
     async fn close_sub_step(&mut self) {
-        if self.sub_step == SubStep::Closed {
+        let SubStep::Open(deferral) = std::mem::replace(&mut self.sub_step, SubStep::Closed) else {
             return;
-        }
-        self.router.release_deferred();
+        };
+        self.router.release_deferred(deferral);
         self.drain_pending().await;
         self.drain_log();
         self.observe().await;
-        self.sub_step = SubStep::Closed;
     }
 
     /// Node `node` decides a request of `hits` for `key` from its own count
@@ -791,44 +804,46 @@ impl EngineState {
         let table = self.nodes[pos].aggregate.table();
         let total = table.window_total(spec, key, now);
         let admission = decide(spec, table, key, now, total, hits);
-        let hits = hits.get();
-        self.outbox.push(Event {
+        let decided = Event {
             virtual_ms: now,
             kind: EventKind::Decided {
                 node,
                 hits,
                 admission,
             },
-        });
+        };
+        let hits = hits.get();
         match admission {
             Admission::Rejected { .. } => {
+                self.outbox.push(decided);
                 let handle = &mut self.nodes[pos];
                 handle.rejected_hits = handle.rejected_hits.saturating_add(hits);
                 self.rejected_hits = self.rejected_hits.saturating_add(hits);
             }
             Admission::Admitted { .. } => {
-                self.router.begin_deferred();
-                self.sub_step = SubStep::Open;
+                self.hold();
                 self.touched.insert(pos);
-                let bucket = spec.bucket_at(now);
                 self.nodes[pos]
                     .client
-                    .record(spec.fingerprint, key, bucket, hits, spec.limit, now)
+                    .record(
+                        spec.fingerprint,
+                        key,
+                        spec.bucket_at(now),
+                        hits,
+                        spec.limit,
+                        now,
+                    )
                     .await
                     .map_err(|source| EngineError::Gossip { node, source })?;
-                // An eager flush's threshold round runs on the runtime's next
-                // turn, so the drain puts its packets in this batch.
+                // Only a recorded request is reported admitted. An eager
+                // flush's threshold round runs on the runtime's next turn, so
+                // the drain puts its packets in this batch, after the decision.
+                self.outbox.push(decided);
                 self.drain_pending().await;
                 self.drain_log();
                 let handle = &mut self.nodes[pos];
                 handle.admitted_hits = handle.admitted_hits.saturating_add(hits);
                 self.admitted_hits = self.admitted_hits.saturating_add(hits);
-                let live = self.admitted_by_bucket.len();
-                let slot = &mut self.admitted_by_bucket[bucket.0 as usize % live];
-                if slot.0 != bucket {
-                    *slot = (bucket, 0);
-                }
-                slot.1 = slot.1.saturating_add(hits);
             }
         }
         Ok(self.batch())
@@ -992,10 +1007,11 @@ impl EngineState {
         self.close_sub_step().await;
         let floor_ms = self.config.min_emit_interval_ms;
         let target = self.virtual_ms.saturating_add(delta_ms);
-        // No request arrives inside a step, so the next expiry is fixed until
-        // the step passes it, and stepping by event stops there.
+        // No request arrives inside a step, and gossip only copies a bucket
+        // some live node holds, so the next expiry is fixed until the step
+        // passes it, and stepping by event stops there.
         let expiry = match until {
-            StepUntil::Event => self.next_expiry_ms(),
+            StepUntil::Event { key } => self.next_expiry_ms(key),
             StepUntil::Time => None,
         };
 
@@ -1033,7 +1049,7 @@ impl EngineState {
                 break;
             }
             let wave = self.open_sub_step(next).await;
-            if until == StepUntil::Event && wave {
+            if wave && matches!(until, StepUntil::Event { .. }) {
                 return self.batch();
             }
             self.close_sub_step().await;
@@ -1213,21 +1229,22 @@ impl EngineState {
             .map(|index| index as u8)
     }
 
-    /// The next instant admitted hits leave the window: the fall-off of the
-    /// oldest live bucket that holds any, always after now.
-    fn next_expiry_ms(&self) -> Option<u64> {
-        let current = self.spec.bucket_at(self.virtual_ms);
-        let live = self.spec.live_buckets.get();
-        let oldest = self
-            .admitted_by_bucket
-            .iter()
-            .filter(|&&(_, hits)| hits > 0)
-            .map(|&(bucket, _)| current.age_since(bucket))
-            .filter(|age| (0..live as i32).contains(age))
-            .max()?;
-        let bucket_ms = self.spec.bucket_millis.get();
-        let fall_off = self.virtual_ms / bucket_ms - oldest as u64 + u64::from(live);
-        Some(fall_off.saturating_mul(bucket_ms))
+    /// The next instant some node's window of `key` drops a bucket that
+    /// holds hits: the fall-off of the oldest live bucket any node's count
+    /// table holds a count in, always after now. One probe per node and live
+    /// bucket, at most, and no allocation.
+    fn next_expiry_ms(&self, key: KeyHash) -> Option<u64> {
+        let (spec, now) = (self.spec, self.virtual_ms);
+        let current = spec.bucket_at(now);
+        let oldest = (0..spec.live_buckets.get()).rev().find(|&back| {
+            self.nodes.iter().any(|node| {
+                node.aggregate
+                    .table()
+                    .get(spec.fingerprint, key, current.back(back))
+                    .is_some_and(|cell| cell.count > 0)
+            })
+        })?;
+        Some(fall_off_ms(spec, now, oldest))
     }
 
     /// Whether some position of `from` has a path of links that do not
@@ -1280,7 +1297,6 @@ impl EngineState {
         // of every origin's cells, so keeping every dump would hold N stores
         // at once. No virtual time passes between the passes.
         let mut origins: Vec<OriginCell> = Vec::new();
-        let mut oracle_buckets = vec![0; live as usize];
         for handle in &self.nodes {
             let own = handle.identity.node_id.0;
             let dump = cell_dump(&handle.admin_tx).await;
@@ -1288,8 +1304,6 @@ impl EngineState {
                 if cell.origin_node_id == Some(own)
                     && watched(cell.rule_fingerprint, cell.key_hash, cell.bucket)
                 {
-                    let age = current.age_since(cell.bucket) as usize;
-                    oracle_buckets[live as usize - 1 - age] += cell.count;
                     origins.push(OriginCell {
                         node_id: own,
                         bucket: cell.bucket,
@@ -1301,9 +1315,12 @@ impl EngineState {
             }
         }
         origins.sort_unstable_by_key(|cell| (cell.node_id, cell.bucket.0));
-        let oracle_total = oracle_buckets.iter().sum();
 
-        // Which nodes hold each origin cell at its origin's count.
+        // Which nodes hold each origin cell at its origin's count. A departed
+        // origin's cells live on in the survivors' replicas until they leave
+        // the window, and still count against the limit, so each is the
+        // fullest replica a live node holds, held by the nodes at that count
+        // and dated by the earliest of their updates.
         let mut inspected_cells = None;
         for (pos, handle) in self.nodes.iter().enumerate() {
             let dump = cell_dump(&handle.admin_tx).await;
@@ -1314,11 +1331,31 @@ impl EngineState {
                 if !watched(cell.rule_fingerprint, cell.key_hash, cell.bucket) {
                     continue;
                 }
-                if let Ok(i) = origins
-                    .binary_search_by_key(&(origin, cell.bucket.0), |c| (c.node_id, c.bucket.0))
-                    && cell.count >= origins[i].count
-                {
-                    origins[i].holders.insert(pos);
+                let departed = !self.node_id_index.contains_key(&origin);
+                let replica = OriginCell {
+                    node_id: origin,
+                    bucket: cell.bucket,
+                    count: cell.count,
+                    updated_ms: cell.last_update_millis,
+                    holders: NodeSet::EMPTY,
+                };
+                let at = origins
+                    .binary_search_by_key(&(origin, cell.bucket.0), |c| (c.node_id, c.bucket.0));
+                let held = match at {
+                    Ok(i) if departed && cell.count > origins[i].count => {
+                        origins[i] = replica;
+                        &mut origins[i]
+                    }
+                    Ok(i) if cell.count >= origins[i].count => &mut origins[i],
+                    Err(i) if departed => {
+                        origins.insert(i, replica);
+                        &mut origins[i]
+                    }
+                    Ok(_) | Err(_) => continue,
+                };
+                held.holders.insert(pos);
+                if departed {
+                    held.updated_ms = held.updated_ms.min(cell.last_update_millis);
                 }
             }
             if inspect == Some(handle.id) {
@@ -1327,6 +1364,13 @@ impl EngineState {
                     .map(|d| self.cells_from_dump(handle.identity, d));
             }
         }
+
+        let mut oracle_buckets = vec![0; live as usize];
+        for cell in &origins {
+            let age = current.age_since(cell.bucket) as usize;
+            oracle_buckets[live as usize - 1 - age] += cell.count;
+        }
+        let oracle_total = oracle_buckets.iter().sum();
 
         // Each origin's gateways, inverted: how many origins route through
         // each node.
@@ -1343,13 +1387,18 @@ impl EngineState {
         let mut inspected = None;
         // Ascending id order, the order the page lays the nodes out in.
         for (pos, handle) in self.nodes.iter().enumerate() {
+            // gabion's `window_total`, summed from the row it probes, so each
+            // live bucket is probed once.
             let table = handle.aggregate.table();
-            let window_total = table.window_total(spec, key, now);
+            let row = window_buckets.len();
             window_buckets.extend((0..live).rev().map(|back| {
                 table
                     .get(spec.fingerprint, key, current.back(back))
                     .map_or(0, |cell| cell.count)
             }));
+            let window_total = window_buckets[row..]
+                .iter()
+                .fold(0, |total: u64, &count| total.saturating_add(count));
             // The oldest change the node lacks was made no later than its
             // cell's last update at the origin, so the time since that update
             // never overstates how long the node has been behind.
@@ -1412,6 +1461,17 @@ impl EngineState {
                     .unwrap_or_default(),
             });
         }
+        // The oldest live bucket any node holds a count in, as
+        // `next_expiry_ms` finds it, read from the rows already probed.
+        let width = live as usize;
+        let next_expiry_ms = (0..width)
+            .find(|&i| {
+                window_buckets[i..]
+                    .iter()
+                    .step_by(width)
+                    .any(|&count| count > 0)
+            })
+            .map(|i| fall_off_ms(spec, now, (width - 1 - i) as u32));
         let live_by_zone = self.live_by_zone();
         let zones = ZONE_NAMES[..self.zone_names.len()]
             .iter()
@@ -1429,7 +1489,7 @@ impl EngineState {
             window_buckets,
             admitted_hits: self.admitted_hits,
             rejected_hits: self.rejected_hits,
-            next_expiry_ms: self.next_expiry_ms(),
+            next_expiry_ms,
             // The CRDT's own window position at this instant — the Strata
             // right-anchors its fixed-width grid on this epoch instead of
             // recomputing the boundary in TypeScript.
@@ -1510,6 +1570,15 @@ struct OriginCell {
     updated_ms: u64,
     /// The positions that hold it at its origin's count.
     holders: NodeSet,
+}
+
+/// The instant the bucket `back` buckets before the one `now` falls in
+/// leaves `spec`'s window of live buckets.
+fn fall_off_ms(spec: RuleSpec, now: u64, back: u32) -> u64 {
+    let bucket_ms = spec.bucket_millis.get();
+    let current = now / bucket_ms;
+    (current.saturating_sub(u64::from(back)) + u64::from(spec.live_buckets.get()))
+        .saturating_mul(bucket_ms)
 }
 
 /// The fewest yields a drain spends, however few nodes it waits for.

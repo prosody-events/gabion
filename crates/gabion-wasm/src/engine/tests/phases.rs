@@ -207,10 +207,10 @@ fn sent_at(events: &[Event], src: Option<u32>, kind: PacketKind, at: u64) -> usi
 /// wave delivered at its own instant, and whether the stop was a wave.
 async fn next_stop(state: &mut EngineState, to: u64) -> (Vec<Event>, bool) {
     let mut events = state
-        .step(to.saturating_sub(state.virtual_ms), StepUntil::Event)
+        .step(to.saturating_sub(state.virtual_ms), EVENT)
         .await
         .events;
-    let wave = state.sub_step == SubStep::Open;
+    let wave = matches!(state.sub_step, SubStep::Open(_));
     if wave {
         events.extend(state.step(0, StepUntil::Time).await.events);
     }
@@ -553,6 +553,39 @@ fn heal_restores_the_configured_loss() {
             (0.2..=0.4).contains(&rate),
             "{rate} of the joiner's packets lost"
         );
+        state
+    });
+}
+
+/// The router holds one policy for each lossy live link, and no more,
+/// however many nodes join and leave; healing a lossless network clears
+/// every policy a cut wrote.
+#[test]
+fn churn_under_loss_keeps_one_policy_per_live_link() {
+    let lossy = SimConfig {
+        uniform_loss: 0.3,
+        ..propagation()
+    };
+    with_state(lossy, |mut state| async move {
+        warm(&mut state).await;
+        for _ in 0..3 {
+            state.add_node(None).await.unwrap();
+            settle(&mut state).await;
+            let first = state.nodes[0].id;
+            state.remove_node(first).await.unwrap();
+            settle(&mut state).await;
+            let n = state.nodes.len();
+            let (policies, counters) = state.router.link_entries();
+            assert_eq!(policies, n * (n - 1), "one policy per live link");
+            assert!(counters <= policies, "{counters} drop counters");
+        }
+        state
+    });
+    with_state(propagation(), |mut state| async move {
+        cut_zone(&mut state, 2).await;
+        assert!(state.router.link_entries().0 > 0);
+        state.heal().await;
+        assert_eq!(state.router.link_entries(), (0, 0));
         state
     });
 }

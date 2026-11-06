@@ -248,6 +248,81 @@ fn lag_tells_behind_from_stranded() {
     });
 }
 
+/// A departed node's hits still count while a survivor holds them: the truth
+/// stays with the views, and a lag still sees the cut its change cannot
+/// cross. Hits that left with their node before any replica did are in no
+/// window, so no expiry is due for them, and another key's hits move neither
+/// the watched key's expiry nor where stepping by event stops.
+#[test]
+fn a_departed_origins_hits_count_while_survivors_hold_them() {
+    // (a) Replicated, then removed: the truth equals every survivor's view.
+    with_state(propagation(), |mut state| async move {
+        ready(&mut state).await;
+        send(&mut state, 0, 25).await;
+        step_until(
+            &mut state,
+            8,
+            |_| {},
+            |snap| snap.nodes.iter().all(|n| n.lag == Lag::CaughtUp),
+        )
+        .await;
+        state.remove_node(0).await.unwrap();
+        let snap = state.snapshot(None, WATCH).await;
+        assert_eq!(snap.oracle_total, 25);
+        assert_eq!(views(&snap), [25; 11]);
+        assert!(
+            snap.nodes.iter().all(|n| n.lag == Lag::CaughtUp),
+            "{snap:?}"
+        );
+        assert!(snap.next_expiry_ms.is_some());
+        state
+    });
+
+    // (b) Zone c cut, then the origin removed: zone c stays stranded from the
+    // survivors that hold its change.
+    with_state(propagation(), |mut state| async move {
+        ready(&mut state).await;
+        cut_zone(&mut state, 2).await;
+        zone_c_stays_stranded(&mut state).await;
+        state.remove_node(0).await.unwrap();
+        let snap = state.snapshot(None, WATCH).await;
+        assert_eq!(snap.oracle_total, 25);
+        assert!(lags(&snap, 2, None).into_iter().all(stranded), "{snap:?}");
+        for zone in [0, 1] {
+            assert!(
+                lags(&snap, zone, None).iter().all(|l| *l == Lag::CaughtUp),
+                "{snap:?}"
+            );
+        }
+        state
+    });
+
+    // (c) Removed before its heartbeat sent the change: no window holds it.
+    with_state(propagation(), |mut state| async move {
+        ready(&mut state).await;
+        send(&mut state, 0, 25).await;
+        state.remove_node(0).await.unwrap();
+        let snap = state.snapshot(None, WATCH).await;
+        assert_eq!((snap.oracle_total, snap.next_expiry_ms), (0, None));
+        assert_eq!(views(&snap), [0; 11]);
+        state
+            .submit_request(1, KeyHash(7), hits(25))
+            .await
+            .expect("a live node");
+        settle(&mut state).await;
+        let other = Watch {
+            key: KeyHash(7),
+            probe_hits: hits(1),
+        };
+        assert!(state.snapshot(None, other).await.next_expiry_ms.is_some());
+        assert_eq!(state.snapshot(None, WATCH).await.next_expiry_ms, None);
+        let target = state.virtual_ms + 15_000;
+        let stop = state.step(15_000, EVENT).await;
+        assert_eq!(stop.virtual_ms, target, "no expiry of the watched key");
+        state
+    });
+}
+
 /// The position of live node `id` in the snapshot.
 fn position(snap: &ClusterState, id: u32) -> usize {
     snap.nodes

@@ -1986,16 +1986,43 @@ fn enobufs_is_held_like_a_full_buffer() {
 fn router_overflow_is_reported_as_a_drop() {
     let router = SimRouter::with_channel_capacity(1);
     let (src, dst) = (router.bind(sock(1)), router.bind(sock(2)));
-    router.begin_deferred();
+    let deferral = router.begin_deferred();
     for _ in 0..2 {
         assert_eq!(src.try_send_to(b"gossip", dst.addr()).unwrap(), 6);
     }
     assert_eq!(router.received_count(dst.addr()), 1);
-    router.release_deferred();
+    router.release_deferred(deferral);
     let mut buf = [0; 16];
     let first = dst.recv_from(&mut buf).now_or_never();
     assert_eq!(first.map(Result::unwrap), Some((6, src.addr())));
     assert!(dst.recv_from(&mut buf).now_or_never().is_none());
+}
+
+/// The router holds state only for live, non-default links: a `Pass` policy
+/// is stored as none, and unbinding an address forgets every policy, drop
+/// counter and delivery count that names it, so churn under loss cannot grow
+/// the maps.
+#[test]
+fn router_forgets_an_unbound_address() {
+    let router = SimRouter::new();
+    let nodes = [sock(1), sock(2), sock(3)].map(|addr| router.bind(addr));
+    for src in &nodes {
+        for dst in &nodes {
+            if src.addr() != dst.addr() {
+                src.try_send_to(b"gossip", dst.addr()).unwrap();
+                router.set_link_policy(src.addr(), dst.addr(), LinkPolicy::DropProb { p: 0.5 });
+                src.try_send_to(b"gossip", dst.addr()).unwrap();
+            }
+        }
+    }
+    assert_eq!(router.link_entries(), (6, 6));
+    let gone = nodes[2].addr();
+    assert!(router.received_count(gone) >= 2, "each first send passes");
+    assert!(router.unbind(gone));
+    assert_eq!(router.link_entries(), (2, 2));
+    assert_eq!(router.received_count(gone), 0);
+    router.set_link_policy(nodes[0].addr(), nodes[1].addr(), LinkPolicy::Pass);
+    assert_eq!(router.link_entries(), (1, 1));
 }
 
 // -- DropProb i.i.d. packet loss --------------------------------------------

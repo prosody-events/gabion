@@ -51,7 +51,7 @@ fn a_send_is_held_until_the_next_engine_call() {
         assert_eq!(own.len(), 5, "{own:?}");
         assert!(own.iter().all(|p| p.0 == 0));
         assert_eq!(own.iter().filter(|p| p.2 == Tier::CrossZone).count(), 2);
-        assert_eq!(state.sub_step, SubStep::Open);
+        assert!(matches!(state.sub_step, SubStep::Open(_)));
 
         let held = state.snapshot(None, WATCH).await;
         let views: Vec<u64> = held.nodes.iter().map(|n| n.window_total).collect();
@@ -62,7 +62,7 @@ fn a_send_is_held_until_the_next_engine_call() {
         assert_eq!(cell_nodes(&landed.events), destinations(&own));
         assert!(landed.events.iter().all(|e| e.virtual_ms == at));
 
-        let relayed = state.step(1_000, StepUntil::Event).await;
+        let relayed = state.step(1_000, EVENT).await;
         assert_eq!(relayed.virtual_ms, at + F_R);
         let relays = packets(&relayed.events, PacketKind::Relay);
         assert_eq!(relays.len(), 6, "{relays:?}");
@@ -70,7 +70,7 @@ fn a_send_is_held_until_the_next_engine_call() {
             cell_nodes(&relayed.events).is_disjoint(&destinations(&relays)),
             "the relays have not landed"
         );
-        assert_eq!(state.sub_step, SubStep::Open);
+        assert!(matches!(state.sub_step, SubStep::Open(_)));
         state
     });
 }
@@ -157,7 +157,7 @@ fn stepped(until: StepUntil) -> (Run, usize) {
                 let (from, delta) = (state.virtual_ms, to - state.virtual_ms);
                 events.extend(state.step(delta, until).await.events);
                 assert!(state.virtual_ms > from, "a step from {from} stood still");
-                holds += usize::from(state.sub_step == SubStep::Open);
+                holds += usize::from(matches!(state.sub_step, SubStep::Open(_)));
             }
             // A wave at `to` itself is still held: deliver it.
             events.extend(state.step(0, StepUntil::Time).await.events);
@@ -173,7 +173,7 @@ fn stepped(until: StepUntil) -> (Run, usize) {
 /// in one call.
 #[test]
 fn event_stepping_equals_time_stepping() {
-    let ((by_event, event_snap), holds) = stepped(StepUntil::Event);
+    let ((by_event, event_snap), holds) = stepped(EVENT);
     let ((by_time, time_snap), time_holds) = stepped(StepUntil::Time);
     assert_eq!(holds, 2, "stepping by event stops at each send's relays");
     assert_eq!(time_holds, 0, "stepping by time holds no wave");
@@ -199,16 +199,16 @@ fn event_stops_at_each_wave_and_at_the_window_edge() {
         let t0 = state.virtual_ms;
         send(&mut state, 0, 25).await;
 
-        let own = state.step(2_000, StepUntil::Event).await;
+        let own = state.step(2_000, EVENT).await;
         let wave = first_heartbeat(0, PERIOD, t0);
         assert_eq!(own.virtual_ms, wave);
         let sent = packets(&own.events, PacketKind::Own);
         assert_eq!(sent.len(), 5, "{sent:?}");
         assert_eq!(sent.iter().filter(|p| p.2 == Tier::CrossZone).count(), 2);
         assert!(cell_nodes(&own.events).is_empty(), "nothing has landed");
-        assert_eq!(state.sub_step, SubStep::Open);
+        assert!(matches!(state.sub_step, SubStep::Open(_)));
 
-        let relay = state.step(2_000, StepUntil::Event).await;
+        let relay = state.step(2_000, EVENT).await;
         let landed: Vec<_> = relay
             .events
             .iter()
@@ -221,9 +221,9 @@ fn event_stops_at_each_wave_and_at_the_window_edge() {
         assert!(relays.iter().all(|p| p.3 == wave + F_R));
         assert_eq!(relay.virtual_ms, wave + F_R);
         assert!(relay.events.iter().all(|e| e.virtual_ms <= wave + F_R));
-        assert_eq!(state.sub_step, SubStep::Open);
+        assert!(matches!(state.sub_step, SubStep::Open(_)));
 
-        let acks = state.step(PERIOD, StepUntil::Event).await;
+        let acks = state.step(PERIOD, EVENT).await;
         assert_eq!(acks.virtual_ms, wave + F_R + PERIOD, "bounded by its delta");
         let relayed: Vec<_> = acks
             .events
@@ -232,7 +232,7 @@ fn event_stops_at_each_wave_and_at_the_window_edge() {
             .cloned()
             .collect();
         assert_eq!(cell_nodes(&relayed), destinations(&relays));
-        assert_eq!(state.sub_step, SubStep::Closed);
+        assert!(matches!(state.sub_step, SubStep::Closed));
 
         let edge_ms = (t0 / 1_000 + 10) * 1_000;
         assert!(
@@ -242,7 +242,7 @@ fn event_stops_at_each_wave_and_at_the_window_edge() {
                 .all(|n| first_heartbeat(n.id, PERIOD, edge_ms - 1) != edge_ms),
             "a heartbeat is due at the window's edge {edge_ms}"
         );
-        let edge = state.step(15_000, StepUntil::Event).await;
+        let edge = state.step(15_000, EVENT).await;
         assert_eq!(edge.virtual_ms, edge_ms);
         for kind in [PacketKind::Own, PacketKind::Relay, PacketKind::Sweep] {
             assert!(packets(&edge.events, kind).is_empty(), "no data moves");

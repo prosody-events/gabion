@@ -36,9 +36,10 @@ Each node decides every request from its own count table: gabion's
 server and nginx make. A rejected request is counted, per node and for the
 cluster, and never recorded. An admitted one is recorded, and the packets of
 its eager flush stay held, as a sub-step's do, until the next command, so no
-count changes before its packet lands. `step` with `"Event"` stops before a
-wave of packets that carry cells lands, or at the instant admitted hits leave
-the window. The snapshot reports each node's windowed view, per-bucket counts,
+count changes before its packet lands. `step` with `{ Event: { key } }` stops
+before a wave of packets that carry cells lands, or at the instant some node's
+window of `key` drops a bucket that holds hits. The truth counts a departed
+node's hits as long as a survivor still holds them. The snapshot reports each node's windowed view, per-bucket counts,
 lag (caught up, behind, or stranded where waiting cannot help), its one-hit
 decision and next heartbeat; heal and every joiner use the scenario's own
 network, its loss included.

@@ -32,6 +32,10 @@ mod window;
 const WATCHED_KEY: u128 = 0x1;
 /// The snapshot's watch: the watched key, decided for one hit.
 const WATCH: Watch = watch(1);
+/// Step to the next event of the watched key.
+const EVENT: StepUntil = StepUntil::Event {
+    key: KeyHash(WATCHED_KEY),
+};
 
 /// `n` hits, which must be at least one.
 const fn hits(n: u64) -> NonZeroU64 {
@@ -1728,7 +1732,7 @@ fn events_serialize_with_hex_identifiers() {
         virtual_ms: 300,
         kind: EventKind::Decided {
             node: 2,
-            hits: 150,
+            hits: hits(150),
             admission: Admission::Rejected {
                 total: 0,
                 reopens: Reopens::Never,

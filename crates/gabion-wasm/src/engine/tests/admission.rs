@@ -47,7 +47,10 @@ fn admission_boundaries_at_limit_100() {
             "{rejected:?}"
         );
         assert_eq!(rejected.events.len(), 1, "only the decision: {rejected:?}");
-        assert_eq!(state.sub_step, SubStep::Closed, "no packet is held");
+        assert!(
+            matches!(state.sub_step, SubStep::Closed),
+            "no packet is held"
+        );
         let after = state.snapshot(None, WATCH).await;
         assert_eq!(after.oracle_total, before.oracle_total);
         for (a, b) in after.nodes.iter().zip(&before.nodes) {
@@ -369,6 +372,26 @@ fn cluster_counters_survive_a_removal() {
         assert_eq!(snap.admitted_hits, 25);
         assert_eq!(snap.rejected_hits, limit + 1);
         assert!(snap.nodes.iter().all(|n| n.id != 0));
+        state
+    });
+}
+
+/// A request whose node's runtime has stopped is refused with an error, and
+/// nothing reports it decided or counts it.
+#[test]
+fn a_stopped_runtime_reports_no_decision() {
+    with_state(rate_limiting(), |mut state| async move {
+        ready(&mut state).await;
+        state.nodes[0].join.abort();
+        state.drain_pending().await;
+        let refused = state
+            .submit_request(0, KeyHash(WATCHED_KEY), hits(25))
+            .await;
+        assert!(matches!(refused, Err(EngineError::Gossip { node: 0, .. })));
+        let next = state.step(0, StepUntil::Time).await;
+        assert_eq!(decisions(&next.events), []);
+        let snap = state.snapshot(None, WATCH).await;
+        assert_eq!((snap.admitted_hits, snap.nodes[0].admitted_hits), (0, 0));
         state
     });
 }

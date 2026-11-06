@@ -35,7 +35,7 @@
     atLimit,
   }: {
     cells: CellView[];
-    /** The bucket epoch "now" sits in (`RuleDescriptor::current_epoch`). */
+    /** The bucket epoch "now" sits in (`RuleSpec::bucket_at`). */
     currentEpoch: number;
     /** Fraction of the current bucket already elapsed, `[0, 1)` — the sub-bucket
      *  scroll offset. `(virtual_ms mod bucket_ms) / bucket_ms`, computed by the

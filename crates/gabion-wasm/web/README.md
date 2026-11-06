@@ -120,10 +120,11 @@ zone configured and Sandbox. Traffic burst and the gateway presets open with
 their origin selected.
 
 `window.sim` is the live engine, the handle the audit and the console use
-(`sim.snapshot(id)`); each chart's plot element carries its uPlot instance as
-`uplot`, which the audit reads to check every mark lies inside its plot; and
-the stage canvas carries `beams`, the renderer's in-flight beam pool, which the
-geometry check reads and the beam check wraps to count every beam drawn.
+(`sim.snapshot(inspect, watch)`); each chart's plot element carries its uPlot
+instance as `uplot`, which the audit reads to check every mark lies inside its
+plot; and the stage canvas carries `beams`, the renderer's in-flight beam pool,
+whose `push` the geometry check wraps to record each beam's route as it is
+drawn and the beam check wraps to count every beam drawn.
 
 ## Layout
 
