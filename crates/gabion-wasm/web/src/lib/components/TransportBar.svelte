@@ -50,18 +50,19 @@
   </label>
 
   <div class="readout">
-    <span class="readout-item">
-      <span class="readout-label">virtual time</span>
-      <span class="readout-value" data-field="virtual-time" data-ms={virtualMs}>{fmtDuration(virtualMs)}</span>
-    </span>
     <!-- Its space is kept before the first period has played, so the bar
-         never reflows when it appears. -->
+         never reflows when it appears, and kept left of the virtual time, so
+         that stays flush right. -->
     <span class="readout-item" class:pending={heartbeatWallMs === null}>
       <span class="readout-label">a heartbeat took</span>
       <span class="readout-value"
         ><span data-field="heartbeat-wall" data-ms={heartbeatWallMs ?? undefined}>{fmtDuration(heartbeatWallMs ?? 0)}</span
         ><span class="readout-unit">&nbsp;to watch</span></span
       >
+    </span>
+    <span class="readout-item">
+      <span class="readout-label">virtual time</span>
+      <span class="readout-value" data-field="virtual-time" data-ms={virtualMs}>{fmtDuration(virtualMs)}</span>
     </span>
   </div>
 </div>

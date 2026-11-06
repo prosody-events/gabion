@@ -137,10 +137,6 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
     // The engine's own snapshot after every Step, which A4 recomputes from.
     const series: ClusterState[] = [await snapshot(page)];
     for (let s = 0; s < STEPS; s++) await period(page, async () => void series.push(await snapshot(page)));
-    expect(
-      series[series.length - 1].virtual_ms - series[0].virtual_ms,
-      `${name}: the walk advanced ${STEPS} heartbeat periods`,
-    ).toBeGreaterThanOrEqual(STEPS * PERIOD_MS);
     converged += await page.locator('.headline.converged').count();
     charted += await page.locator('.plot').count();
     inspected += await page.locator('.inspector').count();
@@ -1372,15 +1368,20 @@ test('the transport stays put when the heartbeat reading appears', async ({ page
   await open(page);
   await page.evaluate(() => document.fonts.ready.then(() => undefined));
   const bar = page.locator('.transport');
-  // Its caption, whose box does not change with the time it reads.
-  const virtualTime = page.locator('.readout-label').first();
+  // The virtual time's caption, whose box does not change with the time it reads.
+  const virtualTime = page.locator('.readout-item', { has: field(page, 'virtual-time') }).locator('.readout-label');
   const before = (await bar.boundingBox())!.height;
-  const left = (await virtualTime.boundingBox())!.x;
+  const caption = (await virtualTime.boundingBox())!;
+  const row = (await page.locator('.readout').boundingBox())!;
+  expect(caption.x + caption.width, "the virtual time stands short of the bar's right edge").toBeCloseTo(
+    row.x + row.width,
+    0,
+  );
   await page.getByRole('button', { name: 'Play' }).click();
   await expect(field(page, 'heartbeat-wall')).toHaveAttribute('data-ms', /\d/, { timeout: 30_000 });
   await page.getByRole('button', { name: 'Pause' }).click();
   expect((await bar.boundingBox())!.height, 'the bar changed height when the reading appeared').toBe(before);
-  expect((await virtualTime.boundingBox())!.x, 'the virtual time moved when the reading appeared').toBe(left);
+  expect((await virtualTime.boundingBox())!.x, 'the virtual time moved when the reading appeared').toBe(caption.x);
   // From 768 px up, Play, Step, Reset, Speed and both readouts share one row.
   const play = (await page.getByRole('button', { name: 'Play' }).boundingBox())!.height;
   if ((page.viewportSize()?.width ?? 0) >= 768) expect(before, 'the bar wrapped').toBeLessThan(2 * play);

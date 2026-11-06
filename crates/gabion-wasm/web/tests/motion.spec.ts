@@ -20,7 +20,7 @@ import { sourceOf } from './sourcemap';
 
 // The flag bits the stage's beam pool packs, passed into the page's functions.
 const BITS = { CROSS, CONTROL, RELAY, DROPPED, LANDED } as const;
-// The animation frames in each stretch the allocation audit tracks.
+// The animation frames in each stretch of the allocation audit.
 const FRAMES = 300;
 // One frame of the fake clock, ms.
 const FRAME_MS = 16;
@@ -596,9 +596,20 @@ test('the transport says how long a heartbeat takes to watch', async ({ page }) 
 });
 
 /** The functions the stage runs every frame, by source file: the ticker, the
- *  beam layer's redraw and every helper it calls. */
+ *  beam layer's redraw and every stage function it calls. */
 const PER_FRAME = {
-  'renderer.ts': ['#tick', '#drawBeams', '#route', '#tangentAt', '#arrowhead', '#stopBar', 'easeInOutQuad'],
+  'renderer.ts': [
+    'land',
+    'removeAt',
+    '#isContext',
+    '#tick',
+    '#drawBeams',
+    '#route',
+    '#tangentAt',
+    '#arrowhead',
+    '#stopBar',
+    'easeInOutQuad',
+  ],
   'layout.ts': ['pointOn'],
 } as const;
 
@@ -655,91 +666,93 @@ function* allocations(snapshot: TrackedSnapshot, nodes = snapshot.trace_tree): G
   }
 }
 
-// The allocation audit's own browser runs V8 with no inlining, so an
-// allocation is charged to the function whose code made it: inlined, Pixi's
-// Graphics calls would charge their own allocations to the stage's code.
-const UNINLINED = '--js-flags=--no-turbo-inlining --no-maglev-inlining';
-// The tracked stretches of `FRAMES` frames the audit runs at most, while V8
-// tiers the per-frame code up.
-const STRETCHES_MAX = 6;
+// The allocation audit's own browser runs V8's interpreter only. Nothing is
+// inlined, so an allocation is charged to the function whose code made it
+// (inlined, Pixi's Graphics calls would charge their own allocations to the
+// stage's code), and nothing tiers up or deoptimizes, so on the fake clock the
+// same frames allocate the same objects on every run. It is also the strictest
+// reading: an object the code makes counts even where an optimizer would elide it.
+const INTERPRETED = '--js-flags=--no-opt --no-maglev --no-sparkplug';
+// The untracked stretches of `FRAMES` frames, each opened by a Send, run
+// before tracking starts. V8 makes objects of its own once, not per frame: each
+// function's bytecode and feedback on its first runs, a property access's
+// feedback as it first meets another shape, and an object's new shape when a
+// field first holds a fraction. On the fake clock's whole-millisecond frames
+// the last of these comes in the third stretch.
+const WARM_STRETCHES = 3;
 
 test('the stage allocates nothing per frame', async ({ playwright, baseURL, viewport, colorScheme, reducedMotion }) => {
   test.setTimeout(120_000);
-  const browser = await playwright.chromium.launch({ args: [UNINLINED] });
+  const browser = await playwright.chromium.launch({ args: [INTERPRETED] });
   try {
     const page = await browser.newPage({ baseURL, viewport, colorScheme, reducedMotion });
-    await open(page);
+    await openOnFakeClock(page);
+    await stopClock(page);
     // Packet loss: no feed, so landed routes stay; loss draws stop bars;
     // resends keep waves coming, and a Send each stretch starts more.
     await loadPreset(page, 'Packet loss');
     await page.getByRole('button', { name: 'Play' }).click();
+    const stretch = async (): Promise<void> => {
+      await railSend(page, 0);
+      await page.clock.runFor(FRAMES * FRAME_MS);
+    };
+    for (let warm = 0; warm < WARM_STRETCHES; warm++) await stretch();
     const perFrame = perFrameLines();
     const cdp = await page.context().newCDPSession(page);
     const chunks: string[] = [];
     cdp.on('HeapProfiler.addHeapSnapshotChunk', ({ chunk }) => void chunks.push(chunk));
     await cdp.send('HeapProfiler.enable');
-    // Tracking allocations counts every one, with its call stack. A double
-    // passed to a call that is not inlined is boxed (a HeapNumber): the
-    // engine's, not an object the code made. A box's size is read from a
-    // function that does nothing else, so the per-frame functions' bytes are
-    // that size times their count exactly, and any object of 16 bytes or more
-    // leaves bytes over. As V8 tiers the code up, and again as a Send brings
-    // new work, it allocates a few objects of its own, so stretches are
-    // tracked until one leaves no byte over, which code that makes an object
-    // per redraw never does.
-    for (let stretch = 1; ; stretch++) {
-      await railSend(page, 0);
-      chunks.length = 0;
-      await cdp.send('HeapProfiler.startTrackingHeapObjects', { trackAllocations: true });
-      await page.evaluate(() => {
-        const field: { v: unknown } = { v: '' };
-        function boxDoubles(): void {
-          for (let i = 0; i < 2000; i++) field.v = i + 0.5;
-        }
-        boxDoubles();
-      });
-      const redrawsFrom = await pool(page, (c) => c.beams.redraws);
-      await frames(page, FRAMES);
-      const redraws = (await pool(page, (c) => c.beams.redraws)) - redrawsFrom;
-      await cdp.send('HeapProfiler.stopTrackingHeapObjects', { reportProgress: false });
-      const snapshot = JSON.parse(chunks.join('')) as TrackedSnapshot;
+    // Tracking allocations counts every one, with its call stack. A double the
+    // interpreter computes is boxed (a HeapNumber): the engine's, not an object
+    // the code made. A box's size is read from a function that does nothing
+    // else, so the per-frame functions' bytes are that size times their count
+    // exactly, and any object of another size leaves bytes over.
+    await cdp.send('HeapProfiler.startTrackingHeapObjects', { trackAllocations: true });
+    await page.evaluate(() => {
+      const field: { v: unknown } = { v: '' };
+      function boxDoubles(): void {
+        for (let i = 0; i < 2000; i++) field.v = i + 0.5;
+      }
+      boxDoubles();
+    });
+    const redrawsFrom = await pool(page, (c) => c.beams.redraws);
+    await stretch();
+    const redraws = (await pool(page, (c) => c.beams.redraws)) - redrawsFrom;
+    await cdp.send('HeapProfiler.stopTrackingHeapObjects', { reportProgress: false });
+    const snapshot = JSON.parse(chunks.join('')) as TrackedSnapshot;
 
-      const box = { count: 0, size: 0 };
-      for (const a of allocations(snapshot)) {
-        if (a.name !== 'boxDoubles') continue;
-        box.count += a.count;
-        box.size += a.size;
-      }
-      const boxed = Math.floor(box.size / box.count);
-      let count = 0;
-      let over = 0;
-      const where: [string, number][] = [];
-      for (const a of allocations(snapshot)) {
-        const bundle = a.script.match(/\/assets\/([^/?#]+\.js)$/)?.[1];
-        if (a.count === 0 || bundle === undefined || a.line === 0) continue;
-        // The function's opening line in its source.
-        const source = sourceOf(`dist/assets/${bundle}.map`, a.line - 1, a.column - 1);
-        if (source === null || !source.file.includes('src/lib/stage/')) continue;
-        const ranges = perFrame.get(source.file.slice(source.file.lastIndexOf('/') + 1)) ?? [];
-        if (!ranges.some(([from, to]) => source.line >= from && source.line <= to)) continue;
-        const extra = a.size - boxed * a.count;
-        count += a.count;
-        over += extra;
-        if (extra !== 0) where.push([`${source.file}:${source.line}`, extra]);
-      }
-      console.log(
-        `stretch ${stretch}: ${count} allocations in the per-frame functions over ${redraws} redraws, ` +
-          `boxed doubles of ${boxed} bytes, ${over} bytes over: ${JSON.stringify(where)}`,
-      );
-      expect(boxed, "a boxed double's size was measured").toBeGreaterThan(0);
-      expect(redraws, 'the beam layer redrew while the waves flew').toBeGreaterThan(0);
-      expect(count, 'the source map placed no allocation in the per-frame functions').toBeGreaterThan(0);
-      if (over === 0) break;
-      expect(
-        stretch,
-        `bytes over boxed doubles in the per-frame functions in each of ${STRETCHES_MAX} stretches of ${FRAMES} frames`,
-      ).toBeLessThan(STRETCHES_MAX);
+    const box = { count: 0, size: 0 };
+    for (const a of allocations(snapshot)) {
+      if (a.name !== 'boxDoubles') continue;
+      box.count += a.count;
+      box.size += a.size;
     }
+    const boxed = Math.floor(box.size / box.count);
+    let count = 0;
+    let over = 0;
+    const where: [string, number][] = [];
+    for (const a of allocations(snapshot)) {
+      const bundle = a.script.match(/\/assets\/([^/?#]+\.js)$/)?.[1];
+      if (a.count === 0 || bundle === undefined || a.line === 0) continue;
+      // The function's opening line in its source.
+      const source = sourceOf(`dist/assets/${bundle}.map`, a.line - 1, a.column - 1);
+      if (source === null || !source.file.includes('src/lib/stage/')) continue;
+      const ranges = perFrame.get(source.file.slice(source.file.lastIndexOf('/') + 1)) ?? [];
+      if (!ranges.some(([from, to]) => source.line >= from && source.line <= to)) continue;
+      // Unsigned, so one call stack's shortfall cannot hide another's excess.
+      const extra = Math.abs(a.size - boxed * a.count);
+      count += a.count;
+      over += extra;
+      if (extra !== 0) where.push([`${source.file}:${source.line}`, extra]);
+    }
+    console.log(
+      `${count} allocations in the per-frame functions over ${redraws} redraws, ` +
+        `boxed doubles of ${boxed} bytes, ${over} bytes over: ${JSON.stringify(where)}`,
+    );
+    expect(boxed, "a boxed double's size was measured").toBeGreaterThan(0);
+    expect(redraws, 'the beam layer redrew while the waves flew').toBeGreaterThan(0);
+    expect(count, 'the source map placed no allocation in the per-frame functions').toBeGreaterThan(0);
+    expect(over, `bytes over boxed doubles in the per-frame functions over ${FRAMES} frames`).toBe(0);
   } finally {
     await browser.close();
   }
