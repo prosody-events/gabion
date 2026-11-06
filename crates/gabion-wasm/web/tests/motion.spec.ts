@@ -20,7 +20,7 @@ import { sourceOf } from './sourcemap';
 
 // The flag bits the stage's beam pool packs, passed into the page's functions.
 const BITS = { CROSS, CONTROL, RELAY, DROPPED, LANDED } as const;
-// The animation frames the allocation audit samples.
+// The animation frames in each stretch the allocation audit tracks.
 const FRAMES = 300;
 // One frame of the fake clock, ms.
 const FRAME_MS = 16;
@@ -627,90 +627,122 @@ function perFrameLines(): Map<string, [number, number][]> {
   return ranges;
 }
 
-test('the stage allocates nothing per frame', async ({ page }) => {
-  test.setTimeout(120_000);
-  await open(page);
-  // Packet loss: no feed, so landed routes stay; loss draws stop bars; resends
-  // keep waves coming.
-  await loadPreset(page, 'Packet loss');
-  await railSend(page, 0);
-  await page.getByRole('button', { name: 'Play' }).click();
-  await frames(page, 60);
-  const perFrame = perFrameLines();
-  const cdp = await page.context().newCDPSession(page);
-  await cdp.send('HeapProfiler.enable');
-  await cdp.send('HeapProfiler.startSampling', {
-    samplingInterval: 16,
-    includeObjectsCollectedByMajorGC: true,
-    includeObjectsCollectedByMinorGC: true,
-  });
-  // V8 boxes a double that is not yet in optimised code (a HeapNumber): an
-  // artefact of the engine's tiers, not an object the code made. Its size is
-  // read here, from a function that does nothing else, so it can be told apart.
-  await page.evaluate(() => {
-    const field: { v: unknown } = { v: '' };
-    function boxDoubles(): void {
-      for (let i = 0; i < 2000; i++) field.v = i + 0.5;
-    }
-    boxDoubles();
-  });
-  const redrawsFrom = await pool(page, (c) => c.beams.redraws);
-  await frames(page, FRAMES);
-  const redraws = (await pool(page, (c) => c.beams.redraws)) - redrawsFrom;
-  const { profile } = await cdp.send('HeapProfiler.stopSampling');
-  await page.getByRole('button', { name: 'Pause' }).click();
+/** The parts of a heap snapshot taken while allocations were tracked that the
+ *  allocation audit reads. */
+interface TrackedSnapshot {
+  snapshot: { meta: { trace_function_info_fields: string[] } };
+  trace_function_infos: number[];
+  trace_tree: unknown[];
+  strings: string[];
+}
 
-  // Each sample's top frame, mapped through the bundle's hidden source map.
-  type ProfileNode = {
-    id: number;
-    callFrame: { url: string; lineNumber: number; columnNumber: number; functionName: string };
-    children: ProfileNode[];
-  };
-  const byId = new Map<number, ProfileNode>();
-  const index = (node: ProfileNode): void => {
-    byId.set(node.id, node);
-    for (const child of node.children) index(child);
-  };
-  index(profile.head as ProfileNode);
-  const sizes = new Map<number, number>();
-  for (const sample of profile.samples) {
-    if (byId.get(sample.nodeId)?.callFrame.functionName !== 'boxDoubles') continue;
-    sizes.set(sample.size, (sizes.get(sample.size) ?? 0) + 1);
+/** One function's allocations at one call stack: its name, script, 1-based
+ *  start line and column, and the objects it allocated and their bytes. */
+type Allocations = { name: string; script: string; line: number; column: number; count: number; size: number };
+
+/** Each call stack's allocations in a tracked heap snapshot, charged to the
+ *  function on top. Its trace tree nests nodes of five fields (`id,
+ *  function_info_index, count, size, children`). */
+function* allocations(snapshot: TrackedSnapshot, nodes = snapshot.trace_tree): Generator<Allocations> {
+  const width = snapshot.snapshot.meta.trace_function_info_fields.length;
+  const info = snapshot.trace_function_infos;
+  const text = snapshot.strings;
+  for (let i = 0; i < nodes.length; i += 5) {
+    const [fn, count, size, children] = nodes.slice(i + 1, i + 5) as [number, number, number, unknown[]];
+    const at = fn * width;
+    yield { name: text[info[at + 1]], script: text[info[at + 2]], line: info[at + 4], column: info[at + 5], count, size };
+    yield* allocations(snapshot, children);
   }
-  const boxed = [...sizes].reduce((a, b) => (b[1] > a[1] ? b : a), [0, 0])[0];
-  expect(boxed, "a boxed double's size was measured").toBeGreaterThan(0);
-  const stage = new Map<string, number>();
-  let app = 0;
-  let own = 0;
-  let objects = 0;
-  let framed = 0;
-  for (const sample of profile.samples) {
-    const frame = byId.get(sample.nodeId)?.callFrame;
-    const bundle = frame?.url.match(/\/assets\/([^/?#]+\.js)$/)?.[1];
-    if (frame === undefined || bundle === undefined) continue;
-    app += 1;
-    const source = sourceOf(`dist/assets/${bundle}.map`, frame.lineNumber, frame.columnNumber);
-    if (source !== null && !source.file.includes('node_modules')) own += 1;
-    if (source === null || !source.file.includes('src/lib/stage/') || sample.size === boxed) continue;
-    objects += 1;
-    const ranges = perFrame.get(source.file.slice(source.file.lastIndexOf('/') + 1)) ?? [];
-    const each = ranges.some(([from, to]) => source.line >= from && source.line <= to);
-    if (each) framed += 1;
-    const where = `${each ? 'per frame: ' : ''}${frame.functionName || '(anonymous)'} at ${source.file}:${source.line}, ${sample.size} bytes`;
-    stage.set(where, (stage.get(where) ?? 0) + 1);
+}
+
+// The allocation audit's own browser runs V8 with no inlining, so an
+// allocation is charged to the function whose code made it: inlined, Pixi's
+// Graphics calls would charge their own allocations to the stage's code.
+const UNINLINED = '--js-flags=--no-turbo-inlining --no-maglev-inlining';
+// The tracked stretches of `FRAMES` frames the audit runs at most, while V8
+// tiers the per-frame code up.
+const STRETCHES_MAX = 6;
+
+test('the stage allocates nothing per frame', async ({ playwright, baseURL, viewport, colorScheme, reducedMotion }) => {
+  test.setTimeout(120_000);
+  const browser = await playwright.chromium.launch({ args: [UNINLINED] });
+  try {
+    const page = await browser.newPage({ baseURL, viewport, colorScheme, reducedMotion });
+    await open(page);
+    // Packet loss: no feed, so landed routes stay; loss draws stop bars;
+    // resends keep waves coming, and a Send each stretch starts more.
+    await loadPreset(page, 'Packet loss');
+    await page.getByRole('button', { name: 'Play' }).click();
+    const perFrame = perFrameLines();
+    const cdp = await page.context().newCDPSession(page);
+    const chunks: string[] = [];
+    cdp.on('HeapProfiler.addHeapSnapshotChunk', ({ chunk }) => void chunks.push(chunk));
+    await cdp.send('HeapProfiler.enable');
+    // Tracking allocations counts every one, with its call stack. A double
+    // passed to a call that is not inlined is boxed (a HeapNumber): the
+    // engine's, not an object the code made. A box's size is read from a
+    // function that does nothing else, so the per-frame functions' bytes are
+    // that size times their count exactly, and any object of 16 bytes or more
+    // leaves bytes over. As V8 tiers the code up, and again as a Send brings
+    // new work, it allocates a few objects of its own, so stretches are
+    // tracked until one leaves no byte over, which code that makes an object
+    // per redraw never does.
+    for (let stretch = 1; ; stretch++) {
+      await railSend(page, 0);
+      chunks.length = 0;
+      await cdp.send('HeapProfiler.startTrackingHeapObjects', { trackAllocations: true });
+      await page.evaluate(() => {
+        const field: { v: unknown } = { v: '' };
+        function boxDoubles(): void {
+          for (let i = 0; i < 2000; i++) field.v = i + 0.5;
+        }
+        boxDoubles();
+      });
+      const redrawsFrom = await pool(page, (c) => c.beams.redraws);
+      await frames(page, FRAMES);
+      const redraws = (await pool(page, (c) => c.beams.redraws)) - redrawsFrom;
+      await cdp.send('HeapProfiler.stopTrackingHeapObjects', { reportProgress: false });
+      const snapshot = JSON.parse(chunks.join('')) as TrackedSnapshot;
+
+      const box = { count: 0, size: 0 };
+      for (const a of allocations(snapshot)) {
+        if (a.name !== 'boxDoubles') continue;
+        box.count += a.count;
+        box.size += a.size;
+      }
+      const boxed = Math.floor(box.size / box.count);
+      let count = 0;
+      let over = 0;
+      const where: [string, number][] = [];
+      for (const a of allocations(snapshot)) {
+        const bundle = a.script.match(/\/assets\/([^/?#]+\.js)$/)?.[1];
+        if (a.count === 0 || bundle === undefined || a.line === 0) continue;
+        // The function's opening line in its source.
+        const source = sourceOf(`dist/assets/${bundle}.map`, a.line - 1, a.column - 1);
+        if (source === null || !source.file.includes('src/lib/stage/')) continue;
+        const ranges = perFrame.get(source.file.slice(source.file.lastIndexOf('/') + 1)) ?? [];
+        if (!ranges.some(([from, to]) => source.line >= from && source.line <= to)) continue;
+        const extra = a.size - boxed * a.count;
+        count += a.count;
+        over += extra;
+        if (extra !== 0) where.push([`${source.file}:${source.line}`, extra]);
+      }
+      console.log(
+        `stretch ${stretch}: ${count} allocations in the per-frame functions over ${redraws} redraws, ` +
+          `boxed doubles of ${boxed} bytes, ${over} bytes over: ${JSON.stringify(where)}`,
+      );
+      expect(boxed, "a boxed double's size was measured").toBeGreaterThan(0);
+      expect(redraws, 'the beam layer redrew while the waves flew').toBeGreaterThan(0);
+      expect(count, 'the source map placed no allocation in the per-frame functions').toBeGreaterThan(0);
+      if (over === 0) break;
+      expect(
+        stretch,
+        `bytes over boxed doubles in the per-frame functions in each of ${STRETCHES_MAX} stretches of ${FRAMES} frames`,
+      ).toBeLessThan(STRETCHES_MAX);
+    }
+  } finally {
+    await browser.close();
   }
-  console.log(
-    `${profile.samples.length} samples, ${app} in the app's bundle, ${own} in the page's own code, ${objects} in src/lib/stage/ other than ` +
-      `boxed doubles (${boxed} bytes), ${framed} of them per frame, over ${redraws} redraws: ${JSON.stringify([...stage])}`,
-  );
-  // A sample names the function it fell in, not its line. What remains in the
-  // per-frame functions are V8's one-off allocations as it tiers them up (27
-  // over 259 redraws when measured, a handful per function). An object of 16
-  // bytes or more is sampled with odds of at least 1 − 1/e at this interval,
-  // so code that builds one per redraw leaves samples in most redraws.
-  expect(own, "the source map resolved no sample to the page's own code").toBeGreaterThan(0);
-  expect(redraws, 'the beam layer redrew while the waves flew').toBeGreaterThan(0);
-  expect(framed, 'objects the per-frame functions allocated, against the redraws').toBeLessThanOrEqual(redraws / 3);
 });
 
 // -- Landed routes -------------------------------------------------------------------

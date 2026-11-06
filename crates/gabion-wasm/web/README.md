@@ -328,10 +328,11 @@ waves one at a time, at 1× and at the slowest speed, and then reaches the
 window's edge; a flight lasts the flight over the speed, at 1× and at a fifth,
 and Pause freezes it, pool, clock and pixels, with the beams in flight painted
 over the labels; the heartbeat readout; the allocations of the stage's
-per-frame functions over 300 played frames, sampled by the heap profiler and
-mapped to their source through the hidden source maps (boxed doubles, the
-engine's own, aside), against the redraws; and the landed routes, with motion
-on and reduced, painted under the labels. The checks of how long a flight or a
+per-frame functions, every one tracked by the heap profiler in a browser that
+inlines nothing and mapped to its source through the hidden source maps: once
+V8 has tiered the code up, a stretch of 300 played frames in which they
+allocate nothing but boxed doubles, the engine's own; and the landed routes,
+with motion on and reduced, painted under the labels. The checks of how long a flight or a
 heartbeat takes to watch, and of the back-to-back Sends, run the page on
 Playwright's fake clock, so they hold on any machine.
 

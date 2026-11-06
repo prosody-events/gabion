@@ -902,7 +902,10 @@ test('the share window holds at any snapshot rate', async ({}, info) => {
   // Twenty seconds at half the data bytes crossing zones, then twenty at a
   // tenth: a window of the last ten seconds lies wholly in the second phase, so
   // σ is 10 % however finely play slices virtual time. 17 ms is a 60 Hz frame
-  // at 1x, 67 ms at 4x, and 500 ms a Step.
+  // at 1x, 67 ms at 4x, and 500 ms a Step. The page's own runs Step from wave
+  // to wave and jump to the window's edge, too coarse at the window's start to
+  // tell one mark spacing from another, so the spacing is checked here: every
+  // window opens within `W / 128` (plus one snapshot) of `t − W`.
   for (const stepMs of [17, 67, 500]) {
     const history = new ChartHistory();
     history.reset(WINDOW_MS);
@@ -919,6 +922,12 @@ test('the share window holds at any snapshot rate', async ({}, info) => {
         bytes_by_tier: { in_zone: { data: inData, control: 0 }, cross_zone: { data: crossData, control: 0 } },
         oracle_total: 0,
       });
+      if (t > WINDOW_MS) {
+        const late = t - WINDOW_MS - history.windowStart(t).t;
+        const where = `at ${stepMs} ms snapshots, the window ending at ${t}: ms it opens before t − W`;
+        expect(late, where).toBeGreaterThanOrEqual(0);
+        expect(late, where).toBeLessThan(WINDOW_MS / 128 + stepMs);
+      }
     }
     expect(history.share.at(-1), `σ at ${stepMs} ms snapshots`).toBeCloseTo(0.1, 9);
   }
