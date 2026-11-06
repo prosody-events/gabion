@@ -1,6 +1,8 @@
 import { expect, test } from '@playwright/test';
 import { heading } from '../src/lib/heading';
+import { admittedWaiting, strandedStop, waveOneCounted } from '../src/lib/narration';
 import { goal, nextAction, observe, progress, START, type RunView } from '../src/lib/next';
+import { PRESETS } from '../src/lib/presets';
 import type { NodeState } from '../src/lib/sim/types';
 import { BASE, COMMANDS, TABLE, clauses } from './next-actions';
 
@@ -19,17 +21,16 @@ for (const row of TABLE) {
 }
 
 test('no goal commands, and none quotes a control (A56)', () => {
-  const scenarios = ['rate-limiting', 'propagation', 'partition', 'overload', 'loss', 'steady', 'no-zone', 'gateway-failure', 'gateway-cut', 'sandbox'];
   for (const row of TABLE) {
     const view: RunView = { ...BASE, ...row.view };
-    for (const scenario of scenarios) {
+    for (const { id: scenario } of PRESETS) {
       const said = text(goal(view, scenario));
       for (const clause of clauses(said)) {
         const first = clause.split(/\s+/)[0].toLowerCase();
         expect(COMMANDS as readonly string[], `"${said}" (${row.name}): the clause "${clause}"`).not.toContain(first);
       }
       for (const label of ['Send', 'Play', 'Step', 'Select node', 'Use 25 hits', 'Go to']) {
-        expect(new RegExp(`\\b${label}\\b`).test(said), `"${said}" quotes "${label}"`).toBe(false);
+        expect(new RegExp(`\\b${label}\\b`, 'i').test(said), `"${said}" quotes "${label}"`).toBe(false);
       }
     }
   }
@@ -79,6 +80,7 @@ test("the heading's forms (A18)", () => {
   const spreading = all(25).map((n) => (n.id === 0 ? n : node(n.id, 0, { kind: 'Behind', missing_for_ms: 1 })));
   const one = heading({ ...base, nodes: spreading, oracle: 25 });
   expect([one.id, text(one.parts)]).toEqual(['rl-1', '1 of 12 nodes sees 25 of the 100 limit · the rest are up to 25 behind']);
+  expect(one.repair).toBeNull();
   expect(heading({ ...base, nodes: all(25), oracle: 25, badge: { hops: 2, afterMs: null } }).id).toBe('rl-2');
   const countdown = heading({ ...base, nodes: all(100), oracle: 100, badge: { hops: 2, afterMs: null }, nextSend: { kind: 'Rejected', total: 100, reopens: { kind: 'In', ms: 9_950 } } });
   expect([countdown.id, text(countdown.parts)], 'the countdown beats the badge').toEqual([
@@ -94,6 +96,13 @@ test("the heading's forms (A18)", () => {
     '✓ All 8 reachable nodes see 25 hits · zone c is cut off',
     'Reconnect zone c',
   ]);
+  // With a feed, a stranded node whose count is within the grace is still
+  // stranded, not up.
+  const fed = cut.map((n) => (n.zone === 2 ? node(n.id, 25, n.lag) : n));
+  expect(heading({ ...base, nodes: fed, oracle: 25, newer: 5, cuts: [{ kind: 'zone', zone: 2 }] }).id).toBe('hd-stranded');
+  const feed = heading({ ...base, nodes: all(25).map((n) => (n.id === 0 ? node(0, 10, { kind: 'Behind', missing_for_ms: 1 }) : n)), oracle: 25, newer: 5 });
+  expect(feed.id).toBe('hd-feed');
+  expect(text(feed.parts)).toMatch(/^11 of 12 nodes have every hit older than one heartbeat/);
   // Zone c stranded with nothing, zone b still behind: the gap is zone b's,
   // the reachable nodes' only.
   const mixed = cut.map((n) => (n.zone === 1 ? node(n.id, 15, { kind: 'Behind', missing_for_ms: 100 }) : n));
@@ -101,4 +110,12 @@ test("the heading's forms (A18)", () => {
   expect([behind.id, text(behind.parts)]).toEqual(['rl-1', '4 of 12 nodes see 25 of the 100 limit · the rest are up to 10 behind']);
   const over = heading({ ...base, nodes: all(200), oracle: 200 });
   expect(text(over.parts)).toContain('· 200 admitted against the limit of 100');
+});
+
+test('narration forms', () => {
+  expect(text(waveOneCounted([3, 6, 9], [4, 8]))).toBe('nodes 3, 6 and 9 and gateways node 4 and node 8 counted them');
+  expect(text(admittedWaiting(0, 1, 1_000_000, 100))).toBe('node 0 admitted 1 hit · that is under 1\u00a0% of the limit, so it waits for its next heartbeat');
+  expect(text(strandedStop([['zone b is cut off'], ['zone c is cut off']]))).toBe(
+    'paused: zone b is cut off and zone c is cut off, so their hits cannot cross until they are reconnected',
+  );
 });

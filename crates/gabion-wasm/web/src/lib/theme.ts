@@ -54,7 +54,7 @@ export type Theme = ReturnType<typeof readTheme>;
 
 /** The longest the canvas waits for the faces before it draws with a
  *  fallback: a missing face is a typographic loss, not a functional one. */
-export const FONT_GATE_MS = 3000;
+const FONT_GATE_MS = 3000;
 
 /** The faces the canvas and the charts measure with. */
 const FACES = ['400 1em "Source Sans 3"', '600 1em "Source Sans 3"', '400 1em "Source Serif 4"', '400 1em "Source Code Pro"'];

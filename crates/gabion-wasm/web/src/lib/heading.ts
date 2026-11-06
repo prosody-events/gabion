@@ -5,13 +5,14 @@
 // form has a template id, published for the audit.
 
 import { cutState, repairLabel, type Cut } from './cuts';
-import { blurb, claim, fmtDuration, fmtSeconds, joined, type Blurb } from './format';
+import { blurb, claim, fmtDuration, fmtSeconds, joined, noun, type Blurb } from './format';
 import type { Admission, NodeState } from './sim/types';
 
 /** The heading's forms. On the scale: `rl-0` nothing in the window yet,
  *  `rl-1` some nodes behind, `rl-2` every node agrees with the badge, `rl-3`
  *  every node agrees and the selected node is refusing (the countdown),
- *  `rl-4` the window emptied, `rl-5` every node agrees. Off the scale
+ *  `rl-4` the window emptied, `rl-5` every node agrees, with no badge latched
+ *  (after an expiry or a restore). Off the scale
  *  `hd-far`, with a feed `hd-feed`, and `hd-stranded` while a cut keeps some
  *  nodes from ever catching up. */
 export type Template = 'rl-0' | 'rl-1' | 'rl-2' | 'rl-3' | 'rl-4' | 'rl-5' | 'hd-far' | 'hd-feed' | 'hd-stranded';
@@ -61,7 +62,7 @@ export function heading(h: HeadingView): Heading {
   for (const node of h.nodes) {
     const lag = node.lag;
     if (lag.kind === 'Stranded') stranded += 1;
-    const caughtUp = h.newer === null ? lag.kind === 'CaughtUp' : node.window_total >= t - h.newer;
+    const caughtUp = lag.kind !== 'Stranded' && (h.newer === null ? lag.kind === 'CaughtUp' : node.window_total >= t - h.newer);
     if (caughtUp) up += 1;
     if (lag.kind === 'Behind') {
       behind += 1;
@@ -79,12 +80,12 @@ export function heading(h: HeadingView): Heading {
     const names = joined(h.cuts.map((c) => cutState(c, h.zones)));
     return {
       id: 'hd-stranded',
-      parts: [...blurb`✓ All ${n - stranded} reachable nodes see ${claim(t, 'cluster', 'view')} hits · `, ...names, ...over],
+      parts: [...blurb`✓ All ${n - stranded} reachable nodes see ${claim(t, 'cluster', 'view')} ${noun(t, 'hit')} · `, ...names, ...over],
       repair,
     };
   }
   if (h.newer !== null) {
-    const tail: Blurb = h.newer > 0 ? blurb` · ${h.newer} newer hits on their way` : [];
+    const tail: Blurb = h.newer > 0 ? blurb` · ${h.newer} newer ${noun(h.newer, 'hit')} on their way` : [];
     const head: Blurb =
       up === n
         ? blurb`✓ All ${n} nodes have every hit older than one heartbeat`
@@ -96,11 +97,11 @@ export function heading(h: HeadingView): Heading {
     if (up < n) {
       return {
         id: 'hd-far',
-        parts: [...blurb`${up} of ${n} nodes ${up === 1 ? 'sees' : 'see'} all ${claim(t, 'cluster', 'view')} hits · the rest are up to ${claim(gap, 'cluster', 'behind')} behind`, ...late],
+        parts: [...blurb`${up} of ${n} nodes ${up === 1 ? 'sees' : 'see'} all ${claim(t, 'cluster', 'view')} ${noun(t, 'hit')} · the rest are up to ${claim(gap, 'cluster', 'behind')} behind`, ...late],
         repair,
       };
     }
-    const all: Blurb = t === 0 ? blurb`All ${n} nodes see no hits yet` : blurb`✓ All ${n} nodes see all ${claim(t, 'cluster', 'view')} hits`;
+    const all: Blurb = t === 0 ? blurb`All ${n} nodes see no hits yet` : blurb`✓ All ${n} nodes see all ${claim(t, 'cluster', 'view')} ${noun(t, 'hit')}`;
     return { id: 'hd-far', parts: [...all, ...agreed], repair };
   }
   const limit = claim(h.limit, 'cluster', 'limit');
@@ -133,5 +134,5 @@ export function heading(h: HeadingView): Heading {
 /** " · agreed in h hops[, t after the send]". */
 function badgeOf(b: Badge): Blurb {
   const after: Blurb = b.afterMs === null ? [] : [', ', claim(fmtDuration(b.afterMs), 'cluster', 'behind'), ' after the send'];
-  return [...blurb` · agreed in ${b.hops} ${b.hops === 1 ? 'hop' : 'hops'}`, ...after];
+  return [...blurb` · agreed in ${b.hops} ${noun(b.hops, 'hop')}`, ...after];
 }

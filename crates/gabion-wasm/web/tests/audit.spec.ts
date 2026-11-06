@@ -24,9 +24,10 @@ import {
 } from '../src/lib/stage/layout';
 import { MARK, RING_BEHIND, RING_CAUGHT_UP, type GlyphTable } from '../src/lib/stage/renderer';
 import { VESSEL_SCALE } from '../src/lib/limit';
+import { PRESETS } from '../src/lib/presets';
 import { BAND_ALPHA, BEAM_ALPHA, readTheme, type Theme } from '../src/lib/theme';
 import timings from './phase-timings.json' with { type: 'json' };
-import { PERIOD_MS, WATCH, period, refusal, send, setSpeed, step, stepUntil, still, virtualMs } from './drive';
+import { PERIOD_MS, WATCH, period, refusal, send, sendButton, setSpeed, step, stepUntil, still, virtualMs } from './drive';
 
 // The automated half of the audit checklist in `../README.md` ("Design rules"):
 // A1 to A9. Each audit project fixes a width and a colour scheme; the main test
@@ -503,7 +504,7 @@ async function checkHeading(page: Page, where: string, snap: ClusterState): Prom
  *  layout, the DOM's counts and names, and the engine's snapshot. */
 async function checkGlyphs(page: Page, where: string, name: string): Promise<void> {
   const snap = await snapshot(page);
-  const feed = ['Steady state', 'No zone configured', 'Sustained overload', 'Gateway cut'].includes(name);
+  const feed = PRESETS.find((p) => p.label === name)?.traffic !== undefined;
   const findings = await page.evaluate(
     ({ k, nodes, grace }) => {
       const found: string[] = [];
@@ -1788,26 +1789,35 @@ test('the node glyph tells level, strata, cap, refusal and ring (A42, A16, C37)'
   expect(contrastOf(theme.fg, theme.level), `${where}: a count over the fill (A16)`).toBeGreaterThanOrEqual(4.5);
   expect(contrastOf(theme.fg, theme.panel), `${where}: a count over the empty inside (A16)`).toBeGreaterThanOrEqual(4.5);
 
+  // Every ring opens closed and caught up: nothing sweeps on load.
+  const opened = await page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { glyphs: GlyphTable }) => {
+    const g = c.glyphs;
+    const out: string[] = [];
+    for (let s = 0; s < g.len; s++) if (g.id[s] >= 0) out.push(`${g.ring[s]}|${g.arc[s]}`);
+    return out;
+  });
+  expect(opened, `${where}: every ring at load`).toEqual(opened.map(() => `${RING_CAUGHT_UP}|1`));
+
   // During the first Send's held flight every receiver's ring is behind and
   // shows less than the whole, though it has heard nothing yet; its vessel
   // and its count are its own view, empty, while only node 0 holds the hits.
   await page.locator('[role="gridcell"][data-node="0"]').press('Enter');
-  await page.locator('.transport').getByRole('button', { name: /^Send/ }).click();
-  await page.waitForFunction(() => document.querySelector<HTMLElement>('.stage-pane')?.dataset.held !== '0');
-  // Strata show where the inside is tall enough: one per non-empty bucket.
-  const tall = (await glyphs(page, (g) => 2 * (g.r[0] - 1))) >= STRATA_MIN_INNER;
-  // One read, so the glyphs, the counts and the hold are of one instant.
-  const held = await page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { glyphs: GlyphTable }) => {
-    const g = c.glyphs;
-    const out: { id: number; ring: number; arc: number; strata: number; count: string | null }[] = [];
+  await sendButton(page).click();
+  // One read, in the first frame the hold shows, so the glyphs, the counts and
+  // the hold are of one instant.
+  const held = (await (await page.waitForFunction(() => {
+    if (document.querySelector<HTMLElement>('.stage-pane')?.dataset.held === '0') return null;
+    const g = (document.querySelector('.stage canvas') as HTMLCanvasElement & { glyphs: GlyphTable }).glyphs;
+    const nodes: { id: number; ring: number; arc: number; strata: number; count: string | null }[] = [];
     for (let s = 0; s < g.len; s++) {
       if (g.id[s] < 0) continue;
       const count = document.querySelector(`[role="gridcell"][data-node="${g.id[s]}"] .count`)?.textContent?.trim() ?? null;
-      out.push({ id: g.id[s], ring: g.ring[s], arc: g.arc[s], strata: g.strata[s], count });
+      nodes.push({ id: g.id[s], ring: g.ring[s], arc: g.arc[s], strata: g.strata[s], count });
     }
-    return { held: document.querySelector<HTMLElement>('.stage-pane')?.dataset.held, nodes: out };
-  });
-  expect(held.held, `${where}: the sample is of the held flight`).not.toBe('0');
+    return { inner: 2 * (g.r[0] - 1), nodes };
+  })).jsonValue())!;
+  // Strata show where the inside is tall enough: one per non-empty bucket.
+  const tall = held.inner >= STRATA_MIN_INNER;
   for (const { id, ring, arc, strata, count } of held.nodes) {
     const origin = id === 0;
     if (!origin) {

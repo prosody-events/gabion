@@ -21,6 +21,7 @@
 // — the one regime where it is legible. See `lib/presets.ts`.
 
 import uPlot from 'uplot';
+import { textWidth } from '../measure';
 import { BAND_ALPHA, cssColor, type Theme } from '../theme';
 
 // One sync group ties every chart's cursor to the same virtual-time x.
@@ -61,16 +62,6 @@ export interface YRange {
 export interface References {
   zones: number;
   nozone: number;
-}
-
-let measuring: OffscreenCanvasRenderingContext2D | null = null;
-
-/** The width of `text` in `theme`'s caption-sm type, in px. */
-function measure(theme: Theme, text: string): number {
-  measuring ??= new OffscreenCanvas(1, 1).getContext('2d');
-  if (measuring === null) return text.length * theme.captionSmPx;
-  measuring.font = font(theme);
-  return measuring.measureText(text).width;
 }
 
 function font(theme: Theme, scale = 1): string {
@@ -212,7 +203,7 @@ function padding(theme: Theme, right: number): uPlot.Padding {
 export function shareOptions(theme: Theme, refs: () => References | null): uPlot.Options {
   const sink = labelSink(theme);
   const labels = ['with zones', 'with no zone', 'both predictions'];
-  const margin = Math.ceil(Math.max(...labels.map((l) => measure(theme, l)))) + LABEL_GAP;
+  const margin = Math.ceil(Math.max(...labels.map((l) => textWidth(l, font(theme))))) + LABEL_GAP;
   return {
     width: 1,
     height: 1,
@@ -265,7 +256,7 @@ export function agreementPanel(theme: Theme, first: boolean, last: boolean, y: Y
   return {
     width: 1,
     height: 1,
-    padding: padding(theme, Math.ceil(measure(theme, 'true total')) + 2 * LABEL_GAP),
+    padding: padding(theme, Math.ceil(textWidth('true total', font(theme))) + 2 * LABEL_GAP),
     cursor: baseCursor(),
     legend: { show: false },
     scales: { x: { time: false }, y: { range: () => [0, y.max] } },

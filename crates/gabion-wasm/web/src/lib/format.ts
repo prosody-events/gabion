@@ -71,3 +71,6 @@ export function fmtSeconds(ms: number): string {
 export function zoneLabel(name: string): string {
   return name.replace('-', ' ');
 }
+
+/** Zone `z`'s name as a sentence says it, or '' for a zone the list lacks. */
+export const zoneAt = (zones: readonly { name: string }[], z: number): string => zoneLabel(zones[z]?.name ?? '');

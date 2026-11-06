@@ -2,7 +2,7 @@
 // canvas and turns simulation state into the tier view. Kept out of Svelte's
 // reactivity on purpose: Svelte feeds it `setLayout` (where every node sits),
 // `setScale` (where the limit sits on the vessels), `setCluster` (each node's
-// window and ring), `setRoles`, `setCuts`, `setPreview` and `setAwaiting`
+// window and ring), `setRoles`, `setFaults`, `setPreview` and `setAwaiting`
 // (marks) and `show` and `reject` (the packets of an engine batch, a refused
 // request); the class owns all imperative Pixi/GSAP bookkeeping and cleanup.
 //
@@ -87,7 +87,7 @@ const ARC_NOTCH = 1 / 12;
 // How long a ring sweeps from its old share to its new one when a packet
 // lands, and how long the refusal plays, on the presentation clock.
 const SWEEP_MS = 250;
-export const BOUNCE_MS = 600;
+const BOUNCE_MS = 600;
 // The refusal's rebound, as a share of its drop, and the hatch's pitch under
 // reduced motion, px.
 const REBOUND = 0.3;
@@ -96,7 +96,7 @@ const HATCH_STEP = 4;
 const SWEEP_SEGMENTS = 32;
 // The most nodes the stage holds at once (the page caps live nodes at 100),
 // and the most window buckets a vessel draws.
-export const MAX_STAGE_NODES = 128;
+const MAX_STAGE_NODES = 128;
 const MAX_BUCKETS = 32;
 
 // The wall time a command's fast-forward of the waves in flight takes, at any
@@ -376,18 +376,16 @@ export class GlyphTable {
   readonly portX = new Float32Array(MAX_STAGE_NODES).fill(Number.NaN);
   readonly portY = new Float32Array(MAX_STAGE_NODES).fill(Number.NaN);
   readonly portSuspect = new Uint8Array(MAX_STAGE_NODES);
-  /** The refusal in flight: its slot (−1 while none), its band's top and
-   *  bottom this frame, and whether the disc clips it. */
+  /** The refusal in flight: its slot (−1 while none) and its band's top and
+   *  bottom this frame. */
   bounce = -1;
   bandTop = Number.NaN;
   bandBottom = Number.NaN;
-  bandMasked = 0;
   /** The selected and the previewed node's slots, −1 for none, and the dash
-   *  patterns each is drawn with. */
+   *  pattern the preview is drawn with. */
   selected = -1;
   preview = -1;
-  readonly previewDash: readonly number[] = PREVIEW_DASH;
-  readonly selectionDash: readonly number[] = [];
+  readonly previewDash: readonly [number, number] = PREVIEW_DASH;
   /** `MARK` bits of what is drawn now. */
   marks = 0;
   /** The limit the vessels are drawn against, and whether it is drawn. */
@@ -444,7 +442,7 @@ export class StageRenderer {
   #zoneNames: readonly string[] = [];
   #cluster: ClusterState | null = null;
   #roles: Roles | null = null;
-  #faults = new Map<number, Fault>();
+  #faults: ReadonlyMap<number, Fault> = new Map();
   #scale: Scale = { limit: 1, onScale: false, hits: 1, buckets: 1 };
   // A lag younger than this does not open a ring: the feed's newest hits.
   #grace = 0;
@@ -648,7 +646,7 @@ export class StageRenderer {
   /** Name the nodes a fault picks out: "node 4 · silenced", "node 4 · can't
    *  reach zone b". */
   setFaults(faults: ReadonlyMap<number, Fault>): void {
-    this.#faults = new Map(faults);
+    this.#faults = faults;
     this.#placeLabels();
   }
 
@@ -684,11 +682,10 @@ export class StageRenderer {
     const gfx = this.#nodes.get(id);
     if (gfx === undefined || !this.#scale.onScale) return;
     this.#endBounce();
-    const inner = 2 * (gfx.radius - 1);
-    const scale = VESSEL_SCALE * this.#scale.limit;
+    const full = VESSEL_SCALE * this.#scale.limit;
     const bottom = gfx.radius - 1;
-    const brimY = bottom - inner / VESSEL_SCALE;
-    const top = bottom - (inner * Math.min(this.#scale.limit + hits, scale)) / scale;
+    const brimY = levelY(gfx.radius, this.#scale.limit, full);
+    const top = levelY(gfx.radius, this.#scale.limit + hits, full);
     const band = gfx.refusal;
     band.clear();
     if (this.#reduceMotion) {
@@ -708,7 +705,6 @@ export class StageRenderer {
     band.position.y = this.#reduceMotion ? 0 : -this.#bounceDrop;
     const glyphs = this.#glyphs;
     glyphs.bounce = gfx.slot;
-    glyphs.bandMasked = band.mask === gfx.mask ? 1 : 0;
     glyphs.bandBottom = brimY + band.position.y;
     glyphs.bandTop = glyphs.bandBottom - this.#bounceHeight;
     this.#animEnd = Math.max(this.#animEnd, this.#pool.clock + BOUNCE_MS);
@@ -891,9 +887,9 @@ export class StageRenderer {
       rowLen: -1,
       total: -1,
       capped: false,
-      arc: 0,
-      arcFrom: 0,
-      arcTo: 0,
+      arc: 1,
+      arcFrom: 1,
+      arcTo: 1,
       arcStart: 0,
       sweeping: false,
       behind: false,
@@ -1138,8 +1134,8 @@ export class StageRenderer {
     const inner = 2 * (r - 1);
     const full = VESSEL_SCALE * scale.limit;
     const bottom = r - 1;
-    const fillTop = bottom - (inner * Math.min(total, full)) / full;
-    const brimY = bottom - inner / VESSEL_SCALE;
+    const fillTop = levelY(r, total, full);
+    const brimY = levelY(r, scale.limit, full);
     glyphs.fillTop[slot] = fillTop;
     glyphs.brimY[slot] = brimY;
     if (fillTop < bottom) {
@@ -1160,8 +1156,7 @@ export class StageRenderer {
         if (hits <= 0) continue;
         strata += 1;
         if (below > 0 && below < full) {
-          const y = bottom - (inner * below) / full;
-          brimLine(g, r - 1, y, 0);
+          brimLine(g, r - 1, levelY(r, below, full), 0);
         }
         below += hits;
       }
@@ -1651,4 +1646,11 @@ function isRejected(admission: Admission): boolean {
  *  flight progress, so it eases the raw age ratio itself. */
 function easeInOutQuad(t: number): number {
   return t < 0.5 ? 2 * t * t : 1 - 2 * (1 - t) * (1 - t);
+}
+
+/** The height in a vessel of radius `r` that holds `count` of `full`, px from
+ *  the centre with y down: the fill's top, the brim, a stratum, the refusal's
+ *  band. */
+function levelY(r: number, count: number, full: number): number {
+  return r - 1 - (2 * (r - 1) * Math.min(count, full)) / full;
 }

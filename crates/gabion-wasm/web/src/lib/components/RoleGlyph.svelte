@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { brim, chord, dashedRing, port, ring, SvgPen } from '../glyphs';
+  import { brim, chord, dashedRing, port, SvgPen } from '../glyphs';
   import { PREVIEW_DASH } from '../stage/layout';
 
   // A node mark as the stage draws it, for the DOM: the key, the node table,
@@ -27,14 +27,13 @@
     draw(pen);
     return pen.d;
   };
-  const disc = path((p) => ring(p, R, 0, 2 * Math.PI));
-  const outer = path((p) => ring(p, R + 2.5, 0, 2 * Math.PI));
+  const disc = path((p) => p.arc(0, 0, R, 0, 2 * Math.PI));
+  const outer = path((p) => p.arc(0, 0, R + 2.5, 0, 2 * Math.PI));
   const level = path((p) => chord(p, R, 1, R));
   const full = path((p) => chord(p, R, BRIM, R));
   const brimLine = path((p) => brim(p, R, BRIM, 1));
   const band = path((p) => chord(p, R, -R, BRIM));
-  const arc = path((p) => ring(p, R + 2.5, -Math.PI / 2, Math.PI));
-  const selection = path((p) => ring(p, R + 2.5, 0, 2 * Math.PI));
+  const arc = path((p) => p.arc(0, 0, R + 2.5, -Math.PI / 2, Math.PI));
   const preview = path((p) => dashedRing(p, R + 2.5, [PREVIEW_DASH[0] / 2, PREVIEW_DASH[1] / 2]));
   const diamond = path((p) => port(p, 0, 0, 4.5, Math.PI / 2));
 </script>
@@ -59,7 +58,7 @@
     <path class="warn-stroke" d={arc} />
   {:else if kind === 'selected'}
     <path class="panel axis-thin" d={disc} />
-    <path class="ink-stroke" d={selection} />
+    <path class="ink-stroke" d={outer} />
   {:else if kind === 'preview'}
     <path class="panel axis-thin" d={disc} />
     <path class="muted-stroke" d={preview} />

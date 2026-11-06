@@ -6,7 +6,7 @@
 import { ChartHistory } from './charts/history';
 import type { Cut } from './cuts';
 import { START, type Progress } from './next';
-import type { Knobs, Preset } from './presets';
+import { ORIGIN, type Knobs, type Preset } from './presets';
 import { RequestLog } from './requests';
 import type { Sim } from './sim/sim';
 import type { ClusterState, SimConfig } from './sim/types';
@@ -23,9 +23,9 @@ export class Run {
   /** The knobs the Tune controls stage for the next Rebuild. */
   knobs: Knobs = $state() as Knobs;
   /** The selected node: always a live one. */
-  selected = $state(0);
+  selected = $state() as number;
   /** Hits per Send: the last value committed valid. */
-  hits = $state(25);
+  hits = $state() as number;
   cluster: ClusterState = $state.raw() as ClusterState;
   cuts: readonly Cut[] = $state.raw([]);
   /** The faults the scenario's own seed made: Restart discards only the
@@ -38,7 +38,7 @@ export class Run {
   readonly requests = new RequestLog();
   /** The feed's start, the instant the build was handed to the reader, and
    *  the hits it has injected since. */
-  feedFrom: number;
+  readonly feedFrom: number;
   trafficInjected = 0;
 
   constructor(sim: Sim, preset: Preset, config: SimConfig, applied: Knobs, cluster: ClusterState, hits: number) {
@@ -47,10 +47,10 @@ export class Run {
     this.config = config;
     this.applied = applied;
     this.knobs = { ...applied };
-    this.selected = preset.select;
+    this.selected = ORIGIN;
     this.hits = hits;
     this.cluster = cluster;
-    this.cuts = [...sim.cuts()];
+    this.cuts = sim.cuts();
     this.seededCuts = this.cuts.length;
     this.feedFrom = cluster.virtual_ms;
     this.history.reset(applied.rule_window_ms);

@@ -193,8 +193,10 @@ export function nextAction(v: RunView): NextAction {
   return storyAction(v);
 }
 
-const press = (control: Control): NextAction => ({ kind: 'press', control });
-const wait = (reason: WaitReason): NextAction => ({ kind: 'wait', reason });
+/** The action that names `control`. */
+export const press = (control: Control): NextAction => ({ kind: 'press', control });
+/** The wait for `reason`. */
+export const wait = (reason: WaitReason): NextAction => ({ kind: 'wait', reason });
 
 /** The action the story's current act wants, once nothing runs. */
 function storyAction(v: RunView): NextAction {
@@ -427,7 +429,7 @@ export function pressClause(v: RunView, control: Control, wave: number): Blurb {
       }
       return [];
     case 'step':
-      if (v.flight === 'waiting') return wave <= 1 ? blurb` to send wave ${1}` : blurb` for wave ${wave}, the relays`;
+      if (v.flight === 'waiting') return wave <= 1 ? blurb` to send wave ${1}` : wave === 2 ? blurb` for wave ${2}, the relays` : blurb` for wave ${wave}`;
       return v.story === 'propagation' ? [" to reach the window's edge"] : [' to the next event'];
     case 'send':
       return v.story === 'rate-limiting' && v.progress.act === 'drained'

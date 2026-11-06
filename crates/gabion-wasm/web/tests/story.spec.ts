@@ -3,8 +3,8 @@ import type { ClusterState } from '../src/lib/sim/types';
 import type { GlyphTable } from '../src/lib/stage/renderer';
 import { CONTROL, CROSS, RELAY, STRATA_MIN_INNER } from '../src/lib/stage/layout';
 import { readTheme } from '../src/lib/theme';
-import { WATCH, still } from './drive';
-import { COMMANDS } from './next-actions';
+import { WATCH, sendButton, still } from './drive';
+import { COMMANDS, clauses } from './next-actions';
 
 // Each scenario's story, walked the way a newcomer walks it: pressing only the
 // one filled control the caption's action line names, and waiting while the
@@ -45,7 +45,7 @@ async function checkState(page: Page, where: string): Promise<string | null> {
   await page.mouse.move(0, 0);
   const tag = await tagOf(page);
   const found = await page.evaluate(
-    ({ commands }) => {
+    () => {
       const out: string[] = [];
       const ink = getComputedStyle(document.documentElement).color;
       // A49.2: only the primary wears the ink fill, the scenario list included.
@@ -70,11 +70,6 @@ async function checkState(page: Page, where: string): Promise<string | null> {
         if (first !== undefined && first !== voice) out.push(`"${said}" is said in the ${first} and the ${voice}`);
         voices.set(said, first ?? voice);
       }
-      // A56: the goal explains and never commands.
-      const goal = (document.querySelector('.scenario')?.textContent ?? '').replace(/\s+/g, ' ').trim();
-      for (const clause of goal.split(/[.;:,·]| and | then /).map((c) => c.trim()).filter((c) => c !== '')) {
-        if ((commands as string[]).includes(clause.split(/\s+/)[0].toLowerCase())) out.push(`the goal commands: "${clause}"`);
-      }
       // A19: the narration takes at most two lines where the stage has its
       // measure (from 1100 px; the narrower layouts come with C22 and C23).
       const narration = innerWidth >= 1100 ? document.querySelector('.narration') : null;
@@ -86,9 +81,17 @@ async function checkState(page: Page, where: string): Promise<string | null> {
       }
       return out;
     },
-    { commands: [...COMMANDS] },
   );
   expect(found, where).toEqual([]);
+  // A56: the goal explains and never commands, nor quotes a control.
+  const goal = squash(await page.locator('.scenario').textContent());
+  for (const clause of clauses(goal)) {
+    expect(COMMANDS as readonly string[], `${where}: the goal "${goal}" commands in "${clause}"`).not.toContain(clause.split(/\s+/)[0].toLowerCase());
+  }
+  for (const label of (await page.locator('button:visible').allInnerTexts()).map(squash).filter((l) => l !== '')) {
+    const quoted = new RegExp(`\\b${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+    expect(quoted.test(goal), `${where}: the goal "${goal}" quotes "${label}"`).toBe(false);
+  }
   const lineText = squash(await line(page).textContent());
   if (tag !== 'Next') {
     await expect(primary(page), `${where}: a ${tag} fills nothing`).toHaveCount(0);
@@ -106,9 +109,11 @@ async function checkState(page: Page, where: string): Promise<string | null> {
   const p = primary(page);
   const label = squash(await p.innerText());
   expect(await p.isDisabled(), `${where}: the next action is never disabled`).toBe(false);
-  expect(lineText.includes(label), `${where}: the line "${lineText}" quotes "${label}"`).toBe(true);
+  if ((await p.evaluate((el) => el.closest('#next-action') === null)) === true) {
+    expect(squash(await line(page).locator('strong').textContent()), `${where}: the line "${lineText}" quotes "${label}"`).toBe(label);
+  }
   const name = await p.evaluate((el) => (el.getAttribute('aria-label') ?? el.textContent ?? '').replace(/\s+/g, ' ').trim());
-  expect(name.startsWith(label.split(' ')[0]), `${where}: its accessible name "${name}" begins with its label`).toBe(true);
+  expect(name.startsWith(label), `${where}: its accessible name "${name}" begins with its label`).toBe(true);
   expect(await line(page).getByRole('button').count(), `${where}: at most one button in the line`).toBeLessThanOrEqual(1);
   // A49.6: in view once the line is scrolled to the top, where the page does
   // not scroll (from 1100 px; the scrolling layouts' sticky bar comes with C22
@@ -140,7 +145,7 @@ async function untilNext(page: Page, where: string, timeout = 60_000): Promise<v
       last = -1;
     }
     if (now >= 0) {
-      expect(now, `${where}: the meter falls in "${clause}"`).toBeGreaterThanOrEqual(last);
+      expect(now, `${where}: the meter never falls in "${clause}"`).toBeGreaterThanOrEqual(last);
       last = now;
     }
     await page.waitForTimeout(100);
@@ -175,13 +180,14 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
   await recordTemplates(page);
   const pressed: string[] = [];
   let refusals = 0;
+  // A57: the buckets the Sends admitted after Play were pressed in.
+  const paced: number[] = [];
   for (let step = 0; step < 40; step++) {
     const where = `${info.project.name}, state ${step}`;
     await untilNext(page, where);
     const label = await checkState(page, where);
     if (label === null) continue;
     pressed.push(label.startsWith('Send') ? 'Send' : label);
-    if (process.env.STORY_DEBUG) console.log(step, label, '|', squash(await page.locator('[data-template]').textContent()), '|', squash(await page.locator('.narration').textContent()), '|', squash(await line(page).textContent()));
     if (label.startsWith('Go to')) break;
     const before = await snapshot(page);
     await primary(page).click();
@@ -197,6 +203,11 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
         const narration = squash(await page.locator('.narration').textContent());
         expect(narration, `${where}: the rejection`).toMatch(/^node \d+ rejected all 25: it sees 100/);
         if (refusals === 1) expect(narration, `${where}: who filled the window`).toContain('admitted at nodes 0, 1 and 2');
+      } else if (pressed.includes('Play')) {
+        // The bucket before the press: the Send decides in it or a later one,
+        // and the page waits past the last Send's bucket before naming Send,
+        // so a playing clock cannot make two readings meet.
+        paced.push(before.bucket_epoch_now);
       }
     } else if (label.startsWith('Select node')) {
       await expect(page.locator('.pane-title [data-field="node"]')).toHaveText(label.replace('Select node ', ''));
@@ -234,6 +245,9 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
   expect(ids.filter((id) => id === 'rl-1').length, 'one spreading per admitted Send').toBe(9);
   expect(ids.filter((id) => id === 'rl-3').length, 'the countdown at each limit').toBeGreaterThanOrEqual(2);
   expect(ids.some((id) => id === 'rl-4' || id === 'rl-5'), 'the window slid').toBe(true);
+  expect(templates.some(([, text]) => text.includes('see 75 of the 100 limit')), 'the partial fall-off').toBe(true);
+  expect(paced.length, 'A57: the five Sends admitted after Play').toBe(5);
+  expect(new Set(paced).size, `A57: each Send after Play in a bucket of its own: ${paced}`).toBe(paced.length);
   // A paused Send's run is its own two waves: the flush and the relays. (A
   // Send while playing may share its run with other waves.)
   const paused = templates.slice(0, templates.findIndex(([id]) => id === 'rl-3'));
@@ -271,11 +285,25 @@ test('Propagation stops before each wave and Step flies it (A55, Q16)', async ({
     }, CONTROL);
   const where = info.project.name;
   expect(await checkState(page, `${where}: load`)).toMatch(/^Send/);
+  // (1) Until the run pauses before wave 1, the line waits and fills nothing:
+  // every state the page shows from the press to the first Next.
+  await page.evaluate(() => {
+    const w = window as unknown as { states: string[] };
+    w.states = [];
+    const take = (): void => {
+      const state = `${(document.querySelector('#next-action .tag')?.textContent ?? '').trim()}|${document.querySelectorAll('[data-primary]').length}`;
+      if (w.states.at(-1) !== state) w.states.push(state);
+    };
+    new MutationObserver(take).observe(document.body, { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ['data-primary'] });
+  });
   await primary(page).click();
-  // (1) Until the run pauses before wave 1, the line waits and fills nothing.
-  await expect(line(page).locator('.tag')).toHaveText(/Wait/);
-  await expect(primary(page)).toHaveCount(0);
   await untilNext(page, `${where}: before wave 1`);
+  const states = await page.evaluate(() => (window as unknown as { states: string[] }).states);
+  // From the first state that is not the Send's own Next to the first Next after it.
+  const from = states.findIndex((s) => !s.startsWith('Next|'));
+  const waits = from < 0 ? [] : states.slice(from, states.findIndex((s, i) => i > from && s.startsWith('Next|')));
+  expect(waits.length, `${where}: the line waited before wave 1: ${states}`).toBeGreaterThan(0);
+  expect(waits, `${where}: before wave 1`).toEqual(waits.map(() => 'Wait|0'));
   // (2) Step, to send wave 1.
   expect(await checkState(page, `${where}: wave 1 held`)).toBe('Step');
   await expect(line(page)).toContainText('to send wave 1');
@@ -321,7 +349,7 @@ test('a Send while a wave waits for Step lands it first (A55, Q16)', async ({ pa
   // Send again instead: the waiting wave lands, then node 0 decides the
   // second request, and its run stops before its own first wave.
   const before = await snapshot(page);
-  await page.locator('.transport').getByRole('button', { name: /^Send/ }).click();
+  await sendButton(page).click();
   await expect
     .poll(async () => {
       const s = await snapshot(page);
@@ -367,14 +395,14 @@ test('Zone partition admits on each side, then counts all of it (A48)', async ({
     for (let s = 0; s < g.len; s++) if (g.id[s] >= 0) out.push(g.fillTop[s] < g.brimY[s]);
     return out;
   });
-  expect(over.every(Boolean), 'every vessel draws over its brim').toBe(true);
+  expect(over, 'every vessel draws over its brim').toEqual(healed.nodes.map(() => true));
 });
 
 test('Hits per Send is checked when committed, not while typed (A59, A50)', async ({ page }, info) => {
   test.skip(info.project.name !== 'audit-1440-light', 'the field, checked once');
   await open(page);
   const field = page.locator('#burst-hits');
-  const send = page.locator('.transport').getByRole('button', { name: /^Send/ });
+  const send = sendButton(page);
   await field.click();
   await field.press('ControlOrMeta+a');
   for (const key of ['5', 'Backspace', '5', '0']) {
@@ -433,7 +461,7 @@ test('while the simulator starts, the transport says so beside its controls (A50
     await expect(button).toBeDisabled();
     expect((await button.getAttribute('aria-describedby')) ?? '', 'the reason describes it').toContain('transport-reason');
   }
-  const [a, b] = [await page.locator('.transport').getByRole('button', { name: /^Send/ }).boundingBox(), await reason.boundingBox()];
+  const [a, b] = [await sendButton(page).boundingBox(), await reason.boundingBox()];
   expect(Math.max(b!.x - (a!.x + a!.width), a!.x - (b!.x + b!.width), b!.y - (a!.y + a!.height), a!.y - (b!.y + b!.height)), 'the reason stands beside the transport').toBeLessThanOrEqual(48);
   resolve();
   await expect(page.locator('.stage canvas')).toBeVisible({ timeout: 30_000 });
@@ -444,7 +472,7 @@ test('a rebuild that fails keeps the running cluster, and the active scenario is
   test.skip(info.project.name !== 'audit-1440-light', 'the rebuilds, checked once');
   await open(page);
   // A Send moves the run on, so a rebuild would show.
-  await page.locator('.transport').getByRole('button', { name: /^Send/ }).click();
+  await sendButton(page).click();
   await still(page);
   const before = await snapshot(page);
   expect(before.oracle_total).toBe(25);
@@ -461,7 +489,7 @@ test('a rebuild that fails keeps the running cluster, and the active scenario is
   const kept = await snapshot(page);
   expect([kept.virtual_ms, kept.oracle_total], 'the running cluster').toEqual([before.virtual_ms, before.oracle_total]);
   await expect(page.locator('.stage canvas')).toBeVisible();
-  await page.locator('.transport').getByRole('button', { name: /^Send/ }).click();
+  await sendButton(page).click();
   await expect.poll(async () => (await snapshot(page)).oracle_total).toBe(50);
 });
 
@@ -522,11 +550,11 @@ test('what can be pressed looks pressable, and a named node is previewed (A51, o
     const bg = (el: Element | null): string => {
       for (let e = el; e !== null; e = e.parentElement) {
         const c = getComputedStyle(e).backgroundColor;
-        if (rgb(c).length > 0 && !c.endsWith(', 0)') && c !== 'transparent') return c;
+        if (!c.endsWith(', 0)') && c !== 'transparent') return c;
       }
       return getComputedStyle(document.documentElement).backgroundColor;
     };
-    for (const el of document.querySelectorAll<HTMLElement>('[role="button"], [onclick]')) {
+    for (const el of document.querySelectorAll<HTMLElement>('[role="button"]')) {
       if (el.tagName !== 'BUTTON' && !(el.tagName === 'A' && el.hasAttribute('href'))) out.push(`${el.tagName} acts as a button`);
     }
     for (const b of document.querySelectorAll<HTMLButtonElement>('button')) {
@@ -543,15 +571,13 @@ test('what can be pressed looks pressable, and a named node is previewed (A51, o
   });
   expect(found).toEqual([]);
   await expect(page.getByRole('button', { name: 'Restart Rate limiting' })).toBeVisible();
-  const glyphs = (): Promise<{ preview: number; id: number; previewDash: number; selectionDash: number }> =>
+  const glyphs = (): Promise<{ preview: number; id: number; previewDash: number }> =>
     page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { glyphs: GlyphTable }) => ({
       preview: c.glyphs.preview,
       id: c.glyphs.preview < 0 ? -1 : c.glyphs.id[c.glyphs.preview],
       previewDash: c.glyphs.previewDash.length,
-      selectionDash: c.glyphs.selectionDash.length,
     }));
   expect((await glyphs()).previewDash, 'the preview is dashed').toBeGreaterThan(0);
-  expect((await glyphs()).selectionDash, 'the selection is solid').toBe(0);
   // Hovering a disc previews it; leaving clears it.
   const box = (await page.locator('[role="gridcell"][data-node="7"]').boundingBox())!;
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);

@@ -36,7 +36,7 @@ SHOT_SETS = {
     'cell': {'metric': 'conv_p50_incl_never_ms', 'regime': 'az-partition', 'arm': 'local-only', 'rope': '0.1',
              'y': 'stale_limited_p99_pct', 'plane': 'all', 'fam': 'Speed'},
 }
-def want(cid): return ONLY is None or any(cid.startswith(p) or p.startswith(cid) for p in ONLY)
+def want(cid): return ONLY is None or any(cid == p or cid.startswith(p + '.') or p.startswith(cid + '.') for p in ONLY)
 
 # ---------------------------------------------------------------- results
 RES = []   # (cid, scope, ok, evidence)

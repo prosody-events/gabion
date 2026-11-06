@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { blurb, fmtCount, fmtSeconds, joined, noun, zoneLabel, type Blurb } from './lib/format';
+  import { blurb, fmtCount, fmtSeconds, joined, noun, zoneAt, type Blurb } from './lib/format';
   import { Sim } from './lib/sim/sim';
   import { readTheme, watchTheme } from './lib/theme';
   import {
@@ -21,8 +21,10 @@
     DEFAULT_PRESET,
     PRESETS,
     WATCHED_KEY,
+    BURST_HITS,
     BURST_HITS_MAX,
     BURST_HITS_MIN,
+    ORIGIN,
     knobsFromPreset,
     presetById,
     warm,
@@ -127,8 +129,7 @@
   let width = $state<Width>(widthNow());
   // Below 640 px the rail folds into a "Controls" disclosure above the stage; at
   // and above it the rail is always open (its summary is hidden).
-  const wide = window.matchMedia('(width >= 640px)');
-  let controlsOpen = $state(wide.matches);
+  let controlsOpen = $state(widthNow() !== 'narrow');
   let helpOpen = $state(false);
 
   // What every snapshot reads: the watched key, and the weight of the next Send
@@ -287,11 +288,11 @@
     awaitingNode === null ? null : (cluster?.nodes.find((n) => n.id === awaitingNode)?.next_heartbeat_ms ?? virtualMs) - virtualMs,
   );
 
-  /** The scenario's node if live, else the lowest live node in its zone, else
-   *  the lowest live node: where Escape and a removal take the selection. */
+  /** The origin if live, else the lowest live node in its zone, else the
+   *  lowest live node: where Escape and a removal take the selection. */
   function subjectOf(r: Run): number {
     const nodes = r.cluster.nodes;
-    const home = r.preset.select;
+    const home = ORIGIN;
     if (nodes.some((n) => n.id === home)) return home;
     const zone = home % Math.max(r.config.zones, 1);
     const inZone = nodes.filter((n) => n.zone === zone);
@@ -330,7 +331,7 @@
       // flush (if any) held: deliver it now, so the first paint shows what
       // the engine holds and nothing lands undrawn later.
       await fresh.step(0);
-      const snap = await fresh.snapshot(preset.select, { key: WATCHED_KEY, probe_hits: hits });
+      const snap = await fresh.snapshot(ORIGIN, { key: WATCHED_KEY, probe_hits: hits });
       return new Run(fresh, preset, config, { ...k }, snap, hits);
     } catch (e) {
       await fresh.shutdown();
@@ -446,7 +447,7 @@
     const peers = r.cluster.inspected?.peers ?? [];
     const gateways = peers.flatMap((p) =>
       p.role === 'gateway' && p.id !== undefined && p.zone !== undefined
-        ? [{ node: p.id, zone: zoneLabel(r.cluster.zones[p.zone]?.name ?? '') }]
+        ? [{ node: p.id, zone: zoneAt(r.cluster.zones, p.zone) }]
         : [],
     );
     return say.idle(r.selected, gateways, onScale(r.applied.rule_limit, r.hits));
@@ -547,7 +548,7 @@
         dataSent += 1;
         if (kind.tier === 'CrossZone') dataCrossed += 1;
       } else if (kind.type === 'GatewayChanged' && kind.origin === r.selected) {
-        narration = say.gatewayChanged(kind.origin, zoneLabel(r.cluster.zones[kind.zone]?.name ?? ''), kind.to, kind.from);
+        narration = say.gatewayChanged(kind.origin, zoneAt(r.cluster.zones, kind.zone), kind.to, kind.from);
       }
     }
   }
@@ -778,7 +779,7 @@
         await refresh(r);
         return;
       }
-      r.requests.push(node, r.cluster.bucket_epoch_now, hits);
+      r.requests.push(node, r.cluster.bucket_epoch_now);
       const eager = isWave(batch);
       hops = 0;
       dataSent = 0;
@@ -788,7 +789,7 @@
       armed = true;
       emptied = false;
       awaitingNode = eager ? null : node;
-      told = eager ? say.admittedEager(node, hits, admission.total_before, limit) : say.admittedWaiting(node, hits, limit);
+      told = eager ? say.admittedEager(node, hits, admission.total_before, limit) : say.admittedWaiting(node, hits, limit, r.config.target_err_bps);
       narration = told;
       runOn(r, r.preset.story === 'propagation' ? 'per-wave' : 'settled');
       await meet(r, batch, ARRIVAL_MS);
@@ -817,7 +818,7 @@
   const cut = (c: Parameters<Sim['cut']>[0]): Promise<void> =>
     act(async (r) => {
       await r.sim.cut(c, r.cluster.nodes);
-      r.cuts = [...r.sim.cuts()];
+      r.cuts = r.sim.cuts();
     });
 
   /** Restore the scenario's own network, its loss included, then run time
@@ -825,7 +826,7 @@
   const heal = (): Promise<void> =>
     command(async (r) => {
       await r.sim.heal();
-      r.cuts = [];
+      r.cuts = r.sim.cuts();
       await refresh(r);
       told = ['the network is whole again'];
       narration = told;
@@ -840,7 +841,7 @@
       await refresh(r);
       await r.sim.reapply(r.cluster.nodes);
       await refresh(r);
-      told = blurb`a node joined ${zoneLabel(r.cluster.zones[zone]?.name ?? '')}`;
+      told = blurb`a node joined ${zoneAt(r.cluster.zones, zone)}`;
       narration = told;
       runOn(r, 'settled');
     });
@@ -850,7 +851,7 @@
   const removeNode = (id: number): Promise<void> =>
     command(async (r) => {
       await r.sim.removeNode(id);
-      r.cuts = [...r.sim.cuts()];
+      r.cuts = r.sim.cuts();
       const snap = await r.sim.snapshot(null, watchOf(r));
       r.cluster = snap;
       r.selected = subjectOf(r);
@@ -936,11 +937,17 @@
     const zones = r.cluster.zones;
     const zoneOf = (id: number): number => r.cluster.nodes.find((n) => n.id === id)?.zone ?? -1;
     if (own.length > 0 && own.every((p) => p.src === r.selected)) {
-      const peers = own.filter((p) => p.tier === 'InZone').length;
-      const gateways = own
-        .filter((p) => p.tier === 'CrossZone')
-        .map((p) => ({ node: p.dst, zone: zoneLabel(zones[zoneOf(p.dst)]?.name ?? '') }));
-      narration = say.waveOne(r.selected, zoneLabel(zones[zoneOf(r.selected)]?.name ?? ''), peers, gateways);
+      if (waited) {
+        const peers = own.filter((p) => p.tier === 'InZone').length;
+        const gateways = own.filter((p) => p.tier === 'CrossZone').map((p) => ({ node: p.dst, zone: zoneAt(zones, zoneOf(p.dst)) }));
+        narration = say.waveOne(r.selected, zoneAt(zones, zoneOf(r.selected)), peers, gateways);
+      } else {
+        const counted = own.filter((p) => p.type === 'PacketSent');
+        narration = say.waveOneCounted(
+          counted.filter((p) => p.tier === 'InZone').map((p) => p.dst),
+          counted.filter((p) => p.tier === 'CrossZone').map((p) => p.dst),
+        );
+      }
     } else if (relays.length > 0 && own.length === 0) {
       const gateways = [...new Set(relays.map((p) => p.src))].sort((a, b) => a - b);
       const lost = relays.filter((p) => p.type === 'PacketDropped').length;
@@ -967,7 +974,7 @@
 
   function selectPreset(preset: Preset): void {
     if (defaults === null || preset.id === run?.preset.id) return;
-    void start(preset, knobsFromPreset(preset, defaults), preset.burst_hits);
+    void start(preset, knobsFromPreset(preset, defaults), BURST_HITS);
   }
 
   const go = (to: PresetId): void => selectPreset(presetById(to));
@@ -1034,7 +1041,7 @@
       busy,
       hits: editingHits ? 'editing' : hitsValid ? 'valid' : 'invalid',
       lastDecision,
-      burstHits: r.preset.burst_hits,
+      burstHits: BURST_HITS,
       sendHits: r.hits,
       oracle: r.cluster.oracle_total,
       virtualMs: r.cluster.virtual_ms,
@@ -1125,19 +1132,17 @@
         busy = false;
         return;
       }
-      await start(DEFAULT_PRESET, knobsFromPreset(DEFAULT_PRESET, defaults), DEFAULT_PRESET.burst_hits);
+      await start(DEFAULT_PRESET, knobsFromPreset(DEFAULT_PRESET, defaults), BURST_HITS);
     })();
     const unwatch = watchTheme(() => (theme = readTheme()));
-    const unwidth = watchWidth((w) => (width = w));
-    const onWide = (event: MediaQueryListEvent): void => {
-      controlsOpen = event.matches;
-    };
-    wide.addEventListener('change', onWide);
+    const unwidth = watchWidth((w) => {
+      if ((w === 'narrow') !== (width === 'narrow')) controlsOpen = w !== 'narrow';
+      width = w;
+    });
     return () => {
       halt();
       unwatch();
       unwidth();
-      wide.removeEventListener('change', onWide);
       dropPrevious();
     };
   });
@@ -1285,7 +1290,7 @@
             subject={r.selected}
             {useHitsReason}
             repairLabel={heading.repair}
-            zoneName={(z) => zoneLabel(cluster.zones[z]?.name ?? '')}
+            zoneName={(z) => zoneAt(cluster.zones, z)}
             {meter}
             presetLabel={(id) => presetById(id).label}
             onSelect={(node) => void select(node)}
@@ -1341,7 +1346,7 @@
             {#if selectedNode !== null}
               <h2 class="pane-title">
                 node <span data-field="node">{selectedNode.id}</span>
-                <span class="pane-sub">selected · {zoneLabel(cluster.zones[selectedNode.zone]?.name ?? '')}</span>
+                <span class="pane-sub">selected · {zoneAt(cluster.zones, selectedNode.zone)}</span>
               </h2>
               <Dashboard
                 {cluster}

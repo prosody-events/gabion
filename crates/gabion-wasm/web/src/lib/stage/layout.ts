@@ -40,9 +40,9 @@ export const RING_REACH = ARC_GAP + ARC_WIDTH / 2;
 export const SELECTION_GAP = 10;
 export const SELECTION_WIDTH = 1.5;
 export const SELECTION_REACH = SELECTION_GAP + SELECTION_WIDTH / 2;
-export const PREVIEW_DASH: readonly number[] = [4, 3];
+export const PREVIEW_DASH: readonly [number, number] = [4, 3];
 /** A gateway's port: its least half-diagonal and its gap outside the ring, px. */
-export const PORT_MIN = 4;
+const PORT_MIN = 4;
 export const PORT_GAP = 1;
 /** A name's near edge outside its node's ring, and the least room between two
  *  names side by side, px. */

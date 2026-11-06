@@ -41,13 +41,18 @@ function assertBoundary(batch: EventBatch): void {
   }
 }
 
+/** Whether faults `a` and `b` are the same fault. */
+const sameCut = (a: Cut, b: Cut): boolean =>
+  a.kind === b.kind && ('zone' in a ? a.zone : -1) === ('zone' in b ? b.zone : -1) && ('node' in a ? a.node : -1) === ('node' in b ? b.node : -1);
+
 /** A live simulation. Mirrors the wasm `Sim` surface with idiomatic JS types,
  *  and keeps the faults the page made as a list of what each means. */
 export class Sim {
   #inner: WasmSim;
-  // Every fault made since the last heal, in the order made: the engine keeps
-  // link policies, not what they were for.
-  #cuts: Cut[] = [];
+  // Every fault made since the last heal, in the order made, each once: the
+  // engine keeps link policies, not what they were for. Replaced, never
+  // mutated, so a reader may keep the list it was given.
+  #cuts: readonly Cut[] = [];
 
   private constructor(inner: WasmSim) {
     this.#inner = inner;
@@ -116,9 +121,11 @@ export class Sim {
     return this.#cuts;
   }
 
-  /** Make fault `cut` over the live `nodes`, and list it. */
+  /** Make fault `cut` over the live `nodes`, and list it, unless it is
+   *  already made. */
   async cut(cut: Cut, nodes: readonly Member[]): Promise<void> {
-    this.#cuts.push(cut);
+    if (this.#cuts.some((c) => sameCut(c, cut))) return;
+    this.#cuts = [...this.#cuts, cut];
     await this.#apply(cut, nodes);
   }
 

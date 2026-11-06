@@ -4,8 +4,7 @@
 // failure, Gateway cut), the study's measurement (Steady state, No zone
 // configured) and Sandbox.
 //
-// A preset is a config, a `pacing` with its feed, the node it selects, the
-// Hits per Send it opens with, the charts its pane shows, the story its
+// A preset is a config, a `pacing` with its feed, the charts its pane shows, the story its
 // caption tells (`lib/next.ts`), the scenario its story hands over to, and an
 // `async seed(sim, config, gateways)` that fires its opening commands (cuts,
 // seed requests) against a freshly built cluster. It is not a timed script:
@@ -50,24 +49,25 @@ const NODES = 12;
 /** The zones the presets place the cluster in. */
 const ZONES = 3;
 
-/** Hits in the request the one-Send presets seed. */
-const BURST = 50;
+/** Hits in the request the seeded presets open with. */
+const SEED_HITS = 50;
 
-/** The node the one-Send presets seed, select on load and read the gateways of. */
+/** The node every preset selects on load, and the node the seeded presets
+ *  seed and read the gateways of. */
 export const ORIGIN = 0;
 
 /** The limit the far-off presets pin: far above their volumes, so ε stays
  *  large and a request spreads by heartbeat. */
 const NARRATIVE_LIMIT = 1_000_000;
 
-/** The limit Rate limiting and Zone partition enforce: four Sends of 25 reach
- *  it exactly. */
-const RATE_LIMIT = 100;
-
 /** Hits per Send every preset opens with, and the range the field accepts. */
-const BURST_HITS = 25;
+export const BURST_HITS = 25;
 export const BURST_HITS_MIN = 1;
 export const BURST_HITS_MAX = 1000;
+
+/** The limit Rate limiting and Zone partition enforce: four Sends of
+ *  `BURST_HITS` reach it exactly. */
+const RATE_LIMIT = 4 * BURST_HITS;
 
 /** The highest rule limit the Tune controls accept. */
 export const RULE_LIMIT_MAX = 1_000_000;
@@ -161,10 +161,6 @@ export type Preset = Paced & {
   /** The rail's group: what gabion does, faults, measurement, Sandbox. */
   readonly group: 0 | 1 | 2 | 3;
   readonly config: Partial<SimConfig>;
-  /** The node the scenario opens with selected. */
-  readonly select: number;
-  /** Hits per Send the scenario opens with. */
-  readonly burst_hits: number;
   /** The charts the detail pane shows, in order. */
   readonly charts: readonly ChartId[];
   /** The story the caption tells, and the scenario it hands over to. */
@@ -244,8 +240,6 @@ export const PRESETS: readonly Preset[] = [
     group: 0,
     config: { nodes: NODES, zones: ZONES, rule_limit: RATE_LIMIT },
     pacing: 'held',
-    select: ORIGIN,
-    burst_hits: BURST_HITS,
     charts: LIMIT_FIRST,
     story: 'rate-limiting',
     next: 'partition',
@@ -259,13 +253,11 @@ export const PRESETS: readonly Preset[] = [
     group: 0,
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
     pacing: 'held',
-    select: ORIGIN,
-    burst_hits: BURST_HITS,
     charts: CHARTS,
     story: 'propagation',
     next: 'rate-limiting',
     async seed(sim, c) {
-      await sim.submitRequest(ORIGIN, WATCHED_KEY, BURST);
+      await sim.submitRequest(ORIGIN, WATCHED_KEY, SEED_HITS);
       await settle(sim, c);
     },
   },
@@ -280,8 +272,6 @@ export const PRESETS: readonly Preset[] = [
     config: { nodes: NODES, zones: ZONES, rule_limit: 400 },
     pacing: 'live',
     traffic: { rate_per_sec: OVERLOAD_RATE_PER_SEC, at: 'every-node' },
-    select: ORIGIN,
-    burst_hits: BURST_HITS,
     charts: LIMIT_FIRST,
     story: 'watch',
     next: 'rate-limiting',
@@ -295,8 +285,6 @@ export const PRESETS: readonly Preset[] = [
     group: 1,
     config: { nodes: NODES, zones: ZONES, rule_limit: RATE_LIMIT },
     pacing: 'held',
-    select: ORIGIN,
-    burst_hits: BURST_HITS,
     charts: LIMIT_FIRST,
     story: 'partition',
     next: 'gateway-failure',
@@ -310,13 +298,11 @@ export const PRESETS: readonly Preset[] = [
     group: 1,
     config: { nodes: NODES, zones: ZONES, uniform_loss: 0.3, rule_limit: NARRATIVE_LIMIT },
     pacing: 'held',
-    select: ORIGIN,
-    burst_hits: BURST_HITS,
     charts: CHARTS,
     story: 'watch',
     next: 'rate-limiting',
     async seed(sim) {
-      await sim.submitRequest(ORIGIN, WATCHED_KEY, BURST);
+      await sim.submitRequest(ORIGIN, WATCHED_KEY, SEED_HITS);
     },
   },
   {
@@ -325,15 +311,13 @@ export const PRESETS: readonly Preset[] = [
     group: 1,
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
     pacing: 'held',
-    select: ORIGIN,
-    burst_hits: BURST_HITS,
     charts: CHARTS,
     story: 'watch',
     next: 'gateway-cut',
     async seed(sim, c, gateways) {
       const g = gateways[ORIGIN]?.[1] ?? noGateway(1);
       await sim.cut({ kind: 'silenced', node: g }, buildNodes(c));
-      await sim.submitRequest(ORIGIN, WATCHED_KEY, BURST);
+      await sim.submitRequest(ORIGIN, WATCHED_KEY, SEED_HITS);
     },
   },
   {
@@ -343,15 +327,13 @@ export const PRESETS: readonly Preset[] = [
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
     pacing: 'held',
     traffic: { rate_per_sec: TRICKLE_RATE_PER_SEC, at: { node: ORIGIN } },
-    select: ORIGIN,
-    burst_hits: BURST_HITS,
     charts: CHARTS,
     story: 'watch',
     next: 'sandbox',
     async seed(sim, c, gateways) {
       const g = gateways[ORIGIN]?.[1] ?? noGateway(1);
       await sim.cut({ kind: 'unheard-in-zone', node: g, zone: 1 }, buildNodes(c));
-      await sim.submitRequest(ORIGIN, WATCHED_KEY, BURST);
+      await sim.submitRequest(ORIGIN, WATCHED_KEY, SEED_HITS);
     },
   },
   {
@@ -361,8 +343,6 @@ export const PRESETS: readonly Preset[] = [
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
     pacing: 'held',
     traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC, at: 'every-node' },
-    select: ORIGIN,
-    burst_hits: BURST_HITS,
     charts: CHARTS,
     story: 'watch',
     next: 'rate-limiting',
@@ -377,8 +357,6 @@ export const PRESETS: readonly Preset[] = [
     config: { nodes: NODES, zones: ZONES, zone_mode: 'Unset', rule_limit: NARRATIVE_LIMIT },
     pacing: 'held',
     traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC, at: 'every-node' },
-    select: ORIGIN,
-    burst_hits: BURST_HITS,
     charts: CHARTS,
     story: 'watch',
     next: 'rate-limiting',
@@ -395,8 +373,6 @@ export const PRESETS: readonly Preset[] = [
     // next heartbeat, one event at a time under Step.
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
     pacing: 'held',
-    select: ORIGIN,
-    burst_hits: BURST_HITS,
     charts: CHARTS,
     story: 'sandbox',
     next: null,

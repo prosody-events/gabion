@@ -12,7 +12,7 @@
 //! the instants the engine fires it for. An `mpsc` queues (unlike a `watch`,
 //! which coalesces and would silently drop a tick a busy runtime hadn't polled
 //! yet), so every fired tick is delivered exactly once — the determinism the
-//! shareable-URL replay relies on. The prompt ticker sets the node's `armed`
+//! replay tests rely on. The prompt ticker sets the node's `armed`
 //! flag while the runtime awaits it, which the runtime does only while it has
 //! prompt work, so the engine fires it only then.
 

@@ -1,9 +1,10 @@
 // One geometry for every mark a node wears, drawn by two pens: the stage's
 // Pixi `Graphics` (which satisfies `Pen` structurally) and `SvgPen`, which
 // writes the same path into an SVG `d` for the DOM (the key, the table, the
-// glossary). Each function writes through its pen and allocates nothing, so
-// the renderer may call them while it redraws. Coordinates are px with y down,
-// centred on the disc; angles are radians, clockwise from 3 o'clock.
+// glossary). Each function writes through its pen. Through the Pixi pen
+// nothing allocates, so the renderer may call them while it redraws; SvgPen
+// builds its strings once, when a component is built. Coordinates are px with
+// y down, centred on the disc; angles are radians, clockwise from 3 o'clock.
 
 /** What a mark is drawn through. */
 export interface Pen {
@@ -45,7 +46,7 @@ export class SvgPen implements Pen {
 const round = (v: number): number => Math.round(v * 100) / 100;
 
 /** Half the chord of a circle of radius `r` at height `y`. */
-export const chordHalf = (r: number, y: number): number => Math.sqrt(Math.max(r * r - y * y, 0));
+const chordHalf = (r: number, y: number): number => Math.sqrt(Math.max(r * r - y * y, 0));
 
 /** A diamond of half-diagonal `half` centred at (`cx`, `cy`), one vertex
  *  pointing along `angle`: a gateway's port, pointing into the zone it
@@ -89,14 +90,9 @@ export function brim(pen: Pen, r: number, y: number, overhang: number): void {
   pen.moveTo(-half, y).lineTo(half, y);
 }
 
-/** An arc of radius `r` from angle `a0` to `a1` around the disc's centre. */
-export function ring(pen: Pen, r: number, a0: number, a1: number): void {
-  pen.arc(0, 0, r, a0, a1);
-}
-
 /** Dashes round a circle of radius `r`, `dash[0]` px drawn and `dash[1]` px
  *  left, as separate subpaths: the selection preview. */
-export function dashedRing(pen: Pen, r: number, dash: readonly number[]): void {
+export function dashedRing(pen: Pen, r: number, dash: readonly [on: number, off: number]): void {
   const turn = 2 * Math.PI * r;
   const period = dash[0] + dash[1];
   const count = Math.max(1, Math.floor(turn / period));

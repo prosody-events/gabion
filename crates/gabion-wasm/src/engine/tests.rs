@@ -600,7 +600,7 @@ fn lag_dates_the_oldest_change_a_node_lacks() {
 
 /// Determinism: the same `(config, command-script)` produces an identical
 /// event log, tier tags and gateway events included — the invariant the
-/// shareable-URL replay relies on.
+/// replay tests rely on.
 #[test]
 fn same_script_produces_identical_events() {
     fn run() -> Vec<EventBatch> {
@@ -807,7 +807,7 @@ fn a_removal_keeps_each_touched_mark_on_its_node() {
 
 /// Determinism across churn: the same command script — including a join and a
 /// leave — yields an identical event log *and* identical stable ids on every
-/// run. This is the invariant the shareable-URL replay relies on once churn is
+/// run. This is the invariant the replay tests rely on once churn is
 /// part of the command stream.
 #[test]
 fn churn_script_is_deterministic() {

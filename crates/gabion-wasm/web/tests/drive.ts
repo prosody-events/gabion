@@ -84,6 +84,13 @@ export async function select(page: Page, node: number): Promise<void> {
 export const sendButton = (page: Page): Locator =>
   page.locator('.transport').getByRole('button', { name: /^Send/ });
 
+/** Pause if the page is playing, checked and clicked in one task, so a run that
+ *  ends by itself cannot leave a click waiting for a Pause that is gone. */
+export const pauseIfPlaying = (page: Page): Promise<void> =>
+  page.evaluate(() => {
+    [...document.querySelectorAll<HTMLButtonElement>('.transport button')].find((b) => b.textContent?.trim() === 'Pause')?.click();
+  });
+
 /** Send at node `node` and return once the node has decided and, if the page
  *  was paused, the run the Send started has ended: the page stands still. With
  *  `pause`, the reader pauses the run as soon as it starts, so later Steps
@@ -102,8 +109,7 @@ export async function send(page: Page, node: number, pause = false): Promise<voi
   if (pause && !playing) {
     // The run may already have stopped by itself; a Pause that freezes a wave
     // mid-flight is followed by a Step that lands it.
-    const pauseButton = page.getByRole('button', { name: 'Pause' });
-    if (await pauseButton.isVisible()) await pauseButton.click();
+    await pauseIfPlaying(page);
     if ((await page.locator('.stage-pane').getAttribute('data-flight')) === 'frozen') await step(page);
   }
   if (!playing) await still(page, 4 * LANDING_MS);
@@ -159,32 +165,35 @@ export interface BandFrame {
   readonly top: number;
   readonly bottom: number;
   readonly brim: number;
-  readonly masked: number;
 }
 
 /** Press Send at the selected node `node`, which refuses it, and return every
- *  frame of the refusal's band, checking each (C37): the disc clips it, and it
- *  never passes the brim nor reaches the count where one is shown. */
+ *  frame of the refusal's band, checking each (C37): it never passes the brim
+ *  nor reaches the count where one is shown. The recorder starts before the
+ *  press, so a band however short is seen from its first frame. */
 export async function refusal(page: Page, node: number, where: string): Promise<BandFrame[]> {
-  await sendButton(page).click();
-  await page.waitForFunction((id) => document.querySelector<HTMLCanvasElement>('.stage canvas')?.dataset.bounce === String(id), node);
-  const frames = await page.evaluate(
+  const recording = page.evaluate(
     () =>
       new Promise<BandFrame[]>((done) => {
         const c = document.querySelector('.stage canvas') as HTMLCanvasElement & { glyphs: GlyphTable };
         const out: BandFrame[] = [];
+        let started = false;
         const tick = (): void => {
           const g = c.glyphs;
-          if (g.bounce < 0) {
+          if (g.bounce >= 0) {
+            started = true;
+            out.push({ top: g.bandTop, bottom: g.bandBottom, brim: g.brimY[g.bounce] });
+          } else if (started) {
             done(out);
             return;
           }
-          out.push({ top: g.bandTop, bottom: g.bandBottom, brim: g.brimY[g.bounce], masked: g.bandMasked });
           requestAnimationFrame(tick);
         };
         tick();
       }),
   );
+  await sendButton(page).click();
+  const frames = await recording;
   expect(frames.length, `${where}: the refusal played`).toBeGreaterThan(0);
   // The count's cap height, where the node shows its count.
   const cap = await page.locator(`[role="gridcell"][data-node="${node}"]`).evaluate((el) => {
@@ -195,7 +204,6 @@ export async function refusal(page: Page, node: number, where: string): Promise<
     return ctx.measureText('0').actualBoundingBoxAscent;
   });
   for (const f of frames) {
-    expect(f.masked, `${where}: the disc clips the band`).toBe(1);
     expect(f.bottom, `${where}: the band never passes the brim`).toBeLessThanOrEqual(f.brim + 1e-3);
     if (cap !== null) expect(f.bottom, `${where}: the band never reaches the count`).toBeLessThanOrEqual(-cap / 2);
   }

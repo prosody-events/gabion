@@ -1,7 +1,17 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test as base, type Page } from '@playwright/test';
 import { CARRIES_CELLS, type AnswerState, type ClusterState, type EventBatch } from '../src/lib/sim/types';
 import { CONTROL } from '../src/lib/stage/layout';
-import { WATCH, select, send, sendButton, setRange, setSpeed, step, stepUntil, virtualMs } from './drive';
+import { WATCH, pauseIfPlaying, select, send, sendButton, setRange, setSpeed, step, stepUntil, virtualMs } from './drive';
+
+/** Every test fails on an error the page throws. */
+const test = base.extend<{ page: Page }>({
+  page: async ({ page }, use) => {
+    const errors: string[] = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await use(page);
+    expect(errors, 'page errors').toEqual([]);
+  },
+});
 
 // Every node holds Propagation's settled seed at load.
 const SEED_TOTAL = '50';
@@ -89,8 +99,6 @@ const lede = (page: Page) => page.locator('.lede');
 // assertions read the table (robust regardless of WebGL pixels); the
 // screenshots are for eyeballing the canvas.
 test('boots settled, spreads a Send, and empties at the window edge', async ({ page }) => {
-  const pageErrors: string[] = [];
-  page.on('pageerror', (err) => pageErrors.push(err.message));
 
   await boot(page);
   await expect(page.locator('[data-template]')).toHaveAttribute('data-template', 'rl-0');
@@ -140,7 +148,6 @@ test('boots settled, spreads a Send, and empties at the window edge', async ({ p
     { timeout: 10_000 },
   );
 
-  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
 // A17: a click selects, and the transport's Send goes to the selection. From
@@ -148,8 +155,6 @@ test('boots settled, spreads a Send, and empties at the window edge', async ({ p
 // run plays its waves until every node has the hits and pauses itself, and
 // every receiver rises by exactly the hits admitted.
 test('the transport Send sends to the selection', async ({ page }) => {
-  const pageErrors: string[] = [];
-  page.on('pageerror', (err) => pageErrors.push(err.message));
   await boot(page);
   // The counts in the discs: the table closed, the stage at its full size. At
   // half speed the run lasts long enough to be seen playing.
@@ -166,7 +171,6 @@ test('the transport Send sends to the selection', async ({ page }) => {
   await expect(page.locator('.count')).toHaveText(Array(NODES).fill(BURST_HITS), { timeout: 15_000 });
   await expect(page.getByRole('button', { name: 'Play' })).toBeVisible({ timeout: 15_000 });
   await expect(page.locator('.stage-pane')).toHaveAttribute('data-run', 'off');
-  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
 // A click on the bare stage selects nothing and keeps the selection: the
@@ -210,8 +214,6 @@ test('the stage heading states the cluster', async ({ page }) => {
 // Strata honesty invariant (Σ over the rendered slots equals the node's count)
 // holds throughout, and with no feed the hits age out to quiet.
 test('a Send runs its waves and pauses itself; Step after Send goes one wave at a time', async ({ page }) => {
-  const pageErrors: string[] = [];
-  page.on('pageerror', (err) => pageErrors.push(err.message));
   await boot(page);
   await loadPreset(page, 'Sandbox');
   await expect(view(page, 0)).toHaveText('0');
@@ -238,7 +240,6 @@ test('a Send runs its waves and pauses itself; Step after Send goes one wave at 
   await expect(strata.locator('.no-traffic')).toBeVisible({ timeout: 20_000 });
   await page.getByRole('button', { name: 'Pause' }).click();
   await expect(view(page, 0)).toHaveText('0');
-  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
 // The Strata is a fixed-width conveyor belt: the time channel is the track's
@@ -277,8 +278,6 @@ test('the Strata keeps a fixed column count as the window scrolls', async ({ pag
 // newcomer fades/scales in at its ring slot while the survivors glide to
 // re-space around it.
 test('adding a node joins it live and it catches up by gossip', async ({ page }) => {
-  const pageErrors: string[] = [];
-  page.on('pageerror', (err) => pageErrors.push(err.message));
 
   await boot(page);
   await loadPreset(page, 'Propagation');
@@ -307,15 +306,12 @@ test('adding a node joins it live and it catches up by gossip', async ({ page })
   await expect(page.locator('.stage-pane')).toHaveAttribute('data-run', 'off', { timeout: 15_000 });
   await page.screenshot({ path: 'screenshots/ring-node-added-caughtup.png' });
 
-  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
 // Live leave through the detail pane: removing the selected node drops exactly
 // that one. Its stable id leaves a *gap* — neighbours 4 and 6 keep their ids, no
 // renumber — and the survivors re-space to close the ring.
 test('the pane removes the selected node', async ({ page }) => {
-  const pageErrors: string[] = [];
-  page.on('pageerror', (err) => pageErrors.push(err.message));
 
   await boot(page);
   await loadPreset(page, 'Propagation');
@@ -335,11 +331,10 @@ test('the pane removes the selected node', async ({ page }) => {
   await expect(view(page, 0)).toHaveText(SEED_TOTAL);
   await page.screenshot({ path: 'screenshots/ring-node-removed.png' });
 
-  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
 // Scenario presets rebuild the cluster from a fresh config + opening seed.
-// Switching from the default Propagation to Steady state should tear down and
+// Switching from the default Rate limiting to Steady state should tear down and
 // rebuild with the steady seed (a light request at one node in each zone).
 test('selecting a scenario preset rebuilds the cluster with its seed', async ({ page }) => {
   await boot(page);
@@ -364,8 +359,6 @@ test('selecting a scenario preset rebuilds the cluster with its seed', async ({ 
 // the explicit Rebuild. This guards the regression where a knob change flashed
 // "Loading…", reset the running sim, and collapsed the disclosure.
 test('a rebuild knob stages, keeps the section open, and applies on Rebuild', async ({ page }) => {
-  const pageErrors: string[] = [];
-  page.on('pageerror', (err) => pageErrors.push(err.message));
 
   await boot(page);
 
@@ -396,7 +389,6 @@ test('a rebuild knob stages, keeps the section open, and applies on Rebuild', as
   await expect(details.locator('summary')).not.toContainText('staged');
   await expect(rebuild).toBeDisabled();
   await expect(page.locator('#rebuild-reason')).toHaveText('nothing staged');
-  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
 // The rule knobs live in the same disclosure: a gossip-interval and window range
@@ -407,8 +399,6 @@ test('a rebuild knob stages, keeps the section open, and applies on Rebuild', as
 // number of 1 s buckets, so `SimConfig::validate` passes). The zone stepper
 // stages the same way and stops at the engine's own ceiling.
 test('the window knob updates its bucket-count readout and rebuilds', async ({ page }) => {
-  const pageErrors: string[] = [];
-  page.on('pageerror', (err) => pageErrors.push(err.message));
 
   await boot(page);
   await loadPreset(page, 'Propagation');
@@ -432,7 +422,6 @@ test('the window knob updates its bucket-count readout and rebuilds', async ({ p
   await expect(page.locator('.overlay')).toHaveCount(0);
   await expect(page.locator(COUNTS)).toHaveCount(NODES);
   await expect(page.locator('.strata .strip .track .bar-cell')).toHaveCount(6);
-  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
 // The sustained-overload scenario feeds the cluster at a steady rate against a
@@ -440,8 +429,6 @@ test('the window knob updates its bucket-count readout and rebuilds', async ({ p
 // limit and reject the rest — the "why gabion exists" story, and the one
 // scenario that surfaces the Aggregate-vs-Limit chart.
 test('sustained overload rejects what passes the limit', async ({ page }) => {
-  const pageErrors: string[] = [];
-  page.on('pageerror', (err) => pageErrors.push(err.message));
 
   await boot(page);
 
@@ -483,7 +470,6 @@ test('sustained overload rejects what passes the limit', async ({ page }) => {
   // white panel — the full-page shot is too small to judge a pale fill.
   await page.locator('.dashboard').screenshot({ path: 'screenshots/dash-overload.png' });
 
-  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
 // On a display with 2 device px per CSS px every chart label is still drawn at
@@ -567,7 +553,7 @@ test('a Send that flushes at once draws its packets as it sends', async ({ page 
 
   await sendButton(page).click();
   await expect(view(page, 0)).toHaveText(BURST_HITS);
-  await page.getByRole('button', { name: 'Pause' }).click();
+  await pauseIfPlaying(page);
   const routes = (): Promise<{ sent: string[]; drawn: string[] }> =>
     page.evaluate(() => {
       const { sent, drawn } = window as unknown as Log;
@@ -599,10 +585,15 @@ test('zone partition splits zone c off until healed', async ({ page }) => {
   await boot(page);
   await loadPreset(page, 'Zone partition');
   await expect(lede(page)).toContainText('zone c cut off');
+  // The same fault made again is listed once: the Send below runs after it.
+  await page.locator('#cut-zone').selectOption({ label: 'zone c' });
+  await page.getByRole('button', { name: 'Cut zone c off' }).click();
 
   await send(page, 0);
   for (const id of [0, 3, 1, 4]) await expect(view(page, id), `node ${id} heard node 0`).toHaveText(BURST_HITS);
   for (const id of [2, 5, 8, 11]) await expect(view(page, id), `node ${id} across the cut`).toHaveText('0');
+  await expect(page.locator('.stage-heading .repair')).toHaveText('Reconnect zone c');
+  expect((await lede(page).textContent())?.split('zone c cut off').length, 'the lede names the cut once').toBe(2);
   await page.screenshot({ path: 'screenshots/ring-partition.png' });
 
   // Heal runs until every node has the hits.
@@ -635,8 +626,6 @@ test('a node that joins a cut zone is cut off with it (A6)', async ({ page }) =>
 // bucket window, the gossip targets with its route sentence and the identity
 // footer.
 test('the detail pane renders every section', async ({ page }) => {
-  const pageErrors: string[] = [];
-  page.on('pageerror', (err) => pageErrors.push(err.message));
 
   await boot(page);
   await loadPreset(page, 'Propagation');
@@ -672,7 +661,6 @@ test('the detail pane renders every section', async ({ page }) => {
   const sigma = num(await inspector.locator('.strata .sigma-value').first().textContent());
   expect(sigma, "Strata Σ should equal node 0's count").toBe(num(await view(page, 0).textContent()));
 
-  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
 // The pane tells a newcomer what node 0's runtime chose: one row per
@@ -681,8 +669,6 @@ test('the detail pane renders every section', async ({ page }) => {
 // runtime's own admin rows, so the test compares the named gateway with the
 // engine's, not just its zone.
 test('the inspector shows gateways per remote zone and the error budget', async ({ page }) => {
-  const pageErrors: string[] = [];
-  page.on('pageerror', (err) => pageErrors.push(err.message));
 
   await boot(page);
   await loadPreset(page, 'Propagation');
@@ -720,7 +706,6 @@ test('the inspector shows gateways per remote zone and the error budget', async 
   await expect(budget).toHaveCount(1);
   expect(num(await budget.textContent())).toBeGreaterThan(0);
 
-  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
 // A gateway going silent is the failure the two-tier design exists to survive.
@@ -730,10 +715,8 @@ test('the inspector shows gateways per remote zone and the error budget', async 
 // periods of virtual time outlast the failover, so a green run has headroom and
 // a red one cannot pass by waiting longer. A silent node's peers include ones it never
 // heard from (`Option::None` crosses as `undefined`), the case that once crashed
-// the inspector, so the test opens it too and then checks Reset still rebuilds.
+// the inspector, so the test opens it too and then checks Restart still rebuilds.
 test('gateway failure fails over and the zone catches up', async ({ page }) => {
-  const pageErrors: string[] = [];
-  page.on('pageerror', (err) => pageErrors.push(err.message));
 
   await boot(page);
   await loadPreset(page, 'Gateway failure');
@@ -815,5 +798,4 @@ test('gateway failure fails over and the zone catches up', async ({ page }) => {
   await expect(page.locator(COUNTS)).toHaveCount(NODES);
   await expect(title(page)).toHaveText('0');
 
-  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });

@@ -3,9 +3,9 @@ import { expect, test, type Page } from '@playwright/test';
 import { ORIGIN } from '../src/lib/presets';
 import type { ClusterState } from '../src/lib/sim/types';
 import { BEAM_FLIGHT_MS, CONTROL, CROSS, DROPPED, LANDED, RELAY } from '../src/lib/stage/layout';
-import type { BeamPool } from '../src/lib/stage/renderer';
+import { RING_CAUGHT_UP, type BeamPool, type GlyphTable } from '../src/lib/stage/renderer';
 import { LANDED_ALPHA } from '../src/lib/theme';
-import { PERIOD_MS, WATCH, refusal, send, sendButton, setRange, setSpeed, step, virtualMs } from './drive';
+import { PERIOD_MS, WATCH, pauseIfPlaying, refusal, send, sendButton, setRange, setSpeed, step, virtualMs } from './drive';
 import { sourceOf } from './sourcemap';
 
 // The waves in motion (README "Tests"), run once at 1440 px in the light theme
@@ -581,7 +581,7 @@ test('flights scale with speed and Pause freezes them', async ({ page }, info) =
   await page.getByRole('button', { name: 'Restart Propagation' }).click();
   await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
   await pressSend(page, 0);
-  await page.getByRole('button', { name: 'Pause' }).click();
+  await pauseIfPlaying(page);
   await setSpeed(page, 0.2);
   await freezeAt(false, 'propagation-wave1.png');
   await inFlightAboveLabels();
@@ -625,6 +625,7 @@ const PER_FRAME = {
     '#syncNode',
     '#drawRing',
     '#drawVessel',
+    'levelY',
   ],
   'layout.ts': ['pointOn'],
 } as const;
@@ -709,13 +710,13 @@ const WARM_STRETCHES = 3;
 /** Each stretch of the allocation audit: a preset played with node 0
  *  selected, and what each stretch presses. Packet loss draws stop bars and
  *  resends, and its landed routes stay; Rate limiting redraws vessels, sweeps
- *  rings and, two Sends of 50 a stretch against its limit of 100, plays
- *  refusals; Propagation sweeps the selection toward node 0's heartbeat. */
+ *  rings and, three Sends of 50 a stretch against its limit of 100, plays a
+ *  refusal; Propagation sweeps the selection toward node 0's heartbeat. */
 const STRETCHES: readonly { name: string; hits?: number; sends: number; warm: number }[] = [
   { name: 'Packet loss', sends: 1, warm: WARM_STRETCHES },
-  // Its stretches repeat every three, admitted, refused, refused, so the
-  // tracked one repeats a warm one.
-  { name: 'Rate limiting', hits: 50, sends: 2, warm: 2 * WARM_STRETCHES },
+  // Each stretch that opens on an empty window admits two Sends and refuses
+  // the third, so the tracked one repeats a warm one.
+  { name: 'Rate limiting', hits: 50, sends: 3, warm: 2 * WARM_STRETCHES },
   { name: 'Propagation', sends: 1, warm: WARM_STRETCHES },
 ];
 
@@ -743,6 +744,7 @@ for (const stretchOf of STRETCHES) {
         await page.clock.runFor(FRAMES * FRAME_MS);
       };
       for (let warm = 0; warm < stretchOf.warm; warm++) await stretch();
+      const decidedFrom = await snapshot(page);
       const perFrame = perFrameLines();
       const cdp = await page.context().newCDPSession(page);
       const chunks: string[] = [];
@@ -767,6 +769,11 @@ for (const stretchOf of STRETCHES) {
       await cdp.send('HeapProfiler.stopTrackingHeapObjects', { reportProgress: false });
       const tracked = JSON.parse(chunks.join('')) as TrackedSnapshot;
       await expect(title, 'node 0 stayed selected').toHaveText(String(ORIGIN));
+      if (stretchOf.name === 'Rate limiting') {
+        const after = await snapshot(page);
+        expect(after.admitted_hits, 'the tracked stretch admitted a Send').toBeGreaterThan(decidedFrom.admitted_hits);
+        expect(after.rejected_hits, 'the tracked stretch refused a Send').toBeGreaterThan(decidedFrom.rejected_hits);
+      }
       if (stretchOf.name === 'Packet loss') {
         // The relays of node 0's gateways: the beams only a selection's roles
         // single out.
@@ -845,6 +852,14 @@ test('a ring sweeps up to its new share as its packet lands (A13)', async ({ pag
     };
     requestAnimationFrame(sample);
   });
+  // Every ring opens closed and caught up: nothing sweeps on load.
+  const opened = await page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { glyphs: GlyphTable }) => {
+    const g = c.glyphs;
+    const out: string[] = [];
+    for (let s = 0; s < g.len; s++) if (g.id[s] >= 0) out.push(`${g.ring[s]}|${g.arc[s]}`);
+    return out;
+  });
+  expect(opened, 'every ring at load').toEqual(opened.map(() => `${RING_CAUGHT_UP}|1`));
   await send(page, 0);
   const arcs = await page.evaluate(() => [...(window as unknown as { arcs: Map<number, number[]> }).arcs]);
   expect(arcs.length, 'every receiver was sampled').toBe(11);

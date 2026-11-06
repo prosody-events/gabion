@@ -2,7 +2,7 @@
 // page's only live region. Pure templates over the numbers the page read from
 // the engine's batch and snapshot; the page decides when each is said.
 
-import { blurb, joined, type Blurb } from './format';
+import { blurb, joined, noun, type Blurb } from './format';
 
 /** A gateway as a sentence names it: its node and the zone it carries hits
  *  into. */
@@ -22,14 +22,16 @@ export function idle(subject: number, gateways: readonly GatewayName[], onScale:
 
 /** An admitted request whose hits left at once: an eager flush. */
 export function admittedEager(node: number, hits: number, before: number, limit: number): Blurb {
-  return blurb`node ${node} admitted ${hits} hits: ${before} + ${hits} is within the limit of ${limit}. It decided alone, then told its zone and one node in each other zone at once.`;
+  return blurb`node ${node} admitted ${hits} ${noun(hits, 'hit')}: ${before} + ${hits} is within the limit of ${limit}. It decided alone, then told its zone and one node in each other zone at once.`;
 }
 
 /** An admitted request too small to send at once: it waits for the node's
- *  heartbeat, counted down beside the sentence. */
-export function admittedWaiting(node: number, hits: number, limit: number): Blurb {
-  const small: Blurb = hits * 100 < limit ? blurb` · that is under ${1} % of the limit, so it waits for its next heartbeat` : [' · it waits for its next heartbeat'];
-  return [...blurb`node ${node} admitted ${hits} hits`, ...small];
+ *  heartbeat, counted down beside the sentence. Under the error budget of
+ *  `bps` basis points of the limit, the budget is why. */
+export function admittedWaiting(node: number, hits: number, limit: number, bps: number): Blurb {
+  const small: Blurb =
+    hits * 10_000 < limit * bps ? blurb` · that is under ${bps / 100} % of the limit, so it waits for its next heartbeat` : [' · it waits for its next heartbeat'];
+  return [...blurb`node ${node} admitted ${hits} ${noun(hits, 'hit')}`, ...small];
 }
 
 /** The one rejection: a whole request refused, with the nodes whose hits fill
@@ -53,7 +55,14 @@ export function never(node: number, hits: number, limit: number): Blurb {
 export function waveOne(subject: number, zone: string, peers: number, gateways: readonly GatewayName[]): Blurb {
   const via = joined(gateways.map((g) => blurb`node ${g.node} (${g.zone})`));
   const to: Blurb = gateways.length === 0 ? [] : [' and to gateways ', ...via];
-  return [...blurb`node ${subject} sent them to ${peers} nodes of ${zone}`, ...to];
+  return [...blurb`node ${subject} sent them to ${peers} ${noun(peers, 'node')} of ${zone}`, ...to];
+}
+
+/** The first wave of an eager flush, on Step: the zone peers and the gateways
+ *  that counted the hits. */
+export function waveOneCounted(peers: readonly number[], gateways: readonly number[]): Blurb {
+  const via: Blurb = gateways.length === 0 ? [] : [` and ${noun(gateways.length, 'gateway')} `, ...joined(gateways.map((g) => blurb`node ${g}`))];
+  return [`${noun(peers.length, 'node')} `, ...joined(peers.map((p) => [p])), ...via, ' counted them'];
 }
 
 /** The gateways' relays, on Step. */
@@ -62,7 +71,7 @@ export function waveTwo(gateways: readonly number[], reached: number, crossed: n
   return [
     'gateways ',
     ...joined(gateways.map((g) => blurb`node ${g}`)),
-    ...blurb` passed them on to ${reached} nodes · ${crossed} of the ${sent} packets crossed a zone`,
+    ...blurb` passed them on to ${reached} ${noun(reached, 'node')} · ${crossed} of the ${sent} packets crossed a zone`,
     ...lostPart,
   ];
 }
@@ -72,7 +81,8 @@ export const EVERY_NODE: Blurb = [' · every node has it'];
 
 /** A run that stopped with nodes it can never reach: why. */
 export function strandedStop(states: readonly Blurb[]): Blurb {
-  return ['paused: ', ...joined(states), ', so its hits cannot cross until it is reconnected'];
+  const why = states.length === 1 ? ', so its hits cannot cross until it is reconnected' : ', so their hits cannot cross until they are reconnected';
+  return ['paused: ', ...joined(states), why];
 }
 
 /** A run that stopped at its cap with a node still behind. */
@@ -85,8 +95,8 @@ export function cappedStop(periods: number, node: number): Blurb {
 export function expiry(left: number, emptied: boolean, windowS: number, subject: number, admits: number | null): Blurb {
   const again: Blurb = admits === null ? [] : emptied ? blurb` · node ${subject} admits again` : blurb` · node ${subject} admits ${admits} again`;
   return emptied
-    ? [...blurb`the ${left} hits left the ${windowS} s window · every node stopped counting them at the same instant, without a packet`, ...again]
-    : [...blurb`the oldest ${left} hits left the window`, ...again];
+    ? [...blurb`the ${left} ${noun(left, 'hit')} left the ${windowS} s window · every node stopped counting them at the same instant, without a packet`, ...again]
+    : [...blurb`the oldest ${left} ${noun(left, 'hit')} left the window`, ...again];
 }
 
 /** A Step that found nothing to fly or expire. */

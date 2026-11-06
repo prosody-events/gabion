@@ -39,17 +39,19 @@
   };
   // The faces load before the first render measures any text; a face that
   // fails, or a slow network past the gate, falls back rather than blocking.
+  // The parameters and every data file load meanwhile.
   const FACES = ['400 1em "Source Sans 3"', '600 1em "Source Sans 3"', '400 1em "Source Serif 4"'];
   const fontsReady = Promise.race([
     Promise.allSettled(FACES.map((face) => document.fonts.load(face))),
     new Promise((resolve) => setTimeout(resolve, 3000)),
   ]);
-  fontsReady.then(() => get('params.json')).catch((e) => (console.error(e), {})).then((defaults) => {
+  const loads = Object.entries(FILES).map(([id, file]) => [
+    id,
+    get(`../data/${file}.json`).then((rows) => ({ status: 'ok', data: rows }), (e) => (console.error(e), { status: 'error', data: [] })),
+  ]);
+  Promise.all([get('params.json').catch((e) => (console.error(e), {})), fontsReady]).then(([defaults]) => {
     state = { ...defaults, ...Object.fromEntries(new URLSearchParams(location.hash.slice(1))) };
-    for (const [id, file] of Object.entries(FILES)) {
-      get(`../data/${file}.json`).then((rows) => ({ status: 'ok', data: rows }), (e) => (console.error(e), { status: 'error', data: [] }))
-        .then((set) => { sets[id] = set; run(); });
-    }
+    for (const [id, load] of loads) load.then((set) => { sets[id] = set; run(); });
   });
   // Each calculation's title and description, under the method section, with
   // one link to the code.

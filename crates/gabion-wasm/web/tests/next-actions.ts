@@ -1,10 +1,8 @@
 // The next-action table: each state a story can stand in, as the run it reads,
 // and the one action the page must name there. `next.spec.ts` runs every row
-// through `nextAction`; `story.spec.ts` presses the page through the same
-// states and reads the scripts below. One source, so a script and the page
-// cannot drift apart.
+// through `nextAction`.
 
-import { START, type NextAction, type Progress, type RunView } from '../src/lib/next';
+import { press, START, wait, type NextAction, type Progress, type RunView } from '../src/lib/next';
 import type { Admission, Lag } from '../src/lib/sim/types';
 
 const caught: Lag = { kind: 'CaughtUp' };
@@ -59,8 +57,6 @@ export interface Row {
   readonly action: NextAction;
 }
 
-const press = (control: 'play' | 'step' | 'send'): NextAction => ({ kind: 'press', control });
-const wait = (reason: 'starting' | 'run' | 'window' | 'bucket' | 'oldest-bucket'): NextAction => ({ kind: 'wait', reason });
 
 export const TABLE: readonly Row[] = [
   // The precedence every story shares.

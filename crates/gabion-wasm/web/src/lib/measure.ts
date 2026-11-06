@@ -1,5 +1,5 @@
 // Text metrics for DOM text laid over the canvas (the counts, the decision
-// text), measured once per string and font on one shared 2D context, in the
+// text) and for the charts' labels, measured on one shared 2D context, in the
 // page's own faces.
 
 let context: OffscreenCanvasRenderingContext2D | null = null;

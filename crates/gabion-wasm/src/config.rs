@@ -16,9 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::CLUSTER_ID_HASH;
 
-/// Largest cluster the visualizer constructs. Bounded so a stray config from
-/// the URL or a fuzzed control can't ask the engine to build an unbounded
-/// number of runtimes; every node's peer table is sized to it.
+/// Largest cluster the visualizer constructs. Bounded so a stray or fuzzed
+/// config can't ask the engine to build an unbounded number of runtimes;
+/// every node's peer table is sized to it.
 pub const MAX_NODES: usize = 256;
 
 /// Most zones the visualizer places nodes in; production regions usually have
@@ -51,8 +51,8 @@ pub enum ZoneMode {
     Unset,
 }
 
-/// Deterministic given `(SimConfig, command-script)` — the pair the
-/// shareable URL encodes. Every field has a production-aligned
+/// Deterministic given `(SimConfig, command-script)` — the determinism the
+/// replay tests rely on. Every field has a production-aligned
 /// default drawn from [`gabion::defaults`].
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -112,13 +112,14 @@ impl Default for SimConfig {
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error(
-        "cluster size {got} is out of range: the visualizer simulates 1 to {MAX_NODES} nodes. \
-         Lower `nodes` in the Tune controls."
+        "cluster size {got} is out of range: the visualizer simulates 1 to {MAX_NODES} nodes. The \
+         page should never send this size: pick a scenario preset to rebuild at its own size, and \
+         report it."
     )]
     NodeCountOutOfRange { got: usize },
     #[error(
-        "packet-loss probability {got} is outside 0.0–1.0. Set `uniform_loss` to a fraction (e.g. \
-         0.1 for 10% loss)."
+        "packet-loss probability {got} is outside 0.0–1.0. Set Packet loss in the Tune controls \
+         to 0 to 100 %."
     )]
     LossOutOfRange { got: f64 },
     #[error(
