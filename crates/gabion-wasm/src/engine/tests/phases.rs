@@ -127,14 +127,15 @@ fn quiet_cost_by_counters() {
     });
 }
 
-/// A wave's close reads the counters of its sender and of every node its
+/// A send's eager flush reads the counters of its sender and of every node its
 /// packets reached, and of no other node.
 #[test]
 fn a_wave_reads_its_sender_and_receivers() {
     with_state(rate_limiting(), |mut state| async move {
         ready(&mut state).await;
-        let held = send(&mut state, 0, 25).await;
-        let mut read: BTreeSet<u32> = held
+        let reads = state.counter_reads;
+        let sent = send(&mut state, 0, 25).await;
+        let mut read: BTreeSet<u32> = sent
             .events
             .iter()
             .filter_map(|e| match e.kind {
@@ -144,8 +145,6 @@ fn a_wave_reads_its_sender_and_receivers() {
             .collect();
         assert_eq!(read.len(), 5, "the eager flush reached five nodes");
         read.insert(0);
-        let reads = state.counter_reads;
-        state.step(0, StepUntil::Time).await;
         assert_eq!(state.counter_reads - reads, read.len() as u64);
         state
     });
@@ -233,11 +232,10 @@ async fn timeline(state: &mut EngineState, node: u32, hits: u64) -> Timeline {
     let mut timeline = Timeline::default();
     let mut own = None;
     let mut relay = None;
-    let mut events = send(state, node, hits).await.events;
+    let events = send(state, node, hits).await.events;
     if sent_at(&events, Some(node), PacketKind::Own, t0) > 0 {
         own = Some(t0);
     }
-    events.extend(state.step(0, StepUntil::Time).await.events);
     let mut last = last_packet(&events);
     let agreed = loop {
         assert!(state.virtual_ms < deadline, "no agreement: {timeline:?}");
@@ -376,9 +374,7 @@ async fn fail_over(
         let next = feed(request).unwrap_or(deadline).min(deadline);
         let events = if state.virtual_ms == next {
             request += 1;
-            let mut events = send(state, 0, 1).await.events;
-            events.extend(state.step(0, StepUntil::Time).await.events);
-            events
+            send(state, 0, 1).await.events
         } else {
             next_stop(state, next).await.0
         };

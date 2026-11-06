@@ -12,17 +12,13 @@ import type { Admission, Lag } from './sim/types';
 
 /** How a command's bounded run plays on its own: `'settled'` until every
  *  node that waiting can reach has the hits and their acknowledgements have
- *  flown; `'per-wave'` (Propagation's Send) also stops before each wave. */
+ *  been sent; `'per-wave'` (Propagation's Send) also stops before each wave. */
 export type UntilSettled = 'settled' | 'per-wave';
 
 /** What time does: paused, playing freely, paused where a bounded run hit its
- *  cap, or a bounded run (playing; a per-wave one stands still while it holds
- *  a wave). */
-export type Clock = 'paused' | 'playing' | 'capped' | UntilSettled;
-
-/** A wave the engine holds: none, held unflown until Step, flying, or frozen
- *  mid-flight by Pause. */
-export type Flight = 'none' | 'waiting' | 'flying' | 'frozen';
+ *  cap, a bounded run playing, or Propagation's run stopped before a wave the
+ *  engine holds, until Step draws it. */
+export type Clock = 'paused' | 'playing' | 'capped' | UntilSettled | 'before-wave';
 
 /** The transport's controls a press can name. */
 export type Control = 'play' | 'step' | 'send';
@@ -219,7 +215,6 @@ export interface RunView {
   /** The repair the heading offers, by its label, or null. */
   readonly repair: Blurb | null;
   readonly clock: Clock;
-  readonly flight: Flight;
   readonly busy: boolean;
   /** Hits per Send: committed and valid, committed and invalid, or being
    *  typed. */
@@ -246,9 +241,9 @@ export function nextAction(v: RunView): NextAction {
   if (v.busy) return wait('starting');
   const never = v.lastDecision?.kind === 'Rejected' && v.lastDecision.reopens.kind === 'Never';
   if (v.hits === 'invalid' || never) return { kind: 'inline', action: { kind: 'use-hits', hits: v.burstHits } };
-  if (v.flight === 'frozen' || v.clock === 'capped') return press('play');
-  if (v.flight === 'waiting') return press('step');
-  if (v.clock === 'settled' || v.clock === 'per-wave' || v.flight === 'flying') return wait('run');
+  if (v.clock === 'capped') return press('play');
+  if (v.clock === 'before-wave') return press('step');
+  if (v.clock === 'settled' || v.clock === 'per-wave') return wait('run');
   const playing = v.clock === 'playing';
   const s = v.story;
   switch (s.kind) {
@@ -308,7 +303,7 @@ function partitionAction(v: RunView, s: Partition, playing: boolean): NextAction
     case 'far-side':
       return selectOtherSide(v, s.refused) ?? press('send');
     case 'repair':
-      // The heading offers the repair once no relay is left to land; until
+      // The heading offers the repair once no relay is left to send; until
       // then the run is what to wait for, or what to play.
       if (v.repair !== null) return { kind: 'repair', label: v.repair };
       if (!v.nodes.some((n) => n.lag.kind === 'Behind')) return press('send');
@@ -513,8 +508,8 @@ export function waitClause(reason: WaitReason, subject: number): Blurb {
 }
 
 /** What follows a press's label on the action line: the press's consequence
- *  where the story names one. Step flies wave `wave` while a wave is held or
- *  some node is still behind, and otherwise runs to the window's edge. */
+ *  where the story names one. Step draws wave `wave` while one is held or some
+ *  node is still behind, and otherwise runs to the window's edge. */
 export function pressClause(v: RunView, control: Control, wave: number): Blurb {
   const s = v.story;
   switch (control) {
@@ -523,7 +518,7 @@ export function pressClause(v: RunView, control: Control, wave: number): Blurb {
       if (s.kind === 'partition' && s.act === 'counted') return blurb` and every node counts ${v.oracle} until the window empties`;
       return [];
     case 'step':
-      if (v.flight !== 'waiting' && v.nodes.every((n) => n.lag.kind !== 'Behind')) return [" to reach the window's edge"];
+      if (v.clock !== 'before-wave' && v.nodes.every((n) => n.lag.kind !== 'Behind')) return [" to reach the window's edge"];
       return wave <= 1 ? blurb` to send wave ${1}` : wave === 2 ? blurb` for wave ${2}, the relays` : blurb` for wave ${wave}`;
     case 'send':
       return s.kind === 'rate-limiting' && s.act === 'drained' && v.subjectCount > 0

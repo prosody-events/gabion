@@ -20,16 +20,15 @@ export const BEAM_CLEARANCE = 0.35;
 /** The two tier strokes, in px: inside a zone and across zones. */
 export const IN_WIDTH = 1.5;
 export const CROSS_WIDTH = 3;
-/** A beam's flight on the stage's presentation clock, ms: wall time at 1×,
- *  eased so it reads as cause then effect. */
-export const BEAM_FLIGHT_MS = 520;
+/** How long a line takes to fade from full ink to nothing, in simulated ms
+ *  (owner: 1.0 s). */
+export const FADE_MS = 1000;
 /** The beam pool's flag bits: across zones, a control packet (no cells), a
- *  relay, lost, landed. */
+ *  relay, lost. */
 export const CROSS = 1;
 export const CONTROL = 2;
 export const RELAY = 4;
 export const DROPPED = 8;
-export const LANDED = 16;
 /** A node's ring (the share of the cluster's hits it has heard): its gap
  *  outside the disc and its stroke width, px, and how far it reaches. */
 export const ARC_GAP = 4;
@@ -216,6 +215,21 @@ export function pointOn(path: QuadPath, t: number, out: Point): Point {
   out.x = u * u * path.from.x + 2 * u * t * path.control.x + t * t * path.to.x;
   out.y = u * u * path.from.y + 2 * u * t * path.control.y + t * t * path.to.y;
   return out;
+}
+
+/** The route position where `path` enters the circle of radius `reach` round
+ *  its end, found by bisection, so a head drawn there sits outside the
+ *  receiver's ring; 0 when it starts inside. Writes `scratch`. */
+export function reachT(path: QuadPath, reach: number, scratch: Point): number {
+  let lo = 0;
+  let hi = 1;
+  for (let k = 0; k < 16; k++) {
+    const mid = (lo + hi) / 2;
+    pointOn(path, mid, scratch);
+    if (Math.hypot(scratch.x - path.to.x, scratch.y - path.to.y) > reach) lo = mid;
+    else hi = mid;
+  }
+  return lo;
 }
 
 /** The id of the node a pointer at `p` picks: the nearest spot within its disc

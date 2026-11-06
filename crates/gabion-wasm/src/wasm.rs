@@ -66,8 +66,8 @@ impl Sim {
     /// A request of `hits` for `key_id` at `node`, at the current virtual
     /// time. Resolves to the [`crate::event::EventBatch`] it produced: the
     /// node's decision first, then, when admitted, its cell events and any
-    /// eager-flush packets, which land at the next command. Throws for zero
-    /// hits.
+    /// eager-flush packets, delivered at the same instant before it resolves,
+    /// with the receivers' cell events. Throws for zero hits.
     pub async fn submit_request(
         &self,
         node: u32,

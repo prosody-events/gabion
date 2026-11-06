@@ -18,8 +18,8 @@ export const WATCH: Watch = { key: WATCHED_KEY, probe_hits: 25 };
  *  record. */
 export const PERIOD_MS = timings.heartbeat_ms;
 
-/** The longest a held wave takes to land, in wall ms: a Send's decision and its
- *  flight at the slowest speed, with room to spare. */
+/** The longest a command's run takes to stop, in wall ms, with room to
+ *  spare. */
 const LANDING_MS = 15_000;
 
 /** The simulated-time readout's value. */
@@ -32,26 +32,19 @@ async function runState(page: Page): Promise<string> {
   return page.evaluate(() => {
     const pane = document.querySelector<HTMLElement>('.stage-pane');
     const ms = document.querySelector<HTMLElement>('[data-field="virtual-time"]')?.dataset.ms;
-    return `${ms}|${pane?.dataset.held}|${pane?.dataset.flight}`;
+    return `${ms}|${pane?.dataset.clock}`;
   });
 }
 
-/** Wait until the page stands still: paused, with no wave flying (one held
- *  unflown for Step may wait), polled each animation frame. */
+/** Wait until the page stands still: paused, stopped at a cap, or stopped
+ *  before a wave Step draws, polled each animation frame. */
 export async function still(page: Page, timeout = LANDING_MS): Promise<void> {
-  await page.waitForFunction(
-    () => {
-      const pane = document.querySelector<HTMLElement>('.stage-pane');
-      return pane?.dataset.playing === '0' && (pane.dataset.flight === 'none' || pane.dataset.flight === 'waiting');
-    },
-    undefined,
-    { timeout },
-  );
+  await page.waitForFunction(() => document.querySelector<HTMLElement>('.stage-pane')?.dataset.playing === '0', undefined, { timeout });
 }
 
 /** One Step to the next event, returning once it is over: something moved
- *  (simulated time, the held wave or its flight) and the page stands still
- *  again, so the step's snapshot is on the page. */
+ *  (simulated time, or the clock's state) and the page stands still again,
+ *  so the step's snapshot is on the page. */
 export async function step(page: Page): Promise<void> {
   const before = await runState(page);
   await page.getByRole('button', { name: 'Step to the next event' }).click();
@@ -59,12 +52,7 @@ export async function step(page: Page): Promise<void> {
     (was) => {
       const pane = document.querySelector<HTMLElement>('.stage-pane');
       const ms = document.querySelector<HTMLElement>('[data-field="virtual-time"]')?.dataset.ms;
-      const now = `${ms}|${pane?.dataset.held}|${pane?.dataset.flight}`;
-      return (
-        now !== was &&
-        pane?.dataset.playing === '0' &&
-        (pane.dataset.flight === 'none' || pane.dataset.flight === 'waiting')
-      );
+      return `${ms}|${pane?.dataset.clock}` !== was && pane?.dataset.playing === '0';
     },
     before,
     { timeout: LANDING_MS },
@@ -106,12 +94,8 @@ export async function send(page: Page, node: number, pause = false): Promise<voi
   const playing = (await page.locator('.stage-pane').getAttribute('data-playing')) === '1';
   await sendButton(page).click();
   await expect.poll(decided, { timeout: LANDING_MS }).toBeGreaterThan(before);
-  if (pause && !playing) {
-    // The run may already have stopped by itself; a Pause that freezes a wave
-    // mid-flight is followed by a Step that lands it.
-    await pauseIfPlaying(page);
-    if ((await page.locator('.stage-pane').getAttribute('data-flight')) === 'frozen') await step(page);
-  }
+  // The run may already have stopped by itself.
+  if (pause && !playing) await pauseIfPlaying(page);
   if (!playing) await still(page, 4 * LANDING_MS);
 }
 

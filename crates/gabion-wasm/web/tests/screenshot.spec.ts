@@ -47,8 +47,8 @@ async function settled(page: Page): Promise<void> {
     .toBe(true);
 }
 
-/** Load the page, open "Show as table" and play at 4×, so a held wave flies in
- *  a quarter of its time. The default scenario, Rate limiting, opens at 0 with
+/** Load the page, open "Show as table" and play at 4×, so a run ends in a
+ *  quarter of its time. The default scenario, Rate limiting, opens at 0 with
  *  node 0 selected. */
 async function boot(page: Page): Promise<void> {
   await page.goto('/');
@@ -109,17 +109,15 @@ test('boots settled, spreads a Send, and empties at the window edge', async ({ p
   await expect(page.locator(COUNTS)).toHaveText(Array(NODES).fill(SEED_TOTAL));
   await expect(page.locator('[data-template]')).toHaveText(`✓ All ${NODES} nodes see all ${SEED_TOTAL} hits`);
 
-  // A Send at node 0 stops before its first wave; Play flies the waves on.
+  // A Send at node 0 stops before its first wave; Play draws the waves on.
   await send(page, 0);
   await expect(view(page, 0)).toHaveText(SENT_TOTAL);
   await page.getByRole('button', { name: 'Play' }).click();
 
-  // Catch the stage mid-gossip once beams are in flight. Best-effort — a
+  // Catch the stage mid-gossip once lines are on it. Best-effort — a
   // snapshot for eyeballing, not an assertion.
   await expect
-    .poll(() =>
-      page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { beams?: { inFlight: number } }) => c.beams?.inFlight ?? 0),
-    )
+    .poll(() => page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { beams?: { len: number } }) => c.beams?.len ?? 0))
     .toBeGreaterThan(0);
   await page.screenshot({ path: 'screenshots/ring-gossip.png' });
 
@@ -130,12 +128,12 @@ test('boots settled, spreads a Send, and empties at the window edge', async ({ p
   await page.screenshot({ path: 'screenshots/ring-converged.png' });
 
   // With no feed, the seed and the Send leave the window, every node at once,
-  // and nothing flies.
+  // and every line has faded.
   await expect(page.locator(COUNTS), 'the hits did not leave the window').toHaveText(Array(NODES).fill('0'), {
     timeout: 30_000,
   });
   await expect
-    .poll(() => page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { beams?: { inFlight: number } }) => c.beams?.inFlight))
+    .poll(() => page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { beams?: { len: number } }) => c.beams?.len))
     .toBe(0);
   await page.getByRole('button', { name: 'Pause' }).click();
 
@@ -290,9 +288,25 @@ test('adding a node joins it live and it catches up by gossip', async ({ page })
   await dashboard.screenshot({ path: 'screenshots/dash-before-add.png' });
 
   // Add a fresh node: it takes id 12, joins zone a and starts cold (view zero).
+  // The run Add starts may catch it up before a read, so its first count is
+  // recorded as its row appears.
   await expect(page.getByLabel('Add to')).toHaveValue('0');
+  await page.evaluate(() => {
+    const w = window as unknown as { joined: string | null };
+    w.joined = null;
+    const table = document.querySelector('.node-table')!;
+    const watch = new MutationObserver(() => {
+      const view = table.querySelector('tr[data-node="12"] [data-field="view"]');
+      if (view === null) return;
+      w.joined = view.textContent;
+      watch.disconnect();
+    });
+    watch.observe(table, { subtree: true, childList: true, characterData: true });
+  });
   await page.getByRole('button', { name: 'Add node' }).click();
-  await expect(view(page, 12)).toHaveText('0');
+  await expect
+    .poll(() => page.evaluate(() => (window as unknown as { joined: string | null }).joined), { message: 'node 12 starts cold' })
+    .toBe('0');
   await expect(page.locator(COUNTS)).toHaveCount(NODES + 1);
   await expect(page.locator('.node-table tr[data-node="12"]')).toHaveAttribute('data-zone', '0');
   await page.screenshot({ path: 'screenshots/ring-node-added.png' });
@@ -514,31 +528,38 @@ test.describe('on a 2× display', () => {
 
 // Against the overload preset's low limit a Send crosses its node's error
 // budget, so it flushes at once: its packets leave in the Send's own batch,
-// and the stage draws each as a beam as it is sent, not a Step later. Paused,
-// so no feed or Step adds a packet of its own. Played on, every data packet of
-// the feed's submits and of the steps is drawn, one beam each.
+// and the stage draws each as a line as it is sent, not a Step later. The
+// feed runs with the Send's run, so no count is read exactly: node 0 holds
+// at least the Send's hits. Played on, every packet of the feed's submits
+// and of the steps is drawn, one line each, once the queue has shown them.
 test('a Send that flushes at once draws its packets as it sends', async ({ page }) => {
   await boot(page);
   await page.getByRole('button', { name: 'Sustained overload' }).click();
   await expect(view(page, 0)).toHaveText('0');
 
   type Route = { src: number; dst: number; data: boolean };
-  type Log = { sent: Route[]; drawn: Route[] };
+  type Log = { sent: Route[]; drawn: Route[]; send: Route[] };
   await page.evaluate(({ carries, control }) => {
     const log = window as unknown as Log;
     log.sent = [];
     log.drawn = [];
+    log.send = [];
     const sim = window.sim!;
+    const routesOf = (batch: EventBatch): Route[] =>
+      batch.events.flatMap(({ kind }) =>
+        kind.type === 'PacketSent' || kind.type === 'PacketDropped' ? [{ src: kind.src, dst: kind.dst, data: carries[kind.kind] }] : [],
+      );
     const record = (batch: EventBatch): EventBatch => {
-      for (const { kind } of batch.events) {
-        if (kind.type === 'PacketSent' || kind.type === 'PacketDropped') {
-          log.sent.push({ src: kind.src, dst: kind.dst, data: carries[kind.kind] });
-        }
-      }
+      log.sent.push(...routesOf(batch));
       return batch;
     };
     const submit = sim.submitRequest.bind(sim);
-    sim.submitRequest = async (...args) => record(await submit(...args));
+    sim.submitRequest = async (node, key, hits) => {
+      const batch = await submit(node, key, hits);
+      // The reader's Send, not one of the feed's one-hit requests.
+      if (hits > 1) log.send = routesOf(batch);
+      return record(batch);
+    };
     const step = sim.step.bind(sim);
     sim.step = async (...args) => record(await step(...args));
     type Push = (path: unknown, start: number, src: number, dst: number, flags: number) => void;
@@ -552,30 +573,42 @@ test('a Send that flushes at once draws its packets as it sends', async ({ page 
   }, { carries: CARRIES_CELLS, control: CONTROL });
 
   await sendButton(page).click();
-  await expect(view(page, 0)).toHaveText(BURST_HITS);
+  await expect
+    .poll(async () => Number(await view(page, 0).textContent()), { message: "node 0 holds the Send's hits" })
+    .toBeGreaterThanOrEqual(Number(BURST_HITS));
   await pauseIfPlaying(page);
-  const routes = (): Promise<{ sent: string[]; drawn: string[] }> =>
+  const routes = (): Promise<{ sent: string[]; drawn: string[]; send: string[] }> =>
     page.evaluate(() => {
-      const { sent, drawn } = window as unknown as Log;
+      const { sent, drawn, send } = window as unknown as Log;
       const name = ({ src, dst }: Route): string => `node ${src} to node ${dst}`;
-      return { sent: sent.map(name).sort(), drawn: drawn.map(name).sort() };
+      return { sent: sent.map(name).sort(), drawn: drawn.map(name).sort(), send: send.map(name) };
     });
-  const { sent } = await routes();
-  expect(sent.length, 'the Send flushed packets in its own batch').toBeGreaterThan(0);
-  await expect.poll(async () => (await routes()).drawn, { message: 'the beams drawn are the packets sent' }).toEqual(sent);
+  const { send } = await routes();
+  expect(send.length, 'the Send flushed packets in its own batch').toBeGreaterThan(0);
+  const drawnAll = async (): Promise<boolean> => {
+    const { sent, drawn } = await routes();
+    return drawn.join() === sent.join() && send.every((r) => drawn.includes(r));
+  };
+  await expect.poll(drawnAll, { message: 'the lines drawn are the packets sent, the Send\'s among them' }).toBe(true);
 
-  // Played on, the feed's eager flushes and the steps' waves: the data beams
+  // Played on, the feed's eager flushes and the steps' waves: the data lines
   // drawn are the data packets sent.
   const from = await virtualMs(page);
   await page.getByRole('button', { name: 'Play' }).click();
   await expect.poll(async () => virtualMs(page), { timeout: 30_000 }).toBeGreaterThan(from + 6000);
   await page.getByRole('button', { name: 'Pause' }).click();
-  const data = await page.evaluate(() => {
-    const { sent, drawn } = window as unknown as Log;
-    return { sent: sent.filter((r) => r.data).length, drawn: drawn.filter((r) => r.data).length };
-  });
-  console.log(`over 6 s of Sustained overload: ${data.sent} data packets sent, ${data.drawn} data beams drawn`);
-  expect(data.drawn, 'the data beams drawn are the data packets sent').toBe(data.sent);
+  const data = (): Promise<{ sent: number; drawn: number }> =>
+    page.evaluate(() => {
+      const { sent, drawn } = window as unknown as Log;
+      return { sent: sent.filter((r) => r.data).length, drawn: drawn.filter((r) => r.data).length };
+    });
+  const shown = async (): Promise<boolean> => {
+    const { sent, drawn } = await data();
+    return drawn === sent;
+  };
+  await expect.poll(shown, { message: 'the data lines drawn are the data packets sent' }).toBe(true);
+  const counted = await data();
+  console.log(`over 6 s of Sustained overload: ${counted.sent} data packets sent, ${counted.drawn} data lines drawn`);
 });
 
 // Zone partition: zone c is cut off at load. A Send at node 0 reaches zones a

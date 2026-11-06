@@ -1,10 +1,9 @@
 <script lang="ts">
   // The time dock: Play/Pause, Step to the next event, then Send, then Speed,
-  // and the simulated-time readout, which says while a run plays itself and
-  // while packets hold the clock; once a heartbeat period has played, how long
-  // it took to watch at the chosen speed. Whichever control the next action
-  // names is filled (`primary`); the others are secondary. A disabled control
-  // says why beside it.
+  // and the simulated-time readout, which says while a run plays itself; once
+  // a heartbeat period has played, how long it took to watch at the chosen
+  // speed. Whichever control the next action names is filled (`primary`); the
+  // others are secondary. A disabled control says why beside it.
   import { fmtCount, fmtDuration, type Blurb } from '../format';
   import { BURST_HITS_MAX } from '../presets';
   import type { Control } from '../next';
@@ -21,7 +20,6 @@
     sendValid,
     primary,
     bounded,
-    inFlight,
     onToggle,
     onStep,
     onSend,
@@ -43,8 +41,6 @@
     primary: Control | null;
     /** A command's bounded run is playing. */
     bounded: boolean;
-    /** A held wave is in the air, flying or frozen. */
-    inFlight: boolean;
     onToggle: () => void;
     onStep: () => void;
     onSend: () => void;
@@ -120,7 +116,7 @@
     </span>
     <span class="readout-item time">
       <span class="time-value" data-field="virtual-time" data-ms={virtualMs}>{fmtDuration(virtualMs)}</span>
-      simulated{#if bounded}{' · playing until every node has it'}{/if}{#if inFlight}{' · packets in flight'}{/if}
+      simulated{#if bounded}{' · playing until every node has it'}{/if}
     </span>
   </div>
 </div>

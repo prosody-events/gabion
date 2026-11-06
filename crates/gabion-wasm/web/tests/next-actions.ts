@@ -35,7 +35,6 @@ export const BASE: RunView = {
   cutZone: null,
   repair: null,
   clock: 'paused',
-  flight: 'none',
   busy: false,
   hits: 'valid',
   lastDecision: null,
@@ -72,10 +71,9 @@ export const TABLE: readonly Row[] = [
   { name: 'an invalid Hits per Send', view: { hits: 'invalid' }, action: { kind: 'inline', action: { kind: 'use-hits', hits: 25 } } },
   { name: 'invalid hits during a run', view: { hits: 'invalid', clock: 'settled' }, action: { kind: 'inline', action: { kind: 'use-hits', hits: 25 } } },
   { name: 'a request heavier than the limit', view: { lastDecision: never }, action: { kind: 'inline', action: { kind: 'use-hits', hits: 25 } } },
-  { name: 'paused mid-wave', view: { flight: 'frozen' }, action: press('play') },
   { name: 'a run stopped at its cap', view: { clock: 'capped' }, action: press('play') },
-  { name: 'a wave held for Step', view: { flight: 'waiting', clock: 'per-wave' }, action: press('step') },
-  { name: "a Send's run", view: { clock: 'settled', flight: 'flying' }, action: wait('run') },
+  { name: 'a wave held for Step', view: { clock: 'before-wave' }, action: press('step') },
+  { name: "a Send's run", view: { clock: 'settled' }, action: wait('run') },
   // Rate limiting, state by state (RL-0 to RL-13).
   { name: 'RL-0 load', view: {}, action: press('send') },
   { name: 'RL-2 zone a sent, select zone b', view: { story: rl('filling', { zones: 1, sendBucket: 3 }), oracle: 25 }, action: { kind: 'inline', action: { kind: 'select', node: 1, zone: 1 } } },
@@ -96,7 +94,7 @@ export const TABLE: readonly Row[] = [
   // Propagation, Send stopping before each wave.
   { name: 'Propagation at load', view: { story: prop('open'), limit: 1_000_000, oracle: 50 }, action: press('send') },
   { name: 'Propagation waiting for its heartbeat', view: { story: prop('sent'), clock: 'per-wave', nodes: nodes((id) => (id === 0 ? caught : behind)) }, action: wait('run') },
-  { name: 'Propagation wave 1 held', view: { story: prop('sent'), clock: 'per-wave', flight: 'waiting' }, action: press('step') },
+  { name: 'Propagation wave 1 held', view: { story: prop('sent'), clock: 'before-wave' }, action: press('step') },
   { name: 'Propagation settled', view: { story: prop('sent'), oracle: 75 }, action: press('step') },
   { name: 'Propagation at the end', view: { story: prop('done') }, action: { kind: 'go', to: 'rate-limiting' } },
   // Zone partition.

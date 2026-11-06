@@ -99,11 +99,12 @@ export function expiry(left: number, emptied: boolean, windowS: number, subject:
     : [...blurb`the oldest ${left} ${noun(left, 'hit')} left the window`, ...again];
 }
 
-/** A Step that found nothing to fly or expire. */
+/** A Step that found nothing to send or expire. */
 export const NOTHING_WAITING: Blurb = ['nothing is waiting: no hits to send and none in the window'];
 
-/** A cut made over a wave in flight: the wave landed first. */
-export const ARRIVED_FIRST: Blurb = [' · the packets already on their way arrived first'];
+/** A command made while Propagation's run stood before a wave: the wave went
+ *  out first. */
+export const ARRIVED_FIRST: Blurb = [' · the wave waiting for Step was sent first'];
 
 /** A fresh start, and what it discarded. */
 export function rebuilt(scenario: string, discarded: Blurb): Blurb {

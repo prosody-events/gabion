@@ -1,5 +1,6 @@
-//! A wave's packets stay in flight until the next engine call, and stepping
-//! by event stops before each wave lands and at the window's edge.
+//! Stepping by event stops before each wave lands, with the wave held until
+//! the next engine call, and at the window's edge; an admitted send's eager
+//! flush lands before the submit returns.
 
 use super::super::{SubStep, first_heartbeat};
 use super::*;
@@ -26,11 +27,11 @@ fn destinations(packets: &[(u32, u32, Tier, u64)]) -> BTreeSet<u32> {
     packets.iter().map(|p| p.1).collect()
 }
 
-/// An admitted send's eager flush is held: only its node has counted it until
-/// the next command delivers the wave at the same instant, and stepping by
-/// event then stops with the relays held.
+/// An admitted send's eager flush lands before the submit returns: every node
+/// it reached has counted the hits at the send's instant, no other has, and
+/// stepping by event then stops with the relays held.
 #[test]
-fn a_send_is_held_until_the_next_engine_call() {
+fn a_sends_eager_flush_lands_before_the_submit_returns() {
     with_state(rate_limiting(), |mut state| async move {
         ready(&mut state).await;
         let at = state.virtual_ms;
@@ -51,16 +52,17 @@ fn a_send_is_held_until_the_next_engine_call() {
         assert_eq!(own.len(), 5, "{own:?}");
         assert!(own.iter().all(|p| p.0 == 0));
         assert_eq!(own.iter().filter(|p| p.2 == Tier::CrossZone).count(), 2);
-        assert!(matches!(state.sub_step, SubStep::Open(_)));
+        assert!(matches!(state.sub_step, SubStep::Closed));
+        let mut counted = destinations(&own);
+        counted.insert(0);
+        assert_eq!(cell_nodes(&submitted.events), counted);
+        assert!(submitted.events.iter().all(|e| e.virtual_ms == at));
 
-        let held = state.snapshot(None, WATCH).await;
-        let views: Vec<u64> = held.nodes.iter().map(|n| n.window_total).collect();
-        assert_eq!(views[0], 25);
-        assert!(views[1..].iter().all(|&v| v == 0), "{views:?}");
-
-        let landed = state.step(0, StepUntil::Time).await;
-        assert_eq!(cell_nodes(&landed.events), destinations(&own));
-        assert!(landed.events.iter().all(|e| e.virtual_ms == at));
+        let snap = state.snapshot(None, WATCH).await;
+        for node in &snap.nodes {
+            let want = if counted.contains(&node.id) { 25 } else { 0 };
+            assert_eq!(node.window_total, want, "node {}", node.id);
+        }
 
         let relayed = state.step(1_000, EVENT).await;
         assert_eq!(relayed.virtual_ms, at + F_R);
@@ -78,7 +80,7 @@ fn a_send_is_held_until_the_next_engine_call() {
 /// One run's flattened events and final snapshot.
 type Run = (Vec<Event>, serde_json::Value);
 
-/// A command run while node 0's send is held.
+/// A command run while the relays of node 0's send are held.
 #[derive(Clone, Copy, Debug)]
 enum HeldCommand {
     Submit,
@@ -109,15 +111,20 @@ impl HeldCommand {
     }
 }
 
-/// Every command closes an open sub-step first: running it while node 0's
-/// send is held gives the snapshot right after it, and the events, of running
-/// it after `step(0)` delivered the send.
+/// Every command closes an open sub-step first: running it while the
+/// gateways' relays of node 0's send are held gives the snapshot right after
+/// it, and the events, of running it after `step(0)` delivered the relays.
 #[test]
 fn every_command_closes_an_open_sub_step_first() {
     fn run(command: HeldCommand, close_first: bool) -> Run {
         run_with_state(rate_limiting(), |mut state| async move {
             ready(&mut state).await;
             let mut events = send(&mut state, 0, 25).await.events;
+            events.extend(state.step(1_000, EVENT).await.events);
+            assert!(
+                matches!(state.sub_step, SubStep::Open(_)),
+                "the relays are held"
+            );
             if close_first {
                 events.extend(state.step(0, StepUntil::Time).await.events);
             }

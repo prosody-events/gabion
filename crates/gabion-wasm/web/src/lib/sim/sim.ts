@@ -82,9 +82,9 @@ export class Sim {
 
   /** A request of `hits` for `key` at `node`, at the current virtual time: the
    *  node decides it first (the batch's `Decided` event), and an admitted
-   *  request's eager-flush packets land at the next step or other command
-   *  (`step(0)` lands them at the same instant; a snapshot leaves them in
-   *  flight). Throws for zero hits. */
+   *  request's eager flush is delivered at the same instant before it
+   *  resolves: its packets and the receivers' cell events are in the batch.
+   *  Throws for zero hits. */
   async submitRequest(node: number, key: number, hits: number): Promise<EventBatch> {
     const batch = (await this.#inner.submit_request(node, BigInt(key), BigInt(hits))) as EventBatch;
     assertBoundary(batch);

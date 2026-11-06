@@ -23,10 +23,10 @@
 //! some node's window drops a bucket that holds hits. A sub-step has two
 //! halves. The open half fires what is due while the router holds every packet
 //! sent; the close half delivers them and reads the counters of the nodes it
-//! touched. An admitted request opens a sub-step too, so its eager-flush
-//! packets are held. Between the halves the sub-step is open, and every command
-//! that is carried out, `Snapshot` aside, closes it first, so no count changes
-//! before its packet lands.
+//! touched. An admitted request runs one sub-step at its own instant, so its
+//! eager flush is delivered before the command returns. Only stepping by event
+//! leaves a sub-step open, between its halves, and every command that is
+//! carried out, `Snapshot` aside, closes it first.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -310,8 +310,8 @@ pub enum EngineError {
 pub enum Command {
     /// A request of `hits` for `key` at node `node`, at the current virtual
     /// time. The node decides it first, from its own count table; an admitted
-    /// request is recorded, and its eager-flush packets are held until the
-    /// next command other than a snapshot.
+    /// request is recorded, and its eager-flush packets are delivered at the
+    /// same instant before the reply.
     SubmitRequest {
         node: u32,
         key: KeyHash,
@@ -789,9 +789,8 @@ impl EngineState {
 
     /// Node `node` decides a request of `hits` for `key` from its own count
     /// table, as the adapters decide. A rejected request is counted and
-    /// nothing else happens. An admitted one is recorded, and the sub-step it
-    /// opens holds its eager-flush packets until the next command other than
-    /// a snapshot.
+    /// nothing else happens. An admitted one is recorded in one sub-step at
+    /// this instant, so its eager-flush packets land before this returns.
     async fn submit_request(
         &mut self,
         node: u32,
@@ -821,9 +820,13 @@ impl EngineState {
                 self.rejected_hits = self.rejected_hits.saturating_add(hits);
             }
             Admission::Admitted { .. } => {
+                // One sub-step at this instant: the eager flush's threshold
+                // round runs on the runtime's next turn with delivery
+                // deferred, and lands before the command returns, as a step's
+                // sub-step does.
                 self.hold();
                 self.touched.insert(pos);
-                self.nodes[pos]
+                let recorded = self.nodes[pos]
                     .client
                     .record(
                         spec.fingerprint,
@@ -833,14 +836,18 @@ impl EngineState {
                         spec.limit,
                         now,
                     )
-                    .await
-                    .map_err(|source| EngineError::Gossip { node, source })?;
+                    .await;
+                if let Err(source) = recorded {
+                    self.close_sub_step().await;
+                    return Err(EngineError::Gossip { node, source });
+                }
                 // Only a recorded request is reported admitted. An eager
                 // flush's threshold round runs on the runtime's next turn, so
                 // the drain puts its packets in this batch, after the decision.
                 self.outbox.push(decided);
                 self.drain_pending().await;
                 self.drain_log();
+                self.close_sub_step().await;
                 let handle = &mut self.nodes[pos];
                 handle.admitted_hits = handle.admitted_hits.saturating_add(hits);
                 self.admitted_hits = self.admitted_hits.saturating_add(hits);

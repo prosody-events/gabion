@@ -65,22 +65,29 @@ export const CARRIES_CELLS: Readonly<Record<PacketKind, boolean>> = {
   SweepRequest: false,
 };
 
-/** Whether `batch` holds a wave: a packet that carries cells, sent or lost, the
- *  engine's own test (`EngineState::open_sub_step`). After a submit or a step
- *  by event the engine leaves exactly such a batch's sub-step open, so its
- *  packets land at the next command. */
-export function isWave(batch: EventBatch): boolean {
+/** How many waves `batch` holds: the distinct instants at which it sent or lost
+ *  a packet that carries cells, the engine's own test
+ *  (`EngineState::open_sub_step`); events come in time order. A step by event
+ *  stops at its first wave with the engine's sub-step open, so there a batch
+ *  with a wave holds one, its packets not yet delivered. */
+export function waves(batch: EventBatch): number {
   const events = batch.events;
+  let count = 0;
+  let at = Number.NaN;
   for (let i = 0; i < events.length; i++) {
-    const kind = events[i].kind;
-    if ((kind.type === 'PacketSent' || kind.type === 'PacketDropped') && CARRIES_CELLS[kind.kind]) return true;
+    const { kind, virtual_ms } = events[i];
+    if ((kind.type === 'PacketSent' || kind.type === 'PacketDropped') && CARRIES_CELLS[kind.kind] && virtual_ms !== at) {
+      count += 1;
+      at = virtual_ms;
+    }
   }
-  return false;
+  return count;
 }
 
 /** Mirror of `crate::engine::StepUntil`: where a step stops. `Event` stops
- *  before a wave of data packets lands, or where some node's window of `key`
- *  drops a bucket that holds hits. */
+ *  before a wave of data packets is delivered (the engine holds it until the
+ *  next call), or where some node's window of `key` drops a bucket that holds
+ *  hits. */
 export type StepUntil = 'Time' | { Event: { key: number } };
 
 /** Mirror of `crate::engine::Watch`: the key a snapshot reads, and the weight

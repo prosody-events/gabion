@@ -4,7 +4,7 @@
 // failure, Gateway cut), the study's measurement (Steady state, No zone
 // configured) and Sandbox.
 //
-// A preset is a config, a `pacing` with its feed, the charts its pane shows, the story its
+// A preset is a config, its feed, the charts its pane shows, the story its
 // caption tells (`lib/next.ts`), the scenario its story hands over to, and an
 // `async seed(sim, config, gateways)` that fires its opening commands (cuts,
 // seed requests) against a freshly built cluster. It is not a timed script:
@@ -13,7 +13,7 @@
 // Every preset opens on a warmed, settled cluster (`warm`): before its seed,
 // the page steps whole heartbeat periods until every node has a gateway into
 // every other zone and one period has passed with no packet, so nothing left
-// over from the cold start flies when the reader first presses anything. The
+// over from the cold start is drawn when the reader first presses anything. The
 // gateway map `warm` gathers is how the gateway presets name the node they
 // fault.
 //
@@ -30,9 +30,7 @@
 // which keeps node 0 sending data that a gateway cut off from its zone must
 // answer with "cannot relay". A feed injects ⌊rate·T⌋ one-hit requests by
 // virtual time T, counted from the moment the build is handed to the reader,
-// so it is deterministic under Step and repeatable from load. Sustained
-// overload alone is `pacing: 'live'`: its feed submits many requests per
-// frame.
+// so it is deterministic under Step and repeatable from load.
 
 import type { PresetId, Story } from './next';
 import type { Member, Sim } from './sim/sim';
@@ -140,27 +138,20 @@ export interface SustainedTraffic {
  *  each other zone while the cluster warmed up. */
 export type Gateways = ReadonlyArray<ReadonlyArray<number | undefined>>;
 
-/** How the page meets a wave of data packets, and the preset's feed, which
- *  the play loop and Step drive where traffic is the subject (the module
- *  header names them). `'held'`: the page does not step the engine while the
- *  wave flies, and each count changes when its packet lands. `'live'`: it
- *  steps by time and shows every snapshot at once, because its feed submits
- *  many requests per frame (Sustained overload), so a live preset has one. */
-type Paced =
-  | { readonly pacing: 'held'; readonly traffic?: SustainedTraffic }
-  | { readonly pacing: 'live'; readonly traffic: SustainedTraffic };
-
 /** A chart the detail pane shows, by what it plots: the share of data bytes
  *  that crossed zones, the agreement and disagreement panels, and the cluster
  *  total against the limit. */
 export type ChartId = 'share' | 'agreement' | 'spread' | 'limit';
 
-export type Preset = Paced & {
+export type Preset = {
   readonly id: PresetId;
   readonly label: string;
   /** The rail's group: what gabion does, faults, measurement, Sandbox. */
   readonly group: 0 | 1 | 2 | 3;
   readonly config: Partial<SimConfig>;
+  /** The feed the play loop and Step drive, where traffic is the subject (the
+   *  module header names them). */
+  readonly traffic?: SustainedTraffic;
   /** The charts the detail pane shows, in order. */
   readonly charts: readonly ChartId[];
   /** The story the caption tells, as it opens, with the scenario it hands
@@ -239,7 +230,6 @@ export const PRESETS: readonly Preset[] = [
     label: 'Rate limiting',
     group: 0,
     config: { nodes: NODES, zones: ZONES, rule_limit: RATE_LIMIT },
-    pacing: 'held',
     charts: LIMIT_FIRST,
     story: { kind: 'rate-limiting', next: 'partition', act: 'open', zones: 0, sendBucket: null },
     async seed() {
@@ -251,7 +241,6 @@ export const PRESETS: readonly Preset[] = [
     label: 'Propagation',
     group: 0,
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
-    pacing: 'held',
     charts: CHARTS,
     story: { kind: 'propagation', next: 'rate-limiting', act: 'open' },
     async seed(sim, c) {
@@ -268,7 +257,6 @@ export const PRESETS: readonly Preset[] = [
     // ≈ rate·window ≈ 800 hits a window, twice the limit, so once the window
     // fills each node admits what expiry frees and rejects the rest.
     config: { nodes: NODES, zones: ZONES, rule_limit: 400 },
-    pacing: 'live',
     traffic: { rate_per_sec: OVERLOAD_RATE_PER_SEC, at: 'every-node' },
     charts: LIMIT_FIRST,
     story: { kind: 'watch', watched: 'overload', next: 'rate-limiting' },
@@ -281,7 +269,6 @@ export const PRESETS: readonly Preset[] = [
     label: 'Zone partition',
     group: 1,
     config: { nodes: NODES, zones: ZONES, rule_limit: RATE_LIMIT },
-    pacing: 'held',
     charts: LIMIT_FIRST,
     story: { kind: 'partition', next: 'gateway-failure', act: 'open' },
     async seed(sim, c) {
@@ -293,7 +280,6 @@ export const PRESETS: readonly Preset[] = [
     label: 'Packet loss',
     group: 1,
     config: { nodes: NODES, zones: ZONES, uniform_loss: 0.3, rule_limit: NARRATIVE_LIMIT },
-    pacing: 'held',
     charts: CHARTS,
     story: { kind: 'watch', watched: 'loss', next: 'rate-limiting' },
     async seed(sim) {
@@ -305,7 +291,6 @@ export const PRESETS: readonly Preset[] = [
     label: 'Gateway failure',
     group: 1,
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
-    pacing: 'held',
     charts: CHARTS,
     story: { kind: 'watch', watched: 'gateway-failure', next: 'gateway-cut' },
     async seed(sim, c, gateways) {
@@ -319,7 +304,6 @@ export const PRESETS: readonly Preset[] = [
     label: 'Gateway cut',
     group: 1,
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
-    pacing: 'held',
     traffic: { rate_per_sec: TRICKLE_RATE_PER_SEC, at: { node: ORIGIN } },
     charts: CHARTS,
     story: { kind: 'watch', watched: 'gateway-cut', next: 'sandbox' },
@@ -334,7 +318,6 @@ export const PRESETS: readonly Preset[] = [
     label: 'Steady state',
     group: 2,
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
-    pacing: 'held',
     traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC, at: 'every-node' },
     charts: CHARTS,
     story: { kind: 'watch', watched: 'steady', next: 'rate-limiting' },
@@ -347,7 +330,6 @@ export const PRESETS: readonly Preset[] = [
     label: 'No zone configured',
     group: 2,
     config: { nodes: NODES, zones: ZONES, zone_mode: 'Unset', rule_limit: NARRATIVE_LIMIT },
-    pacing: 'held',
     traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC, at: 'every-node' },
     charts: CHARTS,
     story: { kind: 'watch', watched: 'no-zone', next: 'rate-limiting' },
@@ -363,7 +345,6 @@ export const PRESETS: readonly Preset[] = [
     // drives every hit. The far-off limit, so a request spreads at its node's
     // next heartbeat, one event at a time under Step.
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
-    pacing: 'held',
     charts: CHARTS,
     story: { kind: 'sandbox' },
     async seed() {

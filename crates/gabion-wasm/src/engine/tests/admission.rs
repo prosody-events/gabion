@@ -388,6 +388,10 @@ fn a_stopped_runtime_reports_no_decision() {
             .submit_request(0, KeyHash(WATCHED_KEY), hits(25))
             .await;
         assert!(matches!(refused, Err(EngineError::Gossip { node: 0, .. })));
+        assert!(
+            matches!(state.sub_step, SubStep::Closed),
+            "a refused record closes its sub-step"
+        );
         let next = state.step(0, StepUntil::Time).await;
         assert_eq!(decisions(&next.events), []);
         let snap = state.snapshot(None, WATCH).await;

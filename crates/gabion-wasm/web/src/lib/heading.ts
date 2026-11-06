@@ -85,7 +85,7 @@ export function heading(h: HeadingView): Heading {
     };
   }
   if (h.newer !== null) {
-    const tail: Blurb = h.newer > 0 ? blurb` · ${h.newer} newer ${noun(h.newer, 'hit')} on their way` : [];
+    const tail: Blurb = h.newer > 0 ? blurb` · ${h.newer} newer ${noun(h.newer, 'hit')} not everywhere yet` : [];
     const head: Blurb =
       up === n
         ? blurb`✓ All ${n} nodes have every hit older than one heartbeat`

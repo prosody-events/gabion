@@ -95,10 +95,10 @@ test("Zone partition's ending says whether both sides refused before the heal", 
 test("the action line's clauses say what the press does", () => {
   const prop: RunView = { ...BASE, story: { kind: 'propagation', next: 'rate-limiting', act: 'sent' } };
   const behind = BASE.nodes.map((n) => (n.id === 0 ? n : { ...n, lag: { kind: 'Behind' as const, missing_for_ms: 5 } }));
-  // Paused before any wave: Step flies the next one, not the window's edge.
+  // Paused before any wave: Step draws the next one, not the window's edge.
   expect(text(pressClause({ ...prop, nodes: behind }, 'step', 1))).toBe(' to send wave 1');
   expect(text(pressClause({ ...prop, nodes: behind }, 'step', 2))).toBe(' for wave 2, the relays');
-  expect(text(pressClause({ ...prop, flight: 'waiting' }, 'step', 1))).toBe(' to send wave 1');
+  expect(text(pressClause({ ...prop, clock: 'before-wave' }, 'step', 1))).toBe(' to send wave 1');
   expect(text(pressClause(prop, 'step', 3))).toBe(" to reach the window's edge");
   // The drained Send names the selected node's own count, and only while it
   // still counts some.

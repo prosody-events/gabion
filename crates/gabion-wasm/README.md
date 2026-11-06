@@ -29,16 +29,17 @@ gap reports or sweeps waiting). A quiet cluster costs one sub-step per distinct
 phase, and each sub-step reads the counters of, and drains for, only the nodes
 it touched.
 
-## Admission and held waves
+## Admission and waves
 
 Each node decides every request from its own count table: gabion's
 `window_total` on its `Aggregate` and `RuleSpec::admits`, the comparison the
 server and nginx make. A rejected request is counted, per node and for the
-cluster, and never recorded. An admitted one is recorded, and the packets of
-its eager flush stay held, as a sub-step's do, until the next command, so no
-count changes before its packet lands. `step` with `{ Event: { key } }` stops
-before a wave of packets that carry cells lands, or at the instant some node's
-window of `key` drops a bucket that holds hits. The truth counts a departed
+cluster, and never recorded. An admitted one is recorded, and its eager flush
+runs as one sub-step at that instant, delivered before the command returns.
+`step` with `{ Event: { key } }` stops between the halves of the first sub-step
+that sends a wave of packets that carry cells, the wave held until the next
+command, or at the instant some node's window of `key` drops a bucket that
+holds hits. The truth counts a departed
 node's hits as long as a survivor still holds them. The snapshot reports each node's windowed view, per-bucket counts,
 lag (caught up, behind, or stranded where waiting cannot help), its one-hit
 decision and next heartbeat; heal and every joiner use the scenario's own

@@ -277,11 +277,9 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
   expect(after.slice(0, -1), `${info.project.name}: the presses after Play`).toEqual(after.slice(0, -1).map(() => 'Send'));
   expect(after.length - 1, `${info.project.name}: four admitted, one refused, one after the fall-off`).toBeGreaterThanOrEqual(6);
   expect(refusals, 'two refusals: at the limit and in the sliding window').toBe(2);
-  // A46: the readout said while a paused Send's run bounded it, and while its
-  // packets flew.
+  // A46: the readout said while a paused Send's run bounded it.
   const readouts = await recorded(page, 'readouts');
-  expect(readouts.some((t) => t.endsWith('simulated · playing until every node has it · packets in flight')), `the readouts: ${readouts.slice(0, 6).join(' | ')}`).toBe(true);
-  expect(readouts.some((t) => t.endsWith('simulated · playing until every node has it')), 'a bounded run between its waves').toBe(true);
+  expect(readouts.some((t) => t.endsWith('simulated · playing until every node has it')), `the readouts: ${readouts.slice(0, 6).join(' | ')}`).toBe(true);
   // A18: the heading opens on rl-0; every Send's spreading (rl-1) ends in
   // agreement, with the badge (rl-2, two hops: the flush and the relays) or
   // the countdown (rl-3) where the selected node now refuses; the window's
@@ -333,7 +331,7 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
   expect(back.nodes.map((n) => n.window_total), 'Undo: the same counts').toEqual(left.nodes.map((n) => n.window_total));
 });
 
-test('Propagation stops before each wave and Step flies it (A55)', async ({ page }, info) => {
+test('Propagation stops before each wave and Step draws it (A55)', async ({ page }, info) => {
   test.skip(!['audit-1440-light-motion', 'audit-1440-light', 'audit-400-dark'].includes(info.project.name), 'the waves, checked where they move and at the widest and narrowest');
   test.setTimeout(120_000);
   await open(page);
@@ -379,17 +377,16 @@ test('Propagation stops before each wave and Step flies it (A55)', async ({ page
   // (2) Step, to send wave 1.
   expect(await checkState(page, `${where}: wave 1 held`)).toBe('Step');
   await expect(line(page)).toContainText('to send wave 1');
-  // A46: halted before the wave, the readout claims neither a playing run
-  // nor packets in flight.
+  // A46: halted before the wave, the readout claims no playing run.
   await expect(page.locator('.readout .time')).toHaveText(/simulated$/);
-  expect(await data(), 'nothing flew before Step').toEqual([]);
+  expect(await data(), 'nothing was drawn before Step').toEqual([]);
   await record(page, 'narrations', '.narration');
   // (3) Wave 1 alone: node 0's own packets, Z − 1 of them across zones.
   await primary(page).click();
   await untilNext(page, `${where}: before wave 2`);
-  // Wave 1's landing played the run on by itself to the relays, held for Step.
-  await expect(page.locator('.stage-pane'), `${where}: the relays wait for Step`).toHaveAttribute('data-flight', 'waiting');
-  await expect(page.locator('.stage-pane'), `${where}: the run is still per-wave`).toHaveAttribute('data-clock', 'per-wave');
+  // Wave 1's lines drew with their counts, and the run played on by itself to
+  // the relays, held for Step.
+  await expect(page.locator('.stage-pane'), `${where}: the relays wait for Step`).toHaveAttribute('data-clock', 'before-wave');
   const wave1 = await data();
   expect(wave1.length, 'wave 1: node 0 to its zone and a gateway per other zone').toBe(5);
   expect(wave1.every((b) => b.src === 0 && (b.flags & RELAY) === 0)).toBe(true);
@@ -421,11 +418,11 @@ test('Propagation stops before each wave and Step flies it (A55)', async ({ page
     await untilNext(page, `${where}: at the window's edge`);
   }
   expect((await snapshot(page)).nodes.every((n) => n.window_total === 0), 'the window emptied').toBe(true);
-  expect(await data(), "the window's edge flew no data").toEqual([]);
+  expect(await data(), "the window's edge drew no data").toEqual([]);
   expect(await checkState(page, `${where}: the end`)).toBe('Go to Rate limiting');
 });
 
-test('a Send while a wave waits for Step lands it first (A55)', async ({ page }, info) => {
+test('a Send while a wave waits for Step sends it first (A55)', async ({ page }, info) => {
   test.skip(!['audit-1440-light-motion', 'audit-1440-light'].includes(info.project.name), 'the waiting wave, with motion on and reduced');
   test.setTimeout(60_000);
   await open(page);
@@ -433,7 +430,7 @@ test('a Send while a wave waits for Step lands it first (A55)', async ({ page },
   await primary(page).click();
   await untilNext(page, `${info.project.name}: before wave 1`);
   expect(await checkState(page, `${info.project.name}: wave 1 held`)).toBe('Step');
-  // Send again instead: the waiting wave lands, then node 0 decides the
+  // Send again instead: the waiting wave is sent, then node 0 decides the
   // second request, and its run stops before its own first wave.
   const before = await snapshot(page);
   await sendButton(page).click();
@@ -447,10 +444,10 @@ test('a Send while a wave waits for Step lands it first (A55)', async ({ page },
   expect(await checkState(page, `${info.project.name}: the second Send's wave held`)).toBe('Step');
   const held = await snapshot(page);
   // Node 0 and wave 1's five receivers hold the first Send.
-  expect(held.nodes.filter((n) => n.window_total >= before.oracle_total).length, 'the first wave landed').toBeGreaterThanOrEqual(6);
+  expect(held.nodes.filter((n) => n.window_total >= before.oracle_total).length, 'the first wave was delivered').toBeGreaterThanOrEqual(6);
 });
 
-test('a cut while a wave waits for Step lands it, and the run goes on (A55, A49)', async ({ page }, info) => {
+test('a cut while a wave waits for Step sends it, and the run goes on (A55, A49)', async ({ page }, info) => {
   test.skip(info.project.name !== 'audit-1440-light', 'the waiting wave under a command, checked once');
   test.setTimeout(60_000);
   await open(page);
@@ -461,13 +458,13 @@ test('a cut while a wave waits for Step lands it, and the run goes on (A55, A49)
   await record(page, 'narrations', '.narration');
   await page.locator('#cut-zone').selectOption({ label: 'zone c' });
   await page.getByRole('button', { name: 'Cut zone c off' }).click();
-  // The cut lands the waiting wave first, and says so; the run then goes on
+  // The cut sends the waiting wave first, and says so; the run then goes on
   // to stop before its next wave, or pauses itself once every node it can
   // reach has the hits. Either way the line names a press again.
   await untilNext(page, 'after the cut', 30_000);
   expect(await checkState(page, 'after the cut')).toBe('Step');
   expect(await recorded(page, 'narrations'), 'the cut over the waiting wave').toContain(
-    'zone c is cut off · the packets already on their way arrived first',
+    'zone c is cut off · the wave waiting for Step was sent first',
   );
 });
 
@@ -518,11 +515,11 @@ test('a scenario change pauses, and says so once over a held wave (A46)', async 
   // changes once, to the change's own sentence.
   await primary(page).click();
   await untilNext(page, 'wave 1 held');
-  await expect(pane).toHaveAttribute('data-flight', 'waiting');
+  await expect(pane).toHaveAttribute('data-clock', 'before-wave');
   await record(page, 'said', '.narration');
   await loadPreset(page, 'Sandbox');
   await expect(narration).toHaveText('Paused at the start of Sandbox');
-  await expect(pane).toHaveAttribute('data-flight', 'none');
+  await expect(pane).toHaveAttribute('data-clock', 'paused');
   const said = await recorded(page, 'said');
   expect(said.slice(1), 'one mutation over the held wave').toEqual(['Paused at the start of Sandbox']);
 });

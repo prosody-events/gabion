@@ -36,33 +36,33 @@ a stroke must fit in 0.35·`r_z`.
 Everything is in CSS pixels of the stage box, so labels are screen-size at every
 width and nothing is letterboxed.
 
-**Beams.** Every packet is drawn along `beamPath` (the one function that gives a
-beam its route): inside a zone a straight segment, across zones a quadratic
-curve bent through the stage's empty centre. Position carries the tier and two
-data strokes repeat it: thin `--chart-muted` inside a zone, thicker `--color-fg`
-across zones. A data packet in flight is a short tail with a head mark, a dot
-inside a zone and an arrowhead across zones. Control packets (header-only acks
-and probes, gap reports, sweep requests) are small dots with no tail. A lost
-packet is a grey half-line ending in a stop bar, never a head, so it cannot
-read as a packet in flight. Dashed strokes are not used: a beam is often
-shorter than a dash.
+**Beams.** Every packet is a line from sender to receiver along `beamPath`
+(the one function that gives a line its route): inside a zone a straight
+segment, across zones a quadratic curve bent through the stage's empty centre.
+Position carries the tier and two data strokes repeat it: thin `--chart-muted`
+inside a zone, thicker `--color-fg` across zones. A data line ends in an
+arrowhead just outside the receiver's ring, 6 px and muted inside a zone, 9 px
+in the foreground colour across zones. A control packet (header-only acks and
+probes, gap reports, sweep requests) is a 1 px muted line ending in a dot. A
+lost packet is the line to half its route ending in a stop bar, never a head,
+so it cannot read as delivered. Dashed strokes are not used.
 
-Beams fly on a presentation clock (`canvas.beams.clock`): a flight is 520 ms of
-it, which Speed scales and Pause freezes. In every preset but Sustained
-overload the clock holds the engine: a wave of data packets is drawn, and the
-engine delivers it, and each count changes, only when the renderer reports it
-landed (rule 29). A Send's decision stands alone for 250 ms (`ARRIVAL_MS`)
-before its eager flush flies. A landed data route stays drawn, whole, 1 px at
-`LANDED_ALPHA` with no head: history, not the event in focus. It stays until
-the next command where no feed runs, so a Send's waves read as a diagram, and
-leaves at landing where a feed runs; a new layout drops it. With a node
-selected, the beams that are not its own (and not relays sent by its gateways)
-are drawn at a quarter of their alpha. `FADED_ALPHA` and `LANDED_ALPHA` are the
-marks the contrast audit exempts, by name. The renderer keeps every beam in a
-pre-sized pool and draws into one `Graphics` per mark style, and only when
-something changed or a beam is in flight, so a frame allocates nothing of its
-own. Each beam in the pool packs its flags (`layout.ts`): `CROSS` 1, `CONTROL`
-2, `RELAY` 4, `DROPPED` 8 and `LANDED` 16.
+A line is drawn the instant its packet is sent, which in the engine's virtual
+time is also the instant it is delivered, so it appears in the frame its
+receiver's count changes (rule 29). It is drawn at full ink (`BEAM_ALPHA`),
+then fades to nothing over `FADE_MS`, one second of simulated time read from
+the applied snapshot, so Pause freezes it and Speed stretches it. Overlapping
+waves draw together; Play never waits for a packet. With a node selected, the
+lines that are not its own (and not relays sent by its gateways) are drawn at
+a quarter of their ink (`FADED_ALPHA`). Full ink passes the contrast rule;
+`FADED_ALPHA` and the age fade are the exemptions the contrast audit names.
+The renderer keeps every line in a pool of `BEAM_CAPACITY` slots, each owning
+one `Graphics` built at construction: a line's geometry is drawn once, when
+its packet is shown, and a frame only sets each live line's opacity, so a
+frame allocates nothing of its own. When the pool is full the line sent first,
+the most faded, yields its slot. A relayout re-routes every live line between
+its nodes' new places, so a paused moment survives a resize. Each line packs
+its flags (`layout.ts`): `CROSS` 1, `CONTROL` 2, `RELAY` 4 and `DROPPED` 8.
 
 **Nodes.** Each node is a vessel inside a ring (`renderer.ts`, `glyphs.ts`).
 The disc's inside, `--color-panel` with no outline, fills from the bottom to the
@@ -78,8 +78,8 @@ have overflowed, clipped to the disc, rebounding and fading over 600 ms (at
 rest and hatched under reduced motion). The ring is the share of the cluster's
 windowed hits the node has heard: a closed neutral ring while its `lag` is
 `CaughtUp`, an amber arc over a thin amber track while it is behind, held a
-twelfth short of closing (`ARC_NOTCH`), sweeping up to its new share as a
-packet lands. The selected node wears a 1.5 px outline, which sweeps closed
+twelfth short of closing (`ARC_NOTCH`), sweeping up to its new share in the
+frame its line appears. The selected node wears a 1.5 px outline, which sweeps closed
 toward its heartbeat while it holds hits it has not sent; a hovered disc, or a
 control that names a node, previews it dashed. The selected node's gateways
 wear a port: a diamond outside the ring facing the zone each relays into,
@@ -91,9 +91,9 @@ the canvas's `glyphs` table first and is drawn from there.
 above the disc in the upper half of its ring and below it otherwise, 7 px
 outside the ring, flipped or nudged when it would come within 12 px of another
 name or touch a node's marks. The stage paints, back to front, the ring
-guides, the landed routes, the labels with their halo, the beams in flight and
-the nodes: a halo knocks out the ground, while a packet in flight, the figure,
-crosses a zone title instead of vanishing under it. The renderer publishes the
+guides, the lines, the labels with their halo and the nodes: a line lasts up
+to a second, so it runs under a name, whose halo knocks a small gap in it,
+rather than hiding it. The renderer publishes the
 stage centre (`data-centre`), the rings (`data-rings`), the stroke width
 (`data-cross-width`), the marks drawn (`data-marks`) and every label's box
 (`data-label-boxes`) on its canvas, and every chart publishes its label boxes
@@ -148,10 +148,10 @@ Hits per Send to the selected node, its label saying so ("Send a request of 25
 hits to node 0", shorter on narrower screens, `lib/controls.ts`). A command
 that creates something to spread (an admitted Send, Heal, Add) pressed while
 paused plays until no node that waiting can reach is behind and one heartbeat
-period has passed since the last landing, so the acknowledgements have flown,
-or 16 periods, then pauses itself; the readout says "playing until every node
-has it" while it does, and "packets in flight" while a wave holds the clock.
-In Propagation the Send also stops before each wave, which Step flies. A
+period has passed since the last wave, so the acknowledgements have been
+sent, or 16 periods, then pauses itself; the readout says "playing until every
+node has it" while it does. In Propagation the Send also stops before each
+wave, which the engine holds until Step draws it with its counts. A
 refused Send runs no time; pressed while playing, a command leaves time alone.
 Step goes to the next event (the next wave of packets that carry hits, the
 next instant hits leave the window, or one heartbeat period when neither is
@@ -179,8 +179,7 @@ into every other zone and a period passes with no packet, then seeds it.
 Propagation settles its seed before the first paint. Only the presets whose
 subject is traffic have a feed (Steady state, No zone configured, Sustained
 overload), plus Gateway cut's trickle of 2 hits/s at node 0, which keeps node 0
-sending data its cut gateway must answer with "cannot relay". Every preset
-declares its `pacing`: `'live'` for Sustained overload, `'held'` for the rest.
+sending data its cut gateway must answer with "cannot relay".
 
 **The next action** (`lib/next.ts`). In every state the page decides one next
 action from the run alone: press a transport control, press a button in the
@@ -205,16 +204,14 @@ window, an expiry, a wave on Step, a gateway change, a fresh start.
 `window.sim` is the live engine, the handle the audit and the console use
 (`sim.snapshot(inspect, watch)`); each chart's plot element carries its uPlot
 instance as `uplot`, which the audit reads to check every mark lies inside its
-plot; the stage canvas carries `beams`, the renderer's beam pool (`clock`,
-`redraws`, `inFlight`, `due`, and the `push` and `land` the audit wraps to see
-each beam enter and land) and `beamGfx`, the Graphics the beams are drawn into
-(read to check how a landed route is drawn) and `glyphs`, the `GlyphTable` of
-every node mark as drawn (vessel heights, strata, cap, ring role and arc, port
-centres, the refusal's band, the selection and the preview); and the stage pane
-publishes `data-held` (the sequence number of the wave held, "0" when none is),
-`data-flight` (`none`, `waiting`, `flying` or `frozen`), `data-clock` (what
-time does: `paused`, `playing`, `capped`, `settled` or `per-wave`) and
-`data-playing`.
+plot; the stage canvas carries `beams`, the renderer's line pool (`len`,
+`redraws`, `sent`, `alpha`, and the `push` and `removeAt` the audit wraps to
+see each line arrive and leave), `beamGfx`, the one Graphics per line slot,
+and `glyphs`, the `GlyphTable` of every node mark as drawn (vessel heights,
+strata, cap, ring role and arc, port centres, the refusal's band, the
+selection and the preview); and the stage pane publishes `data-clock` (what
+time does: `paused`, `playing`, `capped`, `settled`, `per-wave` or
+`before-wave`) and `data-playing`.
 
 ## Fonts
 
@@ -234,10 +231,9 @@ text until a face loads; the canvas and the charts wait for the faces
 
 - `src/App.svelte` — orchestrates the session: builds and warms the `Sim`,
   runs the play loop, owns transport state and the selection, and runs every
-  engine call through one queue, holding each wave until the stage reports it
-  landed. The stage takes state as props (the clock's running and speed, the
-  trail) and the packets as commands (`show`, `finish`, `clearTrail`, `reset`)
-  in the queue's order.
+  engine call through one queue, showing each batch's lines with its
+  snapshot. The stage takes state as props (the speed) and the packets as
+  commands (`show`, `reset`, `reject`) in the queue's order.
 - `src/tokens.css` — the design tokens, the one source of design values. Each
   colour holds its light and dark value in `light-dark()`: the OS preference
   picks one and `<html data-theme="light|dark">` overrides it, which sets the
@@ -261,8 +257,9 @@ text until a face loads; the canvas and the charts wait for the faces
   sentences, the transport's labels, the limit's scale, the one glyph geometry
   and the admitted requests' ring.
 - `src/lib/stage/` — `layout.ts` is the geometry (`stageLayout`, `beamPath`,
-  `pointOn`, `nodeAt`); `renderer.ts` is the framework-agnostic `StageRenderer`
-  that owns the PixiJS canvas, the beam pool, the labels and the glyphs.
+  `pointOn`, `reachT`, `nodeAt`); `renderer.ts` is the framework-agnostic
+  `StageRenderer` that owns the PixiJS canvas, the line pool, the labels and
+  the glyphs.
 - `src/lib/charts/` — `history.ts` is the bounded, column-major rolling
   time-series with the windowed share; `options.ts` builds each uPlot chart's
   options (shared cursor sync, references drawn first, labels through one
@@ -273,7 +270,7 @@ text until a face loads; the canvas and the charts wait for the faces
   line), `StageHeading`, `Dashboard`, `NodeInspector` with `GossipTargets` and
   `BucketStrata`, `ControlRail`, `TransportBar`, `RoleGlyph` and `Icon` (the
   drawn marks), `Sentence` and `InfoTip`.
-- `src/lib/presets.ts` — the scenario presets: a config, a `pacing`, the node
+- `src/lib/presets.ts` — the scenario presets: a config, the node
   it selects, Hits per Send, its charts, its story and the scenario it hands
   over to, an optional feed and an `async seed(sim, config, gateways)` that
   fires the opening commands against a fresh, warmed cluster (`warm`). A feed
@@ -282,7 +279,7 @@ text until a face loads; the canvas and the charts wait for the faces
 - `src/wasm/` — generated by `pnpm run build:wasm`; never edited or committed.
 - `tests/screenshot.spec.ts` — the functional smoke.
 - `tests/audit.spec.ts` — the automated design audit (see "Design rules").
-- `tests/motion.spec.ts` — the waves in motion (see "Tests").
+- `tests/motion.spec.ts` — the packets in motion (see "Tests").
 - `tests/story.spec.ts` — each story walked by its next actions;
   `tests/next.spec.ts` and `tests/next-actions.ts` — the next-action table.
 - `tests/drive.ts` — Step, a heartbeat period of Steps, Steps until a
@@ -344,7 +341,7 @@ study dashboard. A rule that assumes the study's data model says "N/A" and why.
 26. One rAF-coalesced draw, a debounced ResizeObserver, focus kept across a rebuild (A6).
 27. Accessibility: a focusable roving-tabindex grid, sentence labels, tooltips on hover, focus and tap, targets of at least 24 px, contrast (A3, A6, A7).
 28. Automated checks carried over (CI).
-29. Cause before effect: in every preset but Sustained overload, and on every Step, the clock waits while a wave of data packets is drawn; the engine delivers the wave, and each count changes, when it lands. A command first fast-forwards any run in flight past its relays, then shows its own effect; a rebuild discards it. Sustained overload shows counts as the engine computes them. Step stops at the next wave, or at the next instant hits leave the window (motion suite).
+29. Cause and effect in one frame: every packet is drawn as a line the instant it is sent, the instant the engine delivers it, so each count changes in the frame its line appears, never before; Play never waits for a packet, and overlapping waves draw together; a line fades over one simulated second. A command first runs past gabion's emit floor. In Propagation a Send stops before each wave, which the engine holds until Step draws it with its counts. Step stops at the next wave, which it draws at once, or at the next instant hits leave the window (motion suite).
 30. One next action: in every state exactly one control is filled, the caption's action line quotes its label, a wait fills nothing and shows its progress, and the goal never commands (A49, A54, A56; story suite).
 
 The grep gates, which `make hygiene` runs: no colour literal outside
@@ -357,7 +354,7 @@ Automated checks, run on every preset after a walk by Step:
 
 - A1: no page or console errors, no failed requests, no page-level horizontal overflow.
 - A2: no "NaN", "undefined", "null", "Infinity", "[object" or "e+" in page text.
-- A3: no two visible text boxes, DOM or canvas, overlap by 1 px or more, also in a converged state; no text is below the smallest type token (`--font-size-caption-sm`) and none is clipped by an `overflow: hidden` ancestor; every chart value lies inside its plot and every y axis labels at least two values; no glyph that carries meaning is set from a font; the stage names every node; tooltips stay inside the stage; and for every zone count the stage's rings (grown by the largest disc) and labels lie inside it, no two nodes of different rings touch, and no cross-zone `beamPath` comes within a disc and half a stroke of a third ring, and every beam in flight bends through the centre exactly when its nodes' zones differ and wears its packet's kind, tier and fate (a dot for an acknowledgement or a sweep request, a relay marked as one), one beam per packet.
+- A3: no two visible text boxes, DOM or canvas, overlap by 1 px or more, also in a converged state; no text is below the smallest type token (`--font-size-caption-sm`) and none is clipped by an `overflow: hidden` ancestor; every chart value lies inside its plot and every y axis labels at least two values; no glyph that carries meaning is set from a font; the stage names every node; tooltips stay inside the stage; and for every zone count the stage's rings (grown by the largest disc) and labels lie inside it, no two nodes of different rings touch, and no cross-zone `beamPath` comes within a disc and half a stroke of a third ring, and every line bends through the centre exactly when its nodes' zones differ and wears its packet's kind, tier and fate (a dot for an acknowledgement or a sweep request, a relay marked as one), one line per packet.
 - A4: data correctness, recomputed independently from the engine snapshot in the test's own code: the lede's counts, each node's behind-by and gateway-for count, the heading (A18: its form, truth, gap, countdown and censored "not caught up (≥ t)"), each chart-3 spread, the windowed share, both chart-1 predictions (with unequal zones, and absent with one node) and, for the selected node, its Gossip targets.
 - A5: fixed order across the grid, table, chart panels and Gossip-targets rows; the key lists exactly the marks drawn.
 - A42: every node mark against the layout and the snapshot: each port on its circle facing its zone and clear of its disc, every ring and count; the selection clear of facing rings; each name a node's name, smaller than the counts, inside the canvas and clear of every mark; the fill's top and brim on the vessel's scale, the cap with the brim decision, the ring's role with the lag.
@@ -370,7 +367,7 @@ The story, motion and page checks the test titles name:
 
 - A10: every visible text is set in the three self-hosted faces, loaded before the first render, and every request stays on the page's own origin.
 - A12: measure, minimum type size and the 4 px leading grid.
-- A13: cause before effect in every held preset: no count rises before a beam into it lands, relays leave after wave 1, the clock waits while a wave is held, and every applied snapshot is the engine's.
+- A13: cause and effect in one frame in every preset: no count rises in a frame before a line into it appears or its own request is admitted.
 - A16: counts equal `window_total`, fit their disc, and keep 4.5:1 on the fill and on the empty inside.
 - A17: a Send's feedback in the frame of the press, and its run, which ends one heartbeat period after its last landing.
 - A18: the stage heading in all its forms, with template ids, the countdown, the over-admission clause, the hops and repairs only.
@@ -386,12 +383,12 @@ The story, motion and page checks the test titles name:
 - A51: affordance: actions are buttons, the ink fill only on the next action, the disc preview of every control that names a node.
 - A52: the skip link focuses the next action, which the action line describes, and nothing focusable sits in the live region.
 - A54: a wait shows a meter on the action line that never falls.
-- A55: Propagation's Send stops before each wave, and Step flies wave 1 alone, then the relays, then reaches the window's edge.
+- A55: Propagation's Send stops before each wave, and Step draws wave 1 alone, then the relays, then reaches the window's edge.
 - A56: a goal never begins a clause with a control's verb or quotes a control's label.
 - A57: the sliding-window act paces itself: Send is the next action again only in a new bucket.
 - A59: typing in Hits per Send never moves the next action; a committed invalid value does.
 
-`tests/audit.spec.ts` automates them, in ten projects, and checks each preset a second time with `data-theme` forcing the other theme. It saves a full-page PNG per project, preset and theme to `audit-shots/`. `tests/motion.spec.ts` checks rule 29 with motion on and saves Propagation's two waves, paused mid-flight, as `propagation-wave1.png` and `propagation-wave2.png`.
+`tests/audit.spec.ts` automates them, in ten projects, and checks each preset a second time with `data-theme` forcing the other theme. It saves a full-page PNG per project, preset and theme to `audit-shots/`. `tests/motion.spec.ts` checks rule 29 with motion on and saves Propagation's two waves, just drawn by Step, as `propagation-wave1.png` and `propagation-wave2.png`, and a paused fade as `lines-paused.png`.
 
 The visual audit reads those PNGs for: alignment, spacing rhythm, type
 hierarchy, nothing clipped, a dark theme as considered as the light one, and a
@@ -405,7 +402,7 @@ every node and watches the hits leave the window, sends from the transport to
 the selection, selects, adds and removes nodes (and checks a joiner is cut as
 its zone), drives every control and checks the detail pane, reading
 numbers from the node table, and checks that every data packet Sustained
-overload sends, by its feed's submits or by its steps, is drawn, one beam each.
+overload sends, by its feed's submits or by its steps, is drawn, one line each.
 
 `pnpm run audit` runs four suites. `tests/next.spec.ts` checks every row of
 the next-action table, every goal against the clause rule and the heading's
@@ -415,7 +412,7 @@ control, and checks in each state that one control is filled and the line
 quotes it, that a wait shows a meter that never falls, that the goal never
 commands and that one live region speaks, with the heading's templates and the
 refusal's sentence; Propagation's Send stopping before each wave that Step
-flies; Zone partition's 200 admitted against 100; Hits per Send checked on
+draws; Zone partition's 200 admitted against 100; Hits per Send checked on
 commit; the skip link and keys; buttons and boundaries and the dashed preview
 of every control that names a node; the title; the one-column pane; and a
 story's hand-over and Undo. The design audit is ten projects (widths
@@ -427,43 +424,44 @@ theme. Further tests check chart 1 across the rule window, with unequal zones
 over a window that opens at a kept mark, and with one node (at the widest and
 the narrowest stage); the share window at any snapshot rate; the stage geometry
 for every zone count (at the widest and the narrowest stage, with facing discs
-of neighbouring rings kept apart); that the beams a Step draws are its packets,
+of neighbouring rings kept apart); that the lines a Step draws are its packets,
 one each with its packet's kind, tier and fate, over packets of every kind (a
 node added to the live cluster brings the join sweep); that a paused stage's
 labels are not rebuilt per snapshot; that every preset opens warmed and settled
 (each seeded node's first wave reaches one gateway per other zone, and
-Propagation opens with its seed everywhere and no beam); that runs go quiet
+Propagation opens with its seed everywhere and no line); that runs go quiet
 after agreement; that both gateway presets fail over within the rule window;
 that the transport bar keeps its height and its readouts their place when the
 heartbeat reading appears, and is one row from 1100 px up; the node glyph
-through a Rate limiting walk (levels, strata, caps, the rings of a held
-flight, counts and their contrast, and the refusal's band inside its disc,
+through a Rate limiting walk (levels, strata, caps, the rings in every frame
+of a Send's run, counts and their contrast, and the refusal's band inside its disc,
 above its brim and clear of its count); the faces (every visible text in the
 three families, every request to the page itself) and the stage drawing though
 a face fails to load; the key against the marks drawn; and the interactions,
 with touch.
 
 The motion suite (one project, 1440 px, light, motion on) checks rule 29: in
-every held preset, played at 4× after a Send, no node's count rises before a
-beam into it lands or its own request is admitted, no wave leaves while another
-flies, simulated time does not move while a wave is held, and the counts shown
-during a hold are the engine's (also for Gateway cut at limit 100 and a
-one-second heartbeat, whose trickle flushes at once, held too); back-to-back
-Sends each flush at once, past the emit floor; Step flies Propagation's two
-waves one at a time, at 1× and at the slowest speed, and then reaches the
-window's edge; a flight lasts the flight over the speed, at 1× and at a fifth,
-and Pause freezes it, pool, clock and pixels, with the beams in flight painted
-over the labels; the heartbeat readout; a ring sweeping up as its packet
-lands; the allocations of the stage's per-frame and per-snapshot functions,
-every one tracked by the heap profiler in a browser that only interprets and
-mapped to its source through the hidden source maps: after warm stretches, a
-stretch of 300 played frames of Packet loss (node 0's gateways' relays drawn),
-Rate limiting (vessels redrawn, rings sweeping, refusals played) and
-Propagation (the heartbeat sweep), in which they allocate nothing but boxed
-doubles, the engine's own; and the landed routes, with motion
-on and reduced, painted under the labels. The checks of how long a flight or a
-heartbeat takes to watch, of the back-to-back Sends and of the allocations run
-the page on Playwright's fake clock, so they hold on any machine.
+every preset, played at 4× after a Send, no node's count rises in a frame in
+which no data line into it appeared and it admitted no request of its own, and
+while Propagation's run stands before a wave the counts shown are the
+engine's (also for Gateway cut at limit 100 and a one-second heartbeat, whose
+trickle flushes at once); back-to-back Sends each flush at once, past the emit
+floor; Step draws Propagation's two waves one at a time, each with its counts,
+and then reaches the window's edge; Play runs at the chosen speed in every
+scenario, printing the most lines each puts on the stage; a line lives the
+fade over the speed, at 1× and at a fifth, and Pause freezes the lines, their
+opacities, the pool and the pixels, each drawn at its ink times what is left
+of its fade, under the labels; the heartbeat readout; a ring sweeping up in
+the frame its line appears; the allocations of the stage's per-frame
+functions and of the path that draws a packet's line, every one tracked by
+the heap profiler in a browser that only interprets and mapped to its source
+through the hidden source maps: after warm stretches, a stretch of 300 played
+frames of Packet loss (node 0's gateways' relays drawn), Rate limiting
+(vessels redrawn, rings sweeping, refusals played) and Propagation (the
+heartbeat sweep), in which they allocate nothing but boxed doubles, the
+engine's own. The checks of Play's pace, of a line's life, of the heartbeat
+readout, of the back-to-back Sends and of the allocations run the page on
+Playwright's fake clock, so they hold on any machine.
 
 Full-page PNGs land in `audit-shots/`, which is gitignored; CI uploads it as a
 workflow artifact. All of it downloads a browser, so, like the node

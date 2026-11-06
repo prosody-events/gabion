@@ -7,12 +7,9 @@
     MARK,
     StageRenderer,
     type Fault,
-    type Finish,
     type LabelBox,
-    type Landing,
     type Roles,
     type Scale,
-    type Trail,
   } from '../stage/renderer';
   import { R_MAX, countFits, nodeAt, stageLayout, stageMargin, type Point, type StageLayout } from '../stage/layout';
   import { fontsReady, type Theme } from '../theme';
@@ -23,11 +20,10 @@
 
   // The tier view. The WebGL canvas (managed imperatively by `StageRenderer`)
   // draws one ring per zone, each node as a vessel inside its ring with its
-  // name, the selection and its gateways' ports, and the packets in flight.
-  // State arrives as props; the packets and a refusal arrive as commands
-  // (`show`, `finish`, `clearTrail`, `reset`, `reject`), which App calls in the
-  // order its one queue runs the engine, and the renderer reports a held
-  // wave's landing through `onLanded`. `NodeGrid` lays the same nodes over the
+  // name, the selection and its gateways' ports, and the packets as lines that
+  // fade. State arrives as props; the packets and a refusal arrive as commands
+  // (`show`, `reset`, `reject`), which App calls in the order its one queue
+  // runs the engine. `NodeGrid` lays the same nodes over the
   // canvas as focusable cells holding each count, with a tooltip and a table,
   // because the canvas is opaque to assistive tech and to test tooling.
   //
@@ -44,10 +40,7 @@
     previewId,
     decisions,
     phone,
-    running,
     speed,
-    trail,
-    onLanded,
     hoveredId,
     focusedId,
     theme,
@@ -70,13 +63,9 @@
     previewId: number | null;
     decisions: ReadonlyMap<number, Decision>;
     phone: boolean;
-    /** Whether the presentation clock runs freely: the page is playing. */
-    running: boolean;
-    /** The presentation clock's speed against wall time. */
+    /** The presentation clock's speed against wall time: the rings' sweeps
+     *  and a refusal play at it. */
     speed: number;
-    trail: Trail;
-    /** Called once a held wave's beams have all landed. */
-    onLanded: () => void;
     hoveredId: number | null;
     focusedId: number | null;
     theme: Theme;
@@ -159,28 +148,14 @@
   );
   const decisionFont = $derived(`600 ${theme.captionPx}px ${theme.font}`);
 
-  /** Draw `batch`'s packets as beams that leave `delay` ms of presentation
-   *  clock from now; with `'held'`, call `onLanded` once they have all
-   *  landed. False when no renderer exists yet: then nothing will land, and
-   *  the caller delivers at once. */
-  export function show(batch: EventBatch, delay: number, landing: Landing): boolean {
-    if (!ready || renderer === null) return false;
-    renderer.show(batch.events, delay, landing);
-    return true;
+  /** Draw `batch`'s packets as lines, from the instant each was sent. Called
+   *  before the batch's snapshot is applied, in the same task, so a count
+   *  never changes before its line. */
+  export function show(batch: EventBatch): void {
+    renderer?.show(batch.events);
   }
 
-  /** Let the clock run, though paused, until every beam shown has landed; with
-   *  `'fast'`, within a fixed short wall time. */
-  export function finish(pace: Finish): void {
-    renderer?.finish(pace);
-  }
-
-  /** Drop the landed routes: every command starts a fresh picture. */
-  export function clearTrail(): void {
-    renderer?.clearTrail();
-  }
-
-  /** Drop every beam and any landing still due: a rebuild. */
+  /** Drop every line and the refusal: a rebuild. */
   export function reset(): void {
     renderer?.reset();
   }
@@ -213,15 +188,7 @@
   });
 
   $effect(() => {
-    if (ready && renderer !== null) renderer.setRunning(running);
-  });
-
-  $effect(() => {
     if (ready && renderer !== null) renderer.setSpeed(speed);
-  });
-
-  $effect(() => {
-    if (ready && renderer !== null) renderer.setTrail(trail);
   });
 
   $effect(() => {
@@ -343,7 +310,6 @@
       await fontsReady();
       if (disposed) return;
       const r = await StageRenderer.create(container, theme, {
-        onLanded: () => onLanded(),
         onMarks: (bits) => (marks = bits),
         onGliding: (ids) => (gliding = ids),
       });

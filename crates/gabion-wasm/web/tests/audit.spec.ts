@@ -50,7 +50,7 @@ const SELECTION_REACH = SELECTION_GAP + SELECTION_WIDTH / 2;
 // the page prints it in (zone, id) order, never sorted by a value.
 
 // Heartbeat periods each preset is walked: past its first waves, and short,
-// since every wave holds the clock for a flight at every width and theme.
+// to keep CI timely.
 const STEPS = 4;
 // The rule window every preset runs with (`SimConfig::default`, which no preset
 // overrides).
@@ -937,7 +937,7 @@ function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number
   // A7 canvas pairs (graphics 3:1, text 4.5:1): the stage draws on `readTheme().bg`
   // and the charts on the detail rail's panel, so each is checked on its own
   // surface, a translucent mark composited over it first. Marks drawn faded as
-  // context for a selection (`FADED_ALPHA`) and landed routes (`LANDED_ALPHA`)
+  // context for a selection (`FADED_ALPHA`) and the age fade of a line
   // are exempt by name (the README's Beams paragraph); the ring
   // guides repeat what position and the ring title say (structure, not data) and
   // are exempt too.
@@ -1335,7 +1335,7 @@ test("every drawn beam carries its packet's kind, tier and fate", async ({ page 
   type Log = { beams: Beam[] };
 
   // Record the packets the engine reports, and every beam the stage draws, as
-  // it enters the beam pool, so a beam that has already landed and gone is
+  // it enters the beam pool, so a beam that has already faded and gone is
   // still counted.
   await logPackets(page);
   await page.evaluate(() => {
@@ -1869,40 +1869,57 @@ test('the node glyph tells level, strata, cap, refusal and ring (A42, A16)', asy
   });
   expect(opened, `${where}: every ring at load`).toEqual(opened.map(() => `${RING_CAUGHT_UP}|1`));
 
-  // During the first Send's held flight every receiver's ring is behind and
-  // shows less than the whole, though it has heard nothing yet; its vessel
-  // and its count are its own view, empty, while only node 0 holds the hits.
+  // In every frame of the first Send's run a ring is closed exactly where the
+  // vessel has the hits, and its count says so: each line drew with its count.
+  // Before the Send, every ring is closed over an empty window. Every audit
+  // project reduces motion, so an arc moves at once. The sampler runs from
+  // before the press until the run has ended; a vessel has hits when its fill
+  // rises off the bottom.
+  type Sample = { id: number; ring: number; arc: number; strata: number; hits: boolean; count: string | null }[];
   await page.locator('[role="gridcell"][data-node="0"]').press('Enter');
+  await page.evaluate(() => {
+    const w = window as unknown as { samples: Sample[]; sampling: boolean };
+    w.samples = [];
+    w.sampling = true;
+    const take = (): void => {
+      if (!w.sampling) return;
+      const g = (document.querySelector('.stage canvas') as HTMLCanvasElement & { glyphs: GlyphTable }).glyphs;
+      const nodes: Sample = [];
+      for (let s = 0; s < g.len; s++) {
+        if (g.id[s] < 0) continue;
+        const count = document.querySelector(`[role="gridcell"][data-node="${g.id[s]}"] .count`)?.textContent?.trim() ?? null;
+        nodes.push({ id: g.id[s], ring: g.ring[s], arc: g.arc[s], strata: g.strata[s], hits: g.fillTop[s] < g.r[s] - 1 - 1e-3, count });
+      }
+      w.samples.push(nodes);
+      requestAnimationFrame(take);
+    };
+    requestAnimationFrame(take);
+  });
+  const inner = await glyphs(page, (g) => 2 * (g.r[0] - 1));
   await sendButton(page).click();
-  // One read, in the first frame the hold shows, so the glyphs, the counts and
-  // the hold are of one instant.
-  const held = (await (await page.waitForFunction(() => {
-    if (document.querySelector<HTMLElement>('.stage-pane')?.dataset.held === '0') return null;
-    const g = (document.querySelector('.stage canvas') as HTMLCanvasElement & { glyphs: GlyphTable }).glyphs;
-    const nodes: { id: number; ring: number; arc: number; strata: number; count: string | null }[] = [];
-    for (let s = 0; s < g.len; s++) {
-      if (g.id[s] < 0) continue;
-      const count = document.querySelector(`[role="gridcell"][data-node="${g.id[s]}"] .count`)?.textContent?.trim() ?? null;
-      nodes.push({ id: g.id[s], ring: g.ring[s], arc: g.arc[s], strata: g.strata[s], count });
-    }
-    return { inner: 2 * (g.r[0] - 1), nodes };
-  })).jsonValue())!;
-  // Strata show where the inside is tall enough: one per non-empty bucket.
-  const tall = held.inner >= STRATA_MIN_INNER;
-  for (const { id, ring, arc, strata, count } of held.nodes) {
-    const origin = id === 0;
-    if (!origin) {
-      expect(ring, `${where}: node ${id}'s ring while the wave flies`).toBe(RING_BEHIND);
-      expect(arc, `${where}: node ${id}'s arc while the wave flies`).toBeLessThan(1);
-    }
-    if (tall) expect(strata, `${where}: node ${id}'s strata while the wave flies`).toBe(origin ? 1 : 0);
-    if (wide || count !== null) expect(count, `${where}: node ${id}'s count while the wave flies`).toBe(origin ? '25' : '0');
-  }
   // The admitted text stands while its run plays, and goes when it ends.
   if (wide) await expect(page.locator('.decision'), `${where}: node 0's decision`).toHaveCount(1);
   await checkDecisions(page, `${where}, admitted`);
   await still(page, 60_000);
+  const samples = await page.evaluate(() => {
+    const w = window as unknown as { samples: Sample[]; sampling: boolean };
+    w.sampling = false;
+    return w.samples;
+  });
   await expect(page.locator('.decision'), `${where}: the admitted text once its run ended`).toHaveCount(0);
+  // Strata show where the inside is tall enough: one per non-empty bucket.
+  const tall = inner >= STRATA_MIN_INNER;
+  expect(samples.some((nodes) => nodes.some((n) => n.id === 0 && n.hits)), `${where}: the Send was seen`).toBe(true);
+  for (const [frame, nodes] of samples.entries()) {
+    const sent = nodes.some((n) => n.hits);
+    for (const { id, ring, arc, strata, hits, count } of nodes) {
+      const at = `${where}: node ${id} in frame ${frame} of the Send's run`;
+      expect(ring === RING_CAUGHT_UP, `${at}: its ring is closed exactly when its arc is whole`).toBe(arc === 1);
+      expect(ring === RING_CAUGHT_UP, `${at}: its ring is closed exactly where its vessel has the hits`).toBe(hits || !sent);
+      if (count !== null) expect(count, `${at}: its count`).toBe(hits ? '25' : '0');
+      if (tall) expect(strata, `${at}: its strata`).toBe(hits ? 1 : 0);
+    }
+  }
 
   // Sends at nodes 1, 2 and 2, each in a bucket of its own where strata show.
   for (const node of [1, 2, 2]) {
@@ -1930,8 +1947,8 @@ test('the node glyph tells level, strata, cap, refusal and ring (A42, A16)', asy
   if (tall) expect(Math.max(...strata.map(([, n]) => n)), `${where}: four Sends in four buckets`).toBe(4);
 
   // The fifth Send at node 2 is refused: its band plays in node 2's headroom,
-  // inside its disc, above its brim and clear of its count; no beam flies and
-  // no count changes.
+  // inside its disc, above its brim and clear of its count; no line is drawn
+  // and no count changes.
   const counts = await page.locator('.count').allTextContents();
   await page.evaluate(() => {
     const w = window as unknown as { pushed: number };

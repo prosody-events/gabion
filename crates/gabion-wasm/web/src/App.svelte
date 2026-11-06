@@ -6,7 +6,7 @@
   import {
     ANSWER,
     CARRIES_CELLS,
-    isWave,
+    waves,
     type Admission,
     type ClusterState,
     type EventBatch,
@@ -16,7 +16,7 @@
     type StepUntil,
     type Watch,
   } from './lib/sim/types';
-  import type { Fault, Roles, Scale, Trail } from './lib/stage/renderer';
+  import type { Fault, Roles, Scale } from './lib/stage/renderer';
   import {
     DEFAULT_PRESET,
     PRESETS,
@@ -45,7 +45,6 @@
     progress,
     verdictOf,
     type Clock,
-    type Flight,
     type NextAction,
     type PresetId,
     type RunView,
@@ -74,22 +73,20 @@
   // and Rebuild each build a fresh run first, then swap it in; Undo swaps the
   // previous run back.
   //
-  // Every engine call runs through one queue (`serial`), one at a time. In a
-  // `'held'` preset a batch that holds a wave of data packets is held: the
-  // engine keeps the wave in flight, the page shows the senders' snapshot and
-  // draws the wave, and it calls the engine again only once the stage reports
-  // the wave landed (`onLanded`); then `step(0)` delivers it and the receivers'
-  // counts change. So no count changes before its packet lands, and every
-  // readout is the engine's own state. A command that changes the cluster
-  // first fast-forwards the wave in flight and its relays (`land`), then shows
-  // its own effect; a rebuild discards the wave instead. The `'live'` preset
-  // shows every snapshot at once.
+  // Every engine call runs through one queue (`serial`), one at a time, and
+  // each batch the engine returns is shown whole: its packets as lines, then
+  // its snapshot, in one task, so every count changes in the frame its line
+  // appears, never before, and every readout is the engine's own state. Play
+  // never waits for a packet, and a line fades over one simulated second. A
+  // command that changes the cluster first runs past gabion's emit floor
+  // (`pastFloor`), then shows its own effect.
   //
   // One time model: a Send, Heal or Add pressed while paused plays until
   // every node that waiting can reach has the hits and one heartbeat period
-  // has passed since the last landing, so the acknowledgements have flown,
-  // then pauses itself; in Propagation it also stops before each wave, which
-  // Step flies. Pressed while playing, a command leaves time alone.
+  // has passed since the last wave, so the acknowledgements have been sent,
+  // then pauses itself; in Propagation the Send also stops before each wave,
+  // which the engine holds until Step draws it. Pressed while playing, a
+  // command leaves time alone.
   //
   // The page decides one next action per state (`lib/next.ts`): its control
   // alone is filled, and the caption's action line names it.
@@ -109,12 +106,9 @@
   let firstError = $state<string | null>(null);
   let commandError = $state<string | null>(null);
 
-  // Where a held preset's steps stop: before a wave of data packets lands, or
-  // where some node's window drops a bucket that holds hits.
+  // Where a step by event stops: before a wave of data packets is delivered,
+  // or where some node's window drops a bucket that holds hits.
   const EVENT: StepUntil = { Event: { key: WATCHED_KEY } };
-  // Presentation-clock ms a Send's decision stands alone before its eager
-  // flush flies.
-  const ARRIVAL_MS = 250;
   // Cap one advance so a backgrounded tab resuming rAF can't leap seconds of
   // virtual time in a single frame.
   const MAX_STEP_MS = 500;
@@ -148,47 +142,30 @@
   // not count a node as behind.
   const grace = $derived(run?.preset.traffic === undefined ? 0 : tickMs + floorMs);
 
-  /** A wave the engine holds in flight: the page shows it and calls the engine
-   *  again only once it landed, which resolves `landed`: the stage reports it,
-   *  or its delivery does. `seq` tells one hold from the next. */
-  interface Held {
-    readonly seq: number;
-    readonly batch: EventBatch;
-    readonly delay: number;
-    readonly landed: Promise<void>;
-    readonly land: () => void;
-  }
-  /** The wave the page holds: none, or one held unflown until Step (under
-   *  Propagation's per-wave run), flying, or frozen mid-flight by Pause. */
-  type Wave = { readonly kind: 'none' } | { readonly kind: Exclude<Flight, 'none'>; readonly held: Held };
-  const NO_WAVE: Wave = { kind: 'none' };
-  let wave = $state.raw<Wave>(NO_WAVE);
-  let holds = 0;
-  // Virtual ms one emit floor after the last held wave's instant: `land` runs
-  // the run on to here. An instant the run has reached leaves nothing due.
+  // Virtual ms one emit floor after the last wave's instant: a command runs
+  // the run on to here first (`pastFloor`). An instant the run has reached
+  // leaves nothing due.
   let floorUntil = 0;
   // The tail of the queue every engine call runs on.
   let queue: Promise<void> = Promise.resolve();
-  // Whether landed routes stay drawn until the next command: where no feed runs.
-  const trail = $derived<Trail>(run?.preset.traffic === undefined ? 'keep' : 'drop');
 
   /** What time does, the next action's `Clock`: paused; playing freely;
    *  stopped where a command's run reached its cap, until the next Play or
-   *  command; or a command's run playing on its own, with where it started
-   *  and its last data landing, in virtual ms. A per-wave run stands still
-   *  while it holds a wave, so it is never stopped with nothing to Step. */
+   *  command; a command's run playing on its own, with where it started and
+   *  its last wave, in virtual ms; or Propagation's run stopped before the
+   *  wave the engine holds (`held`, the batch that sent it), until Step draws
+   *  it. A held wave exists only there, so time never runs over one. */
   type Time =
-    | { readonly kind: Exclude<Clock, UntilSettled> }
-    | { readonly kind: UntilSettled; readonly start: number; lastLanding: number };
+    | { readonly kind: Exclude<Clock, UntilSettled | 'before-wave'> }
+    | { readonly kind: UntilSettled; readonly start: number; lastWave: number }
+    | { readonly kind: 'before-wave'; readonly start: number; lastWave: number; readonly held: EventBatch };
   const PAUSED: Time = { kind: 'paused' };
   const PLAYING: Time = { kind: 'playing' };
   const CAPPED: Time = { kind: 'capped' };
   let time = $state.raw<Time>(PAUSED);
-  // Whether simulated time runs: the play loop's, the stage's and the
-  // transport's one reading of `time`.
-  const playing = $derived(
-    time.kind === 'playing' || time.kind === 'settled' || (time.kind === 'per-wave' && wave.kind === 'none'),
-  );
+  // Whether simulated time runs: the play loop's and the transport's one
+  // reading of `time`.
+  const playing = $derived(loops(time));
 
   // The last Send: each node's decision text, the decision itself, and the
   // narration sentence it was told in. Cleared at the next command; an
@@ -239,7 +216,9 @@
 
   let rafId = 0;
   let lastWall = 0;
-  // Exactly one advance is ever in flight: the play loop will not issue the
+  // The fraction of a simulated ms the last frame left over.
+  let carry = 0;
+  // Exactly one advance is ever running: the play loop will not issue the
   // next `step` until the previous resolves, so commands can't pile up faster
   // than the engine drains them.
   let stepping = false;
@@ -343,10 +322,6 @@
     const fresh = await Sim.create(config);
     try {
       await preset.seed(fresh, config, await warm(fresh, config));
-      // A seed's last admitted request leaves its sub-step open, its eager
-      // flush (if any) held: deliver it now, so the first paint shows what
-      // the engine holds and nothing lands undrawn later.
-      await fresh.step(0);
       const snap = await fresh.snapshot(ORIGIN, { key: WATCHED_KEY, probe_hits: hits });
       return new Run(fresh, preset, config, { ...k }, snap, hits);
     } catch (e) {
@@ -394,13 +369,12 @@
     return joined(parts);
   }
 
-  /** Keep `old` for Undo, closing the wave it holds first: its engine then
-   *  holds nothing in flight, and its saved snapshot is the engine's own. */
+  /** Keep `old` for Undo, delivering the wave Propagation's run stood before
+   *  (a no-op otherwise): its engine then holds nothing, and its saved
+   *  snapshot is the engine's own. */
   async function keep(old: Run): Promise<void> {
-    if (wave.kind !== 'none') {
-      await old.sim.step(0);
-      old.cluster = await old.sim.snapshot(old.selected, watchOf(old));
-    }
+    await old.sim.step(0);
+    old.cluster = await old.sim.snapshot(old.selected, watchOf(old));
     dropPrevious();
     previous = old;
     undoTimer = window.setTimeout(dropPrevious, UNDO_MS);
@@ -416,7 +390,6 @@
 
   /** Make `r` the run: a fresh picture, paused, nothing held or decided. */
   function adopt(r: Run): void {
-    wave = NO_WAVE;
     floorUntil = 0;
     setTime(PAUSED);
     decisions = new Map();
@@ -507,15 +480,13 @@
     if (!loops(time) || run === null) return;
     rafId = requestAnimationFrame(frame);
     if (stepping) return;
-    // Virtual time waits while a wave is held, and the next advance does not
-    // make up the wait.
-    if (wave.kind !== 'none') {
-      lastWall = now;
-      return;
-    }
     const wallDelta = lastWall === 0 ? tickMs / 6 : now - lastWall;
     lastWall = now;
-    const deltaMs = Math.min(Math.round(wallDelta * speed), MAX_STEP_MS);
+    // The fraction a frame leaves carries to the next, so every speed paces
+    // exactly.
+    const want = carry + wallDelta * speed;
+    const deltaMs = Math.min(Math.floor(want), MAX_STEP_MS);
+    carry = deltaMs === MAX_STEP_MS ? 0 : want - deltaMs;
     if (deltaMs <= 0) return;
     stepping = true;
     void exec((r) => advance(r, deltaMs)).finally(() => {
@@ -523,16 +494,16 @@
     });
   }
 
-  /** Run `task` after every engine call queued before it: no command can then
-   *  deliver a wave the page is still drawing. */
+  /** Run `task` after every engine call queued before it, so the page shows
+   *  each batch in the order the engine made them. */
   function serial(task: () => Promise<void>): Promise<void> {
     const next = queue.then(task);
     queue = next.catch(() => {});
     return next;
   }
 
-  /** Run `task` on the live run, on the queue. A failure stops play, drops any
-   *  hold (the engine's next command closes it) and says so in place. */
+  /** Run `task` on the live run, on the queue. A failure stops play (the
+   *  engine's next command closes a wave it holds) and says so in place. */
   function exec(task: (r: Run) => Promise<void>): Promise<void> {
     return serial(async () => {
       const r = run;
@@ -542,7 +513,6 @@
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
         commandError = `The simulator stopped a command: ${message} The cluster is paused as it was; press Restart to start the scenario again.`;
-        wave = NO_WAVE;
         pause();
       }
     });
@@ -554,109 +524,76 @@
   }
 
   /** What one batch tells the page beyond its snapshot: a held Send's hits
-   *  leaving their node, a gateway change of the selected node. */
+   *  leaving their node, a gateway change of the selected node, and, for a
+   *  batch with a wave, where gabion's emit floor next lets a flush go and the
+   *  run's last wave. */
   function note(r: Run, batch: EventBatch): void {
-    for (const { kind } of batch.events) {
+    let wave = Number.NaN;
+    for (const { kind, virtual_ms } of batch.events) {
       if ((kind.type === 'PacketSent' || kind.type === 'PacketDropped') && CARRIES_CELLS[kind.kind]) {
         if (kind.src === awaitingNode) awaitingNode = null;
         dataSent += 1;
         if (kind.tier === 'CrossZone') dataCrossed += 1;
+        wave = virtual_ms;
       } else if (kind.type === 'GatewayChanged' && kind.origin === r.selected) {
         narration = say.gatewayChanged(kind.origin, zoneAt(r.cluster.zones, kind.zone), kind.to, kind.from);
       }
     }
+    if (Number.isNaN(wave)) return;
+    floorUntil = wave + floorMs;
+    if (time.kind === 'settled' || time.kind === 'per-wave' || time.kind === 'before-wave') time.lastWave = wave;
   }
 
-  /** Show a batch the engine just returned: in a held preset, a wave is held;
-   *  anything else is drawn, its beams leaving `delay` ms from now (flown at
-   *  once while paused), and its snapshot applied. */
-  async function meet(r: Run, batch: EventBatch, delay: number): Promise<void> {
+  /** Show a batch the engine returned, whole: its packets as lines, then its
+   *  snapshot, in one task, so every count changes in the frame its line
+   *  appears. */
+  async function meet(r: Run, batch: EventBatch): Promise<void> {
+    const snap = await r.sim.snapshot(r.selected, watchOf(r));
     note(r, batch);
-    if (r.preset.pacing === 'held' && isWave(batch)) return hold(r, batch, delay);
-    stage?.show(batch, delay, 'free');
-    if (!playing) stage?.finish('at-speed');
-    await refresh(r);
+    hops += waves(batch);
+    stage?.show(batch);
+    applySnapshot(r, snap);
   }
 
-  /** Hold `batch`'s wave: apply the snapshot, in which only the senders have
-   *  changed, then draw the wave and wait for the stage to report it landed;
-   *  while paused the wave flies all the same. Under Propagation's per-wave
-   *  run the wave waits, unflown, for Step, and time stands still with it. */
-  async function hold(r: Run, batch: EventBatch, delay: number): Promise<void> {
-    await refresh(r);
-    const { promise, resolve } = Promise.withResolvers<void>();
-    const h: Held = { seq: ++holds, batch, delay, landed: promise, land: resolve };
-    floorUntil = batch.virtual_ms + floorMs;
-    if (time.kind === 'per-wave') {
-      wave = { kind: 'waiting', held: h };
-      return;
-    }
-    await fly(h);
-  }
-
-  /** Draw held wave `h`'s beams; with no stage to draw on, deliver it at once. */
-  async function fly(h: Held): Promise<void> {
-    wave = { kind: 'flying', held: h };
-    const drawn = stage?.show(h.batch, h.delay, 'held') ?? false;
-    if (!playing) stage?.finish('at-speed');
-    if (!drawn) await deliver(h);
-  }
-
-  /** Deliver held wave `h`, unless something else already has: `step(0)`
-   *  closes the engine's sub-step at the same virtual instant, so the
-   *  receivers merge it, and their counts show; whatever awaits its landing
-   *  then goes on, a per-wave run to its next wave. */
-  async function deliver(h: Held): Promise<void> {
-    const r = run;
-    if (wave.kind === 'none' || wave.held !== h || r === null) return;
-    const batch = await r.sim.step(0);
-    note(r, batch);
-    stage?.show(batch, 0, 'free');
+  /** Deliver the wave the engine stopped before, whose batch is `held`:
+   *  `step(0)` closes its sub-step at the same instant, and its lines and the
+   *  receivers' counts show in one frame. */
+  async function deliverWave(r: Run, held: EventBatch): Promise<void> {
+    const delivered = await r.sim.step(0);
+    const snap = await r.sim.snapshot(r.selected, watchOf(r));
+    note(r, delivered);
     hops += 1;
+    stage?.show(held);
+    stage?.show(delivered);
+    applySnapshot(r, snap);
+  }
+
+  /** Stop Propagation's run before the wave `batch` holds: the engine keeps it
+   *  undelivered, the page shows the senders' state and none of its lines,
+   *  and Step draws it. */
+  async function stopBefore(r: Run, t: { readonly start: number; readonly lastWave: number }, batch: EventBatch): Promise<void> {
+    note(r, batch);
     await refresh(r);
-    wave = NO_WAVE;
-    h.land();
-    if (time.kind === 'settled' || time.kind === 'per-wave') time.lastLanding = r.cluster.virtual_ms;
-    settle(r);
+    setTime({ kind: 'before-wave', start: t.start, lastWave: t.lastWave, held: batch });
   }
 
-  /** The stage reports the held wave landed. */
-  function onLanded(): void {
-    const w = wave;
-    if (w.kind === 'none') return;
-    w.held.land();
-    void exec(() => deliver(w.held));
+  /** Deliver the wave Propagation's run stands before, if it does, and play
+   *  the run on to its next wave. Whether there was one. */
+  async function sendHeld(r: Run): Promise<boolean> {
+    const t = time;
+    if (t.kind !== 'before-wave') return false;
+    await deliverWave(r, t.held);
+    setTime({ kind: 'per-wave', start: t.start, lastWave: t.lastWave });
+    return true;
   }
 
-  /** Fly the held wave, if any, to its landing within a short wall time and
-   *  deliver it. */
-  async function flyFast(): Promise<void> {
-    const w = wave;
-    if (w.kind === 'none') return;
-    const h = w.held;
-    if (w.kind === 'waiting') await fly(h);
-    else wave = { kind: 'flying', held: h };
-    if (stage) {
-      stage.finish('fast');
-      await h.landed;
-    }
-    await deliver(h);
-  }
-
-  /** Fast-forward the run in flight before a command: land the held wave,
-   *  then run on to one emit floor past it, flying each wave due on the way
-   *  (the relays) the same way; each pushes the floor past itself. The run
-   *  then stands at least one floor past its last threshold round, the
-   *  instant gabion's floor (`runtime.rs` `want_immediate_flush`) lets the next
-   *  eager flush go, whatever the floor knob says. Whether a wave was held. */
-  async function land(r: Run): Promise<boolean> {
-    const held = wave.kind !== 'none';
-    await flyFast();
-    while (r.cluster.virtual_ms < floorUntil) {
-      await meet(r, await r.sim.step(floorUntil - r.cluster.virtual_ms, EVENT), 0);
-      await flyFast();
-    }
-    return held;
+  /** Run on to one emit floor past the last wave, drawing each wave due on
+   *  the way (the relays); each pushes the floor past itself. The run then
+   *  stands at least one floor past its last threshold round, the instant
+   *  gabion's floor (`runtime.rs` `want_immediate_flush`) lets the next eager
+   *  flush go, whatever the floor knob says. */
+  async function pastFloor(r: Run): Promise<void> {
+    while (r.cluster.virtual_ms < floorUntil) await meet(r, await r.sim.step(floorUntil - r.cluster.virtual_ms));
   }
 
   /** The node feed hit number `index` goes to, or null when none can take it. */
@@ -666,12 +603,12 @@
     return null;
   }
 
-  /** Inject the feed's owed one-hit requests at the current virtual time: in
-   *  a held preset, until one flushes a wave, which is held (true; the rest
-   *  stay owed); in the live one, each submit's eager flush is drawn. */
-  async function feed(r: Run): Promise<boolean> {
+  /** Inject the feed's owed one-hit requests at the current virtual time,
+   *  each drawn as its eager flush's lines; their counts show with the next
+   *  snapshot. */
+  async function feed(r: Run): Promise<void> {
     const traffic = r.preset.traffic;
-    if (traffic === undefined) return false;
+    if (traffic === undefined) return;
     const nodes = r.cluster.nodes;
     const owed = Math.floor((traffic.rate_per_sec * (r.cluster.virtual_ms - r.feedFrom)) / 1000) - r.trafficInjected;
     for (let i = 0; i < owed; i++) {
@@ -679,37 +616,34 @@
       r.trafficInjected += 1;
       if (node === null) continue;
       const batch = await r.sim.submitRequest(node, WATCHED_KEY, 1);
-      if (r.preset.pacing === 'live') {
-        stage?.show(batch, 0, 'free');
-      } else if (isWave(batch)) {
-        await hold(r, batch, 0);
-        return true;
-      }
+      note(r, batch);
+      stage?.show(batch);
     }
-    return false;
   }
 
-  /** One play-loop advance of `deltaMs` of virtual time. */
+  /** One play-loop advance of `deltaMs` of virtual time; Propagation's run
+   *  stops before a wave. */
   async function advance(r: Run, deltaMs: number): Promise<void> {
-    if (await feed(r)) return;
-    await meet(r, await r.sim.step(deltaMs, r.preset.pacing === 'live' ? 'Time' : EVENT), 0);
+    await feed(r);
+    const t = time;
+    const batch = await r.sim.step(deltaMs, t.kind === 'per-wave' ? EVENT : 'Time');
+    if (t.kind === 'per-wave' && waves(batch) > 0) await stopBefore(r, t, batch);
+    else await meet(r, batch);
     notePeriod(performance.now());
     settle(r);
   }
 
   /** The one stop rule: a command's run pauses itself once no node that
    *  waiting can reach is behind and one heartbeat period has passed since
-   *  the last landing, or at its cap. Its Send's admitted text goes with it. */
+   *  the last wave, or at its cap. Its Send's admitted text goes with it. */
   function settle(r: Run): void {
     const b = time;
-    if ((b.kind !== 'settled' && b.kind !== 'per-wave') || wave.kind !== 'none') return;
+    if (b.kind !== 'settled' && b.kind !== 'per-wave') return;
     const now = r.cluster.virtual_ms;
     const late = r.cluster.nodes.find((n) => n.lag.kind === 'Behind' && n.lag.missing_for_ms >= grace);
-    const ends = late === undefined && now >= b.lastLanding + tickMs;
+    const ends = late === undefined && now >= b.lastWave + tickMs;
     if (!ends && now < b.start + UNTIL_SETTLED_MAX_PERIODS * tickMs) return;
     setTime(ends ? PAUSED : CAPPED);
-    // The acknowledgements still in the air land rather than freeze.
-    stage?.finish('at-speed');
     for (const d of decisions.values()) if (d.admitted) decisions = new Map();
     if (ends) {
       const stranded = r.cluster.nodes.some((n) => n.lag.kind === 'Stranded');
@@ -734,19 +668,19 @@
   }
 
   /** Run `task` against the cluster as a command: the run kept for Undo goes,
-   *  the last Send's decision text clears, the run in flight fast-forwards
-   *  past its relays and the landed routes drop; then `task` shows its own
-   *  effect, told whether a wave was held when it was pressed. */
-  function command(task: (r: Run, landed: boolean) => Promise<void>): Promise<void> {
+   *  the last Send's decision text clears, a wave Propagation's run stood
+   *  before is sent first, and the run goes past gabion's emit floor; then
+   *  `task` shows its own effect, told whether a wave was sent first. */
+  function command(task: (r: Run, delivered: boolean) => Promise<void>): Promise<void> {
     commandError = null;
     dropPrevious();
     return exec(async (r) => {
-      const landed = await land(r);
-      stage?.clearTrail();
+      const delivered = await sendHeld(r);
+      await pastFloor(r);
       decisions = new Map();
       lastDecision = null;
       if (time.kind === 'capped') setTime(PAUSED);
-      await task(r, landed);
+      await task(r, delivered);
     });
   }
 
@@ -756,13 +690,13 @@
   function runOn(r: Run, mode: UntilSettled): void {
     if (time.kind === 'playing') return;
     const start = r.cluster.virtual_ms;
-    setTime({ kind: mode, start, lastLanding: start });
+    setTime({ kind: mode, start, lastWave: start });
   }
 
   /** Send a request of Hits per Send at the selected node, at the current
    *  virtual time. The node decides it in the frame of the press: a refusal
    *  plays in its vessel and runs no time; an admitted request's eager flush
-   *  stands `ARRIVAL_MS` before it flies, and is held. */
+   *  is drawn with its receivers' counts in the frame of the press. */
   const sendBurst = (): Promise<void> =>
     command(async (r) => {
       const node = r.selected;
@@ -785,7 +719,7 @@
         return;
       }
       r.requests.push(node, r.cluster.bucket_epoch_now);
-      const eager = isWave(batch);
+      const eager = waves(batch) > 0;
       hops = 0;
       dataSent = 0;
       dataCrossed = 0;
@@ -797,7 +731,7 @@
       told = eager ? say.admittedEager(node, hits, admission.total_before, limit) : say.admittedWaiting(node, hits, limit, r.config.target_err_bps);
       narration = told;
       runOn(r, r.story.kind === 'propagation' ? 'per-wave' : 'settled');
-      await meet(r, batch, ARRIVAL_MS);
+      await meet(r, batch);
     });
 
   /** The nodes whose admitted hits fill the window, for the rejection, when
@@ -809,24 +743,24 @@
   }
 
   /** Select node `id`, once a snapshot inspecting it has its rows. Changes no
-   *  count, so it lands nothing. */
+   *  count, so it delivers nothing. */
   const select = (id: number): Promise<void> =>
     exec(async (r) => {
       const snap = await r.sim.snapshot(id, watchOf(r));
       r.selected = id;
       inspected = snap.inspected ?? null;
       r.cluster = snap;
-      if (time.kind !== 'settled' && time.kind !== 'per-wave' && wave.kind === 'none') narration = idleOf(r);
+      if (time.kind === 'paused' || time.kind === 'playing' || time.kind === 'capped') narration = idleOf(r);
     });
 
-  /** Make fault `c` over the live nodes; made over a wave in flight, it
-   *  says the wave landed first. */
+  /** Make fault `c` over the live nodes; made while Propagation's run stood
+   *  before a wave, it says the wave was sent first. */
   const cut = (c: Parameters<Sim['cut']>[0]): Promise<void> =>
-    command(async (r, landed) => {
+    command(async (r, delivered) => {
       await r.sim.cut(c, r.cluster.nodes);
       r.cuts = r.sim.cuts();
       await refresh(r);
-      if (landed) narration = [...cutState(c, r.cluster.zones), ...say.ARRIVED_FIRST];
+      if (delivered) narration = [...cutState(c, r.cluster.zones), ...say.ARRIVED_FIRST];
     });
 
   /** Restore the scenario's own network, its loss included, then run time
@@ -866,8 +800,11 @@
       await refresh(r);
     });
 
-  /** Whether the play loop runs under `t`: it idles while a wave is held. */
-  const loops = (t: Time): boolean => t.kind !== 'paused' && t.kind !== 'capped';
+  /** Whether the play loop runs under `t`: playing, or a command's run that
+   *  is not stopped before a wave. */
+  function loops(t: Time): boolean {
+    return t.kind === 'playing' || t.kind === 'settled' || t.kind === 'per-wave';
+  }
 
   /** Set what time does, starting or stopping the play loop to match. */
   function setTime(t: Time): void {
@@ -877,62 +814,63 @@
       rafId = 0;
     } else if (rafId === 0) {
       lastWall = 0;
+      carry = 0;
       period = null;
       rafId = requestAnimationFrame(frame);
     }
   }
 
   /** The reader's Play: time runs freely, ending a bounded run or a stop at
-   *  its cap, and a frozen wave flies on. */
+   *  its cap; a wave Propagation's run stood before is sent first. */
   function play(): void {
     if (run === null || busy) return;
-    if (wave.kind === 'frozen') wave = { kind: 'flying', held: wave.held };
-    setTime(PLAYING);
+    if (time.kind !== 'before-wave') {
+      setTime(PLAYING);
+      return;
+    }
+    void exec(async (r) => {
+      await sendHeld(r);
+      setTime(PLAYING);
+    });
   }
 
-  /** The reader's Pause: time stops, a wave in flight freezes, and a bounded
-   *  run ends. */
+  /** The reader's Pause: time stops, and a bounded run ends. */
   function pause(): void {
     setTime(PAUSED);
-    if (wave.kind === 'flying') wave = { kind: 'frozen', held: wave.held };
   }
 
   function toggle(): void {
-    if (playing) {
-      pause();
-      return;
-    }
-    // A wave held for Step flies once Play runs the clock.
-    const w = wave;
-    if (w.kind === 'waiting') void exec(() => fly(w.held));
-    play();
+    if (playing) pause();
+    else play();
   }
 
-  /** Step to the next event, pausing first: fly the held wave, if any; else,
-   *  in a held preset, run to the next wave, which is held and flown, or to the
-   *  next instant hits leave the window, or one heartbeat period when neither
-   *  is coming; in the live one, one period. A per-wave run holding a wave
-   *  stays one: the wave lands and the run plays on to the next. */
+  /** Step to the next event and draw it: the wave Propagation's run stands
+   *  before, which it sends, the run playing on to its next; else, paused, the
+   *  next wave, drawn at once with its counts, or the next instant hits leave
+   *  the window, or one heartbeat period when neither is coming. */
   async function stepOnce(): Promise<void> {
     if (busy) return;
-    if (time.kind !== 'per-wave' || wave.kind === 'none') pause();
+    if (time.kind !== 'before-wave') pause();
     await exec(async (r) => {
-      const w = wave;
-      if (w.kind !== 'none') {
-        tellWave(r, w.held.batch);
-        if (w.kind === 'waiting') await fly(w.held);
-        else if (w.kind === 'frozen') wave = { kind: 'flying', held: w.held };
-        stage?.finish('at-speed');
+      const t = time;
+      if (t.kind === 'before-wave') {
+        tellWave(r, t.held);
+        await sendHeld(r);
         return;
       }
-      if (await feed(r)) return;
-      const live = r.preset.pacing === 'live';
+      await feed(r);
       const expiry = r.cluster.next_expiry_ms;
-      const delta = live || expiry === undefined ? tickMs : expiry - r.cluster.virtual_ms;
-      const batch = await r.sim.step(delta, live ? 'Time' : EVENT);
-      if (!isWave(batch) && expiry === undefined && r.cluster.oracle_total === 0) narration = say.NOTHING_WAITING;
-      await meet(r, batch, 0);
-      if (isWave(batch)) tellWave(r, batch);
+      const delta = expiry === undefined ? tickMs : expiry - r.cluster.virtual_ms;
+      const batch = await r.sim.step(delta, EVENT);
+      if (waves(batch) === 0) {
+        if (expiry === undefined && r.cluster.oracle_total === 0) narration = say.NOTHING_WAITING;
+        await meet(r, batch);
+        return;
+      }
+      // Stopped before the wave: draw it at once, with its counts.
+      note(r, batch);
+      tellWave(r, batch);
+      await deliverWave(r, batch);
     });
   }
 
@@ -1045,7 +983,6 @@
       cutZone,
       repair: heading?.repair ?? null,
       clock: time.kind,
-      flight: wave.kind,
       busy,
       hits: editingHits ? 'editing' : hitsValid ? 'valid' : 'invalid',
       lastDecision,
@@ -1198,9 +1135,14 @@
         <dt>zone</dt>
         <dd>An availability zone. A node's zone is whatever the node says it is.</dd>
         <dt>inside a zone</dt>
-        <dd>Delivery between nodes of one zone: a thin line that stays inside its ring.</dd>
+        <dd>Delivery between nodes of one zone: a thin arrow that stays inside its ring.</dd>
         <dt>across zones</dt>
         <dd>Delivery between zones: a thick arrow that crosses the empty centre.</dd>
+        <dt>packet</dt>
+        <dd>
+          A line from sender to receiver, drawn the instant it is sent and fading over one simulated second: Pause holds it, Speed
+          stretches it. Data ends in an arrow; an ack, probe, gap report or sweep request in a dot.
+        </dd>
         <dt>gateway</dt>
         <dd>
           <RoleGlyph kind="port" /> The member of a remote zone that the selected node sends its hits to. It relays them into its
@@ -1284,8 +1226,6 @@
           class="stage-pane"
           aria-label="Stage"
           aria-describedby="next-action"
-          data-held={wave.kind === 'none' ? 0 : wave.held.seq}
-          data-flight={wave.kind}
           data-clock={time.kind}
           data-playing={playing ? '1' : '0'}
         >
@@ -1335,10 +1275,7 @@
             previewId={namedId}
             {decisions}
             phone={width === 'narrow'}
-            running={playing}
             {speed}
-            {trail}
-            {onLanded}
             {hoveredId}
             {focusedId}
             {theme}
@@ -1418,7 +1355,6 @@
       sendValid={hitsValid}
       {primary}
       bounded={playing && (time.kind === 'settled' || time.kind === 'per-wave')}
-      inFlight={wave.kind === 'flying' || wave.kind === 'frozen'}
       onToggle={toggle}
       onStep={() => void stepOnce()}
       onSend={() => void sendBurst()}

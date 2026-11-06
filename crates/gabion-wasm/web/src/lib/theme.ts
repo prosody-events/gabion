@@ -72,17 +72,15 @@ export function fontsReady(): Promise<unknown> {
   return faces;
 }
 
-/** The peak alpha of every stage beam, delivered or dropped, and the REJECTING
+/** A line's peak alpha, at full ink, delivered or lost, and the REJECTING
  *  band's fill: the design audit composites each over its surface before
  *  checking contrast. */
 export const BEAM_ALPHA = 0.8;
 export const BAND_ALPHA = 0.15;
-/** The share of its alpha a beam keeps when a selection makes it context: the
- *  one named exemption from the graphics contrast rule. */
+/** The share of its alpha a line keeps when a selection makes it context: a
+ *  named exemption from the graphics contrast rule. The age fade, also exempt
+ *  by name, takes a line below it only as it leaves. */
 export const FADED_ALPHA = 0.25;
-/** A landed route's alpha, drawn 1 px with no head: history, not the event in
- *  focus. Exempt by name from the graphics contrast rule, as `FADED_ALPHA` is. */
-export const LANDED_ALPHA = 0.15;
 
 /** Call `onChange` when the OS colour scheme or `<html data-theme>` changes;
  *  returns the unsubscribe. */
