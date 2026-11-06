@@ -7,8 +7,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::num::NonZeroU16;
+use std::num::{NonZeroU16, NonZeroU64};
 
+use gabion::crdt::KeyHash;
 use gabion::defaults;
 use gabion::gossip::{AnswerState, Role};
 use gabion::settings::SettingError;
@@ -30,10 +31,15 @@ mod window;
 
 const WATCHED_KEY: u128 = 0x1;
 /// The snapshot's watch: the watched key, decided for one hit.
-const WATCH: Watch = Watch {
-    key: WATCHED_KEY,
-    probe_hits: 1,
-};
+const WATCH: Watch = watch(1);
+
+/// `n` hits, which must be at least one.
+const fn hits(n: u64) -> NonZeroU64 {
+    match NonZeroU64::new(n) {
+        Some(hits) => hits,
+        None => panic!("a request carries at least one hit"),
+    }
+}
 
 /// The heartbeat interval of [`test_config`].
 const T: u64 = 100;
@@ -100,12 +106,12 @@ async fn step(tx: &mpsc::Sender<Command>, delta_ms: u64) -> EventBatch {
     rx.await.unwrap()
 }
 
-async fn submit(tx: &mpsc::Sender<Command>, node: u32, key: u128, hits: u64) -> EventBatch {
+async fn submit(tx: &mpsc::Sender<Command>, node: u32, key: u128, n: u64) -> EventBatch {
     let (reply, rx) = oneshot::channel();
     tx.send(Command::SubmitRequest {
         node,
-        key,
-        hits,
+        key: KeyHash(key),
+        hits: hits(n),
         reply,
     })
     .await
@@ -271,7 +277,7 @@ fn error_budget_and_gateway_counters_surface_in_snapshot() {
         ..zoned(12, 3)
     };
     with_state(config, |mut state| async move {
-        state.submit_request(0, 0, 7).await.unwrap();
+        state.submit_request(0, KeyHash(0), hits(7)).await.unwrap();
         let origin = state.snapshot(None, WATCH).await.nodes.swap_remove(0);
         assert_eq!(origin.id, 0);
         assert!(
@@ -282,7 +288,7 @@ fn error_budget_and_gateway_counters_surface_in_snapshot() {
         warm(&mut state).await;
         let g = gateway_of(&state, 0, 1).await;
         silence(&mut state, g).await;
-        state.submit_request(0, 0, 1).await.unwrap();
+        state.submit_request(0, KeyHash(0), hits(1)).await.unwrap();
         state.step(T_U / 2 + T, StepUntil::Time).await;
 
         // Checkpoint A, the peer mirror: the rows the page shows are the rows
@@ -760,7 +766,7 @@ fn one_heartbeat_reaches_the_zone_and_one_gateway_per_remote_zone() {
 
     with_state(zoned(12, 3), |mut state| async move {
         warm(&mut state).await;
-        state.submit_request(0, WATCHED_KEY, 5).await.unwrap();
+        send(&mut state, 0, 5).await;
         assert_eq!(
             known(&state.snapshot(None, WATCH).await),
             [0],
@@ -802,6 +808,24 @@ where
     });
 }
 
+/// [`with_state`] for a `body` that also returns a value, and that value.
+fn run_with_state<T, F, Fut>(config: SimConfig, body: F) -> T
+where
+    F: FnOnce(EngineState) -> Fut,
+    Fut: Future<Output = (EngineState, T)>,
+{
+    let mut out = None;
+    with_state(config, |state| {
+        let out = &mut out;
+        async move {
+            let (state, value) = body(state).await;
+            *out = Some(value);
+            state
+        }
+    });
+    out.expect("the run finished")
+}
+
 /// `test_config` with its nodes placed in `zones` zones.
 fn zoned(nodes: usize, zones: usize) -> SimConfig {
     SimConfig {
@@ -841,10 +865,10 @@ fn propagation() -> SimConfig {
 
 /// A snapshot watch of the watched key, deciding `probe_hits` for the
 /// inspected node.
-fn watch(probe_hits: u64) -> Watch {
+const fn watch(probe_hits: u64) -> Watch {
     Watch {
-        key: WATCHED_KEY,
-        probe_hits,
+        key: KeyHash(WATCHED_KEY),
+        probe_hits: hits(probe_hits),
     }
 }
 
@@ -867,6 +891,12 @@ async fn settle(state: &mut EngineState) -> Vec<Event> {
         }
     }
     panic!("the cluster did not go quiet within 40 periods");
+}
+
+/// Warm and settle `state`.
+async fn ready(state: &mut EngineState) {
+    warm(state).await;
+    settle(state).await;
 }
 
 /// The nodes whose count of a cell was created or raised in `events`.
@@ -893,12 +923,13 @@ fn decisions(events: &[Event]) -> Vec<(u32, Admission)> {
         .collect()
 }
 
-/// Submit `hits` at `node`, which must be a live node, and return the batch.
-async fn send(state: &mut EngineState, node: u32, hits: u64) -> EventBatch {
+/// Submit `n` hits of the watched key at `node`, which must be a live node,
+/// and return the batch.
+async fn send(state: &mut EngineState, node: u32, n: u64) -> EventBatch {
     state
-        .submit_request(node, WATCHED_KEY, hits)
+        .submit_request(node, KeyHash(WATCHED_KEY), hits(n))
         .await
-        .expect("a live node and at least one hit")
+        .expect("a live node")
 }
 
 /// The ids of the live nodes placed in `zone`.
@@ -911,23 +942,28 @@ fn members(state: &EngineState, zone: u8) -> Vec<u32> {
         .collect()
 }
 
+/// Block the links between live nodes `a` and `b`, both ways.
+async fn block_both(state: &mut EngineState, a: u32, b: u32) {
+    for (src, dst) in [(a, b), (b, a)] {
+        state
+            .set_link_policy(src, dst, LinkPolicyKind::Block)
+            .await
+            .unwrap();
+    }
+}
+
 /// Block every link between zone `zone` and the rest, both ways.
 async fn cut_zone(state: &mut EngineState, zone: u8) {
-    let (inside, outside): (Vec<_>, Vec<_>) = state
+    let inside = members(state, zone);
+    let outside: Vec<u32> = state
         .nodes
         .iter()
-        .map(|n| (n.id, n.zone))
-        .partition(|&(_, z)| z == zone);
-    for &(a, _) in &inside {
-        for &(b, _) in &outside {
-            state
-                .set_link_policy(a, b, LinkPolicyKind::Block)
-                .await
-                .unwrap();
-            state
-                .set_link_policy(b, a, LinkPolicyKind::Block)
-                .await
-                .unwrap();
+        .filter(|n| n.zone != zone)
+        .map(|n| n.id)
+        .collect();
+    for &a in &inside {
+        for &b in &outside {
+            block_both(state, a, b).await;
         }
     }
 }
@@ -974,14 +1010,7 @@ async fn inspected(state: &EngineState, id: u32) -> Inspected {
 async fn silence(state: &mut EngineState, g: u32) {
     let ids: Vec<u32> = state.nodes.iter().map(|n| n.id).collect();
     for x in ids.into_iter().filter(|&x| x != g) {
-        state
-            .set_link_policy(g, x, LinkPolicyKind::Block)
-            .await
-            .unwrap();
-        state
-            .set_link_policy(x, g, LinkPolicyKind::Block)
-            .await
-            .unwrap();
+        block_both(state, g, x).await;
     }
 }
 
@@ -1127,7 +1156,7 @@ fn gateway_for_counts_the_origins_routing_through_each_node() {
 fn zones_come_from_config_not_address() {
     with_state(zoned(12, 3), |mut state| async move {
         warm(&mut state).await;
-        state.submit_request(0, WATCHED_KEY, 5).await.unwrap();
+        send(&mut state, 0, 5).await;
         let events = state.step(T, StepUntil::Time).await.events;
         let snap = state.snapshot(None, WATCH).await;
 
@@ -1165,7 +1194,7 @@ fn relay_follows_one_prompt_interval_after_the_gateway_hears() {
     with_state(zoned(12, 3), |mut state| async move {
         warm(&mut state).await;
         let g = gateway_of(&state, 0, 1).await;
-        state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
+        send(&mut state, 0, 1).await;
         let events = state.step(2 * T, StepUntil::Time).await.events;
 
         let t_send = sent(&events, 0, PacketKind::Own)
@@ -1203,7 +1232,7 @@ fn silent_gateway_fails_over_within_suspect_after() {
         let g = gateway_of(&state, 0, 1).await;
         let t_s = state.virtual_ms;
         silence(&mut state, g).await;
-        state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
+        send(&mut state, 0, 1).await;
         let mut events = Vec::new();
         while state.virtual_ms < t_s + T_U + 3 * T + 2 * F_R + T {
             events.extend(state.step(T, StepUntil::Time).await.events);
@@ -1237,13 +1266,7 @@ fn one_way_cut_is_repaired_by_the_backstop() {
     with_state(zoned(12, 3), |mut state| async move {
         warm(&mut state).await;
         let g = gateway_of(&state, 0, 1).await;
-        let members: Vec<u32> = state
-            .nodes
-            .iter()
-            .filter(|n| n.zone == 1 && n.id != g)
-            .map(|n| n.id)
-            .collect();
-        for &m in &members {
+        for m in members(&state, 1).into_iter().filter(|&m| m != g) {
             state
                 .set_link_policy(g, m, LinkPolicyKind::Block)
                 .await
@@ -1255,7 +1278,7 @@ fn one_way_cut_is_repaired_by_the_backstop() {
         let mut failed_over = false;
         while state.virtual_ms < deadline {
             if !failed_over {
-                state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
+                send(&mut state, 0, 1).await;
             }
             let events = state
                 .step(T.min(deadline - state.virtual_ms), StepUntil::Time)
@@ -1300,44 +1323,9 @@ fn zone_partition_heals_to_exact_counts() {
         let mut all = warm(&mut state).await;
         let lone = state.snapshot(None, WATCH).await.zones[2].live;
         assert_eq!(lone, 1, "zone c's gateway has no replacement");
-        let cut: Vec<u32> = state
-            .nodes
-            .iter()
-            .filter(|n| n.zone == 2)
-            .map(|n| n.id)
-            .collect();
-        let rest: Vec<u32> = state
-            .nodes
-            .iter()
-            .filter(|n| n.zone != 2)
-            .map(|n| n.id)
-            .collect();
-        for &a in &cut {
-            for &b in &rest {
-                state
-                    .set_link_policy(a, b, LinkPolicyKind::Block)
-                    .await
-                    .unwrap();
-                state
-                    .set_link_policy(b, a, LinkPolicyKind::Block)
-                    .await
-                    .unwrap();
-            }
-        }
-        all.extend(
-            state
-                .submit_request(0, WATCHED_KEY, 3)
-                .await
-                .unwrap()
-                .events,
-        );
-        all.extend(
-            state
-                .submit_request(2, WATCHED_KEY, 4)
-                .await
-                .unwrap()
-                .events,
-        );
+        cut_zone(&mut state, 2).await;
+        all.extend(send(&mut state, 0, 3).await.events);
+        all.extend(send(&mut state, 2, 4).await.events);
         all.extend(state.step(3_000, StepUntil::Time).await.events);
         for node in &state.snapshot(None, WATCH).await.nodes {
             let side = if node.zone == 2 { 4 } else { 3 };
@@ -1405,13 +1393,7 @@ fn unset_zone_mode_runs_as_one_zone() {
     with_state(config, |mut state| async move {
         let mut all = warm(&mut state).await;
         for node in 0..12 {
-            all.extend(
-                state
-                    .submit_request(node, WATCHED_KEY, 1)
-                    .await
-                    .unwrap()
-                    .events,
-            );
+            all.extend(send(&mut state, node, 1).await.events);
         }
         let events = state.step(T, StepUntil::Time).await.events;
         all.extend(events.iter().cloned());
@@ -1450,7 +1432,7 @@ fn gateway_events_fetch_snapshots_only_on_role_change() {
         state.gateway_fetches = 0;
         let substeps = state.substeps;
         for _ in 0..10 {
-            state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
+            send(&mut state, 0, 1).await;
             state.step(T, StepUntil::Time).await;
         }
         assert_eq!(
@@ -1461,7 +1443,7 @@ fn gateway_events_fetch_snapshots_only_on_role_change() {
 
         let g = gateway_of(&state, 0, 1).await;
         silence(&mut state, g).await;
-        state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
+        send(&mut state, 0, 1).await;
         let t_s = state.virtual_ms;
         let mut events = Vec::new();
         while failover(&events, 0, 1, g).is_none() {
@@ -1567,7 +1549,7 @@ fn last_member_leaving_a_zone_reports_its_gateway_gone() {
         // its roles and diffs it again.
         let g = gateway_of(&state, 0, 1).await;
         silence(&mut state, g).await;
-        state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
+        send(&mut state, 0, 1).await;
         let later = state
             .step(T_U + 3 * T + 2 * F_R + T, StepUntil::Time)
             .await
@@ -1589,7 +1571,7 @@ fn last_member_leaving_a_zone_reports_its_gateway_gone() {
 #[test]
 fn quiet_cluster_takes_one_substep_per_phase() {
     with_state(test_config(12), |mut state| async move {
-        state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
+        send(&mut state, 0, 1).await;
         state.step(500, StepUntil::Time).await;
         assert!(
             state.substeps > 5,
@@ -1623,7 +1605,7 @@ fn full_round_at_max_nodes_drops_nothing_under_pass() {
         for &node in &ids {
             for key in 0..34 {
                 state
-                    .submit_request(node, u128::from(node) << 8 | key, 1)
+                    .submit_request(node, KeyHash(u128::from(node) << 8 | key), hits(1))
                     .await
                     .unwrap();
             }
@@ -1926,14 +1908,7 @@ fn second_burst_after_expiry_still_ages_out() {
 #[test]
 fn a_departed_gateway_is_reported_gone_while_its_zone_lives_on() {
     with_state(zoned(4, 2), |mut state| async move {
-        state
-            .set_link_policy(0, 3, LinkPolicyKind::Block)
-            .await
-            .unwrap();
-        state
-            .set_link_policy(3, 0, LinkPolicyKind::Block)
-            .await
-            .unwrap();
+        block_both(&mut state, 0, 3).await;
         warm(&mut state).await;
         assert_eq!(gateway_of(&state, 0, 1).await, 1);
         let mut users = Vec::new();
@@ -1957,7 +1932,7 @@ fn a_departed_gateway_is_reported_gone_while_its_zone_lives_on() {
 #[test]
 fn snapshot_carries_only_the_inspected_nodes_rows() {
     with_state(zoned(6, 3), |mut state| async move {
-        state.submit_request(4, WATCHED_KEY, 3).await.unwrap();
+        send(&mut state, 4, 3).await;
         warm(&mut state).await;
         let snap = state.snapshot(Some(4), WATCH).await;
         let rows = snap.inspected.expect("node 4 is live");

@@ -1,6 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 import { missingFor, type AnswerState, type ClusterState } from '../src/lib/sim/types';
-import { WATCH, step, stepUntil } from './drive';
+import { WATCH, stepUntil } from './drive';
 
 const SEED_TOTAL = '50';
 const NODES = 12;
@@ -271,7 +271,10 @@ test('Sandbox: inject, Step it out to convergence, then age out to quiet', async
   // heartbeats every node agrees on the injected total.
   await stepUntil(
     page,
-    async () => (await page.locator(COUNTS).allTextContents()).every((t) => t.trim() === BURST_HITS),
+    async () => {
+      const texts = await page.locator(COUNTS).allTextContents();
+      return texts.length === NODES && texts.every((t) => t.trim() === BURST_HITS);
+    },
     12,
     'the cell gossiped out to every node under Step',
   );
@@ -880,11 +883,15 @@ test('gateway failure fails over and the zone catches up', async ({ page }) => {
     expect(text.endsWith(` · ${label}`), `a ${answer} gateway's word in "${text}"`).toBe(true);
     answers.add(answer);
   };
-  await checkRow();
-  for (let i = 0; i < 12 && !(await moved()); i++) {
-    await step(page);
-    await checkRow();
-  }
+  await stepUntil(
+    page,
+    async () => {
+      await checkRow();
+      return moved();
+    },
+    12,
+    'node 0 left its gateway into zone b',
+  );
   expect([...answers].sort(), 'the zone b row was checked settled, then owed').toEqual(['owed', 'settled']);
   const [, origin, to, from] = (await sentence()) ?? [];
   expect(Number(from), `the annotation names g = ${g} as the gateway it left`).toBe(g);

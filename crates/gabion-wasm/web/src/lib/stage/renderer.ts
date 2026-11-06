@@ -93,18 +93,12 @@ const RELAY = 4;
 const DROPPED = 8;
 
 /** Each packet kind's flags: a kind that carries no cells is a dot, and a
- *  relay is the origin's own when its gateway sends it. Built from
- *  `CARRIES_CELLS`, the mirror of `PacketKind::carries_cells`, and exhaustive,
- *  so a new kind is a type error until it is classed. */
+ *  relay is the origin's own when its gateway sends it. Read from
+ *  `CARRIES_CELLS`, the mirror of `PacketKind::carries_cells`, and exhaustive
+ *  through `CARRIES_CELLS`, so a new kind is a type error until it is
+ *  classed. */
 const kindFlags = (kind: PacketKind): number =>
   (CARRIES_CELLS[kind] ? 0 : CONTROL) | (kind === 'Relay' ? RELAY : 0);
-const KIND_FLAGS: Record<PacketKind, number> = {
-  Ack: kindFlags('Ack'),
-  SweepRequest: kindFlags('SweepRequest'),
-  Own: kindFlags('Own'),
-  Relay: kindFlags('Relay'),
-  Sweep: kindFlags('Sweep'),
-};
 
 // Beam mark styles; each has a full and a faded Graphics (`style * 2 + faded`).
 const IN_ZONE = 0;
@@ -404,7 +398,7 @@ export class StageRenderer {
     for (const event of events) {
       const kind = event.kind;
       if (kind.type === 'PacketSent' || kind.type === 'PacketDropped') {
-        let flags = KIND_FLAGS[kind.kind] | (kind.tier === 'CrossZone' ? CROSS : 0);
+        let flags = kindFlags(kind.kind) | (kind.tier === 'CrossZone' ? CROSS : 0);
         if (kind.type === 'PacketDropped') flags |= DROPPED;
         this.#beam(kind.src, kind.dst, flags);
       }

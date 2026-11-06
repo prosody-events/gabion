@@ -30,9 +30,9 @@
 // story. A single burst that approaches the limit can't: to keep each node's
 // local delta under ε while twelve nodes' sum exceeds the limit you'd need
 // L/N < ε = L·bps/(10⁴·N), i.e. bps > 10⁴, an absurd error budget. So overload
-// feeds the cluster fast against a low limit, so the windowed aggregate plateaus
-// well inside the REJECTING band (≈ `rate · window` ≈ 2× the limit). There,
-// eager threshold flushing is the healthy behavior on display — every node's
+// feeds the cluster fast against a low limit: it offers ≈ `rate · window` ≈ 800
+// hits a window, twice the 400 limit; each node admits what expiry frees and
+// rejects the rest. There, eager threshold flushing is the healthy behavior on display — every node's
 // view tracks the aggregate tightly — and `showsLimitChart` surfaces the
 // Aggregate-vs-Limit panel. The `sandbox` preset is the complement: *no* feed at
 // all, a blank cluster the user drives by hand (inject + Step) to watch one cell
@@ -79,9 +79,9 @@ const NARRATIVE_LIMIT = 1_000_000;
  *  windowed oracle plateaus at roughly `rate · window_seconds` ≈ 30 hits. */
 const BACKGROUND_RATE_PER_SEC = 3;
 
-/** The `overload` preset's feed (hits/sec). Uncapped against the low overload
- *  limit, so the windowed aggregate plateaus at ≈ `rate · window_seconds` ≈ 800
- *  — twice the 400 limit, well inside the REJECTING band, and perpetually so. */
+/** The `overload` preset's feed (hits/sec). It offers ≈ `rate · window` ≈ 800
+ *  hits a window, twice the 400 limit; each node admits what expiry frees and
+ *  rejects the rest. */
 const OVERLOAD_RATE_PER_SEC = 80;
 
 /** The most heartbeats the gateway presets wait for the origin to find its

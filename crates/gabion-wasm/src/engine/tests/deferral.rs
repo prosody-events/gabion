@@ -32,8 +32,7 @@ fn destinations(packets: &[(u32, u32, Tier, u64)]) -> BTreeSet<u32> {
 #[test]
 fn a_send_is_held_until_the_next_engine_call() {
     with_state(rate_limiting(), |mut state| async move {
-        warm(&mut state).await;
-        settle(&mut state).await;
+        ready(&mut state).await;
         let at = state.virtual_ms;
         let submitted = send(&mut state, 0, 25).await;
         assert!(matches!(
@@ -111,29 +110,23 @@ impl HeldCommand {
 }
 
 /// Every command closes an open sub-step first: running it while node 0's
-/// send is held gives the events and the snapshot of running it after
-/// `step(0)` delivered the send.
+/// send is held gives the snapshot right after it, and the events, of running
+/// it after `step(0)` delivered the send.
 #[test]
 fn every_command_closes_an_open_sub_step_first() {
     fn run(command: HeldCommand, close_first: bool) -> Run {
-        let mut out = None;
-        with_state(rate_limiting(), |mut state| {
-            let out = &mut out;
-            async move {
-                warm(&mut state).await;
-                settle(&mut state).await;
-                let mut events = send(&mut state, 0, 25).await.events;
-                if close_first {
-                    events.extend(state.step(0, StepUntil::Time).await.events);
-                }
-                events.extend(command.run(&mut state).await);
+        run_with_state(rate_limiting(), |mut state| async move {
+            ready(&mut state).await;
+            let mut events = send(&mut state, 0, 25).await.events;
+            if close_first {
                 events.extend(state.step(0, StepUntil::Time).await.events);
-                let snap = state.snapshot(Some(0), WATCH).await;
-                *out = Some((events, serde_json::to_value(&snap).unwrap()));
-                state
             }
-        });
-        out.expect("the run finished")
+            events.extend(command.run(&mut state).await);
+            let snap = state.snapshot(Some(0), WATCH).await;
+            events.extend(state.step(0, StepUntil::Time).await.events);
+            let run = (events, serde_json::to_value(&snap).unwrap());
+            (state, run)
+        })
     }
     for command in [
         HeldCommand::Submit,
@@ -152,29 +145,23 @@ fn every_command_closes_an_open_sub_step_first() {
 /// The script of the equivalence test: two sends, 700 ms apart, and time to
 /// 12 s after the first, past its window, stepped by `until`.
 fn stepped(until: StepUntil) -> Run {
-    let mut out = None;
-    with_state(rate_limiting(), |mut state| {
-        let out = &mut out;
-        async move {
-            warm(&mut state).await;
-            settle(&mut state).await;
-            let t0 = state.virtual_ms;
-            let mut events = Vec::new();
-            for (node, to) in [(0, t0 + 700), (1, t0 + 12_000)] {
-                events.extend(send(&mut state, node, 25).await.events);
-                while state.virtual_ms < to {
-                    let delta = to - state.virtual_ms;
-                    events.extend(state.step(delta, until).await.events);
-                }
-                // A wave at `to` itself is still held: deliver it.
-                events.extend(state.step(0, StepUntil::Time).await.events);
+    run_with_state(rate_limiting(), |mut state| async move {
+        ready(&mut state).await;
+        let t0 = state.virtual_ms;
+        let mut events = Vec::new();
+        for (node, to) in [(0, t0 + 700), (1, t0 + 12_000)] {
+            events.extend(send(&mut state, node, 25).await.events);
+            while state.virtual_ms < to {
+                let delta = to - state.virtual_ms;
+                events.extend(state.step(delta, until).await.events);
             }
-            let snap = state.snapshot(Some(1), WATCH).await;
-            *out = Some((events, serde_json::to_value(&snap).unwrap()));
-            state
+            // A wave at `to` itself is still held: deliver it.
+            events.extend(state.step(0, StepUntil::Time).await.events);
         }
-    });
-    out.expect("the run finished")
+        let snap = state.snapshot(Some(1), WATCH).await;
+        let run = (events, serde_json::to_value(&snap).unwrap());
+        (state, run)
+    })
 }
 
 /// Stepping by event to an instant, call after call, gives exactly the
@@ -201,8 +188,7 @@ fn event_stops_at_each_wave_and_at_the_window_edge() {
         ..propagation()
     };
     with_state(config, |mut state| async move {
-        warm(&mut state).await;
-        settle(&mut state).await;
+        ready(&mut state).await;
         let t0 = state.virtual_ms;
         send(&mut state, 0, 25).await;
 

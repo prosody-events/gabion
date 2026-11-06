@@ -31,8 +31,8 @@ pub struct Event {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "type")]
 pub enum EventKind {
-    /// `node` decided a request of `hits` against its own count table: the
-    /// first event of every request's batch.
+    /// `node` decided a request of `hits` against its own count table. Find
+    /// it by kind: a batch may open with an earlier wave's packets landing.
     Decided {
         node: u32,
         hits: u64,
@@ -55,10 +55,10 @@ pub enum EventKind {
     },
     /// `dst` consumed a packet from `src`.
     PacketDelivered { src: u32, dst: u32, bytes: u32 },
-    /// `src`'s packet to `dst` was lost on the link (or `dst` had no
-    /// receiver). Distinct from [`EventKind::PacketSent`]: a dropped packet
-    /// never produces a matching delivery. `kind` and `tier` are as for
-    /// [`EventKind::PacketSent`].
+    /// `src`'s packet to `dst` was lost on the link, refused by a full router
+    /// queue, or `dst` had no receiver. Distinct from
+    /// [`EventKind::PacketSent`]: a dropped packet never produces a matching
+    /// delivery. `kind` and `tier` are as for [`EventKind::PacketSent`].
     PacketDropped {
         src: u32,
         dst: u32,
@@ -159,22 +159,22 @@ impl Tier {
 
 /// The events one engine command produced, plus the virtual time the engine
 /// reached. A command that returns no batch leaves its events for the next.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EventBatch {
     pub events: Vec<Event>,
     /// Virtual time after this batch, in milliseconds.
     pub virtual_ms: u64,
 }
 
-/// A node's decision on a request, made whole by its weight against the
+/// A node's decision on a request, admitted or rejected whole, against the
 /// node's own window, as gabion's adapters decide.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind")]
 pub enum Admission {
-    /// Counted: the window held `total_before`, and the request fits under
+    /// Recorded: the window held `total_before`, and the request fits under
     /// the limit on top of it.
     Admitted { total_before: u64 },
-    /// Refused whole, counted nowhere: the window holds `total`, and the
+    /// Refused whole and never recorded: the window holds `total`, and the
     /// request would pass the limit.
     Rejected { total: u64, reopens: Reopens },
 }
@@ -212,7 +212,7 @@ pub enum Lag {
 /// Per-node cluster state, pulled every frame. Only the inspected node's cells
 /// and peer rows are included, so the frame costs one row per node rather than
 /// one per node pair.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ClusterState {
     pub virtual_ms: u64,
     pub nodes: Vec<NodeState>,
@@ -327,7 +327,8 @@ pub struct NodeState {
     /// table: the number its admission reads.
     pub window_total: u64,
     /// The decision a one-hit request would get here now: `Rejected` exactly
-    /// while the node is at its limit.
+    /// while the node's window has reached its limit (`window_total >=
+    /// limit`).
     pub brim: Admission,
     /// Whether the node holds every in-window change, and if not, whether
     /// waiting can help.

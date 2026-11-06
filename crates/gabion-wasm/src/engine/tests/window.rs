@@ -18,8 +18,7 @@ fn window_total_drops_a_bucket_at_its_fall_off() {
         ..rate_limiting()
     };
     with_state(config, |mut state| async move {
-        warm(&mut state).await;
-        settle(&mut state).await;
+        ready(&mut state).await;
         let t0 = state.virtual_ms;
         send(&mut state, 0, 25).await;
         let fall_off = (t0 / 1_000 + 10) * 1_000;
@@ -27,7 +26,13 @@ fn window_total_drops_a_bucket_at_its_fall_off() {
         while state.virtual_ms + 100 < fall_off {
             state.step(100, StepUntil::Time).await;
             let snap = state.snapshot(None, WATCH).await;
-            assert_eq!(views(&snap), [25; 12], "at {}", snap.virtual_ms);
+            let at = snap.virtual_ms;
+            assert_eq!(views(&snap), [25; 12], "at {at}");
+            // Oldest first: the send's bucket moves one slot left each second.
+            let age = (at / 1_000 - t0 / 1_000) as usize;
+            let buckets = &snap.oracle_buckets;
+            assert_eq!(buckets[buckets.len() - 1 - age], 25, "at {at}: {buckets:?}");
+            assert_eq!(buckets.iter().sum::<u64>(), 25, "at {at}: {buckets:?}");
         }
         state
             .step(fall_off - 1 - state.virtual_ms, StepUntil::Time)
@@ -48,8 +53,7 @@ fn window_total_drops_a_bucket_at_its_fall_off() {
 #[test]
 fn views_equal_the_windowed_truth_across_an_expiry() {
     with_state(rate_limiting(), |mut state| async move {
-        warm(&mut state).await;
-        settle(&mut state).await;
+        ready(&mut state).await;
         let fall_off = (state.virtual_ms / 1_000 + 10) * 1_000;
         for node in [0, 1, 2, 2] {
             send(&mut state, node, 25).await;
@@ -64,12 +68,15 @@ fn views_equal_the_windowed_truth_across_an_expiry() {
             let snap = state.snapshot(None, WATCH).await;
             let at = snap.virtual_ms;
             assert_eq!(snap.oracle_buckets.iter().sum::<u64>(), snap.oracle_total);
-            for node in &snap.nodes {
+            let rows = snap.window_buckets.chunks_exact(snap.oracle_buckets.len());
+            assert_eq!(rows.len(), snap.nodes.len());
+            for (node, row) in snap.nodes.iter().zip(rows) {
                 assert_eq!(
                     node.window_total, snap.oracle_total,
                     "node {} at {at}",
                     node.id
                 );
+                assert_eq!(row, snap.oracle_buckets, "node {} at {at}", node.id);
                 assert_eq!(node.lag, Lag::CaughtUp, "node {} at {at}", node.id);
             }
             dropped |= snap.oracle_total < 100;
@@ -115,6 +122,21 @@ async fn step_until(
     panic!("not within {periods} periods");
 }
 
+/// Zone c cut off: a send at node 0 leaves zone c stranded while the rest
+/// catch up.
+async fn zone_c_stays_stranded(state: &mut EngineState) {
+    send(state, 0, 25).await;
+    let zone_c_stranded = |snap: &ClusterState| {
+        assert!(lags(snap, 2, None).into_iter().all(stranded), "{snap:?}");
+    };
+    step_until(state, 4, zone_c_stranded, |snap| {
+        [0, 1]
+            .iter()
+            .all(|&z| lags(snap, z, None).iter().all(|l| *l == Lag::CaughtUp))
+    })
+    .await;
+}
+
 /// A node that lacks a change is behind when some holder still reaches it
 /// over links that do not block, and stranded otherwise: under a zone cut,
 /// a silenced gateway, a one-way cut, partial loss, a removal that shifts
@@ -123,27 +145,16 @@ async fn step_until(
 fn lag_tells_behind_from_stranded() {
     // (a) Zone c cut off: zone c is stranded, the rest catch up.
     with_state(propagation(), |mut state| async move {
-        warm(&mut state).await;
-        settle(&mut state).await;
+        ready(&mut state).await;
         cut_zone(&mut state, 2).await;
-        send(&mut state, 0, 25).await;
-        let zone_c_stranded = |snap: &ClusterState| {
-            assert!(lags(snap, 2, None).into_iter().all(stranded), "{snap:?}");
-        };
-        step_until(&mut state, 4, zone_c_stranded, |snap| {
-            [0, 1]
-                .iter()
-                .all(|&z| lags(snap, z, None).iter().all(|l| *l == Lag::CaughtUp))
-        })
-        .await;
+        zone_c_stays_stranded(&mut state).await;
         state
     });
 
     // (b) The gateway into zone b silenced: zone b is behind until node 0
     // fails over, the gateway stranded throughout.
     with_state(propagation(), |mut state| async move {
-        warm(&mut state).await;
-        settle(&mut state).await;
+        ready(&mut state).await;
         let g = gateway_of(&state, 0, 1).await;
         silence(&mut state, g).await;
         send(&mut state, 0, 25).await;
@@ -172,8 +183,7 @@ fn lag_tells_behind_from_stranded() {
     // (c) The gateway cut from its zone peers, one way: they are behind, it
     // is caught up.
     with_state(propagation(), |mut state| async move {
-        warm(&mut state).await;
-        settle(&mut state).await;
+        ready(&mut state).await;
         let g = gateway_of(&state, 0, 1).await;
         for m in members(&state, 1).into_iter().filter(|&m| m != g) {
             state
@@ -193,40 +203,32 @@ fn lag_tells_behind_from_stranded() {
         state
     });
 
-    // (d) Loss of 0.3 never strands anyone: waiting helps.
+    // (d) Loss of 0.3 never strands anyone, and waiting helps: every node
+    // catches up.
     let lossy = SimConfig {
         uniform_loss: 0.3,
         ..propagation()
     };
     with_state(lossy, |mut state| async move {
-        warm(&mut state).await;
-        settle(&mut state).await;
+        ready(&mut state).await;
         send(&mut state, 0, 25).await;
-        for _ in 0..80 {
-            state.step(25, StepUntil::Time).await;
-            let snap = state.snapshot(None, WATCH).await;
+        let no_one_stranded = |snap: &ClusterState| {
             assert!(!snap.nodes.iter().any(|n| stranded(n.lag)), "{snap:?}");
-        }
+        };
+        step_until(&mut state, 16, no_one_stranded, |snap| {
+            snap.nodes.iter().all(|n| n.lag == Lag::CaughtUp)
+        })
+        .await;
         state
     });
 
     // (e) Zone c cut, then a zone-b node removed, which moves every higher
     // position down by one: zone c stays stranded, the rest catch up.
     with_state(propagation(), |mut state| async move {
-        warm(&mut state).await;
-        settle(&mut state).await;
+        ready(&mut state).await;
         cut_zone(&mut state, 2).await;
         state.remove_node(1).await.unwrap();
-        send(&mut state, 0, 25).await;
-        let zone_c_stranded = |snap: &ClusterState| {
-            assert!(lags(snap, 2, None).into_iter().all(stranded), "{snap:?}");
-        };
-        step_until(&mut state, 4, zone_c_stranded, |snap| {
-            [0, 1]
-                .iter()
-                .all(|&z| lags(snap, z, None).iter().all(|l| *l == Lag::CaughtUp))
-        })
-        .await;
+        zone_c_stays_stranded(&mut state).await;
         state
     });
 
@@ -261,6 +263,7 @@ fn node_set_remove_shift_crosses_words() {
     for i in [0, 63, 64, 65, 255] {
         set.insert(i);
     }
+    assert_eq!(set.len(), 5);
     let mut shifted = set;
     shifted.remove_shift(63);
     assert_eq!(shifted.iter().collect::<Vec<_>>(), [0, 63, 64, 254]);

@@ -3,11 +3,12 @@
 // than a count.
 
 import { expect, type Page } from '@playwright/test';
+import { WATCHED_KEY } from '../src/lib/presets';
 import type { Watch } from '../src/lib/sim/types';
 
-/** What the specs' snapshots read: the watched key (`WATCHED_KEY` in
- *  `presets.ts`), deciding the default Send of 25 hits. */
-export const WATCH: Watch = { key: 1, probe_hits: 25 };
+/** What the specs' snapshots read: the watched key, deciding the default Send
+ *  of 25 hits. */
+export const WATCH: Watch = { key: WATCHED_KEY, probe_hits: 25 };
 
 /** One Step, returning once its snapshot is on the page: the simulated-time
  *  readout moved. */

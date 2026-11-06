@@ -6,11 +6,10 @@ use quickcheck::{Arbitrary, Gen, QuickCheck};
 use super::super::SubStep;
 use super::*;
 
-/// A warmed, settled cluster with `hits` sent at each of `nodes` in turn,
-/// settling after each.
+/// A warmed, settled cluster after each `(node, hits)` send, settling after
+/// each.
 async fn filled(state: &mut EngineState, sends: &[(u32, u64)]) {
-    warm(state).await;
-    settle(state).await;
+    ready(state).await;
     for &(node, hits) in sends {
         send(state, node, hits).await;
         settle(state).await;
@@ -76,8 +75,7 @@ fn admission_boundaries_at_limit_100() {
 #[test]
 fn reopening_time_and_never() {
     with_state(rate_limiting(), |mut state| async move {
-        warm(&mut state).await;
-        settle(&mut state).await;
+        ready(&mut state).await;
         let bucket = state.virtual_ms / 1_000 + 1;
         state
             .step(bucket * 1_000 + 1 - state.virtual_ms, StepUntil::Time)
@@ -247,6 +245,10 @@ fn run_script(config: SimConfig, script: &Script, extra_ms: u64) -> Vec<[(Admiss
                 let want = model.decide(now, script.limit, hits);
                 let got = decided(&send(&mut state, node, hits).await);
                 let snap = state.snapshot(None, WATCH).await;
+                let admitted: u64 = snap.nodes.iter().map(|n| n.admitted_hits).sum();
+                let rejected: u64 = snap.nodes.iter().map(|n| n.rejected_hits).sum();
+                assert_eq!(admitted, snap.admitted_hits, "admitted across the nodes");
+                assert_eq!(rejected, snap.rejected_hits, "rejected across the nodes");
                 let view = snap.nodes[node as usize].window_total;
                 out.push([(got, view), (want, model.total(now))]);
             }
@@ -322,8 +324,7 @@ fn two_nodes_decide_alone_at_one_instant() {
 #[test]
 fn rate_limiting_script_and_counters() {
     with_state(rate_limiting(), |mut state| async move {
-        warm(&mut state).await;
-        settle(&mut state).await;
+        ready(&mut state).await;
         let mut all = Vec::new();
         for node in [0, 1, 2, 2] {
             all.extend(send(&mut state, node, 25).await.events);
@@ -361,23 +362,13 @@ fn rate_limiting_script_and_counters() {
 fn cluster_counters_survive_a_removal() {
     with_state(propagation(), |mut state| async move {
         filled(&mut state, &[(0, 25)]).await;
+        let limit = state.spec.limit;
+        send(&mut state, 0, limit + 1).await;
         state.remove_node(0).await.unwrap();
         let snap = state.snapshot(None, WATCH).await;
         assert_eq!(snap.admitted_hits, 25);
+        assert_eq!(snap.rejected_hits, limit + 1);
         assert!(snap.nodes.iter().all(|n| n.id != 0));
-        state
-    });
-}
-
-/// A request of zero hits is refused and decides nothing.
-#[test]
-fn zero_hits_is_refused() {
-    with_state(rate_limiting(), |mut state| async move {
-        let refused = state.submit_request(0, WATCHED_KEY, 0).await;
-        assert!(matches!(refused, Err(EngineError::NoHits)), "{refused:?}");
-        let batch = state.step(0, StepUntil::Time).await;
-        assert!(decisions(&batch.events).is_empty());
-        assert_eq!(state.sub_step, SubStep::Closed);
         state
     });
 }

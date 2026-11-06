@@ -57,7 +57,7 @@ export type PacketKind = 'Ack' | 'Own' | 'Relay' | 'Sweep' | 'SweepRequest';
 
 /** Mirror of `PacketKind::carries_cells`: whether a kind streams cells (data)
  *  rather than controlling the streams. */
-export const CARRIES_CELLS: Record<PacketKind, boolean> = {
+export const CARRIES_CELLS: Readonly<Record<PacketKind, boolean>> = {
   Own: true,
   Relay: true,
   Sweep: true,
@@ -71,7 +71,8 @@ export const CARRIES_CELLS: Record<PacketKind, boolean> = {
 export type StepUntil = 'Time' | 'Event';
 
 /** Mirror of `crate::engine::Watch`: the key a snapshot reads, and the weight
- *  of the request its inspected node's `next_send` decides. */
+ *  of the request its inspected node's `next_send` decides. Crosses inbound as
+ *  two `bigint` arguments, not as a serde shape; `key` stays a safe integer. */
 export interface Watch {
   key: number;
   probe_hits: number;

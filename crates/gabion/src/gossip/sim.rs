@@ -215,13 +215,16 @@ impl SimRouter {
     }
 
     /// Deliver every packet buffered since [`SimRouter::begin_deferred`], in
-    /// push (send) order, then stop deferring. Each packet goes into the
-    /// queue slot reserved when it was sent, so none can overflow here, and
-    /// each was already counted delivered then, so the `received_count` diff
-    /// the wasm logging shim reads is unaffected.
+    /// push (send) order, reusing the buffer, then stop deferring. Each
+    /// packet goes into the queue slot reserved when it was sent, so none can
+    /// overflow here, and each was already counted delivered then, so the
+    /// `received_count` diff the wasm logging shim reads is unaffected. A
+    /// permit's send only enqueues and wakes its receiver, so the borrow it
+    /// runs under is never re-entered.
     pub fn release_deferred(&self) {
         self.inner.deferring.set(false);
-        for (permit, packet) in self.inner.held.take() {
+        let mut held = self.inner.held.borrow_mut();
+        for (permit, packet) in held.drain(..) {
             permit.send(packet);
         }
     }

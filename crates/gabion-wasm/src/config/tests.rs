@@ -115,25 +115,19 @@ fn built_in_zone_names_are_valid_and_hash_apart() {
     assert_eq!(hashes.len(), MAX_ZONES);
 }
 
-/// Each node's count table is sized for the watched keys, not for the cell
-/// store's every replica: room for `AGGREGATE_KEYS` keys' live buckets and
-/// the one emerging, twice over, and at most 1,024 slots, at a 10 s and a
-/// 60 s window.
+/// Each node's count table is sized for the watched keys, not per replica of
+/// the cell store (1 MiB a node).
 #[test]
 fn aggregate_is_sized_for_the_watched_keys() {
     for window in [10_000, 60_000] {
-        let valid = SimConfig {
+        let config = SimConfig {
             rule_window_ms: window,
             ..SimConfig::default()
-        }
-        .validate()
-        .expect("the config validates");
+        };
+        let cells = SLACK as usize * AGGREGATE_KEYS as usize * config.per_origin() as usize;
+        let valid = config.validate().expect("the config validates");
         let slots = Aggregate::new(&valid.aggregate).table().capacity();
-        let cells = (window / 1_000 + 1) as usize;
         assert!(slots <= 1_024, "{slots} slots at a {window} ms window");
-        assert!(
-            slots >= 2 * AGGREGATE_KEYS as usize * cells,
-            "{slots} slots at a {window} ms window"
-        );
+        assert!(slots >= cells, "{slots} slots at a {window} ms window");
     }
 }

@@ -24,13 +24,14 @@
 //! fires what is due while the router holds every packet sent; the close half
 //! delivers them and reads the counters of the nodes it touched. An admitted
 //! request opens a sub-step too, so its eager-flush packets are held. Between
-//! the halves the sub-step is open, and every command but `Snapshot` closes it
-//! first, so no count changes before its packet lands.
+//! the halves the sub-step is open, and every command that is carried out,
+//! `Snapshot` aside, closes it first, so no count changes before its packet
+//! lands.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::num::NonZeroU128;
+use std::num::{NonZeroU64, NonZeroU128};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -120,13 +121,14 @@ pub enum StepUntil {
 /// inspected node's `next_send` decides.
 #[derive(Clone, Copy, Debug)]
 pub struct Watch {
-    pub key: u128,
-    pub probe_hits: u64,
+    pub key: KeyHash,
+    pub probe_hits: NonZeroU64,
 }
 
 /// Whether a sub-step's packets are still held. `Open` exactly while the
 /// router defers delivery: only [`EngineState::open_sub_step`] and an admitted
-/// request begin deferring, and only [`EngineState::close_sub_step`] releases.
+/// request begin deferring, and only [`EngineState::close_sub_step`], which
+/// every command that is carried out calls first, releases.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SubStep {
     Closed,
@@ -225,6 +227,11 @@ impl NodeSet {
         self.0.iter().all(|&word| word == 0)
     }
 
+    #[inline]
+    fn len(&self) -> usize {
+        self.0.iter().map(|word| word.count_ones() as usize).sum()
+    }
+
     /// The positions, ascending.
     #[inline]
     fn iter(self) -> impl Iterator<Item = usize> {
@@ -294,11 +301,11 @@ pub enum Command {
     /// A request of `hits` for `key` at node `node`, at the current virtual
     /// time. The node decides it first, from its own count table; an admitted
     /// request is recorded, and its eager-flush packets are held until the
-    /// next command. Refused with [`EngineError::NoHits`] for zero hits.
+    /// next command other than a snapshot.
     SubmitRequest {
         node: u32,
-        key: u128,
-        hits: u64,
+        key: KeyHash,
+        hits: NonZeroU64,
         reply: oneshot::Sender<Result<EventBatch, EngineError>>,
     },
     /// Install a directed link policy between two nodes.
@@ -462,10 +469,6 @@ struct NodeHandle {
     /// The instant its prompt ticker fires: one emit floor after the engine
     /// first saw it armed, as a ticker of that interval would fire.
     prompt_due: Option<u64>,
-    /// Fired, prompted, sent a packet to, or admitted a request in the current
-    /// sub-step: the close half reads the counters of, and sizes its drain by,
-    /// the nodes so marked.
-    touched: bool,
     /// The positions whose link into this node blocks.
     blocked_from: NodeSet,
     /// Hits this node admitted since it joined.
@@ -513,6 +516,10 @@ struct EngineState {
     substeps: u64,
     /// Whether the current sub-step's packets are still held.
     sub_step: SubStep,
+    /// Positions fired, prompted, sent a packet, or admitting a request in the
+    /// current sub-step: the close half reads the counters of, and sizes its
+    /// drain by, these.
+    touched: NodeSet,
     /// Events drained and stamped, waiting for the next batch.
     outbox: Vec<Event>,
     /// Hits the cluster admitted, and rejected, since the session began.
@@ -571,6 +578,7 @@ impl EngineState {
             virtual_ms: 0,
             substeps: 0,
             sub_step: SubStep::Closed,
+            touched: NodeSet::EMPTY,
             outbox: Vec::new(),
             admitted_hits: 0,
             rejected_hits: 0,
@@ -711,7 +719,6 @@ impl EngineState {
             own_data_bytes: 0,
             next_heartbeat: first_heartbeat(id, period, self.virtual_ms),
             prompt_due: None,
-            touched: false,
             blocked_from: NodeSet::EMPTY,
             admitted_hits: 0,
             rejected_hits: 0,
@@ -742,7 +749,7 @@ impl EngineState {
         self.router.begin_deferred();
         self.sub_step = SubStep::Open;
         self.fire(at).await;
-        self.drain_pending(Drain::Touched).await;
+        self.drain_pending().await;
         let before = self.outbox.len();
         self.drain_log();
         self.outbox[before..].iter().any(|event| match event.kind {
@@ -761,7 +768,7 @@ impl EngineState {
             return;
         }
         self.router.release_deferred();
-        self.drain_pending(Drain::Touched).await;
+        self.drain_pending().await;
         self.drain_log();
         self.observe().await;
         self.sub_step = SubStep::Closed;
@@ -770,22 +777,21 @@ impl EngineState {
     /// Node `node` decides a request of `hits` for `key` from its own count
     /// table, as the adapters decide. A rejected request is counted and
     /// nothing else happens. An admitted one is recorded, and the sub-step it
-    /// opens holds its eager-flush packets until the next command.
+    /// opens holds its eager-flush packets until the next command other than
+    /// a snapshot.
     async fn submit_request(
         &mut self,
         node: u32,
-        key: u128,
-        hits: u64,
+        key: KeyHash,
+        hits: NonZeroU64,
     ) -> Result<EventBatch, EngineError> {
-        self.close_sub_step().await;
         let pos = position_of(&self.nodes, node).ok_or(EngineError::UnknownNode { id: node })?;
-        if hits == 0 {
-            return Err(EngineError::NoHits);
-        }
-        let (spec, now, key) = (self.spec, self.virtual_ms, KeyHash(key));
+        self.close_sub_step().await;
+        let (spec, now) = (self.spec, self.virtual_ms);
         let table = self.nodes[pos].aggregate.table();
         let total = table.window_total(spec, key, now);
         let admission = decide(spec, table, key, now, total, hits);
+        let hits = hits.get();
         self.outbox.push(Event {
             virtual_ms: now,
             kind: EventKind::Decided {
@@ -803,7 +809,7 @@ impl EngineState {
             Admission::Admitted { .. } => {
                 self.router.begin_deferred();
                 self.sub_step = SubStep::Open;
-                self.nodes[pos].touched = true;
+                self.touched.insert(pos);
                 let bucket = spec.bucket_at(now);
                 self.nodes[pos]
                     .client
@@ -812,7 +818,7 @@ impl EngineState {
                     .map_err(|source| EngineError::Gossip { node, source })?;
                 // An eager flush's threshold round runs on the runtime's next
                 // turn, so the drain puts its packets in this batch.
-                self.drain_pending(Drain::Touched).await;
+                self.drain_pending().await;
                 self.drain_log();
                 let handle = &mut self.nodes[pos];
                 handle.admitted_hits = handle.admitted_hits.saturating_add(hits);
@@ -836,10 +842,11 @@ impl EngineState {
         dst: u32,
         policy: LinkPolicyKind,
     ) -> Result<(), EngineError> {
-        self.close_sub_step().await;
         let [src, dst] = [src, dst]
             .map(|id| position_of(&self.nodes, id).ok_or(EngineError::UnknownNode { id }));
-        self.set_link(src?, dst?, policy);
+        let (src, dst) = (src?, dst?);
+        self.close_sub_step().await;
+        self.set_link(src, dst, policy);
         Ok(())
     }
 
@@ -866,7 +873,6 @@ impl EngineState {
     /// joins `zone`, or the zone with the fewest live members, on links with
     /// the configured network.
     async fn add_node(&mut self, zone: Option<u32>) -> Result<EventBatch, EngineError> {
-        self.close_sub_step().await;
         if self.nodes.len() >= MAX_NODES {
             return Err(EngineError::ClusterFull);
         }
@@ -884,6 +890,7 @@ impl EngineState {
                     zones: zones as u8,
                 })?,
         };
+        self.close_sub_step().await;
         // The newcomer bootstraps against everyone currently live.
         let live_addrs: Vec<SocketAddr> = self.nodes.iter().map(|h| h.addr).collect();
         let id = self.spawn_node(zone, &live_addrs)?;
@@ -901,9 +908,10 @@ impl EngineState {
 
         // Let the newcomer bind and the survivors register the join before we
         // return, so the immediate snapshot already reflects the new member.
-        self.drain_pending(Drain::All).await;
+        self.touched = NodeSet::first(self.nodes.len());
+        self.drain_pending().await;
         self.drain_log();
-        self.observe_all().await;
+        self.observe().await;
         Ok(self.batch())
     }
 
@@ -913,8 +921,8 @@ impl EngineState {
     /// never reused, so survivors keep their own ids and addresses unchanged.
     /// Every survivor whose gateway it was reports that gateway's zone anew.
     async fn remove_node(&mut self, id: u32) -> Result<EventBatch, EngineError> {
-        self.close_sub_step().await;
         let pos = position_of(&self.nodes, id).ok_or(EngineError::UnknownNode { id })?;
+        self.close_sub_step().await;
         let addr = self.nodes[pos].addr;
         let node_id = self.nodes[pos].identity.node_id.0;
 
@@ -945,9 +953,12 @@ impl EngineState {
         self.node_id_index.remove(&node_id);
 
         // Let survivors process the departure and the aborted task fully drop.
-        self.drain_pending(Drain::All).await;
+        // Every survivor is touched, which also drops any bit a remainder's
+        // drain left at a position the removal has shifted.
+        self.touched = NodeSet::first(self.nodes.len());
+        self.drain_pending().await;
         self.drain_log();
-        self.observe_all().await;
+        self.observe().await;
         // Removing a row moves no role, so the role-count diff misses the
         // departed gateway whenever no row left in its zone can replace it
         // (none there, or none heard yet): diff every survivor that used it.
@@ -1051,16 +1062,16 @@ impl EngineState {
     /// closed inbox (the runtime stopped) is ignored.
     async fn fire(&mut self, at: u64) {
         let period = self.config.tick_interval_ms;
-        for node in &mut self.nodes {
+        for (pos, node) in self.nodes.iter_mut().enumerate() {
             if node.next_heartbeat == at {
                 let _ = node.tickers.heartbeat.send(at).await;
                 node.next_heartbeat = at.saturating_add(period);
-                node.touched = true;
+                self.touched.insert(pos);
             }
             if node.prompt_due == Some(at) {
                 let _ = node.tickers.prompt.send(at).await;
                 node.prompt_due = None;
-                node.touched = true;
+                self.touched.insert(pos);
             }
         }
     }
@@ -1073,6 +1084,7 @@ impl EngineState {
     fn drain_log(&mut self) {
         let virtual_ms = self.virtual_ms;
         let nodes = &mut self.nodes;
+        let touched = &mut self.touched;
         let bytes_by_tier = &mut self.bytes_by_tier;
         let mut log = self.log.borrow_mut();
         self.outbox.extend(log.drain(..).map(|kind| {
@@ -1103,48 +1115,32 @@ impl EngineState {
             if let EventKind::PacketSent { dst, .. } = &kind
                 && let Some(pos) = position_of(nodes, *dst)
             {
-                nodes[pos].touched = true;
+                touched.insert(pos);
             }
             Event { virtual_ms, kind }
         }));
     }
 
-    /// Yield until every runtime task the drain covers has been polled after
-    /// a change. Single-thread tokio polls one task per yield, so the budget
-    /// is four yields a node, at least 16: per touched node within a
-    /// sub-step, where only the touched nodes have work, and per live node
-    /// when a join or a departure wakes every runtime.
-    async fn drain_pending(&mut self, drain: Drain) {
-        let nodes = match drain {
-            Drain::Touched => self.nodes.iter().filter(|n| n.touched).count(),
-            Drain::All => self.nodes.len(),
-        };
-        let budget = nodes.saturating_mul(4).max(16);
+    /// Yield until every touched runtime has been polled after a change, only
+    /// the touched nodes having work. Single-thread tokio polls one task per
+    /// yield, so the budget is four yields for each touched node, at least
+    /// [`MIN_DRAIN_YIELDS`]; a join or a departure marks every node.
+    async fn drain_pending(&mut self) {
+        let budget = self.touched.len().saturating_mul(4).max(MIN_DRAIN_YIELDS);
         self.drain_yields += budget as u64;
         for _ in 0..budget {
             tokio::task::yield_now().await;
         }
     }
 
-    /// Mark every node touched and observe them: a join or a departure
-    /// reaches every runtime.
-    async fn observe_all(&mut self) {
-        for node in &mut self.nodes {
-            node.touched = true;
-        }
-        self.observe().await;
-    }
-
     /// After a sub-step: read the counters of every touched node, clearing
-    /// its mark, emit one `Tick` / `ThresholdFire` per round since the last
+    /// the set, emit one `Tick` / `ThresholdFire` per round since the last
     /// read, and diff the gateways of each node whose role count moved, the
     /// only nodes whose snapshot is fetched. A node's events come in that
     /// order, so the stream is deterministic.
     async fn observe(&mut self) {
-        for pos in 0..self.nodes.len() {
-            if !std::mem::take(&mut self.nodes[pos].touched) {
-                continue;
-            }
+        let touched = std::mem::replace(&mut self.touched, NodeSet::EMPTY);
+        for pos in touched.iter() {
             self.counter_reads += 1;
             let Some(now) = counters(&self.nodes[pos].admin_tx).await else {
                 continue;
@@ -1268,7 +1264,7 @@ impl EngineState {
     /// sub-step stays open, so the snapshot shows its packets still held.
     async fn snapshot(&self, inspect: Option<u32>, watch: Watch) -> ClusterState {
         let spec = self.spec;
-        let key = KeyHash(watch.key);
+        let key = watch.key;
         let now = self.virtual_ms;
         let current = spec.bucket_at(now);
         let live = spec.live_buckets.get();
@@ -1398,7 +1394,7 @@ impl EngineState {
                 node_id: handle.identity.node_id.0,
                 incarnation: handle.identity.incarnation,
                 window_total,
-                brim: decide(spec, table, key, now, window_total, 1),
+                brim: decide(spec, table, key, now, window_total, NonZeroU64::MIN),
                 lag,
                 next_heartbeat_ms: handle.next_heartbeat,
                 admitted_hits: handle.admitted_hits,
@@ -1518,14 +1514,8 @@ struct OriginCell {
     holders: NodeSet,
 }
 
-/// Which runtimes a drain waits for.
-#[derive(Clone, Copy, Debug)]
-enum Drain {
-    /// The nodes touched in the current sub-step.
-    Touched,
-    /// Every live node.
-    All,
-}
+/// The fewest yields a drain spends, however few nodes it waits for.
+const MIN_DRAIN_YIELDS: usize = 16;
 
 /// Node `id`'s heartbeat phase within a period of `period_ms`: the integer
 /// Weyl sequence `((id · 0x9E37_79B9 mod 2³²) · period) >> 32`, which spreads
@@ -1559,8 +1549,9 @@ fn decide(
     key: KeyHash,
     now: u64,
     total: u64,
-    hits: u64,
+    hits: NonZeroU64,
 ) -> Admission {
+    let hits = hits.get();
     if spec.admits(total, hits) {
         return Admission::Admitted {
             total_before: total,

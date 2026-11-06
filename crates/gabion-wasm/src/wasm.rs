@@ -23,11 +23,14 @@
 //! snapshot loop against the real wasm artifact; node and the browser share
 //! the same single-threaded wasm executor.
 
+use std::num::NonZeroU64;
+
+use gabion::crdt::KeyHash;
 use tokio::sync::{mpsc, oneshot};
 use wasm_bindgen::prelude::*;
 
 use crate::config::{MAX_ZONES, SimConfig};
-use crate::engine::{Command, LinkPolicyKind, StepUntil, Watch, run_engine};
+use crate::engine::{Command, EngineError, LinkPolicyKind, StepUntil, Watch, run_engine};
 
 /// A live simulation the page drives. Holds the sender end of the engine's
 /// command channel; every method round-trips one command and awaits its reply.
@@ -74,8 +77,8 @@ impl Sim {
         let (reply, rx) = oneshot::channel();
         self.send(Command::SubmitRequest {
             node,
-            key: key_id as u128,
-            hits,
+            key: KeyHash(u128::from(key_id)),
+            hits: nonzero_hits(hits)?,
             reply,
         })
         .await?;
@@ -179,7 +182,8 @@ impl Sim {
 
     /// Pull every node's state of key `key_id` for a re-render, with the
     /// cells and peer rows of the node with stable id `inspect` alone, and
-    /// that node's decision on a request of `probe_hits`.
+    /// that node's decision on a request of `probe_hits`. Throws for zero
+    /// hits.
     pub async fn snapshot(
         &self,
         inspect: Option<u32>,
@@ -188,8 +192,8 @@ impl Sim {
     ) -> Result<JsValue, JsValue> {
         let (reply, rx) = oneshot::channel();
         let watch = Watch {
-            key: key_id.into(),
-            probe_hits,
+            key: KeyHash(u128::from(key_id)),
+            probe_hits: nonzero_hits(probe_hits)?,
         };
         self.send(Command::Snapshot {
             inspect,
@@ -217,8 +221,8 @@ impl Sim {
         self.cmd_tx.send(cmd).await.map_err(|_| engine_gone())
     }
 
-    /// One `SetLinkPolicy` round-trip, shared by `set_link_policy`,
-    /// `partition`, and `heal`.
+    /// One `SetLinkPolicy` round-trip, shared by `set_link_policy` and
+    /// `partition`.
     async fn apply_link(&self, src: u32, dst: u32, policy: LinkPolicyKind) -> Result<(), JsValue> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::SetLinkPolicy {
@@ -248,6 +252,12 @@ pub fn default_config() -> Result<JsValue, JsValue> {
 #[wasm_bindgen]
 pub fn max_zones() -> u32 {
     MAX_ZONES as u32
+}
+
+/// A request's weight as the engine takes it: zero hits throws, as
+/// [`EngineError::NoHits`].
+fn nonzero_hits(hits: u64) -> Result<NonZeroU64, JsValue> {
+    NonZeroU64::new(hits).ok_or_else(|| JsValue::from_str(&EngineError::NoHits.to_string()))
 }
 
 /// Serialize an owned reply into a plain JS object.

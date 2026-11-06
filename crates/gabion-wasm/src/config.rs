@@ -25,15 +25,17 @@ pub const MAX_NODES: usize = 256;
 /// three to six.
 pub const MAX_ZONES: usize = 6;
 
-/// Keys each node's count table holds at once without crowding. The
-/// visualizer watches one key; the table keeps one cell per key per live
-/// bucket plus the one emerging, times `SLACK`. A fifth key live at the same
-/// moment can crowd the table, and its hits then go uncounted there: the
-/// library's `aggregate_full` drop, which gabion counts and logs.
+/// Keys each node's count table is budgeted for: the page watches one, and
+/// the engine accepts any key a command names, so a few others stay counted.
+/// The table is indexed at twice the next power of two of `AGGREGATE_KEYS ×
+/// per_origin × SLACK` cells (256 slots at the default 10 s window), so many
+/// more keys fit before a write finds no free slot within the probe limit.
+/// Past that, a key's hits go uncounted there: the library's `aggregate_full`
+/// drop, which gabion counts and logs.
 pub const AGGREGATE_KEYS: u32 = 4;
 
-/// Headroom over each exact working set, absorbing churn and the bucket just
-/// emerging under "now": the one knob for every size [`SimConfig`] derives.
+/// Headroom over each exact working set, absorbing churn: the one knob for
+/// every size [`SimConfig`] derives.
 const SLACK: u32 = 2;
 
 /// Zone index `i` is `ZONE_NAMES[i]`.
@@ -168,7 +170,14 @@ impl SimConfig {
         }
         let settings = self.settings()?;
         let (_, storage) = settings.validate()?;
-        let (_, aggregate) = self.aggregate_settings(&settings)?.validate()?;
+        // One table per node, sized for the watched keys: sized from the cell
+        // store it would take 1 MiB.
+        let cells = AGGREGATE_KEYS
+            .saturating_mul(self.per_origin())
+            .saturating_mul(SLACK);
+        let mut aggregate = settings.clone();
+        aggregate.apply(Setting::StorageMaxCells, &cells.to_string())?;
+        let (_, aggregate) = aggregate.validate()?;
         let rule = RuleDef {
             name: "watched",
             domain: "viz",
@@ -210,19 +219,6 @@ impl SimConfig {
         }
         .live_buckets()
             + 1
-    }
-
-    /// The node settings with the cell budget of one count table:
-    /// [`AGGREGATE_KEYS`] keys of [`Self::per_origin`] cells, times [`SLACK`].
-    /// Built from the cell store's settings, the table would hold a slot per
-    /// replica of every origin, 1 MiB a node.
-    fn aggregate_settings(&self, node: &Settings) -> Result<Settings, ConfigError> {
-        let cells = AGGREGATE_KEYS
-            .saturating_mul(self.per_origin())
-            .saturating_mul(SLACK);
-        let mut settings = node.clone();
-        settings.apply(Setting::StorageMaxCells, &cells.to_string())?;
-        Ok(settings)
     }
 
     /// The node settings for this session: the controls' gossip tuning and

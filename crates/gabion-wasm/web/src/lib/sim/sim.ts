@@ -17,7 +17,7 @@ function ensureInit(): Promise<unknown> {
 }
 
 /** Confirm the numeric boundary convention `types.ts` documents actually holds
- *  at runtime: u64 fields arrive as JS numbers, u128 ids as hex strings. Runs
+ *  at runtime: u64 fields arrive as JS numbers. Runs
  *  once, on the first batch crossed, and throws loudly if the contract drifts
  *  (e.g. a serde-wasm-bindgen default change) rather than silently corrupting
  *  every count downstream. */
@@ -74,7 +74,9 @@ export class Sim {
 
   /** A request of `hits` for `key` at `node`, at the current virtual time: the
    *  node decides it first (the batch's `Decided` event), and an admitted
-   *  request's eager-flush packets land at the next engine call. */
+   *  request's eager-flush packets land at the next step or other command
+   *  (`step(0)` lands them at the same instant; a snapshot leaves them in
+   *  flight). Throws for zero hits. */
   async submitRequest(node: number, key: number, hits: number): Promise<EventBatch> {
     const batch = (await this.#inner.submit_request(node, BigInt(key), BigInt(hits))) as EventBatch;
     assertBoundary(batch);

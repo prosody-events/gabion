@@ -4,7 +4,7 @@
 
 use serde_json::json;
 
-use super::super::{SubStep, first_heartbeat, heartbeat_phase};
+use super::super::{MIN_DRAIN_YIELDS, SubStep, first_heartbeat, heartbeat_phase};
 use super::*;
 use crate::event::NodeState;
 
@@ -58,8 +58,7 @@ fn phased_heartbeats_never_rewind_a_stream() {
             ..rate_limiting()
         };
         with_state(rate_limiting, |mut state| async move {
-            warm(&mut state).await;
-            settle(&mut state).await;
+            ready(&mut state).await;
             for node in [0, 1, 2, 2, 2, 3] {
                 send(&mut state, node, 25).await;
                 settle(&mut state).await;
@@ -93,27 +92,30 @@ fn due_instants(id: u32, spawned: u64, now: u64) -> u64 {
 }
 
 /// A quiet minute costs one sub-step per due heartbeat, one counter read per
-/// fired heartbeat, and sixteen yields per drain; every node, a joiner too,
+/// fired heartbeat, and the fewest yields per drain; every node, a joiner too,
 /// runs exactly the heartbeats due since it spawned.
 #[test]
 fn quiet_cost_by_counters() {
     with_state(propagation(), |mut state| async move {
-        warm(&mut state).await;
-        settle(&mut state).await;
+        ready(&mut state).await;
         state.counter_reads = 0;
         state.drain_yields = 0;
         state.substeps = 0;
         state.step(60_000, StepUntil::Time).await;
         assert_eq!(state.substeps, 12 * 120, "one sub-step per phase");
         assert_eq!(state.counter_reads, 12 * 120, "one read per heartbeat");
-        assert_eq!(state.drain_yields, 2 * 16 * state.substeps);
+        assert_eq!(
+            state.drain_yields,
+            2 * MIN_DRAIN_YIELDS as u64 * state.substeps
+        );
 
         let joined_at = state.virtual_ms;
         state.add_node(None).await.unwrap();
+        let joiner = state.nodes.last().expect("the joiner").id;
         state.step(60_000, StepUntil::Time).await;
         let now = state.virtual_ms;
         for node in state.snapshot(None, WATCH).await.nodes {
-            let spawned = if node.id == 12 { joined_at } else { 0 };
+            let spawned = if node.id == joiner { joined_at } else { 0 };
             assert_eq!(
                 node.rounds_heartbeat,
                 due_instants(node.id, spawned, now),
@@ -140,6 +142,17 @@ struct Timeline {
     relays: usize,
 }
 
+impl Timeline {
+    fn record(&self) -> serde_json::Value {
+        json!({
+            "own_ms": self.own_ms,
+            "relay_ms": self.relay_ms,
+            "agreed_ms": self.agreed_ms,
+            "quiet_ms": self.quiet_ms,
+        })
+    }
+}
+
 /// The last instant a packet was sent or lost in `events`, if any.
 fn last_packet(events: &[Event]) -> Option<u64> {
     events
@@ -154,7 +167,7 @@ fn last_packet(events: &[Event]) -> Option<u64> {
         .max()
 }
 
-/// Whether `events` hold a `kind` packet from `src` sent at `at`.
+/// How many `kind` packets from `src` in `events` were sent at `at`.
 fn sent_at(events: &[Event], src: Option<u32>, kind: PacketKind, at: u64) -> usize {
     events
         .iter()
@@ -196,32 +209,30 @@ async fn timeline(state: &mut EngineState, node: u32, hits: u64) -> Timeline {
     let mut timeline = Timeline::default();
     let mut own = None;
     let mut relay = None;
-    let mut agreed = None;
     let mut events = send(state, node, hits).await.events;
     if sent_at(&events, Some(node), PacketKind::Own, t0) > 0 {
         own = Some(t0);
     }
     events.extend(state.step(0, StepUntil::Time).await.events);
     let mut last = last_packet(&events);
-    while agreed.is_none() {
+    let agreed = loop {
         assert!(state.virtual_ms < deadline, "no agreement: {timeline:?}");
-        if !caught_up(&state.snapshot(None, WATCH).await, |_| true) {
-            let (events, wave) = next_stop(state, deadline).await;
-            let at = state.virtual_ms;
-            last = last_packet(&events).or(last);
-            if wave && own.is_none() && sent_at(&events, Some(node), PacketKind::Own, at) > 0 {
-                own = Some(at);
-            } else if wave && own.is_some() && relay.is_none() {
-                let relays = sent_at(&events, None, PacketKind::Relay, at);
-                if relays > 0 {
-                    relay = Some(at);
-                    timeline.relays = relays;
-                }
-            }
-            continue;
+        if caught_up(&state.snapshot(None, WATCH).await, |_| true) {
+            break state.virtual_ms;
         }
-        agreed = Some(state.virtual_ms);
-    }
+        let (events, wave) = next_stop(state, deadline).await;
+        let at = state.virtual_ms;
+        last = last_packet(&events).or(last);
+        if wave && own.is_none() && sent_at(&events, Some(node), PacketKind::Own, at) > 0 {
+            own = Some(at);
+        } else if wave && own.is_some() && relay.is_none() {
+            let relays = sent_at(&events, None, PacketKind::Relay, at);
+            if relays > 0 {
+                relay = Some(at);
+                timeline.relays = relays;
+            }
+        }
+    };
     loop {
         assert!(state.virtual_ms < deadline, "never quiet: {timeline:?}");
         let events = state.step(P, StepUntil::Time).await.events;
@@ -233,15 +244,9 @@ async fn timeline(state: &mut EngineState, node: u32, hits: u64) -> Timeline {
     let since = |at: Option<u64>| at.map_or(0, |at| at - t0);
     timeline.own_ms = since(own);
     timeline.relay_ms = since(relay);
-    timeline.agreed_ms = since(agreed);
+    timeline.agreed_ms = agreed - t0;
     timeline.quiet_ms = since(last);
     timeline
-}
-
-/// A cluster built from `config`, warmed and settled.
-async fn ready(state: &mut EngineState) {
-    warm(state).await;
-    settle(state).await;
 }
 
 /// Time a send at each of the twelve nodes of Propagation, each on its own
@@ -274,12 +279,7 @@ fn propagation_record() -> serde_json::Value {
                 assert_eq!(timeline.agreed_ms, timeline.relay_ms, "node {node}");
                 assert!(timeline.quiet_ms <= timeline.agreed_ms + P, "node {node}");
                 relays.insert(timeline.relays);
-                by_node.push(json!({
-                    "own_ms": timeline.own_ms,
-                    "relay_ms": timeline.relay_ms,
-                    "agreed_ms": timeline.agreed_ms,
-                    "quiet_ms": timeline.quiet_ms,
-                }));
+                by_node.push(timeline.record());
                 state
             }
         });
@@ -294,22 +294,11 @@ fn propagation_record() -> serde_json::Value {
 
 /// Rate limiting: a send of 25 at node 0 flushes at once.
 fn rate_limiting_record() -> serde_json::Value {
-    let mut out = None;
-    with_state(rate_limiting(), |mut state| {
-        let out = &mut out;
-        async move {
-            ready(&mut state).await;
-            let timeline = timeline(&mut state, 0, 25).await;
-            *out = Some(json!({
-                "own_ms": timeline.own_ms,
-                "relay_ms": timeline.relay_ms,
-                "agreed_ms": timeline.agreed_ms,
-                "quiet_ms": timeline.quiet_ms,
-            }));
-            state
-        }
-    });
-    out.expect("the run finished")
+    run_with_state(rate_limiting(), |mut state| async move {
+        ready(&mut state).await;
+        let record = timeline(&mut state, 0, 25).await.record();
+        (state, record)
+    })
 }
 
 /// Packet loss: a send of 25 at node 0 with 30 % of packets lost.
@@ -318,20 +307,15 @@ fn packet_loss_record() -> serde_json::Value {
         uniform_loss: 0.3,
         ..propagation()
     };
-    let mut out = None;
-    with_state(lossy, |mut state| {
-        let out = &mut out;
-        async move {
-            ready(&mut state).await;
-            let timeline = timeline(&mut state, 0, 25).await;
-            *out = Some(json!({
-                "agreed_ms": timeline.agreed_ms,
-                "quiet_ms": timeline.quiet_ms,
-            }));
-            state
-        }
-    });
-    out.expect("the run finished")
+    run_with_state(lossy, |mut state| async move {
+        ready(&mut state).await;
+        let timeline = timeline(&mut state, 0, 25).await;
+        let record = json!({
+            "agreed_ms": timeline.agreed_ms,
+            "quiet_ms": timeline.quiet_ms,
+        });
+        (state, record)
+    })
 }
 
 /// A gateway fault, in ms after it: when node 0 left its gateway into zone b,
@@ -390,50 +374,38 @@ async fn fail_over(
 
 /// Gateway failure: node 0's gateway into zone b silenced, then 25 hits.
 fn gateway_failure_record() -> serde_json::Value {
-    let mut out = None;
-    with_state(propagation(), |mut state| {
-        let out = &mut out;
-        async move {
-            ready(&mut state).await;
-            let g = gateway_of(&state, 0, 1).await;
-            silence(&mut state, g).await;
-            let t0 = state.virtual_ms;
-            send(&mut state, 0, 25).await;
-            let repair = fail_over(&mut state, g, t0, |_| None).await;
-            let failover_ms = repair.failover_ms.expect("a failover");
-            assert!(
-                failover_ms <= suspect_after(P) + 2 * P,
-                "failed over {failover_ms} ms after the silence"
-            );
-            *out = Some(repair.record());
-            state
-        }
-    });
-    out.expect("the run finished")
+    run_with_state(propagation(), |mut state| async move {
+        ready(&mut state).await;
+        let g = gateway_of(&state, 0, 1).await;
+        silence(&mut state, g).await;
+        let t0 = state.virtual_ms;
+        send(&mut state, 0, 25).await;
+        let repair = fail_over(&mut state, g, t0, |_| None).await;
+        let failover_ms = repair.failover_ms.expect("a failover");
+        assert!(
+            failover_ms <= suspect_after(P) + 2 * P,
+            "failed over {failover_ms} ms after the silence"
+        );
+        (state, repair.record())
+    })
 }
 
 /// Gateway cut: node 0's gateway into zone b cut off from its zone peers, one
 /// way, with a trickle of one hit every 500 ms at node 0.
 fn gateway_cut_record() -> serde_json::Value {
-    let mut out = None;
-    with_state(propagation(), |mut state| {
-        let out = &mut out;
-        async move {
-            ready(&mut state).await;
-            let g = gateway_of(&state, 0, 1).await;
-            for m in members(&state, 1).into_iter().filter(|&m| m != g) {
-                state
-                    .set_link_policy(g, m, LinkPolicyKind::Block)
-                    .await
-                    .unwrap();
-            }
-            let t0 = state.virtual_ms;
-            let repair = fail_over(&mut state, g, t0, |i| Some(t0 + 500 * i)).await;
-            *out = Some(repair.record());
+    run_with_state(propagation(), |mut state| async move {
+        ready(&mut state).await;
+        let g = gateway_of(&state, 0, 1).await;
+        for m in members(&state, 1).into_iter().filter(|&m| m != g) {
             state
+                .set_link_policy(g, m, LinkPolicyKind::Block)
+                .await
+                .unwrap();
         }
-    });
-    out.expect("the run finished")
+        let t0 = state.virtual_ms;
+        let repair = fail_over(&mut state, g, t0, |i| Some(t0 + 500 * i)).await;
+        (state, repair.record())
+    })
 }
 
 /// A fed cluster: 10 hits at the first node of each zone, then the i-th
@@ -443,48 +415,43 @@ fn gateway_cut_record() -> serde_json::Value {
 /// waves per period over 10 s to 30 s and the share of data bytes that
 /// crossed a zone over 20 s to 30 s.
 fn fed_record(config: SimConfig) -> (f64, f64) {
-    let mut out = None;
-    with_state(config, |mut state| {
-        let out = &mut out;
-        async move {
-            ready(&mut state).await;
-            for node in [0, 4, 8] {
-                send(&mut state, node, 10).await;
-            }
-            let t0 = state.virtual_ms;
-            let (count_from, share_from, end) = (t0 + 10_000, t0 + 20_000, t0 + 30_000);
-            let mut waves = 0u32;
-            let mut at_share_from = None;
-            let mut request = 0u64;
-            while state.virtual_ms < end {
-                let next_request = t0 + (request * 1_000).div_ceil(3);
-                if state.virtual_ms == next_request {
-                    send(&mut state, (request % 12) as u32, 1).await;
-                    request += 1;
-                    continue;
-                }
-                let mut to = next_request.min(end);
-                if at_share_from.is_none() {
-                    to = to.min(share_from);
-                }
-                let (_, wave) = next_stop(&mut state, to).await;
-                if wave && (count_from..=end).contains(&state.virtual_ms) {
-                    waves += 1;
-                }
-                if at_share_from.is_none() && state.virtual_ms == share_from {
-                    at_share_from = Some(state.snapshot(None, WATCH).await.bytes_by_tier);
-                }
-            }
-            let from = at_share_from.expect("the run passed 20 s");
-            let to = state.snapshot(None, WATCH).await.bytes_by_tier;
-            let cross = to.cross_zone.data - from.cross_zone.data;
-            let all = cross + to.in_zone.data - from.in_zone.data;
-            let periods = (end - count_from) / P;
-            *out = Some((f64::from(waves) / periods as f64, cross as f64 / all as f64));
-            state
+    run_with_state(config, |mut state| async move {
+        ready(&mut state).await;
+        for node in [0, 4, 8] {
+            send(&mut state, node, 10).await;
         }
-    });
-    out.expect("the run finished")
+        let t0 = state.virtual_ms;
+        let (count_from, share_from, end) = (t0 + 10_000, t0 + 20_000, t0 + 30_000);
+        let mut waves = 0u32;
+        let mut at_share_from = None;
+        let mut request = 0u64;
+        while state.virtual_ms < end {
+            let next_request = t0 + (request * 1_000).div_ceil(3);
+            if state.virtual_ms == next_request {
+                send(&mut state, (request % 12) as u32, 1).await;
+                request += 1;
+                continue;
+            }
+            let mut to = next_request.min(end);
+            if at_share_from.is_none() {
+                to = to.min(share_from);
+            }
+            let (_, wave) = next_stop(&mut state, to).await;
+            if wave && (count_from..=end).contains(&state.virtual_ms) {
+                waves += 1;
+            }
+            if at_share_from.is_none() && state.virtual_ms == share_from {
+                at_share_from = Some(state.snapshot(None, WATCH).await.bytes_by_tier);
+            }
+        }
+        let from = at_share_from.expect("the run passed 20 s");
+        let to = state.snapshot(None, WATCH).await.bytes_by_tier;
+        let cross = to.cross_zone.data - from.cross_zone.data;
+        let all = cross + to.in_zone.data - from.in_zone.data;
+        let periods = (end - count_from) / P;
+        let record = (f64::from(waves) / periods as f64, cross as f64 / all as f64);
+        (state, record)
+    })
 }
 
 /// Four decimal places, so the record reads and diffs cleanly.
@@ -555,7 +522,8 @@ fn heal_restores_the_configured_loss() {
             "{rate} of packets lost after heal"
         );
 
-        let joiner = state.add_node(None).await.map(|_| 12).unwrap();
+        state.add_node(None).await.unwrap();
+        let joiner = state.nodes.last().expect("the joiner").id;
         let rate = drop_rate(&mut state, |src, dst| src == joiner || dst == joiner).await;
         assert!(
             (0.2..=0.4).contains(&rate),

@@ -1211,7 +1211,7 @@ test.describe('interaction', () => {
     await loadPreset(page, 'Traffic burst');
     // The origin has no gateway until its runtime has heard the other zones.
     const silence = page.getByRole('button', { name: /^Silence node \d+, the gateway into zone b$/ });
-    for (let i = 0; i < 10 && (await silence.count()) === 0; i++) await step(page);
+    await stepUntil(page, async () => (await silence.count()) > 0, 10, 'the origin found its gateway into zone b');
     await silence.click();
     await expect(status('cut')).toHaveText('11');
     await page.getByRole('button', { name: 'Heal network' }).click();
@@ -1271,7 +1271,7 @@ test.describe('interaction', () => {
 
     // Removing a cut node takes its cut links with it.
     const cutFrom = page.getByRole('button', { name: /^Cut node \d+ from zone \w$/ }).first();
-    for (let i = 0; i < 10 && (await cutFrom.count()) === 0; i++) await step(page);
+    await stepUntil(page, async () => (await cutFrom.count()) > 0, 10, 'a node found its gateway to cut from its zone');
     const cutNode = (await cutFrom.locator('[data-field="node"]').textContent()) ?? '';
     await cutFrom.click();
     await expect(status('cut')).toHaveText('3');
