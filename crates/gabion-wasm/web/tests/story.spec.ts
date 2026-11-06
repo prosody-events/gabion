@@ -416,8 +416,10 @@ test('a Send while a wave waits for Step sends it first (A55)', async ({ page },
   await primary(page).click();
   await untilNext(page, `${info.project.name}: before wave 1`);
   expect(await checkState(page, `${info.project.name}: wave 1 held`)).toBe('Step');
-  // Send again instead: the waiting wave is sent, then node 0 decides the
-  // second request, and its run stops before its own first wave.
+  // Send again instead: the waiting wave is sent, drawn with its counts, then
+  // node 0 decides the second request, and its run stops before its own first
+  // wave.
+  const data = await recordData(page);
   const before = await snapshot(page);
   await sendButton(page).click();
   await expect
@@ -431,6 +433,11 @@ test('a Send while a wave waits for Step sends it first (A55)', async ({ page },
   const held = await snapshot(page);
   // Node 0 and wave 1's five receivers hold the first Send.
   expect(held.nodes.filter((n) => n.window_total >= before.oracle_total).length, 'the first wave was delivered').toBeGreaterThanOrEqual(6);
+  // The page drew it: wave 1's five lines from node 0, and no line of the
+  // second Send's wave, which waits for Step.
+  const wave1 = (await data()).filter((b) => b.src === 0 && (b.flags & RELAY) === 0);
+  expect(wave1.length, 'the waiting wave was drawn: node 0 to its zone and a gateway per other zone').toBe(5);
+  expect(wave1.filter((b) => (b.flags & CROSS) !== 0).length, 'two of its lines cross a zone').toBe(2);
 });
 
 test('a cut while a wave waits for Step sends it, and the run goes on (A55, A49)', async ({ page }, info) => {

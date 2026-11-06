@@ -28,33 +28,24 @@ export async function virtualMs(page: Page): Promise<number> {
   return Number(await page.locator('[data-field="virtual-time"]').getAttribute('data-ms'));
 }
 
-/** The page's run state, as the stage pane publishes it. */
-async function runState(page: Page): Promise<string> {
-  return page.evaluate(() => {
-    const pane = document.querySelector<HTMLElement>('.stage-pane');
-    const ms = document.querySelector<HTMLElement>('[data-field="virtual-time"]')?.dataset.ms;
-    return `${ms}|${pane?.dataset.clock}`;
-  });
-}
-
 /** Wait until the page stands still: paused, stopped at a cap, or stopped
  *  before a wave Step draws, polled each animation frame. */
 export async function still(page: Page, timeout = LANDING_MS): Promise<void> {
   await page.waitForFunction(() => document.querySelector<HTMLElement>('.stage-pane')?.dataset.playing === '0', undefined, { timeout });
 }
 
-/** One Step to the next event, returning once it is over: something moved
- *  (simulated time, or the clock's state) and the page stands still again,
- *  so the step's snapshot is on the page. */
+/** One Step to the next event, returning once it is over: simulated time
+ *  moved and the page stands still again, so the step's snapshot is on the
+ *  page. Every Step moves time: one from a wave held for Step plays on to a
+ *  later wave or to its end. The clock's state alone is no sign: a Step from
+ *  a capped run turns it paused at once, before its own step lands. */
 export async function step(page: Page): Promise<void> {
-  const before = await runState(page);
+  const before = await page.locator('[data-field="virtual-time"]').getAttribute('data-ms');
   await page.getByRole('button', { name: 'Step to the next event' }).click();
   await page.waitForFunction(
-    (was) => {
-      const pane = document.querySelector<HTMLElement>('.stage-pane');
-      const ms = document.querySelector<HTMLElement>('[data-field="virtual-time"]')?.dataset.ms;
-      return `${ms}|${pane?.dataset.clock}` !== was && pane?.dataset.playing === '0';
-    },
+    (was) =>
+      document.querySelector<HTMLElement>('[data-field="virtual-time"]')?.dataset.ms !== was &&
+      document.querySelector<HTMLElement>('.stage-pane')?.dataset.playing === '0',
     before,
     { timeout: LANDING_MS },
   );

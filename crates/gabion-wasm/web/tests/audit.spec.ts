@@ -1920,17 +1920,26 @@ test('the node glyph tells level, strata, cap, refusal and ring (A42, A16)', asy
   expect(opened, `${where}: every ring at load`).toEqual(opened.map(() => `${RING_CAUGHT_UP}|1`));
 
   // In every frame of the first Send's run a ring is closed exactly where the
-  // vessel has the hits, and its count says so: each line drew with its count.
+  // vessel has the hits, and its count says so; and each receiver's hits show
+  // in the frame its first data line is drawn, never a frame before or after.
   // Before the Send, every ring is closed over an empty window. Every audit
   // project reduces motion, so an arc moves at once. The sampler runs from
   // before the press until the run has ended; a vessel has hits when its fill
-  // rises off the bottom.
+  // rises off the bottom. A line pushed between two samples is stamped with
+  // the index of the sample after it, the first that can show its count.
   type Sample = { id: number; ring: number; arc: number; strata: number; hits: boolean; count: string | null }[];
   await page.locator('[role="gridcell"][data-node="0"]').press('Enter');
-  await page.evaluate(() => {
-    const w = window as unknown as { samples: Sample[]; sampling: boolean };
+  await page.evaluate((data) => {
+    const w = window as unknown as { samples: Sample[]; sampling: boolean; firstLine: Map<number, number> };
     w.samples = [];
     w.sampling = true;
+    w.firstLine = new Map();
+    const pool = (document.querySelector('.stage canvas') as HTMLCanvasElement & { beams: BeamPool }).beams;
+    const push = pool.push.bind(pool);
+    pool.push = (path, sent, src, dst, flags) => {
+      if ((flags & data) === 0 && !w.firstLine.has(dst)) w.firstLine.set(dst, w.samples.length);
+      push(path, sent, src, dst, flags);
+    };
     const take = (): void => {
       if (!w.sampling) return;
       const g = (document.querySelector('.stage canvas') as HTMLCanvasElement & { glyphs: GlyphTable }).glyphs;
@@ -1944,18 +1953,19 @@ test('the node glyph tells level, strata, cap, refusal and ring (A42, A16)', asy
       requestAnimationFrame(take);
     };
     requestAnimationFrame(take);
-  });
+  }, CONTROL | DROPPED);
   const inner = await glyphs(page, (g) => 2 * (g.r[0] - 1));
   await sendButton(page).click();
   // The admitted text stands while its run plays, and goes when it ends.
   if (wide) await expect(page.locator('.decision'), `${where}: node 0's decision`).toHaveCount(1);
   await checkDecisions(page, `${where}, admitted`);
   await still(page, 60_000);
-  const samples = await page.evaluate(() => {
-    const w = window as unknown as { samples: Sample[]; sampling: boolean };
+  const [samples, lines] = await page.evaluate(() => {
+    const w = window as unknown as { samples: Sample[]; sampling: boolean; firstLine: Map<number, number> };
     w.sampling = false;
-    return w.samples;
+    return [w.samples, [...w.firstLine]] as const;
   });
+  const firstLine = new Map(lines);
   await expect(page.locator('.decision'), `${where}: the admitted text once its run ended`).toHaveCount(0);
   // Strata show where the inside is tall enough: one per non-empty bucket.
   const tall = inner >= STRATA_MIN_INNER;
@@ -1970,6 +1980,13 @@ test('the node glyph tells level, strata, cap, refusal and ring (A42, A16)', asy
       if (tall) expect(strata, `${at}: its strata`).toBe(hits ? 1 : 0);
     }
   }
+  // Node 0 holds its own hits from the press; every other node shows them
+  // first in the frame its first data line is drawn.
+  const rises = new Map<number, number>();
+  for (const [frame, nodes] of samples.entries()) for (const { id, hits } of nodes) if (hits && !rises.has(id)) rises.set(id, frame);
+  rises.delete(0);
+  expect(rises.size, `${where}: the Send reached the other nodes`).toBeGreaterThan(0);
+  for (const [id, frame] of rises) expect(firstLine.get(id), `${where}: node ${id} showed the hits in frame ${frame}, the frame of its first line`).toBe(frame);
 
   // Sends at nodes 1, 2 and 2, each in a bucket of its own where strata show.
   for (const node of [1, 2, 2]) {
