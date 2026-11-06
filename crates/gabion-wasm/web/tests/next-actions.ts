@@ -105,6 +105,7 @@ export const TABLE: readonly Row[] = [
   { name: 'Partition in the cut zone', view: { story: { ...P, act: 'far-side', refused: 'near' }, cutZone: 2, selected: 2, selectedZone: 2 }, action: press('send') },
   { name: 'Partition both refused', view: { story: { ...P, act: 'repair' }, cutZone: 2, repair: ['Reconnect zone c'], nodes: nodes((id) => (id % 3 === 2 ? stranded : caught)) }, action: { kind: 'repair', label: ['Reconnect zone c'] } },
   { name: 'Partition both refused, relays still landing', view: { story: { ...P, act: 'repair' }, cutZone: 2, clock: 'playing', nodes: nodes((id) => (id % 3 === 2 ? stranded : id === 1 ? behind : caught)) }, action: wait('run') },
+  { name: 'Partition both refused, relays still landing, paused', view: { story: { ...P, act: 'repair' }, cutZone: 2, nodes: nodes((id) => (id % 3 === 2 ? stranded : id === 1 ? behind : caught)) }, action: press('play') },
   { name: 'Partition reconnected', view: { story: { ...P, act: 'counted', both: true }, oracle: 200 }, action: press('play') },
   { name: 'Partition counting down', view: { story: { ...P, act: 'counted', both: true }, oracle: 200, clock: 'playing', nextSend: refuses }, action: wait('window') },
   { name: 'Partition at the end', view: { story: { ...P, act: 'done', both: true } }, action: { kind: 'go', to: 'gateway-failure' } },

@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
 import { heading } from '../src/lib/heading';
 import { admittedWaiting, strandedStop, waveOneCounted } from '../src/lib/narration';
-import { goal, nextAction, observe, pressClause, progress, type Observation, type RunView, type Story } from '../src/lib/next';
+import { goal, nextAction, observe, pressClause, progress, verdictOf, type Observation, type RunView, type Story } from '../src/lib/next';
 import { PRESETS } from '../src/lib/presets';
 import type { NodeState } from '../src/lib/sim/types';
 import { BASE, COMMANDS, TABLE, clauses } from './next-actions';
@@ -47,24 +47,27 @@ test('each watched scenario watches itself', () => {
 
 const admitted = { kind: 'Admitted' as const, total_before: 0 };
 const refused = { kind: 'Rejected' as const, total: 100, reopens: { kind: 'In' as const, ms: 1 } };
+const heavier = { kind: 'Rejected' as const, total: 0, reopens: { kind: 'Never' as const } };
 const quiet: Observation = { decided: null, nextSend: refused, oracle: 100, bucket: 3, cuts: 0, cutZone: null };
 const actOf = (s: Story): string => ('act' in s ? s.act : s.kind);
 
 test("Rate limiting's acts move on decisions and reopenings only", () => {
   const o = quiet;
-  let s = observe(PRESETS[0].story, { ...o, decided: { zone: 0, admission: admitted } });
+  let s = observe(PRESETS[0].story, { ...o, decided: verdictOf(admitted, 0) });
   expect(s).toEqual({ kind: 'rate-limiting', next: 'partition', act: 'filling', zones: 1, sendBucket: 3 });
-  s = observe(s, { ...o, decided: { zone: 2, admission: refused } });
+  s = observe(s, { ...o, decided: verdictOf(heavier, 2) });
+  expect(actOf(s), 'a request heavier than the limit moves no story').toBe('filling');
+  s = observe(s, { ...o, decided: verdictOf(refused, 2) });
   expect(actOf(s)).toBe('refused');
   s = observe(s, o);
   expect(actOf(s), 'still refused while the window holds').toBe('refused');
   s = observe(s, { ...o, nextSend: admitted });
   expect(actOf(s)).toBe('reopened');
-  s = observe(s, { ...o, decided: { zone: 2, admission: refused } });
+  s = observe(s, { ...o, decided: verdictOf(refused, 2) });
   expect(actOf(s)).toBe('sliding-refused');
   s = observe(s, { ...o, nextSend: admitted });
   expect(actOf(s)).toBe('drained');
-  s = observe(s, { ...o, decided: { zone: 2, admission: admitted } });
+  s = observe(s, { ...o, decided: verdictOf(admitted, 2) });
   expect(actOf(s)).toBe('done');
 });
 
@@ -78,11 +81,11 @@ test("Zone partition's ending says whether both sides refused before the heal", 
   expect(s).toEqual({ kind: 'partition', next: 'gateway-failure', act: 'done', both: false });
   expect(text(goal({ ...BASE, story: s }))).not.toContain('each side admitted');
   // Both sides refused, then healed: the over-admission ending.
-  s = observe(opening, { ...cut, decided: { zone: 0, admission: refused } });
+  s = observe(opening, { ...cut, decided: verdictOf(refused, 0) });
   expect(s).toEqual({ kind: 'partition', next: 'gateway-failure', act: 'far-side', refused: 'near' });
-  s = observe(s, { ...cut, decided: { zone: 1, admission: refused } });
+  s = observe(s, { ...cut, decided: verdictOf(refused, 1) });
   expect(actOf(s), 'the same side again').toBe('far-side');
-  s = observe(s, { ...cut, decided: { zone: 2, admission: refused } });
+  s = observe(s, { ...cut, decided: verdictOf(refused, 2) });
   expect(actOf(s)).toBe('repair');
   s = observe(observe(s, quiet), { ...quiet, oracle: 0 });
   expect(s).toEqual({ kind: 'partition', next: 'gateway-failure', act: 'done', both: true });

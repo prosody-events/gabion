@@ -3,7 +3,7 @@ import type { ClusterState } from '../src/lib/sim/types';
 import type { GlyphTable } from '../src/lib/stage/renderer';
 import { CONTROL, CROSS, RELAY, STRATA_MIN_INNER } from '../src/lib/stage/layout';
 import { readTheme } from '../src/lib/theme';
-import { WATCH, pauseIfPlaying, sendButton, still } from './drive';
+import { WATCH, pauseIfPlaying, sendButton, setRange, setSpeed, still } from './drive';
 import { WATCHES } from '../src/lib/next';
 import { PRESETS, presetById } from '../src/lib/presets';
 import { COMMANDS, clauses } from './next-actions';
@@ -213,6 +213,7 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
   await record(page, 'readouts', '.readout .time');
   const pressed: string[] = [];
   let refusals = 0;
+  let admitted = 0;
   // A57: the buckets the Sends admitted after Play were pressed in.
   const paced: number[] = [];
   for (let step = 0; step < 60; step++) {
@@ -239,11 +240,12 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
         const narration = said.find((t) => / rejected all 25/.test(t)) ?? said.join(' | ');
         expect(narration, `${where}: the rejection`).toMatch(/^node \d+ rejected all 25: it sees 100/);
         if (refusals === 1) expect(narration, `${where}: who filled the window`).toContain('admitted at nodes 0, 1 and 2');
-      } else if (pressed.includes('Play')) {
+      } else {
+        admitted += 1;
         // The bucket before the press: the Send decides in it or a later one,
         // and the page waits past the last Send's bucket before naming Send,
         // so a playing clock cannot make two readings meet.
-        paced.push(before.bucket_epoch_now);
+        if (pressed.includes('Play')) paced.push(before.bucket_epoch_now);
       }
     } else if (label.startsWith('Select node')) {
       await expect(page.locator('.pane-title [data-field="node"]')).toHaveText(label.replace('Select node ', ''));
@@ -285,7 +287,9 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
   for (const [i, id] of ids.entries()) {
     if (id === 'rl-1' && i + 1 < ids.length) expect(['rl-2', 'rl-3'], `after ${ids.slice(0, i + 2).join(' ')}`).toContain(ids[i + 1]);
   }
-  expect(ids.filter((id) => id === 'rl-1').length, 'one spreading per admitted Send').toBe(9);
+  // How many Sends the playing clock admits before the refusal depends on the
+  // runner's pace, so each is counted as the walk saw it decided.
+  expect(ids.filter((id) => id === 'rl-1').length, 'one spreading per admitted Send').toBe(admitted);
   expect(ids.filter((id) => id === 'rl-3').length, 'the countdown at each limit').toBeGreaterThanOrEqual(2);
   expect(ids.some((id) => id === 'rl-4' || id === 'rl-5'), 'the window slid').toBe(true);
   expect(templates.some(([, text]) => text.includes('see 75 of the 100 limit')), 'the partial fall-off').toBe(true);
@@ -438,6 +442,83 @@ test('a Send while a wave waits for Step lands it first (A55)', async ({ page },
   expect(held.nodes.filter((n) => n.window_total >= before.oracle_total).length, 'the first wave landed').toBeGreaterThanOrEqual(6);
 });
 
+test('a cut while a wave waits for Step lands it, and the run goes on (A55, A49)', async ({ page }, info) => {
+  test.skip(info.project.name !== 'audit-1440-light', 'the waiting wave under a command, checked once');
+  test.setTimeout(60_000);
+  await open(page);
+  await loadPreset(page, 'Propagation');
+  await primary(page).click();
+  await untilNext(page, 'before wave 1');
+  expect(await checkState(page, 'wave 1 held')).toBe('Step');
+  await record(page, 'narrations', '.narration');
+  await page.locator('#cut-zone').selectOption({ label: 'zone c' });
+  await page.getByRole('button', { name: 'Cut zone c off' }).click();
+  // The cut lands the waiting wave first, and says so; the run then goes on
+  // to stop before its next wave, or pauses itself once every node it can
+  // reach has the hits. Either way the line names a press again.
+  await untilNext(page, 'after the cut', 30_000);
+  expect(await checkState(page, 'after the cut')).toBe('Step');
+  expect(await recorded(page, 'narrations'), 'the cut over the waiting wave').toContain(
+    'zone c is cut off · the packets already on their way arrived first',
+  );
+});
+
+test('a run that reaches its cap stops there, and Play plays on (A49, A46)', async ({ page }, info) => {
+  test.skip(info.project.name !== 'audit-1440-light', 'the cap, checked once');
+  test.setTimeout(120_000);
+  await open(page);
+  await loadPreset(page, 'Sandbox');
+  // A 50 ms heartbeat puts the cap, 16 heartbeats, at 800 ms: well inside
+  // gabion's 2 s floor on suspecting a silent gateway, so the zone behind it
+  // is still behind when the run reaches its cap.
+  await page.getByText('Tune the cluster').click();
+  await setRange(page.locator('#knob-gossip'), 50);
+  await page.getByRole('button', { name: 'Rebuild cluster' }).click();
+  await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
+  await expect(page.locator('.tune summary')).not.toContainText('staged');
+  await page.locator('.rail button', { hasText: /^Silence node \d+$/ }).first().click();
+  await expect(page.locator('[data-field="status-cut"]')).toHaveCount(1);
+  await setSpeed(page, 4);
+  const pane = page.locator('.stage-pane');
+  expect(await checkState(page, 'silenced')).toMatch(/^Send/);
+  await primary(page).click();
+  await expect(pane).toHaveAttribute('data-clock', 'capped', { timeout: 60_000 });
+  await expect(page.locator('.narration')).toHaveText(/^paused after 16 heartbeats: node \d+ is still behind$/);
+  await expect(pane).toHaveAttribute('data-playing', '0');
+  expect(await checkState(page, 'capped')).toBe('Play');
+  await primary(page).click();
+  await expect(pane).toHaveAttribute('data-clock', 'playing');
+  await expect(pane).toHaveAttribute('data-playing', '1');
+  expect(await checkState(page, 'playing after the cap')).toMatch(/^Send/);
+  await pauseIfPlaying(page);
+});
+
+test('a scenario change pauses, and says so once over a held wave (A46)', async ({ page }, info) => {
+  test.skip(info.project.name !== 'audit-1440-light', 'the scenario change, checked once');
+  test.setTimeout(60_000);
+  await open(page);
+  const pane = page.locator('.stage-pane');
+  const narration = page.locator('.narration');
+  // While playing: the change pauses at the new scenario's start.
+  await page.getByRole('button', { name: 'Play' }).click();
+  await expect(pane).toHaveAttribute('data-clock', 'playing');
+  await loadPreset(page, 'Propagation');
+  await expect(pane).toHaveAttribute('data-clock', 'paused');
+  await expect(pane).toHaveAttribute('data-playing', '0');
+  await expect(narration).toHaveText('Paused at the start of Propagation');
+  // While a wave is held: the change discards it, and the live region
+  // changes once, to the change's own sentence.
+  await primary(page).click();
+  await untilNext(page, 'wave 1 held');
+  await expect(pane).toHaveAttribute('data-flight', 'waiting');
+  await record(page, 'said', '.narration');
+  await loadPreset(page, 'Sandbox');
+  await expect(narration).toHaveText('Paused at the start of Sandbox');
+  await expect(pane).toHaveAttribute('data-flight', 'none');
+  const said = await recorded(page, 'said');
+  expect(said.slice(1), 'one mutation over the held wave').toEqual(['Paused at the start of Sandbox']);
+});
+
 test('Zone partition admits on each side, then counts all of it (A48)', async ({ page }, info) => {
   test.skip(info.project.name !== 'audit-1440-light', 'the partition story, checked once');
   test.setTimeout(240_000);
@@ -454,7 +535,7 @@ test('Zone partition admits on each side, then counts all of it (A48)', async ({
       // Before the repair: both sides at the limit, 200 against 100.
       await expect(page.locator('[data-template]')).toContainText('· 200 admitted against the limit of 100');
       await primary(page).click();
-      await expect(page.locator('.stage-pane')).toHaveAttribute('data-run', 'off', { timeout: 30_000 });
+      await expect(page.locator('.stage-pane')).toHaveAttribute('data-clock', 'paused', { timeout: 30_000 });
       await still(page);
       break;
     }

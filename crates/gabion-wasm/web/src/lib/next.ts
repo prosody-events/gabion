@@ -16,7 +16,8 @@ import type { Admission, Lag } from './sim/types';
 export type UntilSettled = 'settled' | 'per-wave';
 
 /** What time does: paused, playing freely, paused where a bounded run hit its
- *  cap, or a bounded run (playing, or halted before a wave Step flies). */
+ *  cap, or a bounded run (playing; a per-wave one stands still while it holds
+ *  a wave). */
 export type Clock = 'paused' | 'playing' | 'capped' | UntilSettled;
 
 /** A wave the engine holds: none, held unflown until Step, flying, or frozen
@@ -103,10 +104,25 @@ interface Watched {
 /** Each scenario's story, as it stands: a preset declares its opening. */
 export type Story = RateLimiting | Propagation | Partition | Watched | { readonly kind: 'sandbox' };
 
+/** A decided Send as a story reads it: admitted, or refused by the window,
+ *  in the zone of the node that decided it. */
+export interface Verdict {
+  readonly kind: 'admitted' | 'refused';
+  readonly zone: number;
+}
+
+/** What Send `admission`, decided in `zone`, means to a story; null for a
+ *  request heavier than the limit, which is refused for its weight and moves
+ *  no story. */
+export function verdictOf(admission: Admission, zone: number): Verdict | null {
+  if (admission.kind === 'Admitted') return { kind: 'admitted', zone };
+  return admission.reopens.kind === 'In' ? { kind: 'refused', zone } : null;
+}
+
 /** What one applied snapshot tells a story. */
 export interface Observation {
-  /** The Send this command decided, if any. */
-  readonly decided: { readonly zone: number; readonly admission: Admission } | null;
+  /** The verdict on the Send this command decided, if any. */
+  readonly decided: Verdict | null;
   /** The selected node's decision on its next Send, after. */
   readonly nextSend: Admission | undefined;
   readonly oracle: number;
@@ -115,17 +131,6 @@ export interface Observation {
   /** The zone the scenario cut off, if it cut one. */
   readonly cutZone: number | null;
 }
-
-/** What a decided Send means to a story: admitted, refused by the window, or
- *  neither (no Send, or a request heavier than the limit, which is refused for
- *  its weight and moves no story). */
-type Verdict = 'admitted' | 'refused' | null;
-
-const verdictOf = (o: Observation): Verdict => {
-  const a = o.decided?.admission;
-  if (a?.kind === 'Admitted') return 'admitted';
-  return a?.kind === 'Rejected' && a.reopens.kind === 'In' ? 'refused' : null;
-};
 
 /** The story `s` moves to on observation `o`: the one place a story moves. */
 export function observe(s: Story, o: Observation): Story {
@@ -143,12 +148,13 @@ export function observe(s: Story, o: Observation): Story {
 }
 
 function observeRate(s: RateLimiting, o: Observation): RateLimiting {
-  const verdict = verdictOf(o);
+  const d = o.decided;
+  const verdict = d?.kind;
   const opens = o.nextSend?.kind === 'Admitted';
   switch (s.act) {
     case 'open':
     case 'filling':
-      if (verdict === 'admitted') return { ...s, act: 'filling', zones: s.zones | (1 << o.decided!.zone), sendBucket: o.bucket };
+      if (d?.kind === 'admitted') return { ...s, act: 'filling', zones: s.zones | (1 << d.zone), sendBucket: o.bucket };
       return verdict === 'refused' ? { ...s, act: 'refused' } : s;
     case 'refused':
       return opens ? { ...s, act: 'reopened' } : s;
@@ -167,7 +173,7 @@ function observeRate(s: RateLimiting, o: Observation): RateLimiting {
 function observePropagation(s: Propagation, o: Observation): Propagation {
   switch (s.act) {
     case 'open':
-      return verdictOf(o) === 'admitted' ? { ...s, act: 'sent' } : s;
+      return o.decided?.kind === 'admitted' ? { ...s, act: 'sent' } : s;
     case 'sent':
       return o.oracle === 0 ? { ...s, act: 'done' } : s;
     case 'done':
@@ -186,8 +192,9 @@ function observePartition(s: Partition, o: Observation): Partition {
     case 'far-side':
     case 'repair': {
       if (o.cuts === 0) return { kind: 'partition', next, act: 'counted', both: s.act === 'repair' };
-      if (verdictOf(o) !== 'refused') return s;
-      const side: Side = o.decided!.zone === o.cutZone ? 'cut' : 'near';
+      const d = o.decided;
+      if (d?.kind !== 'refused') return s;
+      const side: Side = d.zone === o.cutZone ? 'cut' : 'near';
       if (s.act === 'open') return { kind: 'partition', next, act: 'far-side', refused: side };
       return s.act === 'far-side' && s.refused !== side ? { kind: 'partition', next, act: 'repair' } : s;
     }
@@ -302,9 +309,10 @@ function partitionAction(v: RunView, s: Partition, playing: boolean): NextAction
       return selectOtherSide(v, s.refused) ?? press('send');
     case 'repair':
       // The heading offers the repair once no relay is left to land; until
-      // then the run is what to wait for.
+      // then the run is what to wait for, or what to play.
       if (v.repair !== null) return { kind: 'repair', label: v.repair };
-      return v.nodes.some((n) => n.lag.kind === 'Behind') ? wait('run') : press('send');
+      if (!v.nodes.some((n) => n.lag.kind === 'Behind')) return press('send');
+      return playing ? wait('run') : press('play');
     case 'counted':
       return playing ? wait('window') : press('play');
     case 'done':
@@ -389,9 +397,7 @@ export function goal(v: RunView): Blurb {
     case 'rate-limiting':
       return rateGoal(v, s);
     case 'propagation':
-      return s.act === 'done'
-        ? ['Hits count only inside the window: every node stopped counting them at the same instant, with no packet.']
-        : ['Far from the limit, a node keeps a small change until its next heartbeat, then two waves of packets carry it.'];
+      return propagationGoal(s);
     case 'partition':
       return partitionGoal(v, s);
     case 'watch':
@@ -417,6 +423,16 @@ function rateGoal(v: RunView, s: RateLimiting): Blurb {
       return ['The window slides one second at a time, so the oldest hits leave first and room opens one bucket at a time.'];
     case 'done':
       return ['That is the limit: one window, counted on every node, and each node decides alone.'];
+  }
+}
+
+function propagationGoal(s: Propagation): Blurb {
+  switch (s.act) {
+    case 'open':
+    case 'sent':
+      return ['Far from the limit, a node keeps a small change until its next heartbeat, then two waves of packets carry it.'];
+    case 'done':
+      return ['Hits count only inside the window: every node stopped counting them at the same instant, with no packet.'];
   }
 }
 

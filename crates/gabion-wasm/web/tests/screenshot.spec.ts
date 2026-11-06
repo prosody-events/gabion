@@ -170,7 +170,7 @@ test('the transport Send sends to the selection', async ({ page }) => {
   await expect(page.getByRole('button', { name: 'Pause' })).toBeVisible();
   await expect(page.locator('.count')).toHaveText(Array(NODES).fill(BURST_HITS), { timeout: 15_000 });
   await expect(page.getByRole('button', { name: 'Play' })).toBeVisible({ timeout: 15_000 });
-  await expect(page.locator('.stage-pane')).toHaveAttribute('data-run', 'off');
+  await expect(page.locator('.stage-pane')).toHaveAttribute('data-clock', 'paused');
 });
 
 // A click on the bare stage selects nothing and keeps the selection: the
@@ -303,7 +303,7 @@ test('adding a node joins it live and it catches up by gossip', async ({ page })
   // Add runs until the newcomer has caught up from zero by anti-entropy, the
   // survivors' join sweep bringing it the seed, then pauses.
   await expect(view(page, 12)).toHaveText(SEED_TOTAL, { timeout: 15_000 });
-  await expect(page.locator('.stage-pane')).toHaveAttribute('data-run', 'off', { timeout: 15_000 });
+  await expect(page.locator('.stage-pane')).toHaveAttribute('data-clock', 'paused', { timeout: 15_000 });
   await page.screenshot({ path: 'screenshots/ring-node-added-caughtup.png' });
 
 });
@@ -609,7 +609,7 @@ test('a node that joins a cut zone is cut off with it (A6)', async ({ page }) =>
   await page.getByLabel('Add to').selectOption({ label: 'zone c' });
   await page.getByRole('button', { name: 'Add node' }).click();
   await expect(page.locator('.node-table tr[data-node="12"]')).toHaveAttribute('data-zone', '2');
-  await expect(page.locator('.stage-pane')).toHaveAttribute('data-run', 'off', { timeout: 15_000 });
+  await expect(page.locator('.stage-pane')).toHaveAttribute('data-clock', 'paused', { timeout: 15_000 });
   // The joiner's own hits reach its zone and stop at the cut.
   await send(page, 12);
   for (const id of [2, 5, 8, 11]) await expect(view(page, id), `node ${id} heard the joiner`).toHaveText(BURST_HITS);

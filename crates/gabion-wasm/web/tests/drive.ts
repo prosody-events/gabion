@@ -207,11 +207,15 @@ export async function refusal(page: Page, node: number, where: string, relayout 
   const frames = await recording;
   expect(frames.length, `${where}: the refusal played`).toBeGreaterThan(0);
   // The count's cap height, where the node shows its count.
+  // Measured in the count's own computed weight, size and family: a canvas
+  // reads a rem against its own 10 px default, and keeps that default when
+  // handed the computed `font` shorthand, which serializes empty.
   const cap = await page.locator(`[role="gridcell"][data-node="${node}"]`).evaluate((el) => {
-    if (el.querySelector('.count') === null) return null;
+    const count = el.querySelector('.count');
+    if (count === null) return null;
     const ctx = new OffscreenCanvas(1, 1).getContext('2d')!;
-    const style = getComputedStyle(el);
-    ctx.font = `600 ${style.getPropertyValue('--font-size-count')} ${style.fontFamily}`;
+    const style = getComputedStyle(count);
+    ctx.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
     return ctx.measureText('0').actualBoundingBoxAscent;
   });
   for (const f of frames) {

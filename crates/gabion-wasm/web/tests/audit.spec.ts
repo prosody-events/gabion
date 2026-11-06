@@ -539,7 +539,10 @@ async function checkGlyphs(page: Page, where: string, name: string): Promise<voi
       const ctx = new OffscreenCanvas(1, 1).getContext('2d')!;
       const boxes = counts.map((el) => {
         const r = el.getBoundingClientRect();
-        ctx.font = getComputedStyle(el).font;
+        // Not the computed `font` shorthand: it serializes empty, and the
+        // canvas would keep its 10 px default.
+        const style = getComputedStyle(el);
+        ctx.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
         const cap = ctx.measureText('0').actualBoundingBoxAscent;
         const cx = r.left + r.width / 2 - at.left;
         const cy = r.top + r.height / 2 - at.top;
@@ -1060,7 +1063,7 @@ test('chart 1 prints the windowed share and follows the placement', async ({ pag
   });
   await page.getByRole('button', { name: 'Add node' }).click();
   await expect(page.locator('[data-field="status-nodes"]')).toHaveText('13');
-  await expect(page.locator('.stage-pane')).toHaveAttribute('data-run', 'off', { timeout: 30_000 });
+  await expect(page.locator('.stage-pane')).toHaveAttribute('data-clock', 'paused', { timeout: 30_000 });
   await send(page, 0);
   await send(page, 1);
   for (let i = 0; i < 26; i++) {
@@ -1386,7 +1389,7 @@ test("every drawn beam carries its packet's kind, tier and fate", async ({ page 
   await take();
   await page.getByRole('button', { name: 'Add node' }).click();
   await expect(field(page, 'status-nodes')).toHaveText('13');
-  await expect(page.locator('.stage-pane')).toHaveAttribute('data-run', 'off', { timeout: 30_000 });
+  await expect(page.locator('.stage-pane')).toHaveAttribute('data-clock', 'paused', { timeout: 30_000 });
   await still(page);
   const joined = await take();
   const name = ({ src, dst }: { src: number; dst: number }): string => `node ${src} to node ${dst}`;
@@ -1544,7 +1547,7 @@ test('runs go quiet after agreement', async ({ page }, info) => {
   await loadPreset(page, 'Zone partition');
   await page.getByRole('button', { name: 'Heal network' }).click();
   await expect(field(page, 'status-cut')).toHaveCount(0);
-  await expect(page.locator('.stage-pane'), 'Zone partition: the heal ran to agreement, not its cap').toHaveAttribute('data-run', 'off', { timeout: 30_000 });
+  await expect(page.locator('.stage-pane'), 'Zone partition: the heal ran to agreement, not its cap').toHaveAttribute('data-clock', 'paused', { timeout: 30_000 });
   await expect(page.locator('.narration')).toHaveText(/every node has it$/);
   await logPackets(page);
   await stepUntil(page, () => agreed(page), 16, 'Zone partition agreed');
@@ -1567,7 +1570,7 @@ test('runs go quiet after agreement', async ({ page }, info) => {
 // stops at the cut zone, long before its cap.
 test('a Send runs only the time it needs (A46)', async ({ page }, info) => {
   test.skip(info.project.name !== 'audit-1440-light', 'the time model, checked once');
-  test.setTimeout(120_000);
+  test.setTimeout(240_000);
   await open(page);
   await setSpeed(page, 4);
   const pane = page.locator('.stage-pane');
@@ -1576,7 +1579,7 @@ test('a Send runs only the time it needs (A46)', async ({ page }, info) => {
   await hits.press('Enter');
   await logPackets(page);
   await send(page, 0);
-  await expect(pane).toHaveAttribute('data-run', 'off');
+  await expect(pane).toHaveAttribute('data-clock', 'paused');
   const end = await virtualMs(page);
   await takePackets(page);
   await page.getByRole('button', { name: 'Play' }).click();
@@ -1600,6 +1603,28 @@ test('a Send runs only the time it needs (A46)', async ({ page }, info) => {
   // Its flush lands at once and its relays within a heartbeat; the run ends a
   // period later. Four periods leave room and stay far below the cap of 16.
   expect((await virtualMs(page)) - from, 'Zone partition: the run stopped at the cut').toBeLessThanOrEqual(4 * PERIOD_MS);
+
+  // Steady state's feed never lets every node be caught up for long: a paused
+  // Send's run still ends, at the latest at its cap of 16 periods, overrun by
+  // at most one advance of the play loop (500 ms).
+  await loadPreset(page, 'Steady state');
+  await page.evaluate(() => {
+    const w = window as unknown as { clocks: string[] };
+    const el = document.querySelector('.stage-pane')!;
+    w.clocks = [el.getAttribute('data-clock') ?? ''];
+    new MutationObserver(() => {
+      const c = el.getAttribute('data-clock') ?? '';
+      if (w.clocks.at(-1) !== c) w.clocks.push(c);
+    }).observe(el, { attributes: true, attributeFilter: ['data-clock'] });
+  });
+  const steady = await virtualMs(page);
+  await sendButton(page).click();
+  await expect
+    .poll(() => page.evaluate(() => (window as unknown as { clocks: string[] }).clocks.join(' ')), { timeout: 90_000 })
+    .toMatch(/^paused settled (paused|capped)$/);
+  const ran = (await virtualMs(page)) - steady;
+  console.log(`Steady state: a paused Send's run lasted ${ran} ms`);
+  expect(ran, "Steady state: the Send's run ended within its cap").toBeLessThanOrEqual(16 * PERIOD_MS + 500);
 });
 
 test('both gateway presets fail over within the window', async ({ page }, info) => {
@@ -1921,7 +1946,11 @@ test('the node glyph tells level, strata, cap, refusal and ring (A42, A16)', asy
   const frames = await refusal(page, 2, where);
   await checkDecisions(page, `${where}, refused`);
   // Every audit project reduces motion (the motion project plays the band).
-  expect(new Set(frames.map((f) => f.top)).size, `${where}: under reduced motion the band rests`).toBe(1);
+  // A relayout the test did not force may still land mid-refusal and reshape
+  // the band with its disc, so the band rests at one top per disc radius.
+  const tops = new Map<number, Set<number>>();
+  for (const f of frames) tops.set(f.r, (tops.get(f.r) ?? new Set()).add(f.top));
+  for (const [r, at] of tops) expect(at.size, `${where}: under reduced motion the band rests (r ${r})`).toBe(1);
   expect(await page.evaluate(() => (window as unknown as { pushed: number }).pushed), `${where}: a refusal sends nothing`).toBe(0);
   expect(await page.locator('.count').allTextContents(), `${where}: a refusal counts nothing`).toEqual(counts);
 
