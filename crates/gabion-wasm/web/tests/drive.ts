@@ -1,11 +1,13 @@
 // Driving the page the way a reader does, shared by the specs: one Step at a
 // time, Steps by the heartbeat period, Steps until a condition holds (with
-// deadlines in simulated time), a selection through the keyboard grid, and a
-// Send that returns once its run has ended.
+// deadlines in simulated time), a selection through the keyboard grid, a Send
+// that returns once its run has ended, and a refused Send's band, frame by
+// frame.
 
 import { expect, type Locator, type Page } from '@playwright/test';
 import { WATCHED_KEY } from '../src/lib/presets';
 import type { Watch } from '../src/lib/sim/types';
+import type { GlyphTable } from '../src/lib/stage/renderer';
 import timings from './phase-timings.json' with { type: 'json' };
 
 /** What the specs' snapshots read: the watched key, deciding the default Send
@@ -151,3 +153,51 @@ export async function setRange(range: Locator, value: number): Promise<void> {
 
 /** Set the playback speed slider. */
 export const setSpeed = (page: Page, value: number): Promise<void> => setRange(page.getByLabel('Playback speed'), value);
+
+/** One frame of a refusal's band, as the stage published it. */
+export interface BandFrame {
+  readonly top: number;
+  readonly bottom: number;
+  readonly brim: number;
+  readonly masked: number;
+}
+
+/** Press Send at the selected node `node`, which refuses it, and return every
+ *  frame of the refusal's band, checking each (C37): the disc clips it, and it
+ *  never passes the brim nor reaches the count where one is shown. */
+export async function refusal(page: Page, node: number, where: string): Promise<BandFrame[]> {
+  await sendButton(page).click();
+  await page.waitForFunction((id) => document.querySelector<HTMLCanvasElement>('.stage canvas')?.dataset.bounce === String(id), node);
+  const frames = await page.evaluate(
+    () =>
+      new Promise<BandFrame[]>((done) => {
+        const c = document.querySelector('.stage canvas') as HTMLCanvasElement & { glyphs: GlyphTable };
+        const out: BandFrame[] = [];
+        const tick = (): void => {
+          const g = c.glyphs;
+          if (g.bounce < 0) {
+            done(out);
+            return;
+          }
+          out.push({ top: g.bandTop, bottom: g.bandBottom, brim: g.brimY[g.bounce], masked: g.bandMasked });
+          requestAnimationFrame(tick);
+        };
+        tick();
+      }),
+  );
+  expect(frames.length, `${where}: the refusal played`).toBeGreaterThan(0);
+  // The count's cap height, where the node shows its count.
+  const cap = await page.locator(`[role="gridcell"][data-node="${node}"]`).evaluate((el) => {
+    if (el.querySelector('.count') === null) return null;
+    const ctx = new OffscreenCanvas(1, 1).getContext('2d')!;
+    const style = getComputedStyle(el);
+    ctx.font = `600 ${style.getPropertyValue('--font-size-count')} ${style.fontFamily}`;
+    return ctx.measureText('0').actualBoundingBoxAscent;
+  });
+  for (const f of frames) {
+    expect(f.masked, `${where}: the disc clips the band`).toBe(1);
+    expect(f.bottom, `${where}: the band never passes the brim`).toBeLessThanOrEqual(f.brim + 1e-3);
+    if (cap !== null) expect(f.bottom, `${where}: the band never reaches the count`).toBeLessThanOrEqual(-cap / 2);
+  }
+  return frames;
+}

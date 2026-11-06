@@ -58,6 +58,18 @@ async function checkState(page: Page, where: string): Promise<string | null> {
       if (document.querySelectorAll('[aria-live]').length !== 1) out.push('not exactly one live region');
       if (document.querySelectorAll('[role="status"]').length !== 0) out.push('a role="status" element');
       if (document.querySelector('[aria-live] button, [aria-live] a, [aria-live] input') !== null) out.push('a control inside the live region');
+      // A19: no claim said twice: each number a voice tags (whose, what,
+      // how much) appears in one voice, the heading, the narration or a
+      // decision.
+      const voices = new Map<string, string>();
+      for (const el of document.querySelectorAll<HTMLElement>('[data-noun]')) {
+        if (!el.checkVisibility()) continue;
+        const voice = el.closest('[data-template]') !== null ? 'heading' : el.closest('.narration') !== null ? 'narration' : 'decision';
+        const said = `${el.dataset.subject} ${el.dataset.noun} ${el.textContent?.trim()}`;
+        const first = voices.get(said);
+        if (first !== undefined && first !== voice) out.push(`"${said}" is said in the ${first} and the ${voice}`);
+        voices.set(said, first ?? voice);
+      }
       // A56: the goal explains and never commands.
       const goal = (document.querySelector('.scenario')?.textContent ?? '').replace(/\s+/g, ' ').trim();
       for (const clause of goal.split(/[.;:,·]| and | then /).map((c) => c.trim()).filter((c) => c !== '')) {
@@ -154,7 +166,9 @@ async function recordTemplates(page: Page): Promise<void> {
 test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ page }, info) => {
   test.setTimeout(240_000);
   await open(page);
-  await loadPreset(page, 'Rate limiting');
+  // Rate limiting is the page's default: it opens there, at nothing counted.
+  await expect(page.getByRole('group', { name: 'Scenario preset' }).getByRole('button', { name: 'Rate limiting', exact: true })).toHaveAttribute('aria-current', 'true');
+  await expect(page.locator('[data-template]')).toHaveAttribute('data-template', 'rl-0');
   // At 1×: the sliding-window act wants its Sends a bucket apart, and the
   // checks between presses then cost the story next to nothing in simulated
   // time.
@@ -296,6 +310,31 @@ test('Propagation stops before each wave and Step flies it (A55, Q16)', async ({
   expect(await checkState(page, `${where}: the end`)).toBe('Go to Rate limiting');
 });
 
+test('a Send while a wave waits for Step lands it first (A55, Q16)', async ({ page }, info) => {
+  test.skip(!['audit-1440-light-motion', 'audit-1440-light'].includes(info.project.name), 'the waiting wave, with motion on and reduced');
+  test.setTimeout(60_000);
+  await open(page);
+  await loadPreset(page, 'Propagation');
+  await primary(page).click();
+  await untilNext(page, `${info.project.name}: before wave 1`);
+  expect(await checkState(page, `${info.project.name}: wave 1 held`)).toBe('Step');
+  // Send again instead: the waiting wave lands, then node 0 decides the
+  // second request, and its run stops before its own first wave.
+  const before = await snapshot(page);
+  await page.locator('.transport').getByRole('button', { name: /^Send/ }).click();
+  await expect
+    .poll(async () => {
+      const s = await snapshot(page);
+      return s.admitted_hits + s.rejected_hits;
+    }, { timeout: 15_000 })
+    .toBeGreaterThan(before.admitted_hits + before.rejected_hits);
+  await untilNext(page, `${info.project.name}: after the second Send`);
+  expect(await checkState(page, `${info.project.name}: the second Send's wave held`)).toBe('Step');
+  const held = await snapshot(page);
+  // Node 0 and wave 1's five receivers hold the first Send.
+  expect(held.nodes.filter((n) => n.window_total >= before.oracle_total).length, 'the first wave landed').toBeGreaterThanOrEqual(6);
+});
+
 test('Zone partition admits on each side, then counts all of it (A48)', async ({ page }, info) => {
   test.skip(info.project.name !== 'audit-1440-light', 'the partition story, checked once');
   test.setTimeout(240_000);
@@ -360,6 +399,70 @@ test('Hits per Send is checked when committed, not while typed (A59, A50)', asyn
   await use.click();
   await expect(send).toBeEnabled();
   await expect(send).toHaveText(/25\s*hits/);
+  // Restart keeps a committed Hits per Send (A6).
+  await field.fill('30');
+  await field.press('Enter');
+  await page.getByRole('button', { name: 'Restart Rate limiting' }).click();
+  await expect(page.locator('.narration')).toContainText('Paused at the start of Rate limiting');
+  await expect(send).toHaveText(/Send a request of\s*30\s*hits/);
+  await expect(field).toHaveValue('30');
+  // A request heavier than the limit is never admitted: the fix is Use 25
+  // hits, until the reader types, when the field is the next action.
+  await field.fill('200');
+  await field.press('Enter');
+  await send.click();
+  await expect(page.getByRole('button', { name: /^Use 25 hits/ })).toHaveAttribute('data-primary', '');
+  await field.press('Backspace');
+  await expect(primary(page)).toHaveAttribute('id', 'burst-hits');
+  await expect(page.getByRole('button', { name: /^Use \d+ hits/ })).toHaveCount(0);
+});
+
+test('while the simulator starts, the transport says so beside its controls (A50)', async ({ page }, info) => {
+  test.skip(info.project.name !== 'audit-1440-light', 'the starting reason, checked once');
+  // Hold the engine's module until the reason has been read.
+  const { promise: release, resolve } = Promise.withResolvers<void>();
+  await page.route('**/*.wasm', async (route) => {
+    await release;
+    await route.continue();
+  });
+  await page.goto('/');
+  const reason = page.locator('.transport #transport-reason');
+  await expect(reason).toHaveText('starting the simulator…');
+  // One reason for the group, beside its last control and describing each.
+  for (const button of await page.locator('.transport button').all()) {
+    await expect(button).toBeDisabled();
+    expect((await button.getAttribute('aria-describedby')) ?? '', 'the reason describes it').toContain('transport-reason');
+  }
+  const [a, b] = [await page.locator('.transport').getByRole('button', { name: /^Send/ }).boundingBox(), await reason.boundingBox()];
+  expect(Math.max(b!.x - (a!.x + a!.width), a!.x - (b!.x + b!.width), b!.y - (a!.y + a!.height), a!.y - (b!.y + b!.height)), 'the reason stands beside the transport').toBeLessThanOrEqual(48);
+  resolve();
+  await expect(page.locator('.stage canvas')).toBeVisible({ timeout: 30_000 });
+  await expect(reason).toHaveCount(0);
+});
+
+test('a rebuild that fails keeps the running cluster, and the active scenario is inert (A6)', async ({ page }, info) => {
+  test.skip(info.project.name !== 'audit-1440-light', 'the rebuilds, checked once');
+  await open(page);
+  // A Send moves the run on, so a rebuild would show.
+  await page.locator('.transport').getByRole('button', { name: /^Send/ }).click();
+  await still(page);
+  const before = await snapshot(page);
+  expect(before.oracle_total).toBe(25);
+  await page.getByRole('group', { name: 'Scenario preset' }).getByRole('button', { name: 'Rate limiting', exact: true }).click();
+  await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
+  const inert = await snapshot(page);
+  expect([inert.virtual_ms, inert.oracle_total], 'pressing the active scenario rebuilt it').toEqual([before.virtual_ms, before.oracle_total]);
+  // The next build fails: the running cluster stays, live, and says why.
+  await page.evaluate(() => {
+    (window.sim!.constructor as unknown as { create: () => Promise<never> }).create = () => Promise.reject(new Error('the test refused the build.'));
+  });
+  await page.getByRole('button', { name: 'Restart Rate limiting' }).click();
+  await expect(page.getByText(/could not be rebuilt, so the running one stays/)).toBeVisible();
+  const kept = await snapshot(page);
+  expect([kept.virtual_ms, kept.oracle_total], 'the running cluster').toEqual([before.virtual_ms, before.oracle_total]);
+  await expect(page.locator('.stage canvas')).toBeVisible();
+  await page.locator('.transport').getByRole('button', { name: /^Send/ }).click();
+  await expect.poll(async () => (await snapshot(page)).oracle_total).toBe(50);
 });
 
 test('the next step is reachable from the keyboard (A52, A21)', async ({ page }, info) => {
@@ -385,6 +488,8 @@ test('the next step is reachable from the keyboard (A52, A21)', async ({ page },
   await expect(page.locator('.pane-title [data-field="node"]')).toHaveText('0');
   await page.keyboard.press('Space');
   await expect(page.getByRole('button', { name: 'Pause' })).toBeVisible();
+  // A50: Step stays enabled while playing; it pauses and steps.
+  await expect(page.getByRole('button', { name: 'Step to the next event' })).toBeEnabled();
   await page.keyboard.press('Space');
   await expect(page.getByRole('button', { name: 'Play' })).toBeVisible();
   // → on a select changes its option and not the time.
@@ -469,6 +574,11 @@ test('what can be pressed looks pressable, and a named node is previewed (A51, o
     await remove.hover();
     const id = Number(await remove.locator('[data-field="node"]').textContent());
     expect(id).toBe(Number(await page.locator('.pane-title [data-field="node"]').textContent()));
+    // Remove names the selection, whose solid outline already marks it: two
+    // frames on, no other node is previewed.
+    await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+    expect((await glyphs()).preview, `"${squash(await remove.textContent())}" previews another node`).toBe(-1);
+    await page.mouse.move(0, 0);
   };
   await check();
   for (let i = 0; i < 12; i++) {
@@ -518,7 +628,7 @@ test('the pane is one column that never swaps (A5)', async ({ page }, info) => {
   expect(after.slice(1, -1), 'selecting another node swaps nothing').toEqual(before.slice(1, -1));
 });
 
-test("a story's end hands over, and Undo brings it back (C55)", async ({ page }, info) => {
+test("a story's end hands over, and Undo brings it back (C55, A6)", async ({ page }, info) => {
   test.skip(info.project.name !== 'audit-1440-light', 'the hand-over, checked once');
   test.setTimeout(120_000);
   await open(page);

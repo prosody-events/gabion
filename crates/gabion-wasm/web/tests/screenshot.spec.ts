@@ -1,7 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 import { CARRIES_CELLS, type AnswerState, type ClusterState, type EventBatch } from '../src/lib/sim/types';
 import { CONTROL } from '../src/lib/stage/layout';
-import { WATCH, period, select, send, sendButton, setRange, setSpeed, step, stepUntil, virtualMs } from './drive';
+import { WATCH, select, send, sendButton, setRange, setSpeed, step, stepUntil, virtualMs } from './drive';
 
 // Every node holds Propagation's settled seed at load.
 const SEED_TOTAL = '50';
@@ -619,9 +619,15 @@ test('a node that joins a cut zone is cut off with it (A6)', async ({ page }) =>
   await page.getByRole('button', { name: 'Add node' }).click();
   await expect(page.locator('.node-table tr[data-node="12"]')).toHaveAttribute('data-zone', '2');
   await expect(page.locator('.stage-pane')).toHaveAttribute('data-run', 'off', { timeout: 15_000 });
+  // The joiner's own hits reach its zone and stop at the cut.
+  await send(page, 12);
+  for (const id of [2, 5, 8, 11]) await expect(view(page, id), `node ${id} heard the joiner`).toHaveText(BURST_HITS);
+  for (const id of [0, 1, 3, 4, 6, 7, 9, 10]) await expect(view(page, id), `node ${id} across the cut from the joiner`).toHaveText('0');
+  // Nor do node 0's hits reach the joiner's zone: the run ends with them
+  // spread on node 0's side only.
   await send(page, 0);
-  for (let i = 0; i < 5; i++) await period(page);
-  for (const id of [2, 5, 8, 11, 12]) await expect(view(page, id), `node ${id} in the cut zone`).toHaveText('0');
+  for (const id of [0, 1, 3, 4, 6, 7, 9, 10]) await expect(view(page, id), `node ${id} heard node 0`).toHaveText(BURST_HITS);
+  for (const id of [2, 5, 8, 11, 12]) await expect(view(page, id), `node ${id} in the cut zone`).toHaveText(BURST_HITS);
   await expect(lede(page)).toContainText('zone c cut off');
 });
 

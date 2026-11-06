@@ -26,7 +26,7 @@ import { MARK, RING_BEHIND, RING_CAUGHT_UP, type GlyphTable } from '../src/lib/s
 import { VESSEL_SCALE } from '../src/lib/limit';
 import { BAND_ALPHA, BEAM_ALPHA, readTheme, type Theme } from '../src/lib/theme';
 import timings from './phase-timings.json' with { type: 'json' };
-import { PERIOD_MS, WATCH, period, send, setSpeed, step, stepUntil, still, virtualMs } from './drive';
+import { PERIOD_MS, WATCH, period, refusal, send, setSpeed, step, stepUntil, still, virtualMs } from './drive';
 
 // The automated half of the audit checklist in `../README.md` ("Design rules"):
 // A1 to A9. Each audit project fixes a width and a colour scheme; the main test
@@ -1519,6 +1519,47 @@ test('runs go quiet after agreement', async ({ page }, info) => {
   }
 });
 
+// A46: one time model. A refused Send runs no time; an admitted Send's run
+// stops by itself one period after its last landing, its acknowledgements
+// sent, so the period of Play after it sends nothing; in Zone partition it
+// stops at the cut zone, long before its cap.
+test('a Send runs only the time it needs (A46)', async ({ page }, info) => {
+  test.skip(info.project.name !== 'audit-1440-light', 'the time model, checked once');
+  test.setTimeout(120_000);
+  await open(page);
+  await setSpeed(page, 4);
+  const pane = page.locator('.stage-pane');
+  const hits = page.locator('#burst-hits');
+  await hits.fill('100');
+  await hits.press('Enter');
+  await logPackets(page);
+  await send(page, 0);
+  await expect(pane).toHaveAttribute('data-run', 'off');
+  const end = await virtualMs(page);
+  await takePackets(page);
+  await page.getByRole('button', { name: 'Play' }).click();
+  await expect.poll(() => virtualMs(page), { timeout: 30_000 }).toBeGreaterThanOrEqual(end + PERIOD_MS);
+  await page.getByRole('button', { name: 'Pause' }).click();
+  await still(page);
+  expect((await takePackets(page)).filter((p) => p.t < end + PERIOD_MS), 'a packet in the period after the run').toEqual([]);
+
+  // Node 0 sees the whole limit: its next Send is refused, and the page
+  // stays paused at the same instant.
+  const at = await virtualMs(page);
+  await refusal(page, 0, 'A46');
+  expect(await virtualMs(page), 'a refused Send ran time').toBe(at);
+  await expect(pane).toHaveAttribute('data-playing', '0');
+  expect(await takePackets(page), 'a refused Send sent a packet').toEqual([]);
+
+  await loadPreset(page, 'Zone partition');
+  const from = await virtualMs(page);
+  await send(page, 0);
+  await expect(page.locator('.narration')).toHaveText(/^paused: zone c is cut off/);
+  // Its flush lands at once and its relays within a heartbeat; the run ends a
+  // period later. Four periods leave room and stay far below the cap of 16.
+  expect((await virtualMs(page)) - from, 'Zone partition: the run stopped at the cut').toBeLessThanOrEqual(4 * PERIOD_MS);
+});
+
 test('both gateway presets fail over within the window', async ({ page }, info) => {
   test.skip(info.project.name !== 'audit-1440-light', 'the failover, checked once');
   test.setTimeout(240_000);
@@ -1710,6 +1751,33 @@ const glyphs = <T>(page: Page, read: (g: GlyphTable) => T): Promise<T> =>
     return (0, eval)(src)(c.glyphs);
   }, read.toString()) as Promise<T>;
 
+/** C14: each decision stands right of its ring, and on its left only when
+ *  the right would leave the stage or touch a name. */
+async function checkDecisions(page: Page, where: string): Promise<void> {
+  const found = await page.evaluate(() => {
+    const out: string[] = [];
+    const names: { x: number; y: number; w: number; h: number }[] = JSON.parse(document.querySelector<HTMLElement>('.stage canvas')?.dataset.labelBoxes ?? '[]');
+    for (const el of document.querySelectorAll<HTMLElement>('.decision')) {
+      const cell = document.querySelector<HTMLElement>(`[role="gridcell"][data-node="${el.dataset.node}"]`)!;
+      const cx = parseFloat(cell.style.left) + parseFloat(cell.style.width) / 2;
+      const cy = parseFloat(cell.style.top) + parseFloat(cell.style.height) / 2;
+      const left = parseFloat(el.style.left);
+      const w = el.getBoundingClientRect().width;
+      const flipped = el.classList.contains('flipped');
+      if (flipped !== left < cx) out.push(`node ${el.dataset.node}'s decision sits ${left < cx ? 'left' : 'right'} but says it is ${flipped ? '' : 'not '}flipped`);
+      // The right slot: where the text stands unflipped, or its mirror.
+      const x = flipped ? 2 * cx - left - w : left;
+      const crosses = names.some((b) => x < b.x + b.w && b.x < x + w && cy - 10 < b.y + b.h && b.y < cy + 10);
+      const overflows = x + w > (el.offsetParent as HTMLElement).clientWidth;
+      if (flipped !== (crosses || overflows)) {
+        out.push(`node ${el.dataset.node}'s decision is ${flipped ? 'left though its right is free' : 'right though it ' + (crosses ? 'touches a name' : 'leaves the stage')}`);
+      }
+    }
+    return out;
+  });
+  expect(found, `${where}: the decisions`).toEqual([]);
+}
+
 test('the node glyph tells level, strata, cap, refusal and ring (A42, A16, C37)', async ({ page }, info) => {
   test.setTimeout(240_000);
   await open(page);
@@ -1721,20 +1789,37 @@ test('the node glyph tells level, strata, cap, refusal and ring (A42, A16, C37)'
   expect(contrastOf(theme.fg, theme.panel), `${where}: a count over the empty inside (A16)`).toBeGreaterThanOrEqual(4.5);
 
   // During the first Send's held flight every receiver's ring is behind and
-  // shows less than the whole, though it has heard nothing yet.
+  // shows less than the whole, though it has heard nothing yet; its vessel
+  // and its count are its own view, empty, while only node 0 holds the hits.
   await page.locator('[role="gridcell"][data-node="0"]').press('Enter');
   await page.locator('.transport').getByRole('button', { name: /^Send/ }).click();
   await page.waitForFunction(() => document.querySelector<HTMLElement>('.stage-pane')?.dataset.held !== '0');
-  const held = await glyphs(page, (g) => {
-    const out: [number, number, number][] = [];
-    for (let s = 0; s < g.len; s++) if (g.id[s] >= 0 && g.id[s] !== 0) out.push([g.id[s], g.ring[s], g.arc[s]]);
-    return out;
+  // Strata show where the inside is tall enough: one per non-empty bucket.
+  const tall = (await glyphs(page, (g) => 2 * (g.r[0] - 1))) >= STRATA_MIN_INNER;
+  // One read, so the glyphs, the counts and the hold are of one instant.
+  const held = await page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { glyphs: GlyphTable }) => {
+    const g = c.glyphs;
+    const out: { id: number; ring: number; arc: number; strata: number; count: string | null }[] = [];
+    for (let s = 0; s < g.len; s++) {
+      if (g.id[s] < 0) continue;
+      const count = document.querySelector(`[role="gridcell"][data-node="${g.id[s]}"] .count`)?.textContent?.trim() ?? null;
+      out.push({ id: g.id[s], ring: g.ring[s], arc: g.arc[s], strata: g.strata[s], count });
+    }
+    return { held: document.querySelector<HTMLElement>('.stage-pane')?.dataset.held, nodes: out };
   });
-  for (const [id, ring, arc] of held) {
-    expect(ring, `${where}: node ${id}'s ring while the wave flies`).toBe(RING_BEHIND);
-    expect(arc, `${where}: node ${id}'s arc while the wave flies`).toBeLessThan(1);
+  expect(held.held, `${where}: the sample is of the held flight`).not.toBe('0');
+  for (const { id, ring, arc, strata, count } of held.nodes) {
+    const origin = id === 0;
+    if (!origin) {
+      expect(ring, `${where}: node ${id}'s ring while the wave flies`).toBe(RING_BEHIND);
+      expect(arc, `${where}: node ${id}'s arc while the wave flies`).toBeLessThan(1);
+    }
+    if (tall) expect(strata, `${where}: node ${id}'s strata while the wave flies`).toBe(origin ? 1 : 0);
+    if (wide || count !== null) expect(count, `${where}: node ${id}'s count while the wave flies`).toBe(origin ? '25' : '0');
   }
   await still(page, 60_000);
+  if (wide) await expect(page.locator('.decision'), `${where}: node 0's decision`).toHaveCount(1);
+  await checkDecisions(page, `${where}, admitted`);
 
   // Sends at nodes 1, 2 and 2, each in a bucket of its own where strata show.
   for (const node of [1, 2, 2]) {
@@ -1750,8 +1835,6 @@ test('the node glyph tells level, strata, cap, refusal and ring (A42, A16, C37)'
   const snap = await snapshot(page);
   await checkGlyphs(page, `${where}, at the limit`, 'Rate limiting');
   const strata = await glyphs(page, (g) => Array.from({ length: g.len }, (_, s) => [g.id[s], g.strata[s]] as [number, number]));
-  // Strata show where the inside is tall enough: one per non-empty bucket.
-  const tall = (await glyphs(page, (g) => 2 * (g.r[0] - 1))) >= STRATA_MIN_INNER;
   const buckets = snap.window_buckets.length / snap.nodes.length;
   for (const [i, node] of snap.nodes.entries()) {
     const row = snap.window_buckets.slice(i * buckets, (i + 1) * buckets);
@@ -1777,40 +1860,10 @@ test('the node glyph tells level, strata, cap, refusal and ring (A42, A16, C37)'
       push(...a);
     };
   });
-  await page.locator('.transport').getByRole('button', { name: /^Send/ }).click();
-  await page.waitForFunction(() => document.querySelector<HTMLCanvasElement>('.stage canvas')?.dataset.bounce === '2');
-  const frames = await page.evaluate(
-    () =>
-      new Promise<{ top: number; bottom: number; brim: number; masked: number }[]>((done) => {
-        const c = document.querySelector('.stage canvas') as HTMLCanvasElement & { glyphs: GlyphTable };
-        const out: { top: number; bottom: number; brim: number; masked: number }[] = [];
-        const tick = (): void => {
-          const g = c.glyphs;
-          if (g.bounce < 0) {
-            done(out);
-            return;
-          }
-          out.push({ top: g.bandTop, bottom: g.bandBottom, brim: g.brimY[g.bounce], masked: g.bandMasked });
-          requestAnimationFrame(tick);
-        };
-        tick();
-      }),
-  );
-  expect(frames.length, `${where}: the refusal played`).toBeGreaterThan(0);
-  const cap = await page.locator('[role="gridcell"][data-node="2"]').evaluate((el) => {
-    const ctx = new OffscreenCanvas(1, 1).getContext('2d')!;
-    const style = getComputedStyle(el);
-    ctx.font = `600 ${style.getPropertyValue('--font-size-count')} ${style.fontFamily}`;
-    return ctx.measureText('0').actualBoundingBoxAscent;
-  });
-  for (const f of frames) {
-    expect(f.masked, `${where}: the disc clips the band`).toBe(1);
-    expect(f.bottom, `${where}: the band never passes the brim`).toBeLessThanOrEqual(f.brim + 1e-3);
-    expect(f.bottom, `${where}: the band never reaches the count`).toBeLessThanOrEqual(-cap / 2);
-  }
-  if (info.project.use.reducedMotion === 'reduce') {
-    expect(new Set(frames.map((f) => f.top)).size, `${where}: under reduced motion the band rests`).toBe(1);
-  }
+  const frames = await refusal(page, 2, where);
+  await checkDecisions(page, `${where}, refused`);
+  // Every audit project reduces motion (the motion project plays the band).
+  expect(new Set(frames.map((f) => f.top)).size, `${where}: under reduced motion the band rests`).toBe(1);
   expect(await page.evaluate(() => (window as unknown as { pushed: number }).pushed), `${where}: a refusal sends nothing`).toBe(0);
   expect(await page.locator('.count').allTextContents(), `${where}: a refusal counts nothing`).toEqual(counts);
 });

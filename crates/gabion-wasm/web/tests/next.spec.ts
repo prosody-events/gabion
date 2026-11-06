@@ -94,6 +94,11 @@ test("the heading's forms (A18)", () => {
     '✓ All 8 reachable nodes see 25 hits · zone c is cut off',
     'Reconnect zone c',
   ]);
+  // Zone c stranded with nothing, zone b still behind: the gap is zone b's,
+  // the reachable nodes' only.
+  const mixed = cut.map((n) => (n.zone === 1 ? node(n.id, 15, { kind: 'Behind', missing_for_ms: 100 }) : n));
+  const behind = heading({ ...base, nodes: mixed, oracle: 25, cuts: [{ kind: 'zone', zone: 2 }] });
+  expect([behind.id, text(behind.parts)]).toEqual(['rl-1', '4 of 12 nodes see 25 of the 100 limit · the rest are up to 10 behind']);
   const over = heading({ ...base, nodes: all(200), oracle: 200 });
   expect(text(over.parts)).toContain('· 200 admitted against the limit of 100');
 });

@@ -5,13 +5,13 @@ import type { ClusterState } from '../src/lib/sim/types';
 import { BEAM_FLIGHT_MS, CONTROL, CROSS, DROPPED, LANDED, RELAY } from '../src/lib/stage/layout';
 import type { BeamPool } from '../src/lib/stage/renderer';
 import { LANDED_ALPHA } from '../src/lib/theme';
-import { PERIOD_MS, WATCH, send, sendButton, setRange, setSpeed, step, virtualMs } from './drive';
+import { PERIOD_MS, WATCH, refusal, send, sendButton, setRange, setSpeed, step, virtualMs } from './drive';
 import { sourceOf } from './sourcemap';
 
 // The waves in motion (README "Tests"), run once at 1440 px in the light theme
 // with motion on: cause before effect in every held preset, a Send's eager
 // flush past the emit floor, Step by event, the presentation clock, the stage's
-// allocations and the landed routes. Every check reads the engine
+// allocations, a refusal's band and the landed routes. Every check reads the engine
 // (`window.sim`), the beam pool the stage publishes (`canvas.beams`) or the
 // DOM, never the page's formatters; every wait is a condition with a deadline,
 // in simulated time where one is meant. A check of how long something takes to
@@ -667,18 +667,27 @@ interface TrackedSnapshot {
  *  start line and column, and the objects it allocated and their bytes. */
 type Allocations = { name: string; script: string; line: number; column: number; count: number; size: number };
 
+/** The function a call stack's allocations are charged to. */
+type Owner = Omit<Allocations, 'count' | 'size'>;
+
 /** Each call stack's allocations in a tracked heap snapshot, charged to the
- *  function on top. Its trace tree nests nodes of five fields (`id,
- *  function_info_index, count, size, children`). */
-function* allocations(snapshot: TrackedSnapshot, nodes = snapshot.trace_tree): Generator<Allocations> {
+ *  function on top, or, when that is one of V8's builtins (a frame of no
+ *  script: `slice`, `map`, a spread), to the function that called it, whose
+ *  code asked for the object. Its trace tree nests nodes of five fields (`id,
+ *  function_info_index, count, size, children`); a function's info is
+ *  `function_id, name, script_name, script_id, line, column`. */
+function* allocations(snapshot: TrackedSnapshot, nodes = snapshot.trace_tree, caller?: Owner): Generator<Allocations> {
   const width = snapshot.snapshot.meta.trace_function_info_fields.length;
   const info = snapshot.trace_function_infos;
   const text = snapshot.strings;
   for (let i = 0; i < nodes.length; i += 5) {
     const [fn, count, size, children] = nodes.slice(i + 1, i + 5) as [number, number, number, unknown[]];
     const at = fn * width;
-    yield { name: text[info[at + 1]], script: text[info[at + 2]], line: info[at + 4], column: info[at + 5], count, size };
-    yield* allocations(snapshot, children);
+    const builtin = info[at + 3] === 0;
+    const owner: Owner =
+      builtin && caller !== undefined ? caller : { name: text[info[at + 1]], script: text[info[at + 2]], line: info[at + 4], column: info[at + 5] };
+    yield { ...owner, count, size };
+    yield* allocations(snapshot, children, owner);
   }
 }
 
@@ -845,6 +854,23 @@ test('a ring sweeps up to its new share as its packet lands (A13)', async ({ pag
     expect(rise.every((v, i) => i === 0 || v >= rise[i - 1]), `node ${id}'s ring only rises once its packet lands: ${seen}`).toBe(true);
     expect(rise.some((v) => v > rise[0] && v < rise.at(-1)!), `node ${id}'s ring sweeps through its way up: ${seen}`).toBe(true);
   }
+});
+
+// -- The refusal in motion -----------------------------------------------------------
+
+test("a refusal's band drops, rebounds and fades in the headroom (C37)", async ({ page }) => {
+  // The stage at its full size, the table closed, so node 0 shows its count.
+  await page.goto('/');
+  await expect(page.locator('.stage canvas')).toBeVisible({ timeout: 30_000 });
+  await loadPreset(page, 'Rate limiting');
+  // A request of the whole limit, then one more: refused at node 0.
+  const field = page.locator('#burst-hits');
+  await field.fill('100');
+  await field.press('Enter');
+  await send(page, 0);
+  await expect(page.locator('[role="gridcell"][data-node="0"] .count')).toHaveText('100');
+  const frames = await refusal(page, 0, 'motion');
+  expect(new Set(frames.map((f) => f.top)).size, 'the band moves').toBeGreaterThan(1);
 });
 
 // -- Landed routes -------------------------------------------------------------------
