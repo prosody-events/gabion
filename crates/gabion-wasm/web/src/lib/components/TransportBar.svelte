@@ -1,6 +1,7 @@
 <script lang="ts">
-  // The time dock: play/pause, single-step, reset, a speed control, and the
-  // current virtual-time readout.
+  // The time dock: play/pause, Step to the next event, reset, a speed control,
+  // the current virtual-time readout and, once a heartbeat period has played,
+  // how long it took to watch at the chosen speed.
   import { fmtDuration } from '../format';
 
   let {
@@ -8,6 +9,7 @@
     busy,
     speed = $bindable(),
     virtualMs,
+    heartbeatWallMs,
     onToggle,
     onStep,
     onReset,
@@ -17,6 +19,9 @@
     busy: boolean;
     speed: number;
     virtualMs: number;
+    /** Wall ms the last whole heartbeat period took to play, or null before
+     *  one has. */
+    heartbeatWallMs: number | null;
     onToggle: () => void;
     onStep: () => void;
     onReset: () => void;
@@ -33,7 +38,9 @@
   >
     {playing ? '❚❚ Pause' : '▶ Play'}
   </button>
-  <button onclick={onStep} disabled={playing || busy} aria-label="Step one heartbeat"> ▸❙ Step </button>
+  <button onclick={onStep} disabled={busy} aria-label="Step to the next event" title="→ steps to the next event">
+    ▸❙ Step
+  </button>
   <button onclick={onReset} disabled={busy} aria-label="Reset to start"> ↺ Reset </button>
 
   <label class="speed">
@@ -47,6 +54,14 @@
       <span class="readout-label">virtual time</span>
       <span class="readout-value" data-field="virtual-time" data-ms={virtualMs}>{fmtDuration(virtualMs)}</span>
     </span>
+    {#if heartbeatWallMs !== null}
+      <span class="readout-item">
+        <span class="readout-note">
+          a heartbeat took <span data-field="heartbeat-wall" data-ms={heartbeatWallMs}>{fmtDuration(heartbeatWallMs)}</span>
+          to watch
+        </span>
+      </span>
+    {/if}
   </div>
 </div>
 
@@ -129,5 +144,14 @@
   .readout-value {
     font-size: var(--font-size-heading);
     color: var(--color-fg);
+  }
+
+  .readout-note {
+    font-size: var(--font-size-caption);
+    color: var(--color-fg);
+  }
+
+  .readout-note [data-field] {
+    font-weight: 600;
   }
 </style>

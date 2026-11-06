@@ -56,6 +56,9 @@ export const BAND_ALPHA = 0.15;
 /** The share of its alpha a beam keeps when a selection makes it context: the
  *  one named exemption from the graphics contrast rule. */
 export const FADED_ALPHA = 0.25;
+/** A landed route's alpha, drawn 1 px with no head: history, not the event in
+ *  focus. Exempt by name from the graphics contrast rule, as `FADED_ALPHA` is. */
+export const LANDED_ALPHA = 0.15;
 
 /** Call `onChange` when the OS colour scheme or `<html data-theme>` changes;
  *  returns the unsubscribe. */

@@ -36,14 +36,28 @@ width and nothing is letterboxed.
 beam its route): inside a zone a straight segment, across zones a quadratic
 curve bent through the stage's empty centre. Position carries the tier and two
 data strokes repeat it: thin `--chart-muted` inside a zone, thicker `--color-fg`
-with an arrowhead across zones. Control packets (header-only acks and probes,
-gap reports, sweep requests) are small dots with no tail. A dropped packet greys
-and stops half-way. Dashed strokes are not used: a beam is often shorter than a
-dash. With a node selected, the beams that are not its own (and not relays sent
-by its gateways) are drawn at a quarter of their alpha, the one mark the
-contrast audit exempts. The renderer keeps every beam in a pre-sized pool and
-draws a frame into one `Graphics` per mark style, so a frame allocates nothing
-of its own.
+across zones. A data packet in flight is a short tail with a head mark, a dot
+inside a zone and an arrowhead across zones. Control packets (header-only acks
+and probes, gap reports, sweep requests) are small dots with no tail. A lost
+packet is a grey half-line ending in a stop bar, never a head, so it cannot
+read as a packet in flight. Dashed strokes are not used: a beam is often
+shorter than a dash.
+
+Beams fly on a presentation clock (`canvas.beams.clock`): a flight is 520 ms of
+it, which Speed scales and Pause freezes. In every preset but Sustained
+overload the clock holds the engine: a wave of data packets is drawn, and the
+engine delivers it, and each count changes, only when the renderer reports it
+landed (rule 29). A Send's decision stands alone for 250 ms (`ARRIVAL_MS`)
+before its eager flush flies. A landed data route stays drawn, whole, 1 px at
+`LANDED_ALPHA` with no head: history, not the event in focus. It stays until
+the next command where no feed runs, so a Send's waves read as a diagram, and
+leaves at landing where a feed runs; a new layout drops it. With a node
+selected, the beams that are not its own (and not relays sent by its gateways)
+are drawn at a quarter of their alpha. `FADED_ALPHA` and `LANDED_ALPHA` are the
+marks the contrast audit exempts, by name. The renderer keeps every beam in a
+pre-sized pool and draws into one `Graphics` per mark style, and only when
+something changed or a beam is in flight, so a frame allocates nothing of its
+own.
 
 **Arcs.** A node's arc sweeps its view as a share of the true total, with butt
 caps, and stays at least a twelfth of a ring open (`ARC_NOTCH`) until the node
@@ -109,28 +123,44 @@ nothing.
 window, limit; edits stage until Rebuild), the network actions (cut a zone off;
 with a node selected, silence its gateway into a zone or cut that gateway from
 its zone, both named by the selection; heal), live membership (add into a zone,
-remove) and a burst. The workspace stays mounted across a rebuild, so an open
-disclosure and keyboard focus survive it.
+remove) and a Send. The workspace stays mounted across a rebuild, so an open
+disclosure and keyboard focus survive it. Step goes to the next event: the next
+wave of packets that carry hits, or the next instant hits leave the window, or
+one heartbeat period when neither is coming; it pauses first, and is never
+disabled for playing. The transport says how long the last heartbeat period
+took to watch at the chosen speed.
 
 **Presets** build their blurbs from the config they run with, so no number in
-them is typed. Traffic burst, Steady state, Sustained overload, Zone partition,
+them is typed. Propagation, Steady state, Sustained overload, Zone partition,
 Packet loss, Gateway failure (the origin's gateway silenced), Gateway cut from
 its zone (one direction blocked, which the `CANNOT_RELAY` backstop repairs), No
-zone configured and Sandbox. Traffic burst and the gateway presets open with
-their origin selected.
+zone configured and Sandbox. Every preset opens on a warmed, settled cluster:
+the page steps whole heartbeat periods until every node has a gateway into
+every other zone and a period passes with no packet, then seeds it. Propagation
+settles its seed before the first paint, so every node opens holding it.
+Propagation and the gateway presets open with node 0 selected. Only the
+presets whose subject is traffic have a feed (Steady state, No zone configured,
+Sustained overload), plus Gateway cut's trickle of 2 hits/s at node 0, which
+keeps node 0 sending data its cut gateway must answer with "cannot relay"; the
+rest show one Send's hits leaving the window. Every preset declares its
+`pacing`: `'live'` for Sustained overload, `'held'` for the rest.
 
 `window.sim` is the live engine, the handle the audit and the console use
 (`sim.snapshot(inspect, watch)`); each chart's plot element carries its uPlot
 instance as `uplot`, which the audit reads to check every mark lies inside its
-plot; and the stage canvas carries `beams`, the renderer's in-flight beam pool,
-whose `push` the geometry check wraps to record each beam's route as it is
-drawn and the beam check wraps to count every beam drawn.
+plot; the stage canvas carries `beams`, the renderer's beam pool (`clock`,
+`redraws`, `inFlight`, `due`, and the `push` and `land` the audit wraps to see
+each beam enter and land); and `.stage-pane[data-held]` is the sequence number
+of the wave held in flight, "0" when none is.
 
 ## Layout
 
-- `src/App.svelte` — orchestrates the session: builds the `Sim`, runs the gated
-  play loop, owns transport state and the selection, and routes each step's events
-  to the stage.
+- `src/App.svelte` — orchestrates the session: builds and warms the `Sim`,
+  runs the play loop, owns transport state and the selection, and runs every
+  engine call through one queue, holding each wave until the stage reports it
+  landed. The stage takes state as props (the clock's running and speed, the
+  trail) and the packets as commands (`show`, `finish`, `clearTrail`, `reset`)
+  in the queue's order.
 - `src/tokens.css` — the design tokens, the one source of design values. Each
   colour holds its light and dark value in `light-dark()`: the OS preference
   picks one and `<html data-theme="light|dark">` overrides it, which sets the
@@ -159,13 +189,18 @@ drawn and the beam check wraps to count every beam drawn.
   `GossipTargets` and `BucketStrata`, `HeadlineMetric`, `ControlRail`,
   `TransportBar` and `InfoTip`.
 - `src/lib/presets.ts` — the scenario presets: a config, a blurb built from it,
-  an optional selected origin and an `async seed(sim, config)` that fires the
-  opening commands against a fresh cluster. Deliberately *not* a timed script:
-  the cut-then-heal story is a user gesture, and a sustained feed is a
-  carry-save rate the play loop folds into each advance.
+  a `pacing`, an optional selected node, an optional feed and an
+  `async seed(sim, config, gateways)` that fires the opening commands against a
+  fresh, warmed cluster (`warm`). Deliberately *not* a timed script: the
+  cut-then-heal story is a user gesture, and a feed injects ⌊rate·T⌋ hits by
+  virtual time T since the build was handed to the reader.
 - `src/wasm/` — generated by `pnpm run build:wasm`; never edited or committed.
 - `tests/screenshot.spec.ts` — the functional smoke.
 - `tests/audit.spec.ts` — the automated design audit (see "Design rules").
+- `tests/motion.spec.ts` — the waves in motion (see "Tests").
+- `tests/drive.ts` — Step, a heartbeat period of Steps, and Steps until a
+  condition, shared by the specs; `tests/sourcemap.ts` maps a bundle position
+  to its source through the hidden source maps the build writes.
 
 ## Develop
 
@@ -183,7 +218,7 @@ and runs the production Vite build — this is what `make wasm-check` runs.
 pnpm exec playwright install chromium   # one-time
 pnpm run build
 pnpm run screenshot                      # writes screenshots/ring-{initial,gossip,converged}.png
-pnpm run audit                           # ten projects; writes audit-shots/
+pnpm run audit                           # eleven projects; writes audit-shots/
 ```
 
 See "Tests" below for what each suite checks.
@@ -221,12 +256,15 @@ study dashboard. A rule that assumes the study's data model says "N/A" and why.
 26. One rAF-coalesced draw, a debounced ResizeObserver, focus kept across a rebuild (A6).
 27. Accessibility: a focusable roving-tabindex grid, sentence labels, tooltips on hover, focus and tap, targets of at least 24 px, contrast (A3, A6, A7).
 28. Automated checks carried over (CI).
+29. Cause before effect: in every preset but Sustained overload, and on every Step, the clock waits while a wave of data packets is drawn; the engine delivers the wave, and each count changes, when it lands. A command first fast-forwards any run in flight past its relays, then shows its own effect; a rebuild discards it. Sustained overload shows counts as the engine computes them. Step stops at the next wave, or at the next instant hits leave the window (motion suite).
 
 The grep gates, which `make hygiene` runs: no colour literal outside
-`tokens.css`, no pixel `font-size`, and no token a component names that
-`tokens.css` does not define (so no pre-token name such as `--ink` survives).
+`tokens.css`, no pixel `font-size`, no token a component names that
+`tokens.css` does not define (so no pre-token name such as `--ink` survives),
+and no `new Graphics` in `renderer.ts` outside its constructor and
+`#createNode`.
 
-Automated checks, run on every preset with the transport paused:
+Automated checks, run on every preset after a walk by Step:
 
 - A1: no page or console errors, no failed requests, no page-level horizontal overflow.
 - A2: no "NaN", "undefined", "null", "Infinity", "[object" or "e+" in page text.
@@ -238,7 +276,7 @@ Automated checks, run on every preset with the transport paused:
 - A8: the wording scan (rule 1) and the clock-time scan (rule 2).
 - A9: a digit scan outside `[data-field]` elements (rule 7).
 
-`tests/audit.spec.ts` automates all nine, in ten projects, and checks each preset a second time with `data-theme` forcing the other theme. It saves a full-page PNG per project, preset and theme to `audit-shots/`.
+`tests/audit.spec.ts` automates all nine, in ten projects, and checks each preset a second time with `data-theme` forcing the other theme. It saves a full-page PNG per project, preset and theme to `audit-shots/`. `tests/motion.spec.ts` checks rule 29 with motion on and saves Propagation's two waves, paused mid-flight, as `propagation-wave1.png` and `propagation-wave2.png`.
 
 The visual audit reads those PNGs for: alignment, spacing rhythm, type
 hierarchy, nothing clipped, a dark theme as considered as the light one, and a
@@ -246,25 +284,49 @@ fully usable phone layout.
 
 ## Tests
 
-`pnpm run screenshot` is the functional smoke (twenty-one tests, one project at
-1440 px in the light theme): it boots the real core, gossips a burst to every
-node, selects, adds and removes nodes, drives every control and checks the
-inspector, reading numbers from the node table. `pnpm run audit` is the design
-audit: ten projects (widths 1440, 1280, 1100, 768 and 400, each in light and dark,
-with motion reduced). Its main test walks every preset to a fixed virtual time
-with the transport paused, runs A1 to A9, checks the stage tooltips, and recomputes
-A4 and A5 from the engine's snapshot, then repeats the page checks with
-`data-theme` forcing the other theme. Further tests check chart 1 across the
-rule window, with unequal zones over a window that opens at a kept mark, and
-with one node, the share window at any snapshot rate, the stage geometry for
-every zone count (at the widest and the narrowest stage, with facing discs of
-neighbouring rings kept apart), that the beams a Step draws are its packets, one
-each with its packet's kind, tier and fate, over packets of every kind, that a
-paused stage's labels are not rebuilt per snapshot, and the interactions, with
-touch. Full-page PNGs land in `audit-shots/`, which is gitignored; CI uploads it
-as a workflow artifact. All of it downloads a browser, so, like the node
-`smoke.cjs`, it is an on-demand and CI run, not part of `make wasm-check`. On the
-machine that wrote this the whole audit takes about four and a half minutes with one worker and under two with six.
+`pnpm run screenshot` is the functional smoke (twenty-two tests, one project
+at 1440 px in the light theme): it boots the real core on a settled cluster,
+spreads a Send to every node and watches the hits leave the window, selects,
+adds and removes nodes, drives every control and checks the inspector, reading
+numbers from the node table, and checks that every data packet Sustained
+overload sends, by its feed's submits or by its steps, is drawn, one beam each.
+
+`pnpm run audit` runs two suites. The design audit is ten projects (widths
+1440, 1280, 1100, 768 and 400, each in light and dark, with motion reduced).
+Its main test walks every preset a few heartbeat periods by Step at 4×, runs A1
+to A9, checks the stage tooltips, and recomputes A4 and A5 from the engine's
+snapshot, then repeats the page checks with `data-theme` forcing the other
+theme. Further tests check chart 1 across the rule window, with unequal zones
+over a window that opens at a kept mark, and with one node (at the widest and
+the narrowest stage); the share window at any snapshot rate; the stage geometry
+for every zone count (at the widest and the narrowest stage, with facing discs
+of neighbouring rings kept apart); that the beams a Step draws are its packets,
+one each with its packet's kind, tier and fate, over packets of every kind (a
+node added to the live cluster brings the join sweep); that a paused stage's
+labels are not rebuilt per snapshot; that every preset opens warmed and settled
+(each seeded node's first wave reaches one gateway per other zone, and
+Propagation opens with its seed everywhere and no beam); that runs go quiet
+after agreement; that both gateway presets fail over within the rule window;
+and the interactions, with touch.
+
+The motion suite (one project, 1440 px, light, motion on) checks rule 29: in
+every held preset, played at 4× after a Send, no node's count rises before a
+beam into it lands or its own request is admitted, no wave leaves while another
+flies, simulated time does not move while a wave is held, and the counts shown
+during a hold are the engine's (also for Steady state at limit 100, whose feed
+flushes at once); back-to-back Sends each flush at once, past the emit floor;
+Step flies Propagation's two waves one at a time, at 1× and at the slowest
+speed, and then reaches the window's edge; a flight lasts longer at a quarter
+speed and Pause freezes it, pool, clock and pixels; the heartbeat readout; the
+stage's allocations over 300 played frames, sampled by the heap profiler and
+mapped to their source through the hidden source maps (boxed doubles, the
+engine's own, aside); and the landed routes, with motion on and reduced.
+
+Full-page PNGs land in `audit-shots/`, which is gitignored; CI uploads it as a
+workflow artifact. All of it downloads a browser, so, like the node
+`smoke.cjs`, it is an on-demand and CI run, not part of `make wasm-check`.
+On the machine that wrote this, `pnpm run audit` takes about two and a half
+minutes with Playwright's default workers.
 
 ## Why no `vite-plugin-wasm`
 

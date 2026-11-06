@@ -21,7 +21,6 @@
     return max - min;
   });
   const hasTotal = $derived(cluster !== null && cluster.oracle_total > 0);
-  const converged = $derived(hasTotal && disagreement === 0);
   // How long the node behind longest has lacked a change, at least: the largest
   // lower bound the engine reports, or `undefined` while every node holds every
   // change. A censored value, so it prints as "≥" (design rule 12).
@@ -33,6 +32,9 @@
     }
     return longest;
   });
+  // Converged by the engine's own predicate: every node holds every change.
+  // Equal views are not enough: both sides of a cut can count the same.
+  const converged = $derived(hasTotal && missingFor === undefined);
 </script>
 
 <div class="headline" class:converged>
@@ -40,12 +42,10 @@
   <span class="headline-value" data-field="disagreement">{fmtCount(disagreement)}</span>
   {#if converged}
     <span class="badge" role="status">✓ converged</span>
-  {:else if hasTotal && missingFor !== undefined}
+  {:else if missingFor !== undefined}
     <span class="badge muted" role="status">
       not caught up (≥ <span data-field="missing-for">{fmtDuration(missingFor)}</span>)
     </span>
-  {:else if hasTotal}
-    <span class="badge muted" role="status">spreading…</span>
   {/if}
 </div>
 

@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
   import { blurb, zoneLabel, type Blurb } from '../format';
-  import type { ClusterState, SimEvent } from '../sim/types';
-  import { StageRenderer, labelExtent, type Roles } from '../stage/renderer';
+  import type { ClusterState, EventBatch } from '../sim/types';
+  import { StageRenderer, labelExtent, type Roles, type Trail } from '../stage/renderer';
   import {
     CROSS_WIDTH,
     IN_WIDTH,
@@ -18,18 +18,24 @@
 
   // The tier view. The WebGL canvas (managed imperatively by `StageRenderer`)
   // draws one ring per zone, the nodes with their cell arcs and role glyphs, and
-  // the packets in flight; `cluster` feeds steady per-node state and `events`
-  // feeds the transient packets from each step. `NodeGrid` lays the same nodes
-  // over the canvas as focusable cells with a tooltip, and a table, because the
-  // canvas is opaque to assistive tech and to test tooling.
+  // the packets in flight. State arrives as props (`cluster`, `roles`, whether
+  // the clock runs, its speed, the trail); the packets arrive as commands
+  // (`show`, `finish`, `clearTrail`, `reset`), which App calls in the order its
+  // one queue runs the engine, and the renderer reports a held wave's landing
+  // through `onLanded`. `NodeGrid` lays the same nodes over the canvas as
+  // focusable cells with a tooltip, and a table, because the canvas is opaque
+  // to assistive tech and to test tooling.
   //
   // Clicking or tapping a disc selects that node and shows its tooltip; clicking
   // the bare stage deselects. The key and the one-line annotation sit under the
   // canvas, outside it, so nothing overlaps the drawing.
   let {
     cluster,
-    events,
     roles,
+    running,
+    speed,
+    trail,
+    onLanded,
     hoveredId,
     focusedId,
     theme,
@@ -39,9 +45,15 @@
     onFocus,
   }: {
     cluster: ClusterState | null;
-    events: SimEvent[];
     /** The selected origin's marks, or `null` with no selection. */
     roles: Roles | null;
+    /** Whether the presentation clock runs freely: the page is playing. */
+    running: boolean;
+    /** The presentation clock's speed against wall time. */
+    speed: number;
+    trail: Trail;
+    /** Called once a held wave's beams have all landed. */
+    onLanded: () => void;
     hoveredId: number | null;
     focusedId: number | null;
     theme: Theme;
@@ -105,38 +117,65 @@
     return next;
   });
 
-  // The latest gateway change or join-sweep request, in a sentence.
+  // The latest gateway change or join-sweep request, in a sentence: it stands
+  // until a later one replaces it.
   let annotation = $state.raw<Blurb>([]);
-  $effect(() => {
-    if (events.length === 0) {
-      annotation = [];
-      return;
-    }
-    // Read once per batch: the cluster moves every frame, the annotation doesn't.
-    const names = untrack(() => cluster?.zones.map((z) => z.name) ?? []);
-    const nodes = untrack(() => cluster?.nodes ?? []);
-    const zone = (z: number): string => zoneLabel(names[z] ?? '');
+
+  /** Draw `batch`'s packets as beams that leave `delay` ms of presentation
+   *  clock from now, and read its annotation; with `hold`, call `onLanded`
+   *  once they have all landed. False when no renderer exists yet: then
+   *  nothing will land, and the caller delivers at once. */
+  export function show(batch: EventBatch, delay: number, hold: boolean): boolean {
+    annotation = annotate(batch) ?? annotation;
+    if (!ready || renderer === null) return false;
+    renderer.show(batch.events, delay, hold);
+    return true;
+  }
+
+  /** Let the clock run, though paused, until every beam shown has landed; with
+   *  `fast`, within a fixed short wall time. */
+  export function finish(fast: boolean): void {
+    renderer?.finish(fast);
+  }
+
+  /** Drop the landed routes: every command starts a fresh picture. */
+  export function clearTrail(): void {
+    renderer?.clearTrail();
+  }
+
+  /** Drop every beam, any landing still due and the annotation: a rebuild. */
+  export function reset(): void {
+    renderer?.reset();
+    annotation = [];
+  }
+
+  /** Zone `z`'s name as the stage writes it. */
+  function zoneName(z: number): string {
+    return zoneLabel(cluster?.zones[z]?.name ?? '');
+  }
+
+  /** The newest gateway change or join-sweep request in `batch`, in a sentence,
+   *  or null with neither. */
+  function annotate(batch: EventBatch): Blurb | null {
+    const events = batch.events;
     for (let i = events.length - 1; i >= 0; i--) {
       const kind = events[i].kind;
       if (kind.type === 'GatewayChanged') {
         const { origin, to, from } = kind;
-        annotation =
-          to === undefined
-            ? blurb`node ${origin} has no gateway into ${zone(kind.zone)}`
-            : from === undefined
-              ? blurb`node ${origin} now reaches ${zone(kind.zone)} through node ${to}`
-              : blurb`node ${origin} now reaches ${zone(kind.zone)} through node ${to}, after node ${from}`;
-        return;
+        return to === undefined
+          ? blurb`node ${origin} has no gateway into ${zoneName(kind.zone)}`
+          : from === undefined
+            ? blurb`node ${origin} now reaches ${zoneName(kind.zone)} through node ${to}`
+            : blurb`node ${origin} now reaches ${zoneName(kind.zone)} through node ${to}, after node ${from}`;
       }
       if (kind.type === 'PacketSent' && kind.kind === 'SweepRequest') {
         // A request to a node that has since left names no zone: skip it.
-        const dst = nodes.find((n) => n.id === kind.dst);
-        if (dst === undefined) continue;
-        annotation = blurb`node ${kind.src} asked ${zone(dst.zone)} for missed changes`;
-        return;
+        const dst = cluster?.nodes.find((n) => n.id === kind.dst);
+        if (dst !== undefined) return blurb`node ${kind.src} asked ${zoneName(dst.zone)} for missed changes`;
       }
     }
-  });
+    return null;
+  }
 
   $effect(() => {
     if (ready && renderer !== null) renderer.resize(size.w, size.h);
@@ -156,7 +195,15 @@
   });
 
   $effect(() => {
-    if (ready && renderer !== null && events.length > 0) renderer.applyEvents(events);
+    if (ready && renderer !== null) renderer.setRunning(running);
+  });
+
+  $effect(() => {
+    if (ready && renderer !== null) renderer.setSpeed(speed);
+  });
+
+  $effect(() => {
+    if (ready && renderer !== null) renderer.setTrail(trail);
   });
 
   $effect(() => {
@@ -206,7 +253,7 @@
     let timer = 0;
 
     void (async () => {
-      const r = await StageRenderer.create(container, theme);
+      const r = await StageRenderer.create(container, theme, () => onLanded());
       if (disposed) {
         r.destroy();
         return;
@@ -271,6 +318,13 @@
     <li>
       <svg width="10" height="10" aria-hidden="true"><circle class="dot" cx="5" cy="5" r="2" /></svg>
       ack, probe or gap report
+    </li>
+    <li>
+      <svg width="28" height="12" aria-hidden="true">
+        <line class="lost" x1="1" y1="6" x2="20" y2="6" stroke-width={IN_WIDTH} />
+        <line class="lost" x1="20" y1="1" x2="20" y2="11" stroke-width={IN_WIDTH} />
+      </svg>
+      lost on the way
     </li>
     <li><span aria-hidden="true">◆</span> gateway</li>
     <li><span aria-hidden="true">◇</span> suspected gateway</li>
@@ -357,6 +411,10 @@
 
   .key .dot {
     fill: var(--chart-muted);
+  }
+
+  .key .lost {
+    stroke: var(--chart-muted);
   }
 
   .annotation {

@@ -2,7 +2,7 @@
 // canvas and turns simulation state into the tier view. Kept out of Svelte's
 // reactivity on purpose: Svelte feeds it `setLayout` (where every node sits),
 // `setCluster` (steady per-node state), `setRoles` and `setFocus` (marks) and
-// `applyEvents` (transient gossip packets); the class owns all imperative
+// `show` (the packets of an engine batch); the class owns all imperative
 // Pixi/GSAP bookkeeping and cleanup.
 //
 // Layers, back to front (design rule 19): the zone ring guides, the beams, the
@@ -12,15 +12,24 @@
 // out (its beams cancelled) and every survivor glides to the slot the new
 // layout gives it.
 //
-// Every beam is one record in a pre-sized pool, drawn each frame along the path
-// `beamPath` gives it into one Graphics per mark style, so a frame allocates
-// nothing of its own however many packets fly.
+// Beams fly on a presentation clock of their own (`BeamPool.clock`), which
+// advances with the ticker's wall time times the speed while playing, and only
+// to a bound (`finish`) while paused, so Speed stretches a flight and Pause
+// freezes it. A held wave's landing is the renderer's to report: the tick that
+// sets the last of its beams' `LANDED` bit calls `onLanded`, and only then does
+// the page let the engine deliver it. A landed data route stays in the pool,
+// drawn 1 px and quiet, until the next command where no feed runs.
+//
+// Every beam is one record in a pre-sized pool, drawn along the path
+// `beamPath` gives it into one Graphics per mark style, and the beam layer is
+// redrawn only when something changed or a beam is in flight, so a frame
+// allocates nothing of its own however many packets fly.
 
 import { gsap } from 'gsap';
-import { Application, CanvasTextMetrics, Container, Graphics, Text, TextStyle } from 'pixi.js';
+import { Application, CanvasTextMetrics, Container, Graphics, Text, TextStyle, type Ticker } from 'pixi.js';
 import { zoneLabel } from '../format';
 import { CARRIES_CELLS, type ClusterState, type PacketKind, type SimEvent } from '../sim/types';
-import { BEAM_ALPHA, FADED_ALPHA, type Theme } from '../theme';
+import { BEAM_ALPHA, FADED_ALPHA, LANDED_ALPHA, type Theme } from '../theme';
 import {
   ARC_GAP,
   ARC_WIDTH,
@@ -44,28 +53,32 @@ const CONVERGED_EPSILON = 0.001;
 // one hit short of the total still shows a notch (design rule 17).
 const ARC_NOTCH = 1 / 12;
 
-// Wall-clock flight time of a gossip packet beam. Eased so the beam accelerates
-// off the source and decelerates into the target: motion that reads as cause
-// then effect.
+// Presentation-clock flight time of a gossip packet beam: wall time at 1×.
+// Eased so the beam accelerates off the source and decelerates into the
+// target: motion that reads as cause then effect.
 const BEAM_FLIGHT_MS = 520;
-// Reduced motion: a beam is its whole route, shown at constant alpha for this
-// span instead of flying.
-const REDUCE_FADE_MS = 400;
+// The wall time a command's fast-forward of the waves in flight takes, at any
+// speed.
+const LAND_FAST_MS = 150;
 // A flying stroke's tail, as a share of its route.
 const TAIL = 0.26;
-// A dropped packet dies partway across instead of landing, told by shape and by
-// the muted colour, never by a fainter alpha: every beam peaks at `BEAM_ALPHA`.
+// A dropped packet dies partway across instead of landing: a half-line ending
+// in a stop bar, told by shape and by the muted colour, never by a fainter
+// alpha: every beam peaks at `BEAM_ALPHA`.
 const DROP_FRACTION = 0.5;
-// Segments of a reduced-motion route.
+const STOP_BAR = 12;
+// Segments of a route drawn whole: landed, lost, or under reduced motion.
 const ROUTE_SEGMENTS = 8;
 // A cross-zone arrowhead's length and half width, and a control dot's radius, px.
 const ARROW_LEN = 9;
 const ARROW_HALF = 4.5;
 const DOT_R = 2;
-// The most beams in flight. Beams self-expire, so the live set is bounded by
-// sends in one flight window; a 100-node sustained overload peaks in the low
-// tens of thousands, so this leaves an order of magnitude of headroom and is
-// not reached in normal operation. Excess is dropped rather than grown.
+// The most beams the pool holds, landed routes included. A beam in flight is
+// bounded by the sends of one flight window and a landed route by the waves
+// since the last command; a 100-node sustained overload peaks in the low tens
+// of thousands, so this leaves an order of magnitude of headroom. When full,
+// the oldest landed route makes room; with none, the new beam is dropped
+// rather than the pool grown.
 const BEAM_CAPACITY = 32768;
 
 // Role glyphs and rings, in px: the origin's thick ring and the focus ring's gap.
@@ -91,6 +104,7 @@ const CROSS = 1;
 const CONTROL = 2;
 const RELAY = 4;
 const DROPPED = 8;
+const LANDED = 16;
 
 /** Each packet kind's flags: a kind that carries no cells is a dot, and a
  *  relay is the origin's own when its gateway sends it. Read from
@@ -106,7 +120,14 @@ const CROSS_ZONE = 1;
 const DROPPED_CROSS = 2;
 const DOTS = 3;
 const ARROWS = 4;
-const STYLES = 5;
+const LANDED_IN = 5;
+const LANDED_CROSS = 6;
+const STYLES = 7;
+
+/** What becomes of a data route once it lands: kept, quiet, until the next
+ *  command (`'keep'`, presets with no feed, so a Send's waves read as a
+ *  diagram), or dropped at once (`'drop'`, where a feed sends all the time). */
+export type Trail = 'keep' | 'drop';
 
 /** The selected origin's marks: the origin itself and each gateway into a
  *  remote zone, `suspect` once its peer has left something unanswered. */
@@ -129,7 +150,7 @@ export interface LabelBox {
 /** How one beam Graphics is painted: stroked or filled, in what style. */
 interface Brush {
   stroke: boolean;
-  style: { color: number; alpha: number; width?: number; cap?: 'round' };
+  style: { color: number; alpha: number; width?: number; cap?: 'round' | 'butt' };
 }
 
 /** One node's persistent display objects, keyed by stable id. */
@@ -154,11 +175,22 @@ interface NodeGfx {
   tweens: Set<gsap.core.Tween>;
 }
 
-/** Every packet in flight, as columns of plain data: a beam's route (`from`,
- *  `control`, `to` as six floats), start time, ends and flags. Removal swaps
- *  the last beam in, so the pool stays dense and nothing is allocated. */
+/** Every beam on the stage, in flight or landed, as columns of plain data: a
+ *  beam's route (`from`, `control`, `to` as six floats), its start on the
+ *  presentation clock, its ends and flags. Removal swaps the last beam in, so
+ *  the pool stays dense and nothing is allocated. Published on the canvas as
+ *  `beams`, where the audit wraps `push` and `land` to see each beam enter and
+ *  land, and reads `clock`, `redraws`, `inFlight` and `due`. */
 class BeamPool {
   len = 0;
+  /** The presentation clock, ms: every `start` is on it. */
+  clock = 0;
+  /** Redraws of the beam layer. */
+  redraws = 0;
+  /** Beams not yet landed. */
+  inFlight = 0;
+  /** When the held wave lands on the clock, or null while nothing is held. */
+  due: number | null = null;
   readonly route = new Float32Array(BEAM_CAPACITY * 6);
   readonly start = new Float64Array(BEAM_CAPACITY);
   readonly src = new Int32Array(BEAM_CAPACITY);
@@ -166,23 +198,36 @@ class BeamPool {
   readonly flags = new Uint8Array(BEAM_CAPACITY);
 
   push(path: QuadPath, start: number, src: number, dst: number, flags: number): void {
-    if (this.len === BEAM_CAPACITY) return;
-    const o = this.len * 6;
+    let i = this.len;
+    if (i === BEAM_CAPACITY) {
+      i = this.#oldestLanded();
+      if (i < 0) return;
+    } else {
+      this.len += 1;
+    }
+    const o = i * 6;
     this.route[o] = path.from.x;
     this.route[o + 1] = path.from.y;
     this.route[o + 2] = path.control.x;
     this.route[o + 3] = path.control.y;
     this.route[o + 4] = path.to.x;
     this.route[o + 5] = path.to.y;
-    this.start[this.len] = start;
-    this.src[this.len] = src;
-    this.dst[this.len] = dst;
-    this.flags[this.len] = flags;
-    this.len += 1;
+    this.start[i] = start;
+    this.src[i] = src;
+    this.dst[i] = dst;
+    this.flags[i] = flags;
+    this.inFlight += 1;
+  }
+
+  /** Mark beam `i` landed: the frame it reaches its target. */
+  land(i: number): void {
+    this.flags[i] |= LANDED;
+    this.inFlight -= 1;
   }
 
   /** Drop beam `i` by moving the last beam into its slot. */
   removeAt(i: number): void {
+    if ((this.flags[i] & LANDED) === 0) this.inFlight -= 1;
     const last = this.len - 1;
     if (i !== last) {
       this.route.copyWithin(i * 6, last * 6, last * 6 + 6);
@@ -192,6 +237,22 @@ class BeamPool {
       this.flags[i] = this.flags[last];
     }
     this.len = last;
+  }
+
+  /** Empty the pool. */
+  clear(): void {
+    this.len = 0;
+    this.inFlight = 0;
+  }
+
+  /** The landed route that started first, or -1 with none: the one a full pool
+   *  overwrites. A scan, paid only when the pool is full. */
+  #oldestLanded(): number {
+    let oldest = -1;
+    for (let i = 0; i < this.len; i++) {
+      if ((this.flags[i] & LANDED) !== 0 && (oldest < 0 || this.start[i] < this.start[oldest])) oldest = i;
+    }
+    return oldest;
   }
 }
 
@@ -219,15 +280,19 @@ export class StageRenderer {
   readonly #labelLayer: Container;
   readonly #reduceMotion: boolean;
   readonly #guides: Graphics;
-  // One Graphics per beam mark style and fade, each redrawn by `#stepBeams`.
+  // One Graphics per beam mark style and fade, each redrawn by `#drawBeams`.
   readonly #beamGfx: Graphics[] = [];
   readonly #pool = new BeamPool();
-  // How each beam Graphics is painted once its marks are added, rebuilt with the
-  // theme so a frame builds no style of its own.
+  // How each beam Graphics is painted once its marks are added, and the two
+  // arc strokes, rebuilt with the theme so neither a frame nor a snapshot
+  // builds a style of its own.
   #brushes: Brush[] = [];
+  #arcCaughtUp: Brush['style'] = { color: 0, alpha: 1 };
+  #arcBehind: Brush['style'] = { color: 0, alpha: 1 };
   // Scratch the beam paths and the frame draw reuse.
   readonly #path: QuadPath = { from: { x: 0, y: 0 }, control: { x: 0, y: 0 }, to: { x: 0, y: 0 } };
   readonly #at: Point = { x: 0, y: 0 };
+  readonly #dir: Point = { x: 0, y: 0 };
   readonly #from: Spot = { id: 0, zone: 0, x: 0, y: 0, r: 0 };
   readonly #to: Spot = { id: 0, zone: 0, x: 0, y: 0, r: 0 };
   #theme: Theme;
@@ -238,21 +303,25 @@ export class StageRenderer {
   #cluster: ClusterState | null = null;
   #roles: Roles | null = null;
   #focusId: number | null = null;
-  // Whether the beam Graphics currently hold marks, so the always-on ticker
-  // issues exactly one final clear when the pool drains and does nothing after.
-  #beamsActive = false;
-  #lastMs = -1;
-  #lastDisagreement = 0;
-  // Delivered beams that landed since the last frame, coalesced so each disc
-  // pulses at most once per frame: without this, several arrivals in one frame
-  // each fire their own tween on the same `disc.alpha` and strobe it. Drained
-  // by a single rAF (`#flashRaf`, 0 when idle).
-  #pendingFlash = new Set<number>();
-  #flashRaf = 0;
 
-  private constructor(app: Application, theme: Theme) {
+  // The presentation clock's drive: whether it runs freely (playing), how
+  // fast, and the bound it may still run to while paused (`finish`), at the
+  // rate a fast-forward needs (0 when none).
+  #running = false;
+  #speed = 1;
+  #until = 0;
+  #fastRate = 0;
+  // The latest instant any beam shown, or any hold, ends.
+  #flightEnd = 0;
+  #trail: Trail = 'drop';
+  // The beam layer must be redrawn though no beam moved.
+  #dirty = false;
+  readonly #onLanded: () => void;
+
+  private constructor(app: Application, theme: Theme, onLanded: () => void) {
     this.#app = app;
     this.#theme = theme;
+    this.#onLanded = onLanded;
     this.#reduceMotion =
       typeof window !== 'undefined' &&
       window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -276,14 +345,16 @@ export class StageRenderer {
       this.#beamLayer.addChild(g);
     }
     this.#restyle();
-    this.#app.ticker.add(this.#stepBeams, this);
-    // The in-flight beams, read by the design audit as Chart.svelte's `uplot` is: set once, so a frame pays nothing.
+    this.#app.ticker.add(this.#tick, this);
+    // The beam pool, read by the design audit as Chart.svelte's `uplot` is: set
+    // once, so a frame pays nothing.
     Object.assign(this.#app.canvas, { beams: this.#pool });
   }
 
   /** Build the renderer and attach its canvas to `container`. Async because
-   *  Pixi's WebGL/WebGPU context init is async. */
-  static async create(container: HTMLElement, theme: Theme): Promise<StageRenderer> {
+   *  Pixi's WebGL/WebGPU context init is async. `onLanded` is called in the
+   *  tick a held wave's beams have all landed. */
+  static async create(container: HTMLElement, theme: Theme, onLanded: () => void): Promise<StageRenderer> {
     const app = new Application();
     await app.init({
       background: theme.bg,
@@ -301,7 +372,7 @@ export class StageRenderer {
     app.canvas.style.width = '100%';
     app.canvas.style.height = '100%';
     container.appendChild(app.canvas);
-    return new StageRenderer(app, theme);
+    return new StageRenderer(app, theme, onLanded);
   }
 
   /** Resize the canvas to `width × height` CSS pixels. */
@@ -340,6 +411,9 @@ export class StageRenderer {
         this.#removeNode(id, gfx);
       }
     }
+    // A landed route keeps the geometry it flew; history is not worth a
+    // re-route, so a new layout drops it.
+    this.clearTrail();
     this.#drawGuides();
     this.#rebuildLabels();
     const dataset = this.#app.canvas.dataset;
@@ -349,42 +423,18 @@ export class StageRenderer {
     if (this.#cluster !== null) this.#drawArcs(this.#cluster);
   }
 
-  /** Apply steady per-node state: each node's cell arc and cluster-wide
-   *  convergence. */
+  /** Apply steady per-node state: each node's cell arc. */
   setCluster(state: ClusterState | null): void {
     if (state === null) return;
-    // Time that runs backward means the session was reset (a fresh sim starts
-    // at 0). Tear down transient state, killing in-flight beams before
-    // touching node graphics, so a stale tween can't animate a disc being
-    // reconciled.
-    if (state.virtual_ms < this.#lastMs) {
-      this.#clearBeams();
-      this.#lastDisagreement = 0;
-    }
-    this.#lastMs = state.virtual_ms;
     this.#cluster = state;
     this.#drawArcs(state);
-
-    // The cluster agrees the instant every node's total matches. Pulse once on
-    // the transition from disagreement to agreement (and only once there is a
-    // real total to agree on).
-    let max = 0;
-    let min = state.nodes.length === 0 ? 0 : Number.POSITIVE_INFINITY;
-    for (const node of state.nodes) {
-      if (node.window_total > max) max = node.window_total;
-      if (node.window_total < min) min = node.window_total;
-    }
-    const disagreement = max - min;
-    if (this.#lastDisagreement > 0 && disagreement === 0 && state.oracle_total > 0) {
-      this.#pulse();
-    }
-    this.#lastDisagreement = disagreement;
   }
 
   /** Mark the selected origin and its gateways, or clear the marks with `null`. */
   setRoles(roles: Roles | null): void {
     this.#roles = roles;
     for (const [id, gfx] of this.#nodes) this.#drawMark(id, gfx);
+    this.#dirty = true;
   }
 
   /** Ring the node with keyboard focus, or clear the ring with `null`. */
@@ -393,18 +443,70 @@ export class StageRenderer {
     for (const [nodeId, gfx] of this.#nodes) this.#drawFocus(nodeId, gfx);
   }
 
-  /** Animate the gossip packets in a step's event batch as beams. */
-  applyEvents(events: SimEvent[]): void {
-    for (const event of events) {
-      const kind = event.kind;
-      if (kind.type === 'PacketSent' || kind.type === 'PacketDropped') {
-        let flags = kindFlags(kind.kind) | (kind.tier === 'CrossZone' ? CROSS : 0);
-        if (kind.type === 'PacketDropped') flags |= DROPPED;
-        this.#beam(kind.src, kind.dst, flags);
-      }
+  /** Run the presentation clock freely (playing) or stop it. Stopping leaves
+   *  a bound `finish` set, so a command's landing completes even if a Pause
+   *  arrives in the same moment. */
+  setRunning(running: boolean): void {
+    this.#running = running;
+  }
+
+  /** How fast the presentation clock runs against wall time. */
+  setSpeed(speed: number): void {
+    this.#speed = speed;
+  }
+
+  /** Keep landed data routes until the next command, or drop them at once. */
+  setTrail(trail: Trail): void {
+    this.#trail = trail;
+    if (trail === 'drop') this.clearTrail();
+  }
+
+  /** Draw the packets of `events` as beams that leave `delay` ms of
+   *  presentation clock from now. With `hold`, call `onLanded` once they have
+   *  all landed (after one flight, even if none is drawn). */
+  show(events: readonly SimEvent[], delay: number, hold: boolean): void {
+    const start = this.#pool.clock + delay;
+    let drawn = false;
+    for (let i = 0; i < events.length; i++) {
+      const kind = events[i].kind;
       // `PacketDelivered` is the receiver-side echo of a `PacketSent` already
       // drawn at the sender, so it would double the beams: skip it.
+      if (kind.type !== 'PacketSent' && kind.type !== 'PacketDropped') continue;
+      let flags = kindFlags(kind.kind) | (kind.tier === 'CrossZone' ? CROSS : 0);
+      if (kind.type === 'PacketDropped') flags |= DROPPED;
+      drawn = this.#beam(kind.src, kind.dst, flags, start) || drawn;
     }
+    if (!drawn && !hold) return;
+    const end = start + BEAM_FLIGHT_MS;
+    if (end > this.#flightEnd) this.#flightEnd = end;
+    if (hold) this.#pool.due = Math.max(this.#pool.due ?? 0, end);
+    this.#dirty = true;
+  }
+
+  /** Let the clock run, though paused, until every beam shown has landed:
+   *  at the speed with `fast` false, or within `LAND_FAST_MS` of wall time. */
+  finish(fast: boolean): void {
+    this.#until = this.#flightEnd;
+    this.#fastRate = fast ? (this.#until - this.#pool.clock) / LAND_FAST_MS : 0;
+  }
+
+  /** Drop every landed route: each command starts a fresh picture. */
+  clearTrail(): void {
+    const pool = this.#pool;
+    for (let i = pool.len - 1; i >= 0; i--) {
+      if ((pool.flags[i] & LANDED) !== 0) pool.removeAt(i);
+    }
+    this.#dirty = true;
+  }
+
+  /** Drop every beam, any landing still due and its bound: a rebuild. */
+  reset(): void {
+    this.#pool.clear();
+    this.#pool.due = null;
+    this.#flightEnd = this.#pool.clock;
+    this.#until = this.#pool.clock;
+    this.#fastRate = 0;
+    this.#dirty = true;
   }
 
   /** Re-tint every mark from `theme` (an OS scheme or `data-theme` change),
@@ -412,6 +514,7 @@ export class StageRenderer {
   setTheme(theme: Theme): void {
     this.#theme = theme;
     this.#restyle();
+    this.#dirty = true;
     this.#app.renderer.background.color = theme.bg;
     this.#drawGuides();
     for (const [id, gfx] of this.#nodes) this.#drawNode(id, gfx);
@@ -422,33 +525,38 @@ export class StageRenderer {
    *  resource, drop the canvas. Safe to call once; the owner must not reuse the
    *  instance after. */
   destroy(): void {
-    this.#clearBeams();
+    this.#pool.clear();
     for (const gfx of this.#nodes.values()) {
       for (const tween of gfx.tweens) tween.kill();
       gfx.tweens.clear();
     }
     this.#nodes.clear();
-    this.#app.ticker.remove(this.#stepBeams, this);
+    this.#app.ticker.remove(this.#tick, this);
     this.#app.canvas.remove();
     this.#app.destroy(true, { children: true, texture: true, textureSource: true });
   }
 
-  /** Rebuild the brush of every beam style and fade from the theme. */
+  /** Rebuild the brush of every beam style and fade, and the arc strokes,
+   *  from the theme. A landed route is 1 px at `LANDED_ALPHA`. */
   #restyle(): void {
-    const { muted, fg } = this.#theme;
-    const marks: [boolean, number, number][] = [
-      [true, muted, IN_WIDTH], // IN_ZONE
-      [true, fg, CROSS_WIDTH], // CROSS_ZONE
-      [true, muted, CROSS_WIDTH], // DROPPED_CROSS
-      [false, muted, 0], // DOTS
-      [false, fg, 0], // ARROWS
+    const { muted, fg, ok, warn } = this.#theme;
+    const marks: [boolean, number, number, number][] = [
+      [true, muted, IN_WIDTH, BEAM_ALPHA], // IN_ZONE
+      [true, fg, CROSS_WIDTH, BEAM_ALPHA], // CROSS_ZONE
+      [true, muted, CROSS_WIDTH, BEAM_ALPHA], // DROPPED_CROSS
+      [false, muted, 0, BEAM_ALPHA], // DOTS
+      [false, fg, 0, BEAM_ALPHA], // ARROWS
+      [true, muted, 1, LANDED_ALPHA], // LANDED_IN
+      [true, fg, 1, LANDED_ALPHA], // LANDED_CROSS
     ];
-    this.#brushes = marks.flatMap(([stroke, color, width]) =>
-      [BEAM_ALPHA, BEAM_ALPHA * FADED_ALPHA].map((alpha) => ({
+    this.#brushes = marks.flatMap(([stroke, color, width, peak]) =>
+      [peak, peak * FADED_ALPHA].map((alpha) => ({
         stroke,
         style: stroke ? { width, color, alpha, cap: 'round' as const } : { color, alpha },
       })),
     );
+    this.#arcCaughtUp = { width: ARC_WIDTH, color: ok, alpha: 1 };
+    this.#arcBehind = { width: ARC_WIDTH, color: warn, alpha: 1, cap: 'butt' };
   }
 
   /** Create one node's display objects at `target` and animate its join. */
@@ -517,9 +625,6 @@ export class StageRenderer {
   /** Animate a departed node's leave, then destroy it. */
   #removeNode(id: number, gfx: NodeGfx): void {
     this.#nodes.delete(id);
-    // Drop any queued delivery pulse for this node: a leaving node shouldn't
-    // linger in the queue.
-    this.#pendingFlash.delete(id);
     const finish = (): void => {
       for (const tween of gfx.tweens) tween.kill();
       gfx.tweens.clear();
@@ -579,20 +684,24 @@ export class StageRenderer {
     if (f <= 0) return;
     const reach = node.radius + ARC_GAP;
     if (f >= 1 - CONVERGED_EPSILON) {
-      node.arc.circle(0, 0, reach).stroke({ width: ARC_WIDTH, color: this.#theme.ok });
+      node.arc.circle(0, 0, reach).stroke(this.#arcCaughtUp);
       return;
     }
     const start = -Math.PI / 2;
     node.arc
       .arc(0, 0, reach, start, start + Math.min(f, 1 - ARC_NOTCH) * 2 * Math.PI)
-      .stroke({ width: ARC_WIDTH, color: this.#theme.warn, cap: 'butt' });
+      .stroke(this.#arcBehind);
   }
 
+  /** Redraw the arc of every node whose fraction changed: most snapshots move
+   *  few. */
   #drawArcs(state: ClusterState): void {
     const oracle = Math.max(state.oracle_total, 1);
-    for (const node of state.nodes) {
-      const gfx = this.#nodes.get(node.id);
-      if (gfx !== undefined) this.#drawArc(gfx, node.window_total / oracle);
+    const nodes = state.nodes;
+    for (let i = 0; i < nodes.length; i++) {
+      const gfx = this.#nodes.get(nodes[i].id);
+      const f = nodes[i].window_total / oracle;
+      if (gfx !== undefined && gfx.fraction !== f) this.#drawArc(gfx, f);
     }
   }
 
@@ -705,13 +814,14 @@ export class StageRenderer {
     this.#app.canvas.dataset.labelBoxes = JSON.stringify(boxes);
   }
 
-  /** Record one gossip packet as a beam along the route between its nodes'
-   *  live (mid-glide) positions, captured now so the beam keeps flying its
-   *  original path even as the nodes glide. */
-  #beam(src: number, dst: number, flags: number): void {
+  /** Record one gossip packet as a beam leaving at `start` along the route
+   *  between its nodes' live (mid-glide) positions, captured now so the beam
+   *  keeps flying its original path even as the nodes glide. False when either
+   *  node is not on the stage. */
+  #beam(src: number, dst: number, flags: number, start: number): boolean {
     const a = this.#nodes.get(src);
     const b = this.#nodes.get(dst);
-    if (a === undefined || b === undefined || this.#layout === null) return;
+    if (a === undefined || b === undefined || this.#layout === null) return false;
     this.#from.x = a.root.position.x;
     this.#from.y = a.root.position.y;
     this.#from.zone = a.zone;
@@ -719,8 +829,8 @@ export class StageRenderer {
     this.#to.y = b.root.position.y;
     this.#to.zone = b.zone;
     beamPath(this.#from, this.#to, this.#layout.centre, this.#path);
-    this.#pool.push(this.#path, performance.now(), src, dst, flags);
-    this.#beamsActive = true;
+    this.#pool.push(this.#path, start, src, dst, flags);
+    return true;
   }
 
   /** Whether a beam is the selected origin's: sent by it, or a relay sent by
@@ -731,29 +841,42 @@ export class StageRenderer {
     return !((flags & RELAY) !== 0 && roles.gateways.has(src));
   }
 
-  /** The per-frame beam render: one pass over the pool that adds every live
-   *  beam to its style's Graphics by wall-clock age, then one stroke or fill
-   *  per style. Idle pays nothing: when the pool drains it issues one final
-   *  clear and then returns immediately each tick.
-   *
-   *  A stroke beam flies along its route: a short tail from the eased head back
-   *  through the route's midpoint. A control packet is a dot at the head, with
-   *  no tail. A cross-zone beam also wears an arrowhead along the route's
-   *  tangent. A dropped beam stops at `DROP_FRACTION` and turns muted. */
-  #stepBeams(): void {
+  /** The ticker: advance the presentation clock, redraw the beams if
+   *  anything changed or a beam is in flight, then report a held wave whose
+   *  beams this redraw has all landed. */
+  #tick(ticker: Ticker): void {
     if (this.#guides.destroyed) return;
     const pool = this.#pool;
-    if (pool.len === 0) {
-      if (this.#beamsActive) {
-        for (const g of this.#beamGfx) g.clear();
-        this.#beamsActive = false;
-      }
-      return;
+    const before = pool.clock;
+    const rate = before < this.#until ? Math.max(this.#speed, this.#fastRate) : this.#speed;
+    if (this.#running) pool.clock += ticker.deltaMS * rate;
+    else if (before < this.#until) pool.clock = Math.min(this.#until, before + ticker.deltaMS * rate);
+    if (pool.clock >= this.#until) this.#fastRate = 0;
+    if (this.#dirty || (pool.clock !== before && pool.inFlight > 0)) this.#drawBeams();
+    if (pool.due !== null && pool.clock >= pool.due) {
+      pool.due = null;
+      this.#onLanded();
     }
-    for (const g of this.#beamGfx) g.clear();
-    const now = performance.now();
+  }
+
+  /** The beam layer: one pass over the pool that adds every started beam to
+   *  its style's Graphics by its age on the presentation clock, then one stroke
+   *  or fill per style.
+   *
+   *  A data beam in flight is a short tail from the eased head back through
+   *  the route's midpoint, with a head mark: an arrowhead across zones, a dot
+   *  inside one. A control packet is a dot at the head. A lost packet is the
+   *  line to `DROP_FRACTION` ending in a stop bar. Under reduced motion each is
+   *  drawn whole for its flight. A beam lands the frame its age reaches the
+   *  flight: a landed data route stays, whole, 1 px and quiet, while the trail
+   *  is kept; every other landed beam leaves. */
+  #drawBeams(): void {
+    const pool = this.#pool;
+    const gfx = this.#beamGfx;
+    for (let k = 0; k < gfx.length; k++) gfx[k].clear();
+    const now = pool.clock;
     const reduce = this.#reduceMotion;
-    const duration = reduce ? REDUCE_FADE_MS : BEAM_FLIGHT_MS;
+    const keep = this.#trail === 'keep';
     const path = this.#path;
     const at = this.#at;
     let used = 0;
@@ -761,13 +884,15 @@ export class StageRenderer {
     // Backwards, so the beam a removal swaps into slot `i` is one already drawn.
     for (let i = pool.len - 1; i >= 0; i--) {
       const age = now - pool.start[i];
-      const flags = pool.flags[i];
-      if (age >= duration) {
-        // Flight done. A delivered (non-reduced) beam hands off to the target's
-        // pulse; removing it this same frame means that pulse fires exactly once.
-        if ((flags & DROPPED) === 0 && !reduce) this.#queueFlash(pool.dst[i]);
-        pool.removeAt(i);
-        continue;
+      if (age < 0) continue;
+      let flags = pool.flags[i];
+      if ((flags & LANDED) === 0 && age >= BEAM_FLIGHT_MS) {
+        pool.land(i);
+        if (!keep || (flags & (CONTROL | DROPPED)) !== 0) {
+          pool.removeAt(i);
+          continue;
+        }
+        flags |= LANDED;
       }
       const o = i * 6;
       path.from.x = pool.route[o];
@@ -776,30 +901,34 @@ export class StageRenderer {
       path.control.y = pool.route[o + 3];
       path.to.x = pool.route[o + 4];
       path.to.y = pool.route[o + 5];
-
       const cross = (flags & CROSS) !== 0;
-      const dropped = (flags & DROPPED) !== 0;
       const fade = this.#isContext(pool.src[i], flags) ? 1 : 0;
-      const end = dropped ? DROP_FRACTION : 1;
-      const head = reduce ? end : easeInOutQuad(age / duration) * end;
 
+      if ((flags & LANDED) !== 0) {
+        const style = (cross ? LANDED_CROSS : LANDED_IN) * 2 + fade;
+        this.#route(gfx[style], 1);
+        used |= 1 << style;
+        continue;
+      }
+      const dropped = (flags & DROPPED) !== 0;
+      const end = dropped ? DROP_FRACTION : 1;
+      const head = reduce ? end : easeInOutQuad(age / BEAM_FLIGHT_MS) * end;
       if ((flags & CONTROL) !== 0) {
         pointOn(path, head, at);
-        this.#beamGfx[DOTS * 2 + fade].circle(at.x, at.y, DOT_R);
+        gfx[DOTS * 2 + fade].circle(at.x, at.y, DOT_R);
         used |= 1 << (DOTS * 2 + fade);
         continue;
       }
-      const style = cross ? (dropped ? DROPPED_CROSS : CROSS_ZONE) : IN_ZONE;
-      const g = this.#beamGfx[style * 2 + fade];
-      used |= 1 << (style * 2 + fade);
+      const style = (cross ? (dropped ? DROPPED_CROSS : CROSS_ZONE) : IN_ZONE) * 2 + fade;
+      const g = gfx[style];
+      used |= 1 << style;
+      if (dropped) {
+        this.#route(g, head);
+        this.#stopBar(g, head);
+        continue;
+      }
       if (reduce) {
-        // No flight: the whole route at constant alpha: a diff, not travel.
-        pointOn(path, 0, at);
-        g.moveTo(at.x, at.y);
-        for (let s = 1; s <= ROUTE_SEGMENTS; s++) {
-          pointOn(path, (head * s) / ROUTE_SEGMENTS, at);
-          g.lineTo(at.x, at.y);
-        }
+        this.#route(g, 1);
       } else {
         const tail = Math.max(0, head - TAIL);
         pointOn(path, tail, at);
@@ -809,126 +938,85 @@ export class StageRenderer {
         pointOn(path, head, at);
         g.lineTo(at.x, at.y);
       }
-      if (cross && !dropped) {
-        this.#arrowhead(this.#beamGfx[ARROWS * 2 + fade], head);
+      if (cross) {
+        this.#arrowhead(gfx[ARROWS * 2 + fade], head);
         used |= 1 << (ARROWS * 2 + fade);
+      } else {
+        pointOn(path, head, at);
+        gfx[DOTS * 2 + fade].circle(at.x, at.y, IN_WIDTH + 1);
+        used |= 1 << (DOTS * 2 + fade);
       }
     }
 
     for (let k = 0; k < STYLES * 2; k++) {
       if ((used & (1 << k)) === 0) continue;
       const brush = this.#brushes[k];
-      if (brush.stroke) this.#beamGfx[k].stroke(brush.style);
-      else this.#beamGfx[k].fill(brush.style);
+      if (brush.stroke) gfx[k].stroke(brush.style);
+      else gfx[k].fill(brush.style);
     }
+    pool.redraws += 1;
+    this.#dirty = false;
+  }
+
+  /** Add the current route from its start to position `to`, as straight
+   *  segments. */
+  #route(g: Graphics, to: number): void {
+    const path = this.#path;
+    const at = this.#at;
+    pointOn(path, 0, at);
+    g.moveTo(at.x, at.y);
+    for (let s = 1; s <= ROUTE_SEGMENTS; s++) {
+      pointOn(path, (to * s) / ROUTE_SEGMENTS, at);
+      g.lineTo(at.x, at.y);
+    }
+  }
+
+  /** Set `#at` to route position `head` and `#dir` to the route's unit tangent
+   *  there; false where the tangent vanishes. */
+  #tangentAt(head: number): boolean {
+    const path = this.#path;
+    pointOn(path, head, this.#at);
+    // B'(t) = 2(1 - t)(C - A) + 2t(B - C).
+    const tx = 2 * (1 - head) * (path.control.x - path.from.x) + 2 * head * (path.to.x - path.control.x);
+    const ty = 2 * (1 - head) * (path.control.y - path.from.y) + 2 * head * (path.to.y - path.control.y);
+    const len = Math.hypot(tx, ty);
+    if (len === 0) return false;
+    this.#dir.x = tx / len;
+    this.#dir.y = ty / len;
+    return true;
   }
 
   /** Add a triangle at route position `head`, pointing along the route. */
   #arrowhead(g: Graphics, head: number): void {
-    const path = this.#path;
-    const at = this.#at;
-    pointOn(path, head, at);
-    // The route's tangent at the head: B'(t) = 2(1 - t)(C - A) + 2t(B - C).
-    const tx = 2 * (1 - head) * (path.control.x - path.from.x) + 2 * head * (path.to.x - path.control.x);
-    const ty = 2 * (1 - head) * (path.control.y - path.from.y) + 2 * head * (path.to.y - path.control.y);
-    const len = Math.hypot(tx, ty);
-    if (len === 0) return;
-    const ux = tx / len;
-    const uy = ty / len;
-    const bx = at.x - ux * ARROW_LEN;
-    const by = at.y - uy * ARROW_LEN;
-    g.moveTo(at.x, at.y)
+    if (!this.#tangentAt(head)) return;
+    const { x, y } = this.#at;
+    const { x: ux, y: uy } = this.#dir;
+    const bx = x - ux * ARROW_LEN;
+    const by = y - uy * ARROW_LEN;
+    g.moveTo(x, y)
       .lineTo(bx - uy * ARROW_HALF, by + ux * ARROW_HALF)
       .lineTo(bx + uy * ARROW_HALF, by - ux * ARROW_HALF)
       .closePath();
   }
 
-  /** Queue node `dst` for a coalesced delivery pulse on the next frame, instead
-   *  of pulsing it now, so several beams landing in one frame brighten the disc
-   *  once, not N times. A no-op under reduced motion: the pulse is motion the
-   *  user opted out of, and the arc/count already updated. */
-  #queueFlash(dst: number): void {
-    if (this.#reduceMotion) return;
-    this.#pendingFlash.add(dst);
-    if (this.#flashRaf === 0) {
-      this.#flashRaf = requestAnimationFrame(() => this.#flushFlashes());
-    }
+  /** Add a bar across the route at position `head`: where a lost packet died. */
+  #stopBar(g: Graphics, head: number): void {
+    if (!this.#tangentAt(head)) return;
+    const { x, y } = this.#at;
+    const half = STOP_BAR / 2;
+    const nx = -this.#dir.y * half;
+    const ny = this.#dir.x * half;
+    g.moveTo(x - nx, y - ny).lineTo(x + nx, y + ny);
   }
 
-  /** Fire one delivery pulse per disc that received a beam this frame. Resolves
-   *  the disc fresh (a node may have left between queue and flush) and brightens
-   *  to a gentle dim floor (0.7) over a soft duration, `overwrite: 'auto'` so a
-   *  delivery on the next frame can't strand `disc.alpha` below 1. */
-  #flushFlashes(): void {
-    this.#flashRaf = 0;
-    for (const dst of this.#pendingFlash) {
-      const disc = this.#nodes.get(dst)?.disc;
-      if (disc === undefined) continue;
-      gsap.fromTo(
-        disc,
-        { alpha: 1 },
-        { alpha: 0.7, duration: 0.16, yoyo: true, repeat: 1, overwrite: 'auto' },
-      );
-    }
-    this.#pendingFlash.clear();
-  }
-
-  /** Cancel a queued flush and drop every pending target: a teardown or beam
-   *  sweep must not pulse a disc that is being freed. */
-  #cancelFlashes(): void {
-    if (this.#flashRaf !== 0) {
-      cancelAnimationFrame(this.#flashRaf);
-      this.#flashRaf = 0;
-    }
-    this.#pendingFlash.clear();
-  }
-
-  /** The synchronized convergence pulse: one expanding ring from each node,
-   *  fired the instant the cluster agrees. Reduced motion skips it: the arcs
-   *  already snapped to ok. */
-  #pulse(): void {
-    if (this.#reduceMotion) return;
-    for (const node of this.#nodes.values()) {
-      const ring = new Graphics();
-      node.root.addChild(ring);
-      // A bold ring (3px, near-opaque at the outset) reads as a deliberate
-      // "agrees now" beat rather than an ambient halo as it expands and fades.
-      const state = { r: node.radius, alpha: 0.85 };
-      gsap.to(state, {
-        r: node.radius * 3,
-        alpha: 0,
-        duration: 0.6,
-        ease: 'power2.out',
-        onUpdate: () => {
-          // The ring can be destroyed (its node left, or a reset tore the stage
-          // down) while this tween still ticks.
-          if (ring.destroyed) return;
-          ring
-            .clear()
-            .circle(0, 0, state.r)
-            .stroke({ width: 3, color: this.#theme.ok, alpha: state.alpha });
-        },
-        onComplete: () => {
-          if (!ring.destroyed) ring.destroy();
-        },
-      });
-    }
-  }
-
-  /** Drop every in-flight beam touching node `id`, called when that node
-   *  leaves, so no beam draws to or from a disc that is being destroyed. */
+  /** Drop every beam touching node `id`, called when that node leaves, so no
+   *  beam draws to or from a disc that is being destroyed. */
   #cancelBeamsFor(id: number): void {
     const pool = this.#pool;
     for (let i = pool.len - 1; i >= 0; i--) {
       if (pool.src[i] === id || pool.dst[i] === id) pool.removeAt(i);
     }
-  }
-
-  #clearBeams(): void {
-    this.#cancelFlashes();
-    this.#pool.len = 0;
-    for (const g of this.#beamGfx) g.clear();
-    this.#beamsActive = false;
+    this.#dirty = true;
   }
 }
 

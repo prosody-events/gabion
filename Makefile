@@ -252,6 +252,7 @@ hygiene:
 		rg -q -- "^\s*$$token:" $(WEB_DIR)/src/tokens.css || { echo "design token \`$$token\` is not defined in $(WEB_DIR)/src/tokens.css, so it resolves to nothing; use a token defined there (web/README.md \"Design rules\") or define it:"; rg -nF -- "$$token" $(WEB_DIR)/src; exit 1; }; \
 	done
 	cmp $(WEB_DIR)/src/tokens.css docs/study/dashboard/tokens.css
+	@awk '/^  ([a-z]+ )*(#?[A-Za-z]+|constructor)\(/ { fn = $$0 } /^(export )?(async )?function / { fn = $$0 } /new Graphics/ && fn !~ /constructor\(|#createNode\(/ { print FILENAME ":" FNR ": " $$0; bad = 1 } END { exit bad }' $(WEB_DIR)/src/lib/stage/renderer.ts || { echo "renderer.ts builds a Graphics outside its constructor and #createNode, so a frame or an event can allocate GPU objects; draw into the pre-built Graphics instead ($(WEB_DIR)/README.md, \"Beams\")"; exit 1; }
 	@bad=$$(rg -n '\bgabion(_server)?\s*(::|as\b|;)|\bcrate\s+gabion' $(SIM)/src --glob '!**/harness/adapter.rs' | rg -v '$(SIM_BOUNDARY)'); \
 	test -z "$$bad" || { printf '%s\n' "$$bad" "these lines in $(SIM) name gabion outside src/harness/adapter.rs, so the regression gate's arms would no longer share one core; outside it import only gabion::gossip::{Clock, GossipTransport, Ticker} and gabion::discovery::{Peer, PeerEvent}, one use line each, and reach anything else through a re-export from adapter.rs (crates/gossip-bench/README.md, \"The adapter contract\")"; exit 1; }
 

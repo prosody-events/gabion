@@ -1,7 +1,7 @@
 import { inflateSync } from 'node:zlib';
 import { expect, test, type Locator, type Page } from '@playwright/test';
 import { ChartHistory } from '../src/lib/charts/history';
-import { missingFor, type ClusterState, type PacketKind, type Tier } from '../src/lib/sim/types';
+import { CARRIES_CELLS, missingFor, type ClusterState, type EventBatch, type PacketKind, type StepUntil, type Tier } from '../src/lib/sim/types';
 import {
   ARC_GAP,
   ARC_WIDTH,
@@ -14,21 +14,24 @@ import {
   type Spot,
 } from '../src/lib/stage/layout';
 import { BAND_ALPHA, BEAM_ALPHA, readTheme, type Theme } from '../src/lib/theme';
-import { WATCH, step, stepUntil } from './drive';
+import timings from './phase-timings.json' with { type: 'json' };
+import { PERIOD_MS, WATCH, period, setSpeed, step, stepUntil, virtualMs } from './drive';
 
 // The automated half of the audit checklist in `../README.md` ("Design rules"):
 // A1 to A9. Each audit project fixes a width and a colour scheme; the main test
-// walks every preset to a fixed virtual time with the transport paused, checks
-// it, then checks it again with `data-theme` forcing the other theme. Full-page
-// PNGs land in `audit-shots/` for the visual audit. Three more tests check
-// chart 1's window and placement, the stage's geometry for every zone count, and
-// the interactions.
+// walks every preset a number of heartbeat periods by Step, at 4×, checks it,
+// then checks it again with `data-theme` forcing the other theme. Full-page
+// PNGs land in `audit-shots/` for the visual audit. More tests check chart 1's
+// window and placement, the stage's geometry for every zone count, the beams,
+// the interactions, and how every preset opens, goes quiet and fails over.
 //
 // A4 recomputes what the page prints from the engine's own snapshot, in this
 // file's code and with its own formatting, never the page's, and A5 checks that
 // the page prints it in (zone, id) order, never sorted by a value.
 
-const STEPS = 10;
+// Heartbeat periods each preset is walked: past its first waves, and short,
+// since every wave holds the clock for a flight at every width and theme.
+const STEPS = 4;
 // The rule window every preset runs with (`SimConfig::default`, which no preset
 // overrides).
 const WINDOW_MS = 10_000;
@@ -113,6 +116,7 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
   });
 
   const canvas = await open(page);
+  await setSpeed(page, 4);
   const forced = info.project.use.colorScheme === 'dark' ? 'light' : 'dark';
   const presets = page.getByRole('group', { name: 'Scenario preset' }).getByRole('button');
   const names = (await presets.allInnerTexts()).map((name) => name.trim());
@@ -128,13 +132,11 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
     if (name === 'Sandbox') await page.locator('.rail').getByRole('button', { name: 'Send burst' }).click();
     // The engine's own snapshot after every Step, which A4 recomputes from.
     const series: ClusterState[] = [await snapshot(page)];
-    for (let s = 0; s < STEPS; s++) {
-      await step(page);
-      series.push(await snapshot(page));
-    }
-    const advanced = series.slice(1).map((snap, i) => snap.virtual_ms - series[i].virtual_ms);
-    expect(new Set(advanced).size, `${name}: every Step advanced simulated time alike`).toBe(1);
-    expect(advanced[0], `${name}: a Step advanced simulated time`).toBeGreaterThan(0);
+    for (let s = 0; s < STEPS; s++) await period(page, async () => void series.push(await snapshot(page)));
+    expect(
+      series[series.length - 1].virtual_ms - series[0].virtual_ms,
+      `${name}: the walk advanced ${STEPS} heartbeat periods`,
+    ).toBeGreaterThanOrEqual(STEPS * PERIOD_MS);
     converged += await page.locator('.headline.converged').count();
     charted += await page.locator('.plot').count();
     inspected += await page.locator('.inspector').count();
@@ -267,12 +269,20 @@ const totals = (s: ClusterState): Totals => ({
   own: new Map(s.nodes.map((n) => [n.id, n.own_data_bytes])),
 });
 
-/** The cumulative totals the window ending at the last of `series` starts from:
- *  the newest snapshot at or before `t − W`, or the session start while the
- *  window reaches back past it. */
+/** The cumulative totals the window ending at the last of `series` starts from.
+ *  `series` holds a snapshot at every instant the page applied one. A snapshot
+ *  is kept as a mark once `W / 128` has passed since the last kept one, and the
+ *  window starts at the newest mark at or before `t − W`, or at the session
+ *  start while the window reaches back past every mark. */
 function windowStart(series: ClusterState[]): Totals {
   const now = series[series.length - 1].virtual_ms;
-  const start = [...series].reverse().find((s) => s.virtual_ms <= now - WINDOW_MS);
+  let start: ClusterState | undefined;
+  let kept: number | undefined;
+  for (const snap of series) {
+    if (kept !== undefined && snap.virtual_ms - kept < WINDOW_MS / 128) continue;
+    kept = snap.virtual_ms;
+    if (kept <= now - WINDOW_MS) start = snap;
+  }
   return now <= WINDOW_MS || start === undefined
     ? { t: 0, inData: 0, crossData: 0, own: new Map() }
     : totals(start);
@@ -331,15 +341,15 @@ async function checkData(page: Page, name: string, series: ClusterState[]): Prom
   }
   await expect(field(page, 'status-total'), where).toHaveText(int(oracle));
 
-  // Rule 12: while the cluster disagrees, the headline gives the longest any
-  // node has lacked a change, at least, as a censored "≥".
+  // Rule 12: while a node lacks a change, the headline gives the longest any
+  // node has lacked one, at least, as a censored "≥".
   let longest: number | undefined;
   for (const node of nodes) {
     const t = missingFor(node.lag);
     if (t !== undefined && (longest === undefined || t > longest)) longest = t;
   }
   const hero = page.locator('.headline [data-field="missing-for"]');
-  if (oracle > 0 && spread(nodes) > 0 && longest !== undefined) {
+  if (longest !== undefined) {
     await expect(hero, `${where}: not caught up`).toHaveText(duration(longest));
   } else {
     await expect(hero, `${where}: no node lacks a change`).toHaveCount(0);
@@ -782,26 +792,30 @@ function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number
 
 // -- A4: chart 1 across the window, and unequal zones ---------------------------
 
-test('chart 1 prints the windowed share and follows the placement', async ({ page }) => {
+test('chart 1 prints the windowed share and follows the placement', async ({ page }, info) => {
+  test.skip(
+    !['audit-1440-light', 'audit-400-light'].includes(info.project.name),
+    'the numbers are the same at every width and theme: checked at the widest and the narrowest',
+  );
   test.setTimeout(240_000);
   await open(page);
+  await setSpeed(page, 4);
 
-  // Steady state after exactly one Step: σ is printed, not the empty state.
+  // Steady state after one heartbeat period: σ is printed, not the empty
+  // state. A snapshot after every Step: the page applies one at each Step's
+  // instant, and the window's start depends on which of them it kept.
   await loadPreset(page, 'Steady state');
   const series: ClusterState[] = [await snapshot(page)];
-  await step(page);
-  series.push(await snapshot(page));
+  const record = async (): Promise<void> => void series.push(await snapshot(page));
+  await period(page, record);
   const first = share(series);
-  expect(first, 'one Step of Steady state sends data bytes').not.toBeNull();
+  expect(first, 'one heartbeat period of Steady state sends data bytes').not.toBeNull();
   await expect(field(page, 'share')).toHaveText(percent(first!));
   await expect(page.getByText('No traffic yet')).toHaveCount(0);
 
-  // Thirty Steps on, the window (ten seconds) has slid past the start: σ is the
-  // share of the last window's bytes, not the whole run's.
-  for (let i = 0; i < 30; i++) {
-    await step(page);
-    series.push(await snapshot(page));
-  }
+  // Thirty periods on, the window (ten seconds) has slid past the start: σ is
+  // the share of the last window's bytes, not the whole run's.
+  for (let i = 0; i < 30; i++) await period(page, record);
   const now = series[series.length - 1];
   expect(now.virtual_ms, 'the run is past one window').toBeGreaterThan(WINDOW_MS);
   await expect(field(page, 'share')).toHaveText(percent(share(series)!));
@@ -810,26 +824,32 @@ test('chart 1 prints the windowed share and follows the placement', async ({ pag
   expect(Math.abs(Number(await figure.getAttribute('data-ref-zones')) - refs.zones)).toBeLessThan(1e-9);
   expect(Math.abs(Number(await figure.getAttribute('data-ref-nozone')) - refs.nozone)).toBeLessThan(1e-9);
 
-  // Sandbox with unequal zones: Add node in zone a (5, 4, 4), bursts at nodes 0
-  // and 1, then 26 Steps (13 s, past one window) with another burst at node 0
-  // four Steps from the end. Both references follow the placement and the bytes
-  // each origin sent in the window, which opens at a kept mark, not the session
-  // start, so the mark's per-origin bytes count.
+  // Sandbox with unequal zones: Add node in zone a (5, 4, 4), Sends at nodes 0
+  // and 1, then 26 heartbeat periods (past one window) with another Send at
+  // node 0 four periods from the end. Both references follow the placement and
+  // the bytes each origin sent in the window, which opens at a kept mark, not
+  // the session start, so the mark's per-origin bytes count.
   await loadPreset(page, 'Sandbox');
   await page.getByRole('button', { name: 'Add node' }).click();
   await expect(page.locator('[data-field="status-nodes"]')).toHaveText('13');
   const rail = page.locator('.rail');
+  const sandbox: ClusterState[] = [];
+  const recordSandbox = async (): Promise<void> => void sandbox.push(await snapshot(page));
+  // A Send first lands the run in flight, which may move time one emit floor:
+  // its snapshot is recorded once the page has applied its own.
   const burst = async (node: string): Promise<void> => {
     await page.getByLabel('Node', { exact: true }).selectOption(node);
+    const sent = (await snapshot(page)).admitted_hits;
     await rail.getByRole('button', { name: 'Send burst' }).click();
+    await expect.poll(async () => (await snapshot(page)).admitted_hits).toBeGreaterThan(sent);
+    await expect(page.locator('.stage-pane')).toHaveAttribute('data-held', '0');
+    await recordSandbox();
   };
   await burst('0');
   await burst('1');
-  const sandbox: ClusterState[] = [await snapshot(page)];
   for (let i = 0; i < 26; i++) {
     if (i === 22) await burst('0');
-    await step(page);
-    sandbox.push(await snapshot(page));
+    await period(page, recordSandbox);
   }
   expect(sandbox[0].zones.map((z) => z.live), 'zones of 5, 4 and 4').toEqual([5, 4, 4]);
   const opened = windowStart(sandbox);
@@ -1048,9 +1068,10 @@ test('stage geometry holds for every zone count', async ({ page }, info) => {
         .evaluate((c: HTMLCanvasElement & { drawn?: Drawn[] }) => c.drawn ?? []);
     const zoneOf = new Map(spots.map((s) => [s.id, s.zone]));
     const crosses = (b: { src: number; dst: number }): boolean => zoneOf.get(b.src) !== zoneOf.get(b.dst);
-    // Forty Steps are twenty seconds of simulated time, two windows of the
-    // scenario's feed of 3 hits/s: a deadline in simulated time, not in wall
-    // time.
+    // Propagation opens quiet (its seed settled, no feed), so a Send gives the
+    // Steps a wave that crosses zones. Forty heartbeat periods: a deadline in
+    // simulated time, not in wall time.
+    await page.locator('.rail').getByRole('button', { name: 'Send burst' }).click();
     await stepUntil(page, async () => (await drawn()).some(crosses), 40, `${where}: a Step drew a cross-zone beam`);
     const beams = await drawn();
     for (const b of beams) {
@@ -1071,7 +1092,7 @@ test('stage geometry holds for every zone count', async ({ page }, info) => {
 test("every drawn beam carries its packet's kind, tier and fate", async ({ page }, info) => {
   test.skip(info.project.name !== 'audit-1440-light', "the renderer's beam flags, checked once");
   await open(page);
-  await loadPreset(page, 'Steady state');
+  await loadPreset(page, 'Sandbox');
 
   // The flag bits the stage's beam pool packs, and what each packet should
   // wear, written out here from the packet kinds rather than read from the
@@ -1095,8 +1116,8 @@ test("every drawn beam carries its packet's kind, tier and fate", async ({ page 
     log.beams = [];
     const sim = window.sim!;
     const step = sim.step.bind(sim);
-    sim.step = async (ms: number) => {
-      const batch = await step(ms);
+    sim.step = async (ms: number, until?: StepUntil) => {
+      const batch = await step(ms, until);
       for (const { kind } of batch.events) {
         if (kind.type === 'PacketSent' || kind.type === 'PacketDropped') {
           const { src, dst, tier } = kind;
@@ -1140,10 +1161,18 @@ test("every drawn beam carries its packet's kind, tier and fate", async ({ page 
     return packets.map((p) => p.kind);
   };
 
-  // Steady state sends own streams, relays and acknowledgements every Step, and
-  // its freshly built nodes each ask for a join sweep and are sent one.
+  // A Send's waves are own streams, relays and acknowledgements. Once every
+  // store holds its hits, a node added to the live cluster asks its zone for a
+  // join sweep and is sent one.
+  const rail = page.locator('.rail');
+  await rail.getByRole('button', { name: 'Send burst' }).click();
+  await period(page);
+  await period(page);
+  await page.getByRole('button', { name: 'Add node' }).click();
+  await expect(field(page, 'status-nodes')).toHaveText('13');
+  await rail.getByRole('button', { name: 'Send burst' }).click();
   const seen = new Set<PacketKind>();
-  for (let i = 0; i < 10 && seen.size < Object.keys(KIND).length; i++) {
+  for (let i = 0; i < 40 && seen.size < Object.keys(KIND).length; i++) {
     for (const kind of await checkStep()) seen.add(kind);
   }
   expect([...seen].sort(), 'every packet kind was sent and drawn').toEqual([
@@ -1161,8 +1190,8 @@ test('a paused stage lays its labels out once, not per snapshot', async ({ page 
   test.skip(info.project.name !== 'audit-1440-light', 'a count of layouts, checked once');
   await open(page);
   await loadPreset(page, 'Sandbox');
-  // Warm up first, so every gateway is found and the annotation line settles.
-  for (let i = 0; i < 4; i++) await step(page);
+  // Run a few periods first, so the annotation line settles.
+  for (let i = 0; i < 4; i++) await period(page);
   await settled(page);
   await page.locator('.stage canvas').evaluate((c: HTMLCanvasElement) => {
     const w = window as unknown as { labelWrites: number };
@@ -1172,9 +1201,171 @@ test('a paused stage lays its labels out once, not per snapshot', async ({ page 
     }).observe(c, { attributeFilter: ['data-label-boxes'] });
   });
   // Each Step hands the stage a fresh snapshot with the same members and size.
-  for (let i = 0; i < 3; i++) await step(page);
+  for (let i = 0; i < 3; i++) await period(page);
   const writes = await page.evaluate(() => (window as unknown as { labelWrites: number }).labelWrites);
   expect(writes, 'the labels were rebuilt for snapshots that moved no node').toBe(0);
+});
+
+// -- How every preset opens, goes quiet and fails over ---------------------------
+
+/** A packet the engine reported sent or lost, at its instant. */
+type Packet = { t: number; src: number; dst: number; kind: PacketKind; tier: Tier; dropped: boolean };
+
+/** Log every packet in the batches of the page's engine, its steps and its
+ *  submits alike, from now on. Installed once per engine. */
+async function logPackets(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const w = window as unknown as { packets: Packet[] };
+    w.packets = [];
+    const sim = window.sim! as typeof window.sim & { logged?: boolean };
+    if (sim.logged === true) return;
+    sim.logged = true;
+    const record = (batch: EventBatch): EventBatch => {
+      for (const { virtual_ms: t, kind } of batch.events) {
+        if (kind.type === 'PacketSent' || kind.type === 'PacketDropped') {
+          const { src, dst, tier } = kind;
+          w.packets.push({ t, src, dst, kind: kind.kind, tier, dropped: kind.type === 'PacketDropped' });
+        }
+      }
+      return batch;
+    };
+    const step = sim.step.bind(sim);
+    sim.step = async (ms: number, until?: StepUntil) => record(await step(ms, until));
+    const submit = sim.submitRequest.bind(sim);
+    sim.submitRequest = async (node: number, key: number, hits: number) => record(await submit(node, key, hits));
+  });
+}
+
+/** The packets logged since the last call. */
+const takePackets = (page: Page): Promise<Packet[]> =>
+  page.evaluate(() => (window as unknown as { packets: Packet[] }).packets.splice(0));
+
+/** Whether every node holds every in-window hit. */
+const agreed = async (page: Page): Promise<boolean> =>
+  (await snapshot(page)).nodes.every((n) => n.lag.kind === 'CaughtUp');
+
+test('every preset opens warmed and settled', async ({ page }, info) => {
+  test.skip(info.project.name !== 'audit-1440-light', 'the opening state, checked once');
+  test.setTimeout(240_000);
+  await open(page);
+  await setSpeed(page, 4);
+  const gateways = page.locator('.inspector tr.remote [data-field="gateway"]');
+
+  // Propagation's seed has spread and been acknowledged before the first
+  // paint, and node 0's gateways were found while the cluster warmed up.
+  await loadPreset(page, 'Propagation');
+  const settledSeed = await snapshot(page);
+  expect(settledSeed.nodes.map((n) => n.window_total), 'every node holds the seed').toEqual(
+    settledSeed.nodes.map(() => 50),
+  );
+  expect(
+    await page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { beams?: { len: number } }) => c.beams?.len),
+    'no beam at load',
+  ).toBe(0);
+  await expect(gateways, "node 0's gateway into each other zone, named at load").toHaveCount(2);
+
+  // Every other zoned preset: each seeded node's first wave reaches one gateway
+  // in each other zone, not every peer, as a warm cluster's does.
+  const names = (await page.getByRole('group', { name: 'Scenario preset' }).getByRole('button').allInnerTexts())
+    .map((name) => name.trim())
+    .filter((name) => name !== 'Propagation' && name !== 'No zone configured');
+  for (const name of names) {
+    await loadPreset(page, name);
+    if ((await page.locator('.inspector').count()) > 0) await expect(gateways, `${name}: gateways at load`).toHaveCount(2);
+    const load = await snapshot(page);
+    const seeded = load.nodes.filter((n) => n.admitted_hits > 0).map((n) => n.id);
+    await logPackets(page);
+    const log: Packet[] = [];
+    await stepUntil(
+      page,
+      async () => {
+        log.push(...(await takePackets(page)));
+        return seeded.every((id) => log.some((p) => p.src === id && p.kind === 'Own'));
+      },
+      4,
+      `${name}: every seeded node sent its hits`,
+    );
+    for (const id of seeded) {
+      const own = log.filter((p) => p.src === id && p.kind === 'Own');
+      const across = own.filter((p) => p.t === own[0].t && p.tier === 'CrossZone').length;
+      expect(across, `${name}: node ${id}'s first wave crossed a zone ${across} times`).toBe(load.zones.length - 1);
+    }
+    console.log(`${name}: ${seeded.length} seeded node(s) checked`);
+  }
+});
+
+test('runs go quiet after agreement', async ({ page }, info) => {
+  test.skip(info.project.name !== 'audit-1440-light', 'the quiet after a run, checked once');
+  test.setTimeout(240_000);
+  await open(page);
+  await setSpeed(page, 4);
+
+  // Propagation: after the relays land, only the acknowledgements fly, each at
+  // its node's next heartbeat, so the period after that sends nothing at all.
+  await loadPreset(page, 'Propagation');
+  await logPackets(page);
+  await page.locator('.rail').getByRole('button', { name: 'Send burst' }).click();
+  await step(page);
+  await stepUntil(page, () => agreed(page), 4, 'Propagation agreed');
+  const at = await virtualMs(page);
+  await takePackets(page);
+  for (let i = 0; i < 5; i++) await period(page);
+  const after = await takePackets(page);
+  expect(after.filter((p) => CARRIES_CELLS[p.kind]), 'Propagation: data after agreement').toEqual([]);
+  expect(
+    after.filter((p) => p.t >= at + PERIOD_MS && p.t < at + 2 * PERIOD_MS),
+    'Propagation: a packet in the second period after agreement',
+  ).toEqual([]);
+
+  // Zone partition, healed: it reconciles, then sends no data.
+  await loadPreset(page, 'Zone partition');
+  await page.getByRole('button', { name: 'Heal network' }).click();
+  await expect(field(page, 'status-cut')).toHaveText('0');
+  await logPackets(page);
+  await stepUntil(page, () => agreed(page), 16, 'Zone partition agreed');
+  await takePackets(page);
+  for (let i = 0; i < 5; i++) await period(page);
+  expect((await takePackets(page)).filter((p) => CARRIES_CELLS[p.kind]), 'Zone partition: data after agreement').toEqual([]);
+
+  // Packet loss: its resends are not asserted away, but once agreed it stays so.
+  await loadPreset(page, 'Packet loss');
+  await stepUntil(page, () => agreed(page), 20, 'Packet loss agreed');
+  for (let i = 0; i < 5; i++) {
+    await period(page);
+    expect(await agreed(page), `Packet loss: agreed ${i + 1} period(s) on`).toBe(true);
+  }
+});
+
+test('both gateway presets fail over within the window', async ({ page }, info) => {
+  test.skip(info.project.name !== 'audit-1440-light', 'the failover, checked once');
+  test.setTimeout(240_000);
+  await open(page);
+  await setSpeed(page, 4);
+  for (const [name, record, trickle] of [
+    ['Gateway failure', timings.gateway_failure, 0],
+    // The trickle's hits in the last period may not have reached zone b yet.
+    ['Gateway cut from its zone', timings.gateway_cut, Math.ceil((2 * PERIOD_MS) / 1000)],
+  ] as const) {
+    await loadPreset(page, name);
+    const load = await snapshot(page, 0);
+    const faulted = load.inspected?.peers.find((p) => p.role === 'gateway' && p.zone === 1)?.id;
+    expect(faulted, `${name}: node 0's gateway into zone b at load`).toBeDefined();
+    const failovers = async (): Promise<number> =>
+      (await snapshot(page)).nodes.find((n) => n.id === 0)?.gateway_failovers ?? 0;
+    await stepUntil(page, async () => (await failovers()) >= 1, WINDOW_MS / PERIOD_MS, `${name}: node 0 failed over`);
+    const failedOver = await virtualMs(page);
+    const zoneB = load.nodes.filter((n) => n.zone === 1 && n.id !== faulted).map((n) => n.id);
+    await stepUntil(
+      page,
+      async () => {
+        const snap = await snapshot(page);
+        return zoneB.every((id) => snap.nodes.find((n) => n.id === id)!.window_total >= snap.oracle_total - trickle);
+      },
+      3,
+      `${name}: zone b caught up through its new gateway`,
+    );
+    console.log(`${name}: failed over ${failedOver - load.virtual_ms} ms after load (the record: ${record.failover_ms} ms)`);
+  }
 });
 
 // -- A6: interaction -----------------------------------------------------------
@@ -1206,12 +1397,12 @@ test.describe('interaction', () => {
     await page.getByRole('button', { name: 'Heal network' }).click();
     await expect(status('cut')).toHaveText('0');
 
-    // Traffic burst, with node 0 selected: silence its gateway, then cut one
-    // direction of another.
-    await loadPreset(page, 'Traffic burst');
-    // The origin has no gateway until its runtime has heard the other zones.
+    // Propagation, with node 0 selected: silence its gateway, then cut one
+    // direction of another. The cluster warmed up before it opened, so the
+    // gateway is already found.
+    await loadPreset(page, 'Propagation');
     const silence = page.getByRole('button', { name: /^Silence node \d+, the gateway into zone b$/ });
-    await stepUntil(page, async () => (await silence.count()) > 0, 10, 'the origin found its gateway into zone b');
+    await expect(silence).toHaveCount(1);
     await silence.click();
     await expect(status('cut')).toHaveText('11');
     await page.getByRole('button', { name: 'Heal network' }).click();
@@ -1271,7 +1462,7 @@ test.describe('interaction', () => {
 
     // Removing a cut node takes its cut links with it.
     const cutFrom = page.getByRole('button', { name: /^Cut node \d+ from zone \w$/ }).first();
-    await stepUntil(page, async () => (await cutFrom.count()) > 0, 10, 'a node found its gateway to cut from its zone');
+    await expect(cutFrom, 'node 7 found its gateways while the cluster warmed up').toBeVisible();
     const cutNode = (await cutFrom.locator('[data-field="node"]').textContent()) ?? '';
     await cutFrom.click();
     await expect(status('cut')).toHaveText('3');

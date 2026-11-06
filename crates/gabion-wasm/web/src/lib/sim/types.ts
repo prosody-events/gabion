@@ -65,6 +65,19 @@ export const CARRIES_CELLS: Readonly<Record<PacketKind, boolean>> = {
   SweepRequest: false,
 };
 
+/** Whether `batch` holds a wave: a packet that carries cells, sent or lost, the
+ *  engine's own test (`EngineState::open_sub_step`). After a submit or a step
+ *  by event the engine leaves exactly such a batch's sub-step open, so its
+ *  packets land at the next command. */
+export function isWave(batch: EventBatch): boolean {
+  const events = batch.events;
+  for (let i = 0; i < events.length; i++) {
+    const kind = events[i].kind;
+    if ((kind.type === 'PacketSent' || kind.type === 'PacketDropped') && CARRIES_CELLS[kind.kind]) return true;
+  }
+  return false;
+}
+
 /** Mirror of `crate::engine::StepUntil`: where a step stops. `Event` stops
  *  before a wave of data packets lands, or where some node's window of `key`
  *  drops a bucket that holds hits. */
