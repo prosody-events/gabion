@@ -23,7 +23,7 @@ import {
   type QuadPath,
   type Spot,
 } from '../src/lib/stage/layout';
-import { MARK, RING_BEHIND, RING_CAUGHT_UP, STOP_BAR, type BeamPool, type GlyphTable } from '../src/lib/stage/renderer';
+import { DROP_STOPS, MARK, RING_BEHIND, RING_CAUGHT_UP, STOP_BAR, type BeamPool, type GlyphTable } from '../src/lib/stage/renderer';
 import { VESSEL_SCALE } from '../src/lib/limit';
 import { zoneAt } from '../src/lib/format';
 import { PRESETS } from '../src/lib/presets';
@@ -1422,10 +1422,15 @@ test("every drawn beam carries its packet's kind, tier and fate", async ({ page 
 // glyph of it, and a bar against a port reads as one glyph with it, which the
 // key does not define. A route always has room either side of the centre and
 // clear of its ends' ports; a node's name beside a short chord may leave none,
-// so names are kept clear where the route allows, not checked here.
+// so names are kept clear where the route allows, not checked here. It samples
+// the periods the main audit shoots: Gateway failure's node 10 sends to the
+// failed node 4 only after the first two, and that packet's route is the one
+// where a stop runs into node 4's port. The check must have met such a route,
+// or its port half proves nothing.
 test("a lost packet's bar stands clear of every zone's title and gateway port", async ({ page }, info) => {
   test.skip(info.project.name.endsWith('-dark'), 'geometry, the same in either theme');
   await open(page);
+  const beside = new Set<string>();
   for (const name of ['Gateway failure', 'Gateway cut']) {
     await loadPreset(page, name);
     const bars = new Set<string>();
@@ -1447,8 +1452,11 @@ test("a lost packet's bar stands clear of every zone's title and gateway port", 
           const labels = JSON.parse(c.dataset.labelBoxes ?? '[]') as { text: string; x: number; y: number; w: number; h: number }[];
           return { lines, labels: labels.filter((l) => l.text.startsWith('zone ')), ports };
         }, DROPPED);
+      const port = (at: { x: number; y: number }) => ports.find((p) => Math.hypot(at.x - p.x, at.y - p.y) <= portHalf(p.r) + STOP_BAR / 2 + 1);
       for (const { route: [fx, fy, cx, cy, tx, ty], stop, src, dst } of lines) {
-        const at = pointOn({ from: { x: fx, y: fy }, control: { x: cx, y: cy }, to: { x: tx, y: ty } }, stop, { x: 0, y: 0 });
+        const path = { from: { x: fx, y: fy }, control: { x: cx, y: cy }, to: { x: tx, y: ty } };
+        const at = pointOn(path, stop, { x: 0, y: 0 });
+        if (DROP_STOPS.some((s) => port(pointOn(path, s, { x: 0, y: 0 })) !== undefined)) beside.add(`node ${src} to node ${dst}`);
         const bar = `node ${src} to node ${dst}, its bar at ${stop}`;
         bars.add(bar);
         for (const l of labels) {
@@ -1456,16 +1464,17 @@ test("a lost packet's bar stands clear of every zone's title and gateway port", 
           const ny = Math.max(l.y, Math.min(at.y, l.y + l.h));
           if (Math.hypot(at.x - nx, at.y - ny) <= STOP_BAR / 2 + 1) against.add(`${bar} stands against "${l.text}"`);
         }
-        for (const port of ports) {
-          if (Math.hypot(at.x - port.x, at.y - port.y) <= portHalf(port.r) + STOP_BAR / 2 + 1) against.add(`${bar} stands against node ${port.id}'s port`);
-        }
+        const by = port(at);
+        if (by !== undefined) against.add(`${bar} stands against node ${by.id}'s port`);
       }
     };
-    for (let i = 0; i < 2; i++) await period(page, check);
+    for (let i = 0; i < STEPS; i++) await period(page, check);
     console.log(`${name}: checked ${bars.size} lost packet bar(s)`);
     expect(bars.size, `${name}: a lost packet was drawn`).toBeGreaterThan(0);
     expect([...against], name).toEqual([]);
   }
+  console.log(`routes with a stop against a port: ${[...beside].join(', ')}`);
+  expect(beside.size, "no lost packet's route had a stop against a port, so the port check was not exercised").toBeGreaterThan(0);
 });
 
 // -- The stage's labels, laid out once per layout -------------------------------

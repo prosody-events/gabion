@@ -102,7 +102,7 @@ const MAX_BUCKETS = 32;
 // the ring's centre), at the first stop further out either way clear of both,
 // `LABEL_SPACING` from a label as names keep from each other, else the stop
 // furthest from any label.
-const DROP_STOPS = [0.5, 0.42, 0.58, 0.34, 0.66, 0.26, 0.74] as const;
+export const DROP_STOPS = [0.5, 0.42, 0.58, 0.34, 0.66, 0.26, 0.74] as const;
 export const STOP_BAR = 12;
 // Segments a route is drawn in.
 const ROUTE_SEGMENTS = 8;
