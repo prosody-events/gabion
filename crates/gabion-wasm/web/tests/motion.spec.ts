@@ -452,9 +452,9 @@ test("Step draws Propagation's waves one at a time, each with its counts", async
 // The page's time Play runs for in each scenario.
 const PACE_MS = 2000;
 
-// Owner Q16 holds for a Send that flushes at once too: at a limit of 100 the
-// error budget is one hit, so the Send's own wave leaves in its own batch, and
-// Propagation's Send still stops before it, and Step draws it with its counts.
+// Propagation's Send stops before its wave even when it flushes at once: at a
+// limit of 100 the error budget is one hit, so the Send's own wave leaves in its
+// own batch, and Step draws it with its counts.
 test("Propagation's Send stops before its wave when it flushes at once", async ({ page }) => {
   await open(page);
   await loadPreset(page, 'Propagation');

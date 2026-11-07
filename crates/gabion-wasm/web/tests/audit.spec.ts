@@ -1417,12 +1417,13 @@ test("every drawn beam carries its packet's kind, tier and fate", async ({ page 
 // -- A lost packet's bar ------------------------------------------------------------
 
 // A lost packet's line stops partway, at its bar, which never stands against a
-// zone's title (rule 19): a gateway's packet across its zone passes the title
-// at the ring's centre, where a bar half way along reads as a glyph of it. A
-// route always has room either side of the centre; a node's name beside a short
-// chord may leave none, so names are kept clear where the route allows, not
-// checked here.
-test("a lost packet's bar stands clear of every zone's title", async ({ page }, info) => {
+// zone's title or a gateway's port (rule 19): a gateway's packet across its zone
+// passes the title at the ring's centre, where a bar half way along reads as a
+// glyph of it, and a bar against a port reads as one glyph with it, which the
+// key does not define. A route always has room either side of the centre and
+// clear of its ends' ports; a node's name beside a short chord may leave none,
+// so names are kept clear where the route allows, not checked here.
+test("a lost packet's bar stands clear of every zone's title and gateway port", async ({ page }, info) => {
   test.skip(info.project.name.endsWith('-dark'), 'geometry, the same in either theme');
   await open(page);
   for (const name of ['Gateway failure', 'Gateway cut']) {
@@ -1430,15 +1431,22 @@ test("a lost packet's bar stands clear of every zone's title", async ({ page }, 
     const bars = new Set<string>();
     const against = new Set<string>();
     const check = async (): Promise<void> => {
-      const { lines, labels } = await page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { beams: BeamPool }, dropped) => {
-        const p = c.beams;
-        const lines: { route: number[]; stop: number; src: number; dst: number }[] = [];
-        for (let i = 0; i < p.len; i++) {
-          if ((p.flags[i] & dropped) !== 0) lines.push({ route: [...p.route.subarray(i * 6, i * 6 + 6)], stop: p.stop[i], src: p.src[i], dst: p.dst[i] });
-        }
-        const labels = JSON.parse(c.dataset.labelBoxes ?? '[]') as { text: string; x: number; y: number; w: number; h: number }[];
-        return { lines, labels: labels.filter((l) => l.text.startsWith('zone ')) };
-      }, DROPPED);
+      const { lines, labels, ports } = await page
+        .locator('.stage canvas')
+        .evaluate((c: HTMLCanvasElement & { beams: BeamPool; glyphs: GlyphTable }, dropped) => {
+          const p = c.beams;
+          const lines: { route: number[]; stop: number; src: number; dst: number }[] = [];
+          for (let i = 0; i < p.len; i++) {
+            if ((p.flags[i] & dropped) !== 0) lines.push({ route: [...p.route.subarray(i * 6, i * 6 + 6)], stop: p.stop[i], src: p.src[i], dst: p.dst[i] });
+          }
+          const g = c.glyphs;
+          const ports: { id: number; x: number; y: number; r: number }[] = [];
+          for (let s = 0; s < g.id.length; s++) {
+            if (!Number.isNaN(g.portX[s])) ports.push({ id: g.id[s], x: g.portX[s], y: g.portY[s], r: g.r[s] });
+          }
+          const labels = JSON.parse(c.dataset.labelBoxes ?? '[]') as { text: string; x: number; y: number; w: number; h: number }[];
+          return { lines, labels: labels.filter((l) => l.text.startsWith('zone ')), ports };
+        }, DROPPED);
       for (const { route: [fx, fy, cx, cy, tx, ty], stop, src, dst } of lines) {
         const at = pointOn({ from: { x: fx, y: fy }, control: { x: cx, y: cy }, to: { x: tx, y: ty } }, stop, { x: 0, y: 0 });
         const bar = `node ${src} to node ${dst}, its bar at ${stop}`;
@@ -1447,6 +1455,9 @@ test("a lost packet's bar stands clear of every zone's title", async ({ page }, 
           const nx = Math.max(l.x, Math.min(at.x, l.x + l.w));
           const ny = Math.max(l.y, Math.min(at.y, l.y + l.h));
           if (Math.hypot(at.x - nx, at.y - ny) <= STOP_BAR / 2 + 1) against.add(`${bar} stands against "${l.text}"`);
+        }
+        for (const port of ports) {
+          if (Math.hypot(at.x - port.x, at.y - port.y) <= portHalf(port.r) + STOP_BAR / 2 + 1) against.add(`${bar} stands against node ${port.id}'s port`);
         }
       }
     };

@@ -6,10 +6,10 @@ import { defineConfig } from '@playwright/test';
 // boots and gossips in a browser. `audit.spec.ts` is the automated design audit
 // (README "Design rules") and `story.spec.ts` walks each scenario's story by
 // its next actions, both at five widths in each theme with motion reduced.
-// `motion.spec.ts` checks the waves in motion, cause before effect, once at
-// 1440 px in the light theme with motion on (its landed-routes test also with
-// motion reduced); the story walks run there too. `next.spec.ts` checks the
-// next action, the goals and the heading as pure functions, with no page.
+// `motion.spec.ts` checks each packet's line and its counts, cause before
+// effect, once at 1440 px in the light theme with motion on; the story walks
+// run there too. `next.spec.ts` checks the next action, the goals and the
+// heading as pure functions, with no page.
 const audits = [1440, 1280, 1100, 768, 400].flatMap((width) =>
   (['light', 'dark'] as const).map((colorScheme) => ({
     name: `audit-${width}-${colorScheme}`,

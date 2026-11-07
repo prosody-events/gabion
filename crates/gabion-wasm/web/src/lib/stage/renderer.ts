@@ -1543,8 +1543,8 @@ export class StageRenderer {
 
   /** Where on the current route a lost packet's bar stands: of the
    *  `DROP_STOPS` clear of every disc's ring, the first `LABEL_SPACING` from
-   *  every label, else the one furthest from any label; half way when none
-   *  clears the discs. */
+   *  every label and gateway port, else the one furthest from them; half way
+   *  when none clears the discs. */
   #dropStop(): number {
     const at = this.#at;
     const spots = this.#layout?.spots;
@@ -1566,6 +1566,13 @@ export class StageRenderer {
         const nx = Math.max(box.x, Math.min(at.x, box.x + box.w));
         const ny = Math.max(box.y, Math.min(at.y, box.y + box.h));
         near = Math.min(near, Math.hypot(at.x - nx, at.y - ny) - STOP_BAR / 2);
+      }
+      for (let n = 0; spots !== undefined && n < spots.length; n++) {
+        const spot = spots[n];
+        const gfx = this.#nodes.get(spot.id);
+        if (gfx?.ported !== true) continue;
+        const port = Math.hypot(at.x - spot.x - gfx.portX, at.y - spot.y - gfx.portY);
+        near = Math.min(near, port - portHalf(spot.r) - STOP_BAR / 2);
       }
       if (near > LABEL_SPACING) return stop;
       if (near > room) {
