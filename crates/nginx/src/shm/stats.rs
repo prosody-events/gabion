@@ -1,21 +1,28 @@
-//! Lightweight per-zone counters surfaced via `/snapshot` and logs. All
-//! mutation is `Relaxed` — these are best-effort observability values, not
-//! synchronization signals.
+//! Per-zone counters, in two groups. Workers bump `Stats::workers` on
+//! requests and share its line, as every worker bumps the same ones.
+//! Everything the leader writes (each drain pass, each aggregate overflow,
+//! the marks below) sits in `Stats::leader`, on the lines after it, together
+//! with `queue_dropped`, which workers bump only when the queue is full.
+//! Leader threads log four of them at powers of two (`leader::log_bypasses`),
+//! and `aggregate_dropped` logs as `aggregate_full`. All mutation is
+//! `Relaxed`: observability values, not synchronization.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use gabion::defaults;
-use gabion::rules::RuleId;
-
-/// Cap on per-rule counters held in [`Stats::exempted_per_rule`]. Matches
-/// the cluster-wide rule-dictionary cap so a rule that fits in the gossip
-/// CRDT also has a per-rule slot here. Operators see the cap via the same
-/// config key (`STORAGE_RULE_DICTIONARY_CAPACITY`).
-pub const STATS_MAX_RULES: usize = defaults::STORAGE_RULE_DICTIONARY_CAPACITY as usize;
+use super::{CACHELINE, CachePadded};
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Stats {
+    pub workers: WorkerLine,
+    /// Starts a line of its own, so no leader write takes the workers' line.
+    pub leader: CachePadded<LeaderLine>,
+}
+
+/// The counters workers bump on every request.
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct WorkerLine {
     pub requests: AtomicU64,
     pub allowed: AtomicU64,
     pub rejected: AtomicU64,
@@ -23,34 +30,37 @@ pub struct Stats {
     pub declines_invalid_descriptor: AtomicU64,
     pub matched_rule_overflows: AtomicU64,
     pub exempted: AtomicU64,
-    /// Per-rule exempt counter, indexed by `rule_id - 1`. A rule whose id
-    /// falls outside `1..=STATS_MAX_RULES` contributes only to the global
-    /// `exempted` counter (the dictionary cap is observable via the same
-    /// `STORAGE_RULE_DICTIONARY_CAPACITY` operators already configure).
-    pub exempted_per_rule: [AtomicU64; STATS_MAX_RULES],
     pub queue_pushed: AtomicU64,
+}
+
+// A request that bumps two lines pays two line transfers.
+const _: () = assert!(
+    size_of::<WorkerLine>() <= CACHELINE,
+    "keep the counters workers bump on every request within one cache line"
+);
+
+/// What the leader writes, and the counter only a full queue bumps.
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct LeaderLine {
     pub queue_drained: AtomicU64,
     pub queue_dropped: AtomicU64,
     pub aggregate_dropped: AtomicU64,
+    /// The total of each logged counter a leader thread last read, advanced
+    /// by `gabion::throttle::catch_up`; written by leader threads only. It
+    /// lives in the zone so the threads of every worker, across a reload,
+    /// log each power of two once between them.
+    pub logged: Logged,
 }
 
-impl Default for Stats {
-    fn default() -> Self {
-        Self {
-            requests: AtomicU64::new(0),
-            allowed: AtomicU64::new(0),
-            rejected: AtomicU64::new(0),
-            rejected_cardinality: AtomicU64::new(0),
-            declines_invalid_descriptor: AtomicU64::new(0),
-            matched_rule_overflows: AtomicU64::new(0),
-            exempted: AtomicU64::new(0),
-            exempted_per_rule: [const { AtomicU64::new(0) }; STATS_MAX_RULES],
-            queue_pushed: AtomicU64::new(0),
-            queue_drained: AtomicU64::new(0),
-            queue_dropped: AtomicU64::new(0),
-            aggregate_dropped: AtomicU64::new(0),
-        }
-    }
+/// The marks `LeaderLine::logged` holds, one per counter leader threads log.
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct Logged {
+    pub matched_rule_overflows: AtomicU64,
+    pub queue_dropped: AtomicU64,
+    pub declines_invalid_descriptor: AtomicU64,
+    pub rejected_cardinality: AtomicU64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,119 +72,91 @@ pub struct StatsSnapshot {
     pub declines_invalid_descriptor: u64,
     pub matched_rule_overflows: u64,
     pub exempted: u64,
-    pub exempted_per_rule: [u64; STATS_MAX_RULES],
     pub queue_pushed: u64,
     pub queue_drained: u64,
     pub queue_dropped: u64,
     pub aggregate_dropped: u64,
 }
 
-impl Default for StatsSnapshot {
-    fn default() -> Self {
-        Self {
-            requests: 0,
-            allowed: 0,
-            rejected: 0,
-            rejected_cardinality: 0,
-            declines_invalid_descriptor: 0,
-            matched_rule_overflows: 0,
-            exempted: 0,
-            exempted_per_rule: [0_u64; STATS_MAX_RULES],
-            queue_pushed: 0,
-            queue_drained: 0,
-            queue_dropped: 0,
-            aggregate_dropped: 0,
-        }
-    }
-}
-
 impl Stats {
     pub fn snapshot(&self) -> StatsSnapshot {
-        let mut exempted_per_rule = [0_u64; STATS_MAX_RULES];
-        for (slot, atom) in exempted_per_rule
-            .iter_mut()
-            .zip(self.exempted_per_rule.iter())
-        {
-            *slot = atom.load(Ordering::Relaxed);
-        }
         StatsSnapshot {
-            requests: self.requests.load(Ordering::Relaxed),
-            allowed: self.allowed.load(Ordering::Relaxed),
-            rejected: self.rejected.load(Ordering::Relaxed),
-            rejected_cardinality: self.rejected_cardinality.load(Ordering::Relaxed),
-            declines_invalid_descriptor: self.declines_invalid_descriptor.load(Ordering::Relaxed),
-            matched_rule_overflows: self.matched_rule_overflows.load(Ordering::Relaxed),
-            exempted: self.exempted.load(Ordering::Relaxed),
-            exempted_per_rule,
-            queue_pushed: self.queue_pushed.load(Ordering::Relaxed),
-            queue_drained: self.queue_drained.load(Ordering::Relaxed),
-            queue_dropped: self.queue_dropped.load(Ordering::Relaxed),
-            aggregate_dropped: self.aggregate_dropped.load(Ordering::Relaxed),
+            requests: self.workers.requests.load(Ordering::Relaxed),
+            allowed: self.workers.allowed.load(Ordering::Relaxed),
+            rejected: self.workers.rejected.load(Ordering::Relaxed),
+            rejected_cardinality: self.workers.rejected_cardinality.load(Ordering::Relaxed),
+            declines_invalid_descriptor: self
+                .workers
+                .declines_invalid_descriptor
+                .load(Ordering::Relaxed),
+            matched_rule_overflows: self.workers.matched_rule_overflows.load(Ordering::Relaxed),
+            exempted: self.workers.exempted.load(Ordering::Relaxed),
+            queue_pushed: self.workers.queue_pushed.load(Ordering::Relaxed),
+            queue_drained: self.leader.queue_drained.load(Ordering::Relaxed),
+            queue_dropped: self.leader.queue_dropped.load(Ordering::Relaxed),
+            aggregate_dropped: self.leader.aggregate_dropped.load(Ordering::Relaxed),
         }
     }
 
     pub fn record_request(&self) {
-        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.workers.requests.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_allow(&self) {
-        self.allowed.fetch_add(1, Ordering::Relaxed);
+        self.workers.allowed.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_reject(&self) {
-        self.rejected.fetch_add(1, Ordering::Relaxed);
+        self.workers.rejected.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_cardinality_reject(&self) {
-        self.rejected_cardinality.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// A descriptor's value could not be read as a UTF-8 string; the
-    /// request was declined (passed through without recording). Unmasks
-    /// what was previously a silent bypass.
-    pub fn record_decline_invalid_descriptor(&self) {
-        self.declines_invalid_descriptor
+        self.workers
+            .rejected_cardinality
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A single request matched more rules than the per-request cap. Per
-    /// the allow-by-default principle the request still passes through
-    /// (best-effort: events buffered before the overflow are still
-    /// recorded), but operators want visibility into the bypass.
+    /// A descriptor's value could not be read as a UTF-8 string; the
+    /// request was declined (passed through without recording).
+    pub fn record_decline_invalid_descriptor(&self) {
+        self.workers
+            .declines_invalid_descriptor
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One per allowed request whose allowed rules outnumbered
+    /// `gabion_storage_max_matched_rules`; the request was still allowed and
+    /// the rules past the bound under-count.
     pub fn record_matched_rule_overflow(&self) {
-        self.matched_rule_overflows.fetch_add(1, Ordering::Relaxed);
+        self.workers
+            .matched_rule_overflows
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// A rule's `except_if=` predicate resolved truthy, so the rule was
-    /// skipped for this request. Operators watch this counter to detect a
-    /// misconfigured predicate that always-exempts; the per-rule slot
-    /// (indexed by `rule_id - 1`) lets them attribute the bypass to a
-    /// specific rule rather than the aggregate.
-    pub fn record_exempt(&self, rule_id: RuleId) {
-        self.exempted.fetch_add(1, Ordering::Relaxed);
-        let idx = (rule_id as usize).wrapping_sub(1);
-        if idx < STATS_MAX_RULES {
-            self.exempted_per_rule[idx].fetch_add(1, Ordering::Relaxed);
+    /// skipped for this request.
+    pub fn record_exempt(&self) {
+        self.workers.exempted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_queue_push(&self, n: u64) {
+        if n > 0 {
+            self.workers.queue_pushed.fetch_add(n, Ordering::Relaxed);
         }
     }
 
-    pub fn record_queue_push(&self) {
-        self.queue_pushed.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_queue_drop(&self) {
-        self.queue_dropped.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// The aggregate table had no free slot for a cell, so its count was
-    /// dropped (allowed and under-counted). Returns the new total.
-    pub fn record_aggregate_drop(&self) -> u64 {
-        self.aggregate_dropped.fetch_add(1, Ordering::Relaxed) + 1
+    /// Hits the full request queue dropped: their requests were allowed and
+    /// never counted. Only a drop writes, so a request that drops nothing
+    /// leaves the leader's line alone.
+    pub fn record_queue_drop(&self, n: u64) {
+        if n > 0 {
+            self.leader.queue_dropped.fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     pub fn record_queue_drain(&self, n: u64) {
         if n > 0 {
-            self.queue_drained.fetch_add(n, Ordering::Relaxed);
+            self.leader.queue_drained.fetch_add(n, Ordering::Relaxed);
         }
     }
 }

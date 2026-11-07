@@ -1,11 +1,10 @@
 //! The single long-lived simulation engine.
 //!
 //! There is no new simulator here: [`run_engine`] stands up N
-//! [`GossipRuntime`]s on one shared [`SimRouter`] under paused virtual time —
-//! exactly the shape `gossip-bench`'s `run_inner` proves — and then loops over
-//! a command channel, replying on a `oneshot` per command. The same function
-//! backs both faces of the visualizer: playback (`step`) and live interaction
-//! (`submit_request`, `set_link_policy`).
+//! [`GossipRuntime`]s on one shared [`SimRouter`] under paused virtual time,
+//! then loops over a command channel, replying on a `oneshot` per command. The
+//! same function backs both faces of the visualizer: playback (`step`) and
+//! live interaction (`submit_request`, `set_link_policy`).
 //!
 //! **Spawn once, drive forever.** `run_engine` owns the `Vec<NodeHandle>` and
 //! the `LocalSet` for the whole session; the runtimes are `spawn_local`'d once
@@ -15,94 +14,76 @@
 //!
 //! The caller must run `run_engine` on a runtime with **paused time** (native:
 //! `Builder::new_current_thread().enable_all().start_paused(true)`); virtual
-//! time only moves when a `Step` / `StepTo` handler calls `sim_advance`.
+//! time moves only inside a `Step` or `StepTo` handler, which sets the shared
+//! clock every node reads.
+//!
+//! **Sub-steps.** Time moves from one due instant to the next: a node's
+//! heartbeat (each node at its own fixed phase), one emit floor after a node
+//! armed its prompt ticker, or, stepping by [`StepUntil::Event`], the instant
+//! some node's window drops a bucket that holds hits. A sub-step has two
+//! halves. The open half fires what is due while the router holds every packet
+//! sent; the close half delivers them and reads the counters of the nodes it
+//! touched. An admitted request runs one sub-step at its own instant, so its
+//! eager flush is delivered before the command returns, unless the request
+//! asked to stop before a wave. Only a command run by event leaves a sub-step
+//! open, between its halves, and every command that is carried out,
+//! `Snapshot` aside, closes it first.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::num::{NonZeroU64, NonZeroU128};
 use std::rc::Rc;
 use std::time::Duration;
 
 use futures::channel::mpsc::{UnboundedSender, unbounded};
-use gabion::crdt::{CellStore, KeyHash, NodeId, NodeIdentity, RuleDescriptor};
-use gabion::defaults;
+use gabion::aggregate::AggregateTable;
+use gabion::crdt::{BucketEpoch, CellStore, KeyHash, NodeId, NodeIdentity, ValidStorageConfig};
 use gabion::discovery::{Peer, PeerEvent};
-use gabion::gossip::sim::{LinkPolicy, SimRouter};
+use gabion::gossip::sim::{Deferral, LinkPolicy, SimRouter};
 use gabion::gossip::{
-    AdminCommand, AdminSnapshot, CellDumpSnapshot, GossipClient, GossipConfig, GossipError,
-    GossipRuntime,
+    AdminCommand, AdminSnapshot, CellDumpSnapshot, GossipClient, GossipCounters, GossipError,
+    GossipRuntime, PeerZone, Role,
 };
-use gabion::wire::FrameLimits;
-use serde::{Deserialize, Serialize};
+use gabion::rules::{RuleSpec, RuleTable};
+use gabion::settings::{SettingError, Settings};
+use gabion::zone::{ZoneHash, ZoneName};
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, LocalSet};
 
-use crate::clock::{ManualClock, SharedNow};
-use crate::config::{ConfigError, SimConfig};
-use crate::event::{CellView, ClusterState, Event, EventBatch, EventKind, NodeState, PeerView};
-use crate::shims::{AddressBook, EventEmittingAggregateStore, EventLog, LoggingSimTransport};
+use crate::clock::{ManualClock, SharedNow, Tickers};
+use crate::config::{MAX_NODES, MAX_ZONES, SimConfig, ValidSimConfig, ZONE_NAMES, ZoneMode};
+use crate::event::{
+    Admission, BytesByTier, CellView, ClusterState, Event, EventBatch, EventKind, Inspected, Lag,
+    NodeState, PacketKind, PeerView, Reopens, ZoneView,
+};
+use crate::shims::{
+    AddressBook, EventEmittingAggregateStore, EventLog, LoggingSimTransport, Member,
+};
 
 /// First UDP port the engine assigns; node `i` binds `BASE_PORT + i`.
 const BASE_PORT: u16 = 40_000;
-/// Cluster id mixed into every packet header (matches the bench).
-const CLUSTER_ID_HASH: u128 = 0xC1;
-/// Local rule id for the single watched rule. Any value other than
-/// `u32::MAX` marks the rule as locally applicable so its cells count toward
-/// the aggregate (see `RuleDescriptor::applies_locally`).
-const LOCAL_RULE_ID: u32 = 0;
+/// The last stable id with a port of its own, `BASE_PORT + MAX_ID = 65535`.
+const MAX_ID: u32 = (u16::MAX - BASE_PORT) as u32;
+/// Cluster id mixed into every packet header (matches the bench). Non-zero,
+/// checked when the constant is evaluated.
+pub(crate) const CLUSTER_ID_HASH: NonZeroU128 = NonZeroU128::new(0xC1).unwrap();
 
-/// The visualizer's per-node gossip buffer sizing. **Not** the library
-/// production defaults (`GOSSIP_SEND_QUEUE_CAPACITY` = 128, tuned for a
-/// deployment whose per-tick output is small): the visualizer drives a far
-/// denser regime — up to `MAX_NODES` runtimes on one thread under a 100-node
-/// sustained-overload peak — so it sizes its own pool to that regime.
-///
-/// The invariant that fixes the high-node gossip freeze: **the send pool must
-/// hold one tick's worst-case packet output, with headroom for any cross-tick
-/// backlog.** Send-pool slots recycle only on the runtime's separate `Writable`
-/// select arm, never within `handle_gossip_tick`, so all `pick_count` peers'
-/// frames for one tick must fit in the free slots at once. If a frame can't
-/// finish, [`gabion::wire::Packets::next_into`] runs out of slots mid-frame and
-/// the iterator's drain contract trips its `debug_assert` (an `unreachable`
-/// freeze in dev wasm; a silent re-send next tick in release, since the dirty
-/// rings are persistent — no data loss, just slower flush).
-///
-/// **The pool ceiling is 255, not a free choice.** The runtime addresses
-/// send-pool slots with a `u8` (`send_pending: VecDeque<(SocketAddr, u8)>`) and
-/// builds the free list as `(0..send_pool_size as u8)`, so any capacity ≥ 256
-/// wraps to an *empty* free list and silently kills all gossip. So the pool is
-/// pinned at the largest addressable value, and the per-tick frame is capped so
-/// one tick stays well inside it:
-///
-/// One tick emits at most `pick_count × packets_per_frame` packets, where
-/// `pick_count = ⌈ln(peers)+c⌉` (the coverage fanout, `c` =
-/// `GOSSIP_COVERAGE_MARGIN` = 3), capped at the peer count. The widest cluster
-/// the visualizer builds is `MAX_NODES` = 256, so `peers ≤ 255` and
-/// `pick_count ≤ ⌈ln(255)+3⌉ = 9`; at the 100-node overload point it is
-/// `⌈ln(99)+3⌉ = 8`. `packets_per_frame = ceil(VIZ_MAX_CELLS_PER_TICK /
-/// cells_per_packet)`, with `cells_per_packet ≈ 21` at a 1400-byte payload in
-/// the worst case (every cell a distinct origin, so the node dictionary costs
-/// 16 B/cell on top of the 46 B row) — so `ceil(160 / 21) = 8`. The worst case
-/// at 100 nodes is therefore ≈ `8 × 8 = 64` packets/tick, which the 255-slot
-/// pool clears ~4×, leaving the rest of the pool for packets still draining
-/// from the previous tick. A native 100-node Sustained-overload run (40 s of
-/// virtual time, debug build with the drain `debug_assert` live) measured an
-/// actual `max_send_pending_depth` peak of **64** — no trap, ~4× under the
-/// pool. (The coverage fanout is stable for a cluster size, so this peak does
-/// not climb with burst volume the way the old dirty-set widening did.)
-///
-/// Capping the per-tick frame is what keeps one tick inside the fixed pool. The
-/// cap is inert at the default 12-node scenarios — their cross-node working set
-/// (≈ 132 cells) never reaches 160 — so it changes nothing user-visible there;
-/// a large cluster's burst simply flushes over a few ticks instead of one (the
-/// dirty rings are persistent, so the residual rides the next tick rather than
-/// dropping). Pool memory is `255 × 1400 B × live_nodes` ≈ 36 MB at 100 nodes.
-const VIZ_MAX_CELLS_PER_TICK: usize = 160;
-const VIZ_SEND_QUEUE_CAPACITY: usize = 255;
-
-/// The count width every node uses. `u32` matches the bench and is plenty for
-/// the visualizer's hit volumes.
-type Count = u32;
+/// Each node's inbound queue: three packets from each of the other
+/// `MAX_NODES − 1` nodes, 765 at 256 nodes, for every node in one zone. A
+/// round sends each peer one own-stream frame, 33 cells to a packet at the
+/// default payload, so two packets carry a frame of up to 66 cells; the
+/// visualizer's one watched key leaves each node at most `live_buckets + 1`
+/// own cells (11 at the default window). The third is first contact: a peer
+/// that hears a node's greeting answers it in its next prompt round, frame
+/// and sweep request together, and with heartbeat phases spread every peer's
+/// answer can land in the same sub-step. A bounded channel allocates as it
+/// fills, so the bound costs nothing unused. A step that hands a node more (a
+/// window over 65 buckets, or many keys through the engine API) overflows the
+/// queue: the logging transport reports the excess as `PacketDropped`, and
+/// each stream resends it after one heartbeat.
+pub(crate) const VIZ_ROUTER_CAPACITY: usize = 3 * (MAX_NODES - 1);
 
 /// Per-(src, dst) link policy in a serde-friendly shape. Maps onto the
 /// simulator's [`LinkPolicy`].
@@ -126,17 +107,183 @@ impl From<LinkPolicyKind> for LinkPolicy {
     }
 }
 
+/// Where a `Step` stops.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+pub enum StepUntil {
+    /// At the requested instant.
+    Time,
+    /// At the first of: the requested instant; right after a sub-step's fired
+    /// rounds sent a packet that carries cells, before it lands, with the
+    /// sub-step left open; or the instant some node's window of `key` drops
+    /// a bucket that holds hits.
+    Event {
+        #[serde(deserialize_with = "key_from_u64")]
+        key: KeyHash,
+    },
+}
+
+/// A key as the page names it, a safe integer.
+fn key_from_u64<'de, D: Deserializer<'de>>(de: D) -> Result<KeyHash, D::Error> {
+    u64::deserialize(de).map(|key| KeyHash(u128::from(key)))
+}
+
+/// The key the snapshot watches, and the weight of the request its
+/// inspected node's `next_send` decides.
+#[derive(Clone, Copy, Debug)]
+pub struct Watch {
+    pub key: KeyHash,
+    pub probe_hits: NonZeroU64,
+}
+
+/// Whether a sub-step's packets are still held. `Open` holds the router's
+/// [`Deferral`], so it is open exactly while the router defers delivery:
+/// [`EngineState::hold`] alone opens it, and
+/// [`EngineState::close_sub_step`], which every command that is carried out
+/// calls first, alone releases it.
+#[derive(Debug)]
+enum SubStep {
+    Closed,
+    Open(Deferral),
+}
+
+/// Words of a [`NodeSet`].
+const NODE_SET_WORDS: usize = MAX_NODES / 64;
+const _: () = assert!(
+    MAX_NODES.is_multiple_of(64),
+    "a NodeSet covers MAX_NODES exactly"
+);
+
+/// A set of positions in the engine's `nodes`, one bit each: fixed size, so
+/// it never allocates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NodeSet([u64; NODE_SET_WORDS]);
+
+impl NodeSet {
+    const EMPTY: Self = Self([0; NODE_SET_WORDS]);
+
+    /// Positions `0..n`.
+    #[inline]
+    fn first(n: usize) -> Self {
+        let mut set = Self::EMPTY;
+        for (w, word) in set.0.iter_mut().enumerate() {
+            let below = n.saturating_sub(w * 64);
+            *word = if below >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << below) - 1
+            };
+        }
+        set
+    }
+
+    #[inline]
+    fn insert(&mut self, i: usize) {
+        self.0[i / 64] |= 1 << (i % 64);
+    }
+
+    #[inline]
+    fn contains(&self, i: usize) -> bool {
+        self.0[i / 64] & (1 << (i % 64)) != 0
+    }
+
+    #[inline]
+    fn set(&mut self, i: usize, on: bool) {
+        let bit = 1 << (i % 64);
+        if on {
+            self.0[i / 64] |= bit;
+        } else {
+            self.0[i / 64] &= !bit;
+        }
+    }
+
+    /// Delete position `i` and move every higher position down by one, as
+    /// `Vec::remove` moves the nodes above a removed one.
+    #[inline]
+    fn remove_shift(&mut self, i: usize) {
+        let (w, b) = (i / 64, i % 64);
+        let word = self.0[w];
+        let below = word & ((1u64 << b) - 1);
+        // Two shifts, so that `b == 63` never shifts by the word's width.
+        let above = (word >> b) >> 1;
+        self.0[w] = below | (above << b);
+        for k in w + 1..NODE_SET_WORDS {
+            self.0[k - 1] |= (self.0[k] & 1) << 63;
+            self.0[k] >>= 1;
+        }
+    }
+
+    #[inline]
+    fn union_assign(&mut self, other: Self) {
+        for (word, other) in self.0.iter_mut().zip(other.0) {
+            *word |= other;
+        }
+    }
+
+    /// The positions of `self` that `other` lacks.
+    #[inline]
+    fn and_not(mut self, other: Self) -> Self {
+        for (word, other) in self.0.iter_mut().zip(other.0) {
+            *word &= !other;
+        }
+        self
+    }
+
+    #[inline]
+    fn intersects(&self, other: &Self) -> bool {
+        self.0.iter().zip(other.0).any(|(a, b)| a & b != 0)
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.0.iter().all(|&word| word == 0)
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.0.iter().map(|word| word.count_ones() as usize).sum()
+    }
+
+    /// The positions, ascending.
+    #[inline]
+    fn iter(self) -> impl Iterator<Item = usize> {
+        self.0.into_iter().enumerate().flat_map(|(w, mut bits)| {
+            std::iter::from_fn(move || {
+                (bits != 0).then(|| {
+                    let bit = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    w * 64 + bit
+                })
+            })
+        })
+    }
+}
+
 /// Things the engine cannot do, surfaced back to the caller.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
-    #[error(transparent)]
-    Config(#[from] ConfigError),
     #[error(
         "node {id} is not a member of this cluster — it never joined, or it has already left. \
          Node ids are stable and are never reused, so a removed node's id stays gone. Pick an id \
          from the current cluster (the live ids appear on the stage and in the Cluster control)."
     )]
     UnknownNode { id: u32 },
+    #[error(
+        "a node cannot join zone {zone}: this cluster has {zones} zones, indexed from 0 (zone-a). \
+         Pass an index below {zones}, or rebuild with more zones."
+    )]
+    UnknownZone { zone: u32, zones: u8 },
+    #[error(
+        "no node can join: the cluster already has {MAX_NODES} live nodes, the most the \
+         visualizer simulates, and every node's peer table and cell store is sized for that many. \
+         Remove a node first."
+    )]
+    ClusterFull,
+    #[error(
+        "no node can join: this session has handed out all {count} node ids, and ids are never \
+         reused, so every join spends one. Reset or reload the page to start a new session.",
+        count = MAX_ID + 1
+    )]
+    IdsExhausted,
     #[error(
         "the gossip runtime for node {node} has stopped, so the request could not be recorded. \
          The simulation has ended; reload to start over."
@@ -146,17 +293,32 @@ pub enum EngineError {
         #[source]
         source: GossipError,
     },
+    /// A node's settings, refused as `Settings::validate` refuses them for
+    /// both adapters: a joiner whose peers overflow `gossip.peer_capacity`.
+    #[error(transparent)]
+    Setting(#[from] SettingError),
+    #[error(
+        "a request must carry at least one hit: gabion admits or rejects a request whole by its \
+         weight, and a request of zero hits would count nothing. Set Hits per Send to a whole \
+         number of 1 or more."
+    )]
+    NoHits,
 }
 
 /// A command sent into the engine. Each carries a `oneshot` the engine replies
 /// on once it has done the work; the reply ordering across commands is FIFO
 /// because the engine processes one at a time.
 pub enum Command {
-    /// Inject `hits` for `key` at node `node`, at the current virtual time.
+    /// A request of `hits` for `key` at node `node`, at the current virtual
+    /// time. The node decides it first, from its own count table; an admitted
+    /// request is recorded, and its eager-flush packets are delivered at the
+    /// same instant before the reply, or, with `until` a
+    /// [`StepUntil::Event`], held, as stepping by event holds a wave.
     SubmitRequest {
         node: u32,
-        key: u128,
-        hits: u64,
+        key: KeyHash,
+        hits: NonZeroU64,
+        until: StepUntil,
         reply: oneshot::Sender<Result<EventBatch, EngineError>>,
     },
     /// Install a directed link policy between two nodes.
@@ -166,14 +328,26 @@ pub enum Command {
         policy: LinkPolicyKind,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
-    /// Restore every directed link between live nodes to lossless `Pass` —
-    /// undo any partition or per-link drop. Engine-driven (it owns the live
-    /// membership) so it stays correct as nodes join and leave.
+    /// Restore the configured network on every directed link between live
+    /// nodes, the scenario's uniform loss included, undoing any partition or
+    /// per-link policy. Engine-driven (it owns the live membership) so it
+    /// stays correct as nodes join and leave.
     Heal { reply: oneshot::Sender<()> },
     /// Spawn a fresh cold-start member that bootstraps knowing every current
     /// node. The newcomer takes the next never-reused id; survivors are told it
-    /// joined so they gossip to it. Replies with the events the join produced.
-    AddNode { reply: oneshot::Sender<EventBatch> },
+    /// joined so they gossip to it. Replies with the events the join produced,
+    /// [`EngineError::UnknownZone`] for a zone the cluster does not have,
+    /// [`EngineError::ClusterFull`] or [`EngineError::IdsExhausted`] when no
+    /// node can join, or [`EngineError::Setting`] if the newcomer's settings
+    /// fail to validate.
+    AddNode {
+        /// The zone to join; `None` joins the zone with the fewest live
+        /// members, the lowest index on a tie. A `u32`, so that an index past
+        /// 255 is refused rather than wrapped onto a zone; wasm-bindgen still
+        /// truncates a JS number to 32 bits on the way in.
+        zone: Option<u32>,
+        reply: oneshot::Sender<Result<EventBatch, EngineError>>,
+    },
     /// Remove the node with stable id `id`: tell every survivor it left, stop
     /// its runtime, and unbind its transport. Replies with the events the
     /// removal produced, or [`EngineError::UnknownNode`] if no such live node.
@@ -181,9 +355,11 @@ pub enum Command {
         id: u32,
         reply: oneshot::Sender<Result<EventBatch, EngineError>>,
     },
-    /// Advance virtual time by `delta_ms`, collecting the events produced.
+    /// Advance virtual time by at most `delta_ms`, stopping where `until`
+    /// says, collecting the events produced.
     Step {
         delta_ms: u64,
+        until: StepUntil,
         reply: oneshot::Sender<EventBatch>,
     },
     /// Advance virtual time to absolute `virtual_ms` (no-op if already past).
@@ -191,8 +367,11 @@ pub enum Command {
         virtual_ms: u64,
         reply: oneshot::Sender<EventBatch>,
     },
-    /// Full per-node cluster snapshot, for seek / re-render.
+    /// Per-node cluster snapshot of `watch`'s key, with the cells and peer
+    /// rows of node `inspect` alone.
     Snapshot {
+        inspect: Option<u32>,
+        watch: Watch,
         reply: oneshot::Sender<ClusterState>,
     },
     /// End the session and shut every runtime down.
@@ -200,31 +379,30 @@ pub enum Command {
 }
 
 /// Spawn the engine and process commands until the channel closes or a
-/// `Shutdown` arrives. Validates the config up front so a bad config fails
-/// before any runtime is built.
+/// `Shutdown` arrives.
 pub async fn run_engine(
-    config: SimConfig,
+    valid: ValidSimConfig,
     cmd_rx: mpsc::Receiver<Command>,
 ) -> Result<(), EngineError> {
-    config.validate()?;
     let local = LocalSet::new();
-    local.run_until(engine_loop(config, cmd_rx)).await
+    local.run_until(engine_loop(valid, cmd_rx)).await
 }
 
 async fn engine_loop(
-    config: SimConfig,
+    valid: ValidSimConfig,
     mut cmd_rx: mpsc::Receiver<Command>,
 ) -> Result<(), EngineError> {
-    let mut state = EngineState::build(config);
+    let mut state = EngineState::build(valid)?;
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             Command::SubmitRequest {
                 node,
                 key,
                 hits,
+                until,
                 reply,
             } => {
-                let _ = reply.send(state.submit_request(node, key, hits).await);
+                let _ = reply.send(state.submit_request(node, key, hits, until).await);
             }
             Command::SetLinkPolicy {
                 src,
@@ -232,27 +410,35 @@ async fn engine_loop(
                 policy,
                 reply,
             } => {
-                let _ = reply.send(state.set_link_policy(src, dst, policy));
+                let _ = reply.send(state.set_link_policy(src, dst, policy).await);
             }
             Command::Heal { reply } => {
-                state.heal();
+                state.heal().await;
                 let _ = reply.send(());
             }
-            Command::AddNode { reply } => {
-                let _ = reply.send(state.add_node().await);
+            Command::AddNode { zone, reply } => {
+                let _ = reply.send(state.add_node(zone).await);
             }
             Command::RemoveNode { id, reply } => {
                 let _ = reply.send(state.remove_node(id).await);
             }
-            Command::Step { delta_ms, reply } => {
-                let _ = reply.send(state.step(delta_ms).await);
+            Command::Step {
+                delta_ms,
+                until,
+                reply,
+            } => {
+                let _ = reply.send(state.step(delta_ms, until).await);
             }
             Command::StepTo { virtual_ms, reply } => {
                 let delta = virtual_ms.saturating_sub(state.virtual_ms);
-                let _ = reply.send(state.step(delta).await);
+                let _ = reply.send(state.step(delta, StepUntil::Time).await);
             }
-            Command::Snapshot { reply } => {
-                let _ = reply.send(state.snapshot().await);
+            Command::Snapshot {
+                inspect,
+                watch,
+                reply,
+            } => {
+                let _ = reply.send(state.snapshot(inspect, watch).await);
             }
             Command::Shutdown => break,
         }
@@ -261,23 +447,24 @@ async fn engine_loop(
     Ok(())
 }
 
-/// One node's handles, owned by the engine for the session. The `Vec` of these
-/// stays insertion-ordered (append on add, `remove` on delete), so a handle's
-/// position in the `Vec` is the node's **rank** — what the frontend turns into
-/// a ring slot — while `id` is its stable identity. The two are equal only
-/// until the first removal opens a gap.
+/// One node's handles, owned by the engine for the session. The engine's `Vec`
+/// of these is sorted by ascending `id`: `spawn_node` alone appends, with the
+/// next unused id, and `remove_node` keeps the order, so a lookup by id is a
+/// binary search (`position_of`).
 struct NodeHandle {
     /// Stable id (see [`crate::event`]). Assigned once, never reused.
     id: u32,
+    /// The zone it is placed in.
+    zone: u8,
     /// This node's gossip address, `127.0.0.1:(BASE_PORT + id)`. Cached so a
     /// removal can unbind it without recomputing.
     addr: SocketAddr,
-    client: GossipClient<Count>,
-    aggregate: Rc<EventEmittingAggregateStore<Count>>,
+    client: GossipClient,
+    aggregate: Rc<EventEmittingAggregateStore>,
     admin_tx: mpsc::Sender<AdminCommand>,
-    /// Fires one gossip tick on this node (its `ManualClock`'s ticker drains
-    /// the matching receiver).
-    tick_tx: mpsc::Sender<()>,
+    /// Fires this node's heartbeat and prompt tickers, and shows whether the
+    /// prompt ticker is armed.
+    tickers: Tickers,
     /// The discovery stream this node's runtime watches. The engine pushes
     /// `PeerEvent::Added`/`Removed` here as other nodes join and leave, so
     /// membership is dynamic rather than the static `stream::empty()` the bench
@@ -285,12 +472,42 @@ struct NodeHandle {
     peer_tx: UnboundedSender<PeerEvent>,
     join: JoinHandle<Result<(), GossipError>>,
     identity: NodeIdentity,
+    /// This runtime's counters as last read, for the round and role diffs.
+    seen: GossipCounters,
+    /// Its gateway into each zone as last read.
+    gateways: [Option<u32>; MAX_ZONES],
+    /// Bytes of `Own` packets this node sent, from the log.
+    own_data_bytes: u64,
+    /// The next instant its heartbeat fires: its phase, then every period.
+    next_heartbeat: u64,
+    /// The instant its prompt ticker fires: one emit floor after the engine
+    /// first saw it armed, as a ticker of that interval would fire.
+    prompt_due: Option<u64>,
+    /// The positions whose link into this node blocks.
+    blocked_from: NodeSet,
+    /// Hits this node admitted since it joined, of every key.
+    admitted_hits: u64,
+    /// Hits this node rejected since it joined, of every key.
+    rejected_hits: u64,
 }
 
 /// All engine state, owned as a local inside [`engine_loop`] (no `Rc<RefCell>`
 /// wrapper — the task owns it outright).
 struct EngineState {
     config: SimConfig,
+    /// Every node's settings, before its gossip bind and static peers.
+    settings: Settings,
+    /// Every node's storage, sized by [`SimConfig::settings`].
+    storage: ValidStorageConfig,
+    /// Every node's count table's storage, sized for the watched keys.
+    aggregate: ValidStorageConfig,
+    /// The watched rule, which every node interns at construction.
+    rules: RuleTable,
+    /// That rule as admission reads it: the bucket a request is recorded in,
+    /// the limit, and the window.
+    spec: RuleSpec,
+    /// Every zone's name, parsed and hashed once.
+    zone_names: Box<[ZoneName]>,
     router: SimRouter,
     nodes: Vec<NodeHandle>,
     addresses: AddressBook,
@@ -309,10 +526,43 @@ struct EngineState {
     now: SharedNow,
     /// Virtual time elapsed since the session began, in milliseconds.
     virtual_ms: u64,
+    /// Sub-steps opened: one per distinct heartbeat phase in a quiet cluster.
+    substeps: u64,
+    /// Whether the current sub-step's packets are still held.
+    sub_step: SubStep,
+    /// Positions fired, prompted, sent a packet to, or admitting a request in
+    /// the current sub-step: the close half reads the counters of, and sizes
+    /// its drain by, these.
+    touched: NodeSet,
+    /// Events drained and stamped, waiting for the next batch.
+    outbox: Vec<Event>,
+    /// Hits the cluster admitted, and rejected, since the session began, of
+    /// every key.
+    admitted_hits: u64,
+    rejected_hits: u64,
+    /// Bytes every sender put on the wire, drained from the log.
+    bytes_by_tier: BytesByTier,
+    /// Admin snapshots the gateway diff has fetched: one per node whose roles
+    /// moved.
+    gateway_fetches: u64,
+    /// `Counters` round trips `observe` has made.
+    counter_reads: u64,
+    /// Yields the drains have spent.
+    drain_yields: u64,
 }
 
 impl EngineState {
-    fn build(config: SimConfig) -> Self {
+    fn build(
+        ValidSimConfig {
+            config,
+            settings,
+            storage,
+            aggregate,
+            rules,
+            spec,
+            zone_names,
+        }: ValidSimConfig,
+    ) -> Result<Self, EngineError> {
         let log: EventLog = Rc::new(RefCell::new(Vec::new()));
         let addresses: AddressBook = Rc::new(RefCell::new(HashMap::new()));
         // One shared time base for the whole cluster; each node gets its own
@@ -322,12 +572,13 @@ impl EngineState {
         let initial_nodes = config.nodes;
         let mut state = Self {
             config,
-            // The inbound channel is kept in lockstep with the send pool: if a
-            // receiver's queue fills, `try_send_to` returns `WouldBlock`, the
-            // sender re-queues the packet, and the slot never frees between
-            // ticks — a second backpressure source that would re-create the
-            // freeze. Sized ≥ the send pool so it is never the bottleneck.
-            router: SimRouter::with_channel_capacity(VIZ_SEND_QUEUE_CAPACITY),
+            settings,
+            storage,
+            aggregate,
+            rules,
+            spec,
+            zone_names,
+            router: SimRouter::with_channel_capacity(VIZ_ROUTER_CAPACITY),
             nodes: Vec::with_capacity(initial_nodes),
             addresses,
             node_id_index: HashMap::with_capacity(initial_nodes),
@@ -335,124 +586,113 @@ impl EngineState {
             log,
             now,
             virtual_ms: 0,
+            substeps: 0,
+            sub_step: SubStep::Closed,
+            touched: NodeSet::EMPTY,
+            outbox: Vec::new(),
+            admitted_hits: 0,
+            rejected_hits: 0,
+            bytes_by_tier: BytesByTier::default(),
+            gateway_fetches: 0,
+            counter_reads: 0,
+            drain_yields: 0,
         };
 
         // The initial members are ids 0..N, so the address of id `i` is
         // `BASE_PORT + i` — the same set every member bootstraps against, and
         // the set a later newcomer will be handed too.
         let addrs: Vec<SocketAddr> = (0..initial_nodes).map(|i| addr_of_id(i as u32)).collect();
-        for _ in 0..initial_nodes {
-            let id = state.next_id;
-            state.next_id += 1;
-            state.spawn_node(id, &addrs);
+        let zones = state.zone_names.len();
+        for i in 0..initial_nodes {
+            state.spawn_node((i % zones) as u8, &addrs)?;
+            state.baseline_links(i);
         }
+        Ok(state)
+    }
 
-        // Apply the uniform i.i.d. loss model to every directed link.
-        if state.config.uniform_loss > 0.0 {
-            let p = state.config.uniform_loss;
-            for src in &addrs {
-                for dst in &addrs {
-                    if src != dst {
-                        state
-                            .router
-                            .set_link_policy(*src, *dst, LinkPolicy::DropProb { p });
-                    }
-                }
+    /// The configured network: the scenario's uniform loss on every link.
+    fn baseline_policy(&self) -> LinkPolicyKind {
+        if self.config.uniform_loss > 0.0 {
+            LinkPolicyKind::DropProb {
+                p: self.config.uniform_loss,
             }
-        }
-
-        state
-    }
-
-    /// The watched rule as a [`RuleDescriptor`], built from `self.config`. The
-    /// one construction site, so the rule the nodes intern, the bucket epoch
-    /// the submission path stamps, and the window the snapshot reports can
-    /// never drift from one another (or from gabion's own window/epoch
-    /// helpers).
-    fn rule_descriptor(&self) -> RuleDescriptor {
-        RuleDescriptor {
-            fingerprint: self.config.rule_fingerprint,
-            window_millis: self.config.rule_window_ms,
-            bucket_millis: self.config.rule_bucket_ms,
-            limit: self.config.rule_limit,
-            flags: 0,
-            local_rule_id: LOCAL_RULE_ID,
+        } else {
+            LinkPolicyKind::Pass
         }
     }
 
-    /// Build, spawn, and register one node with stable id `id`, bootstrapped
-    /// against `bootstrap` (its own address is filtered out if present). The
-    /// single node-construction path: both [`EngineState::build`] and
-    /// [`EngineState::add_node`] route through here, so the rule-intern footgun
-    /// guard below is honored identically on every path.
+    /// Install `policy` on the link from position `src` to position `dst`:
+    /// the one path that writes the router's policy and the reachability bit
+    /// the snapshot's lag reads.
+    fn set_link(&mut self, src: usize, dst: usize, policy: LinkPolicyKind) {
+        self.router
+            .set_link_policy(self.nodes[src].addr, self.nodes[dst].addr, policy.into());
+        self.nodes[dst].blocked_from.set(src, blocks(policy));
+    }
+
+    /// Give every link between position `pos` and a lower position the
+    /// baseline, both ways: called after each spawn, so every pair is set
+    /// once. A new address has no policy, which the router treats as `Pass`
+    /// and the reachability bits as open, so a lossless baseline writes
+    /// nothing.
+    fn baseline_links(&mut self, pos: usize) {
+        let baseline = self.baseline_policy();
+        if matches!(baseline, LinkPolicyKind::Pass) {
+            return;
+        }
+        for other in 0..pos {
+            self.set_link(pos, other, baseline);
+            self.set_link(other, pos, baseline);
+        }
+    }
+
+    /// Build, spawn, and register one node with the next unused stable id,
+    /// bootstrapped against `bootstrap` (its own address is filtered out if
+    /// present), and return that id. The single node-construction path and the
+    /// only push onto `nodes`, so `nodes` stays sorted by id: both
+    /// [`EngineState::build`] and [`EngineState::add_node`] route through here.
     ///
-    /// Per-node storage is sized by [`SimConfig::cell_store_config`] from the
-    /// cluster size and the watched rule's live buckets — the one sizing site,
-    /// with no production floors (the browser working set is a few hundred
-    /// cells, not the hundreds of thousands a deployment sizes for). The caps
-    /// scale with `config.nodes`, so a newcomer is sized for the same
-    /// `MAX_NODES`-bounded cluster the initial members were — no resize on
-    /// join.
-    fn spawn_node(&mut self, id: u32, bootstrap: &[SocketAddr]) {
+    /// Every node shares the storage config and settings `SimConfig::validate`
+    /// built once, so a joiner is sized like the initial members; its gossip
+    /// config adds only its bind and peers, through `Settings::validate`. Its
+    /// first heartbeat is the first instant after now at its phase.
+    fn spawn_node(&mut self, zone: u8, bootstrap: &[SocketAddr]) -> Result<u32, SettingError> {
+        let id = self.next_id;
         let addr = addr_of_id(id);
+        let peers: Box<[SocketAddr]> = bootstrap.iter().copied().filter(|a| *a != addr).collect();
+        let (gossip_cfg, _) = Settings {
+            // A bind with no static peers would mean Kubernetes discovery: a
+            // node with no peers yet is alone until the engine reports one.
+            gossip_bind: (!peers.is_empty()).then_some(addr),
+            bootstrap_peers: peers,
+            zone: match self.config.zone_mode {
+                ZoneMode::Configured => Some(self.zone_names[usize::from(zone)].clone()),
+                ZoneMode::Unset => None,
+            },
+            ..self.settings.clone()
+        }
+        .validate()?;
         let identity = NodeIdentity::new(NodeId((id as u128) * 0x100 + 1), 1);
 
-        let store_config = self
-            .config
-            .cell_store_config(self.rule_descriptor().live_buckets());
-        // The per-tick frame is capped (see `VIZ_MAX_CELLS_PER_TICK`) so one
-        // tick's packet output stays inside the send pool. A small cluster's
-        // working set is below the cap, so it still flushes in a single round;
-        // a large cluster's burst flushes over a few ticks (the dirty rings are
-        // persistent, so the residual rides the next tick rather than
-        // dropping).
-        let max_cells_per_tick = VIZ_MAX_CELLS_PER_TICK.min(store_config.cell_capacity as usize);
-        let max_cells_per_frame = store_config.cell_capacity;
-        let tick_interval = Duration::from_millis(self.config.tick_interval_ms);
-
-        let mut store = CellStore::<Count>::new(store_config, identity);
-        // Footgun guard: intern the watched rule with the configured
-        // window/bucket *before* any request. Unknown rules otherwise intern
-        // with `RuleDescriptor::default()` (60 s / 1 s), making bucket and
-        // expiry math silently wrong.
-        store.intern_rule(self.rule_descriptor());
-
-        let bootstrap_peers: Vec<SocketAddr> =
-            bootstrap.iter().copied().filter(|a| *a != addr).collect();
+        let store = CellStore::new(self.storage, identity, &self.rules);
 
         let transport = LoggingSimTransport::new(
             self.router.bind(addr),
             self.router.clone(),
             id,
+            zone,
             self.addresses.clone(),
             self.log.clone(),
         );
 
-        let gossip_cfg = GossipConfig {
-            local_identity: identity,
-            cluster_id_hash: CLUSTER_ID_HASH,
-            bootstrap_peers,
-            fanout: self.config.fanout,
-            max_cells_per_tick,
-            wire_limits: FrameLimits {
-                max_payload_bytes: defaults::GOSSIP_MAX_PAYLOAD_BYTES,
-                max_cells: max_cells_per_frame,
-            },
-            send_queue_capacity: VIZ_SEND_QUEUE_CAPACITY,
-            limit_queue_capacity: defaults::GOSSIP_LIMIT_QUEUE_CAPACITY,
-            tick_interval,
-            auth_key: None,
-            rng_seed: self.config.rng_seed.wrapping_add(id as u64),
-            target_err_bps: self.config.target_err_bps,
-            min_emit_interval: Duration::from_millis(self.config.min_emit_interval_ms),
-        };
-
-        let aggregate = Rc::new(EventEmittingAggregateStore::<Count>::new(
+        let aggregate = Rc::new(EventEmittingAggregateStore::new(
             id,
             self.log.clone(),
+            &self.aggregate,
         ));
         let (admin_tx, admin_rx) = mpsc::channel::<AdminCommand>(1);
-        let (clock, tick_tx) = ManualClock::new(self.now.clone());
+        let period = self.config.tick_interval_ms;
+        let (clock, tickers) = ManualClock::new(self.now.clone(), Duration::from_millis(period));
         let (runtime, client) = GossipRuntime::from_parts_with_admin(
             transport,
             clock,
@@ -469,94 +709,193 @@ impl EngineState {
         let join = tokio::task::spawn_local(runtime.run(peer_rx));
 
         self.node_id_index.insert(identity.node_id.0, id);
-        self.addresses.borrow_mut().insert(addr, id);
+        self.addresses
+            .borrow_mut()
+            .insert(addr, Member { id, zone });
         self.nodes.push(NodeHandle {
             id,
+            zone,
             addr,
             client,
             aggregate,
             admin_tx,
-            tick_tx,
+            tickers,
             peer_tx,
             join,
             identity,
+            seen: GossipCounters::default(),
+            gateways: [None; MAX_ZONES],
+            own_data_bytes: 0,
+            next_heartbeat: first_heartbeat(id, period, self.virtual_ms),
+            prompt_due: None,
+            blocked_from: NodeSet::EMPTY,
+            admitted_hits: 0,
+            rejected_hits: 0,
         });
+        self.next_id += 1;
+        Ok(id)
     }
 
-    fn current_tick(&self) -> u64 {
-        self.virtual_ms / self.config.tick_interval_ms.max(1)
-    }
-
-    /// Position in the `nodes` `Vec` of the live node with stable id `id`,
-    /// or `None` if no live node has it. The `Vec` is small (≤ `MAX_NODES`)
-    /// and rarely scanned (only on a targeted command), so a linear search is
-    /// simpler than maintaining a second id→position map that would have to
-    /// stay in sync across every add and remove.
-    fn position_of(&self, id: u32) -> Option<usize> {
-        self.nodes.iter().position(|h| h.id == id)
-    }
-
-    async fn submit_request(
-        &mut self,
-        node: u32,
-        key: u128,
-        hits: u64,
-    ) -> Result<EventBatch, EngineError> {
-        let handle = self
-            .position_of(node)
-            .map(|pos| &self.nodes[pos])
-            .ok_or(EngineError::UnknownNode { id: node })?;
-        let bucket = self.rule_descriptor().current_epoch(self.virtual_ms);
-        handle
-            .client
-            .record(
-                self.config.rule_fingerprint,
-                KeyHash(key),
-                bucket,
-                hits,
-                self.config.rule_limit,
-                self.virtual_ms,
-            )
-            .await
-            .map_err(|source| EngineError::Gossip { node, source })?;
-
-        // `record` returns only after the aggregate `apply` ran, so the cell
-        // events are already buffered. Drain and stamp them at the current
-        // virtual time.
-        let mut events = Vec::new();
-        self.drain_log(&mut events);
-        Ok(EventBatch {
-            events,
+    /// The events drained since the last batch, and the instant reached.
+    fn batch(&mut self) -> EventBatch {
+        // Sized like the batch just taken, so a quiet command allocates
+        // nothing and a busy one never regrows.
+        let len = self.outbox.len();
+        EventBatch {
+            events: std::mem::replace(&mut self.outbox, Vec::with_capacity(len)),
             virtual_ms: self.virtual_ms,
-            tick: self.current_tick(),
+        }
+    }
+
+    /// The open half of a sub-step at `at`: move the clock, hold every packet
+    /// sent, fire every heartbeat due and every armed prompt, and let the
+    /// fired rounds run. Whether those rounds sent or lost a packet that
+    /// carries cells: a wave.
+    async fn open_sub_step(&mut self, at: u64) -> bool {
+        self.virtual_ms = at;
+        self.now.set(at);
+        self.substeps += 1;
+        self.hold();
+        self.fire(at).await;
+        self.drain_wave().await
+    }
+
+    /// Let the rounds the open sub-step started run, and drain their events.
+    /// Whether they sent or lost a packet that carries cells: a wave.
+    async fn drain_wave(&mut self) -> bool {
+        self.drain_pending().await;
+        let before = self.outbox.len();
+        self.drain_log();
+        self.outbox[before..].iter().any(|event| match event.kind {
+            EventKind::PacketSent { kind, .. } | EventKind::PacketDropped { kind, .. } => {
+                kind.carries_cells()
+            }
+            _ => false,
         })
     }
 
-    fn set_link_policy(
+    /// Open a sub-step: the router holds every packet sent until
+    /// [`EngineState::close_sub_step`]. Called only with the sub-step closed.
+    fn hold(&mut self) {
+        debug_assert!(
+            matches!(self.sub_step, SubStep::Closed),
+            "one sub-step at a time"
+        );
+        self.sub_step = SubStep::Open(self.router.begin_deferred());
+    }
+
+    /// The close half: deliver the held packets at the current instant, let
+    /// the receivers merge them, and read the touched nodes' counters. No
+    /// time passes. A no-op while no sub-step is open.
+    async fn close_sub_step(&mut self) {
+        let SubStep::Open(deferral) = std::mem::replace(&mut self.sub_step, SubStep::Closed) else {
+            return;
+        };
+        self.router.release_deferred(deferral);
+        self.drain_pending().await;
+        self.drain_log();
+        self.observe().await;
+    }
+
+    /// Node `node` decides a request of `hits` for `key` from its own count
+    /// table, as the adapters decide. A rejected request is counted and
+    /// nothing else happens. An admitted one is recorded in one sub-step at
+    /// this instant, so its eager-flush packets land before this returns;
+    /// with `until` a [`StepUntil::Event`], a flush that sent a wave is held
+    /// instead, the sub-step left open.
+    async fn submit_request(
+        &mut self,
+        node: u32,
+        key: KeyHash,
+        hits: NonZeroU64,
+        until: StepUntil,
+    ) -> Result<EventBatch, EngineError> {
+        let pos = position_of(&self.nodes, node).ok_or(EngineError::UnknownNode { id: node })?;
+        self.close_sub_step().await;
+        let (spec, now) = (self.spec, self.virtual_ms);
+        let table = self.nodes[pos].aggregate.table();
+        let total = table.window_total(spec, key, now);
+        let admission = decide(spec, table, key, now, total, hits);
+        let decided = Event {
+            virtual_ms: now,
+            kind: EventKind::Decided {
+                node,
+                hits,
+                admission,
+            },
+        };
+        let hits = hits.get();
+        match admission {
+            Admission::Rejected { .. } => {
+                self.outbox.push(decided);
+                let handle = &mut self.nodes[pos];
+                handle.rejected_hits = handle.rejected_hits.saturating_add(hits);
+                self.rejected_hits = self.rejected_hits.saturating_add(hits);
+            }
+            Admission::Admitted { .. } => {
+                // One sub-step at this instant: the eager flush's threshold
+                // round runs on the runtime's next turn with delivery
+                // deferred, and lands as a step's sub-step does.
+                self.hold();
+                self.touched.insert(pos);
+                let recorded = self.nodes[pos]
+                    .client
+                    .record(
+                        spec.fingerprint,
+                        key,
+                        spec.bucket_at(now),
+                        hits,
+                        spec.limit,
+                        now,
+                    )
+                    .await;
+                if let Err(source) = recorded {
+                    self.close_sub_step().await;
+                    return Err(EngineError::Gossip { node, source });
+                }
+                // Only a recorded request is reported admitted. An eager
+                // flush's threshold round runs on the runtime's next turn, so
+                // the drain puts its packets in this batch, after the decision.
+                self.outbox.push(decided);
+                let wave = self.drain_wave().await;
+                if !(wave && matches!(until, StepUntil::Event { .. })) {
+                    self.close_sub_step().await;
+                }
+                let handle = &mut self.nodes[pos];
+                handle.admitted_hits = handle.admitted_hits.saturating_add(hits);
+                self.admitted_hits = self.admitted_hits.saturating_add(hits);
+            }
+        }
+        Ok(self.batch())
+    }
+
+    /// Install `policy` on the link from node `src` to node `dst`. Packets
+    /// already sent keep the fate the link gave them when they left.
+    async fn set_link_policy(
         &mut self,
         src: u32,
         dst: u32,
         policy: LinkPolicyKind,
     ) -> Result<(), EngineError> {
-        for id in [src, dst] {
-            if self.position_of(id).is_none() {
-                return Err(EngineError::UnknownNode { id });
-            }
-        }
-        self.router
-            .set_link_policy(addr_of_id(src), addr_of_id(dst), policy.into());
+        let [src, dst] = [src, dst]
+            .map(|id| position_of(&self.nodes, id).ok_or(EngineError::UnknownNode { id }));
+        let (src, dst) = (src?, dst?);
+        self.close_sub_step().await;
+        self.set_link(src, dst, policy);
         Ok(())
     }
 
-    /// Restore every directed link between live nodes to lossless `Pass`.
-    /// Sweeps the live address set (not a stale `0..N`), so it stays correct
-    /// after churn; `set_link_policy(Pass)` also clears any drop counter.
-    fn heal(&mut self) {
-        let addrs: Vec<SocketAddr> = self.nodes.iter().map(|h| h.addr).collect();
-        for &src in &addrs {
-            for &dst in &addrs {
+    /// Restore the configured network on every directed link between live
+    /// nodes: the scenario's uniform loss, never lossless when the scenario
+    /// has loss. Sweeps the live nodes (not a stale `0..N`), so it stays
+    /// correct after churn; writing a policy also clears any drop counter.
+    async fn heal(&mut self) {
+        self.close_sub_step().await;
+        let baseline = self.baseline_policy();
+        for src in 0..self.nodes.len() {
+            for dst in 0..self.nodes.len() {
                 if src != dst {
-                    self.router.set_link_policy(src, dst, LinkPolicy::Pass);
+                    self.set_link(src, dst, baseline);
                 }
             }
         }
@@ -565,44 +904,59 @@ impl EngineState {
     /// Spawn a fresh cold-start member. It takes the next never-reused id and
     /// bootstraps knowing every current node; each survivor is told it joined
     /// (via that survivor's discovery stream) so gossip flows both ways. The
-    /// newcomer starts with an empty store and catches up by anti-entropy.
-    async fn add_node(&mut self) -> EventBatch {
-        let id = self.next_id;
-        self.next_id += 1;
-        let newcomer_addr = addr_of_id(id);
+    /// newcomer starts with an empty store and catches up by anti-entropy. It
+    /// joins `zone`, or the zone with the fewest live members, on links with
+    /// the configured network.
+    async fn add_node(&mut self, zone: Option<u32>) -> Result<EventBatch, EngineError> {
+        if self.nodes.len() >= MAX_NODES {
+            return Err(EngineError::ClusterFull);
+        }
+        if self.next_id > MAX_ID {
+            return Err(EngineError::IdsExhausted);
+        }
+        let zones = self.zone_names.len();
+        let zone = match zone {
+            None => self.smallest_zone(),
+            Some(zone) => u8::try_from(zone)
+                .ok()
+                .filter(|&z| usize::from(z) < zones)
+                .ok_or(EngineError::UnknownZone {
+                    zone,
+                    zones: zones as u8,
+                })?,
+        };
+        self.close_sub_step().await;
         // The newcomer bootstraps against everyone currently live.
         let live_addrs: Vec<SocketAddr> = self.nodes.iter().map(|h| h.addr).collect();
-        self.spawn_node(id, &live_addrs);
+        let id = self.spawn_node(zone, &live_addrs)?;
+        self.baseline_links(self.nodes.len() - 1);
+        let newcomer_addr = addr_of_id(id);
 
         // Tell every survivor (everyone but the just-pushed newcomer) the
         // newcomer joined, so they add it to their peer table and gossip to it.
         let joined = PeerEvent::Added(Peer::new(newcomer_addr));
         for handle in &self.nodes {
             if handle.id != id {
-                let _ = handle.peer_tx.unbounded_send(joined);
+                let _ = handle.peer_tx.unbounded_send(joined.clone());
             }
         }
 
-        // Let the newcomer bind and the survivors register the join before we
-        // return, so the immediate snapshot already reflects the new member.
+        // Let the newcomer bind and the survivors register the join before
+        // any of them runs a round. No round runs here, so no counter moves.
         self.drain_pending().await;
-        let mut events = Vec::new();
-        self.drain_log(&mut events);
-        EventBatch {
-            events,
-            virtual_ms: self.virtual_ms,
-            tick: self.current_tick(),
-        }
+        self.drain_log();
+        self.observe().await;
+        Ok(self.batch())
     }
 
     /// Remove the live node with stable id `id`. Symmetric with
     /// [`EngineState::add_node`]: tell every survivor it left, stop its
     /// runtime, unbind its transport, and drop every trace of it. Its id is
     /// never reused, so survivors keep their own ids and addresses unchanged.
+    /// Every survivor whose gateway it was reports that gateway's zone anew.
     async fn remove_node(&mut self, id: u32) -> Result<EventBatch, EngineError> {
-        let pos = self
-            .position_of(id)
-            .ok_or(EngineError::UnknownNode { id })?;
+        let pos = position_of(&self.nodes, id).ok_or(EngineError::UnknownNode { id })?;
+        self.close_sub_step().await;
         let addr = self.nodes[pos].addr;
         let node_id = self.nodes[pos].identity.node_id.0;
 
@@ -611,7 +965,7 @@ impl EngineState {
         let left = PeerEvent::Removed(Peer::new(addr));
         for (i, handle) in self.nodes.iter().enumerate() {
             if i != pos {
-                let _ = handle.peer_tx.unbounded_send(left);
+                let _ = handle.peer_tx.unbounded_send(left.clone());
             }
         }
 
@@ -622,228 +976,519 @@ impl EngineState {
         self.router.unbind(addr);
 
         // Drop every trace: the handle (closing its client / admin / tick /
-        // peer channels), the address-book entry, and the id reverse-map entry.
+        // peer channels), its reachability bit in every survivor, the
+        // address-book entry, and the id reverse-map entry.
         let handle = self.nodes.remove(pos);
         drop(handle);
+        for survivor in &mut self.nodes {
+            survivor.blocked_from.remove_shift(pos);
+        }
         self.addresses.borrow_mut().remove(&addr);
         self.node_id_index.remove(&node_id);
+        self.touched.remove_shift(pos);
 
-        // Let survivors process the departure and the aborted task fully drop.
+        // Let survivors process the departure, before any of them runs a
+        // round, and the aborted task fully drop.
         self.drain_pending().await;
-        let mut events = Vec::new();
-        self.drain_log(&mut events);
-        Ok(EventBatch {
-            events,
-            virtual_ms: self.virtual_ms,
-            tick: self.current_tick(),
-        })
+        self.drain_log();
+        self.observe().await;
+        // Removing a row moves no role, so the role-count diff misses the
+        // departed gateway whenever no row left in its zone can replace it
+        // (none there, or none heard yet): diff every survivor that used it.
+        for pos in 0..self.nodes.len() {
+            if self.nodes[pos].gateways.contains(&Some(id)) {
+                self.diff_gateways(pos).await;
+            }
+        }
+        Ok(self.batch())
     }
 
-    async fn step(&mut self, delta_ms: u64) -> EventBatch {
-        let tick_ms = self.config.tick_interval_ms.max(1);
-        let target = self.virtual_ms.saturating_add(delta_ms);
-        let mut events = Vec::new();
-        let mut prev = self.admin_counters().await;
+    /// Live members in each zone, by zone index.
+    fn live_by_zone(&self) -> [u32; MAX_ZONES] {
+        let mut live = [0; MAX_ZONES];
+        for node in &self.nodes {
+            live[usize::from(node.zone)] += 1;
+        }
+        live
+    }
 
-        // Advance one whole gossip tick at a time. Each boundary moves the
-        // bucket clock and fires exactly one tick on every runtime — the manual
-        // analogue of a single `tokio::time::advance` firing every node's
-        // interval — then drains so the tick and any gossip it triggers fully
-        // propagate before the next.
+    /// The zone with the fewest live members, the lowest index on a tie.
+    fn smallest_zone(&self) -> u8 {
+        let live = self.live_by_zone();
+        let zones = self.zone_names.len();
+        (0..zones)
+            .min_by_key(|&zone| (live[zone], zone))
+            .map_or(0, |zone| zone as u8)
+    }
+
+    /// Advance by at most `delta_ms`, sub-step by sub-step, stopping where
+    /// `until` says.
+    async fn step(&mut self, delta_ms: u64, until: StepUntil) -> EventBatch {
+        self.close_sub_step().await;
+        let floor_ms = self.config.min_emit_interval_ms;
+        let target = self.virtual_ms.saturating_add(delta_ms);
+        // No request arrives inside a step, and gossip only copies a bucket
+        // some live node holds, so the next expiry is fixed until the step
+        // passes it, and stepping by event stops there.
+        let expiry = match until {
+            StepUntil::Event { key } => self.next_expiry_ms(key),
+            StepUntil::Time => None,
+        };
+
+        // Each sub-step runs at the next due instant: a node's heartbeat, one
+        // emit floor after a node armed its prompt ticker (it has relays,
+        // resends, gap reports, probe answers or sweeps waiting), or the
+        // expiry. So a relay leaves one floor after it is owed, as in
+        // production, and a quiet cluster costs one sub-step per distinct
+        // heartbeat phase.
         //
-        // Delivery is deferred across the round: a sim send buffers its packet
-        // (the source flushes its outbound queue within its own poll, so no
-        // engine-side drain order can otherwise separate "every node has
-        // gossiped" from "packets delivered"). The first drain lets every node
-        // consume its tick and buffer its sends with nothing yet delivered;
-        // `release_deferred` then delivers this round's packets; the second
-        // drain lets receivers merge them. Their ticks are already consumed, so
-        // a freshly-merged count cannot re-gossip in the same step — one step
-        // is one epidemic round, capped at `fanout` new peers. This is the
-        // physically correct model and keeps `submit`/churn paths (which never
-        // arm deferral) unchanged.
+        // The open half fires the due nodes with delivery deferred, so every
+        // fired node runs its round with nothing yet delivered; the close
+        // half delivers the sub-step's packets and lets receivers merge them.
+        // Their ticks are already consumed, so a freshly merged count goes out
+        // no earlier than the next sub-step. Stepping by event returns between
+        // the halves of the first sub-step that sent a wave, with its packets
+        // held; the next command delivers them.
         loop {
-            let next_tick = (self.virtual_ms / tick_ms + 1).saturating_mul(tick_ms);
-            if next_tick > target {
+            let t = self.virtual_ms;
+            let mut next = u64::MAX;
+            for node in &mut self.nodes {
+                node.prompt_due = match (node.tickers.armed.get(), node.prompt_due) {
+                    (false, _) => None,
+                    (true, None) => Some(t.saturating_add(floor_ms)),
+                    (true, due) => due,
+                };
+                next = next
+                    .min(node.next_heartbeat)
+                    .min(node.prompt_due.unwrap_or(u64::MAX));
+            }
+            if let Some(expiry) = expiry {
+                next = next.min(expiry);
+            }
+            if next > target {
                 break;
             }
-            self.virtual_ms = next_tick;
-            self.now.set(next_tick);
-            self.router.begin_deferred();
-            self.fire_tick().await;
-            self.drain_pending().await;
-            self.router.release_deferred();
-            self.drain_pending().await;
-            self.drain_log(&mut events);
-            let now = self.admin_counters().await;
-            self.push_tick_events(&prev, &now, &mut events);
-            prev = now;
+            let wave = self.open_sub_step(next).await;
+            if wave && matches!(until, StepUntil::Event { .. }) {
+                return self.batch();
+            }
+            self.close_sub_step().await;
+            if expiry == Some(next) {
+                return self.batch();
+            }
         }
 
-        // A sub-tick remainder moves the clock without firing a heartbeat, so
-        // `virtual_ms` and the bucket clock still reach exactly `target`.
+        // A remainder short of the next event moves the clock without firing
+        // anything, so `virtual_ms` and the bucket clock still reach exactly
+        // `target`.
         if self.virtual_ms < target {
             self.virtual_ms = target;
             self.now.set(target);
-            self.drain_log(&mut events);
+            self.drain_log();
         }
+        self.batch()
+    }
 
-        EventBatch {
-            events,
-            virtual_ms: self.virtual_ms,
-            tick: self.current_tick(),
+    /// Fire, in node order, the heartbeat and the prompt ticker of every node
+    /// due at `at`, and mark each touched.
+    /// Each send queues in that node's bounded inbox, so a busy runtime still
+    /// consumes the tick on its next idle poll rather than dropping it. A
+    /// closed inbox (the runtime stopped) is ignored.
+    async fn fire(&mut self, at: u64) {
+        let period = self.config.tick_interval_ms;
+        for (pos, node) in self.nodes.iter_mut().enumerate() {
+            if node.next_heartbeat == at {
+                let _ = node.tickers.heartbeat.send(at).await;
+                node.next_heartbeat = at.saturating_add(period);
+                self.touched.insert(pos);
+            }
+            if node.prompt_due == Some(at) {
+                let _ = node.tickers.prompt.send(at).await;
+                node.prompt_due = None;
+                self.touched.insert(pos);
+            }
         }
     }
 
-    /// Fire one gossip tick on every runtime, in node order. Each send queues
-    /// in that node's bounded tick channel, so a busy runtime still consumes
-    /// the tick on its next idle poll rather than dropping it. A closed channel
-    /// (the runtime stopped) is ignored — the tick simply has nowhere to land.
-    async fn fire_tick(&self) {
-        for node in &self.nodes {
-            let _ = node.tick_tx.send(()).await;
-        }
-    }
-
-    /// Drain the shims' raw events, stamping each with the current virtual
-    /// time and gossip-tick index.
-    fn drain_log(&self, events: &mut Vec<Event>) {
-        let tick = self.current_tick();
+    /// Drain the shims' raw events into the outbox, stamping each with the
+    /// current virtual time. Every packet sent or dropped also counts into
+    /// `bytes_by_tier`, and into its sender's `own_data_bytes` when it is an
+    /// `Own` packet; a packet sent wakes its receiver, which is marked
+    /// touched.
+    fn drain_log(&mut self) {
         let virtual_ms = self.virtual_ms;
+        let nodes = &mut self.nodes;
+        let touched = &mut self.touched;
+        let bytes_by_tier = &mut self.bytes_by_tier;
         let mut log = self.log.borrow_mut();
-        events.extend(log.drain(..).map(|kind| Event {
-            tick,
-            virtual_ms,
-            kind,
+        self.outbox.extend(log.drain(..).map(|kind| {
+            if let EventKind::PacketSent {
+                src,
+                bytes,
+                kind,
+                tier,
+                ..
+            }
+            | EventKind::PacketDropped {
+                src,
+                bytes,
+                kind,
+                tier,
+                ..
+            } = &kind
+            {
+                bytes_by_tier.add(*tier, *kind, *bytes);
+                // A sender removed since (its last packets drain after the
+                // removal) is skipped: the page weights live origins only.
+                if *kind == PacketKind::Own
+                    && let Some(pos) = position_of(nodes, *src)
+                {
+                    nodes[pos].own_data_bytes += u64::from(*bytes);
+                }
+            }
+            if let EventKind::PacketSent { dst, .. } = &kind
+                && let Some(pos) = position_of(nodes, *dst)
+            {
+                touched.insert(pos);
+            }
+            Event { virtual_ms, kind }
         }));
     }
 
-    /// Number of yields needed so every spawned runtime task gets polled after
-    /// a virtual-time advance. Mirrors `gossip-bench`'s `drain_pending_tasks`:
-    /// single-thread tokio polls one task per yield, so a large cluster needs
-    /// an explicit drain or it under-polls.
-    async fn drain_pending(&self) {
-        // Scale with the *live* node count, not the initial config, so a
-        // cluster grown by joins is still fully polled.
-        let budget = self.nodes.len().saturating_mul(4).max(16);
+    /// Yield until every touched runtime has been polled after a change, only
+    /// the touched nodes having work. Single-thread tokio polls one task per
+    /// yield, so the budget is four yields for each touched node, at least
+    /// [`MIN_DRAIN_YIELDS`].
+    async fn drain_pending(&mut self) {
+        let budget = self.touched.len().saturating_mul(4).max(MIN_DRAIN_YIELDS);
+        self.drain_yields += budget as u64;
         for _ in 0..budget {
             tokio::task::yield_now().await;
         }
     }
 
-    /// Pull `(ticks_total, threshold_fires)` from every runtime via its admin
-    /// channel. One `oneshot` round-trip per node, done sequentially.
-    async fn admin_counters(&self) -> Vec<(u64, u64)> {
-        let mut out = Vec::with_capacity(self.nodes.len());
-        for node in &self.nodes {
-            match admin_snapshot(&node.admin_tx).await {
-                Some(snap) => out.push((snap.ticks_total, snap.threshold_fires)),
-                None => out.push((0, 0)),
+    /// After a sub-step: read the counters of every touched node, clearing
+    /// the set, emit one `Tick` / `ThresholdFire` per round since the last
+    /// read, and diff the gateways of each node whose role count moved, the
+    /// only nodes whose snapshot is fetched. A node's events come in that
+    /// order, so the stream is deterministic.
+    async fn observe(&mut self) {
+        let touched = std::mem::replace(&mut self.touched, NodeSet::EMPTY);
+        for pos in touched.iter() {
+            self.counter_reads += 1;
+            let Some(now) = counters(&self.nodes[pos].admin_tx).await else {
+                continue;
+            };
+            let seen = std::mem::replace(&mut self.nodes[pos].seen, now);
+            let node = self.nodes[pos].id;
+            let virtual_ms = self.virtual_ms;
+            let rounds = [
+                (
+                    now.rounds_heartbeat - seen.rounds_heartbeat,
+                    EventKind::Tick { node },
+                ),
+                (
+                    now.rounds_threshold - seen.rounds_threshold,
+                    EventKind::ThresholdFire { node },
+                ),
+            ];
+            for (count, kind) in rounds {
+                self.outbox.extend((0..count).map(|_| Event {
+                    virtual_ms,
+                    kind: kind.clone(),
+                }));
+            }
+            if now.role_changes != seen.role_changes {
+                self.diff_gateways(pos).await;
             }
         }
-        out
     }
 
-    /// Emit one `Tick`/`ThresholdFire` event per tick each node fired this
-    /// sub-step. `threshold_fires` is a subset of `ticks_total`, so the
-    /// difference of the two is the heartbeat count.
-    fn push_tick_events(&self, prev: &[(u64, u64)], now: &[(u64, u64)], events: &mut Vec<Event>) {
-        let tick = self.current_tick();
+    /// Compare node `pos`'s gateway into each zone, as its runtime reports
+    /// it, with the last read, and emit a `GatewayChanged` for each that moved.
+    async fn diff_gateways(&mut self, pos: usize) {
+        let Some(snap) = admin_snapshot(&self.nodes[pos].admin_tx).await else {
+            return;
+        };
+        self.gateway_fetches += 1;
+        let mut gateways = [None; MAX_ZONES];
+        {
+            let addresses = self.addresses.borrow();
+            for peer in snap.peers.iter().filter(|p| p.role == Role::Gateway) {
+                if let PeerZone::Other(hash) = peer.zone
+                    && let Some(zone) = self.zone_index(hash)
+                {
+                    gateways[usize::from(zone)] = addresses.get(&peer.addr).map(|m| m.id);
+                }
+            }
+        }
         let virtual_ms = self.virtual_ms;
-        // `prev`/`now` are aligned to `self.nodes` order (both built by
-        // iterating it), so position `index` is `self.nodes[index]` — map it to
-        // that node's stable id for the emitted event.
-        for (index, (before, after)) in prev.iter().zip(now.iter()).enumerate() {
-            let node = self.nodes[index].id;
-            let total_delta = after.0.saturating_sub(before.0);
-            let threshold_delta = after.1.saturating_sub(before.1);
-            let heartbeat_delta = total_delta.saturating_sub(threshold_delta);
-            for _ in 0..heartbeat_delta {
-                events.push(Event {
-                    tick,
+        let node = &mut self.nodes[pos];
+        let before = std::mem::replace(&mut node.gateways, gateways);
+        for zone in 0..self.zone_names.len() {
+            if before[zone] != gateways[zone] {
+                self.outbox.push(Event {
                     virtual_ms,
-                    kind: EventKind::Tick { node },
-                });
-            }
-            for _ in 0..threshold_delta {
-                events.push(Event {
-                    tick,
-                    virtual_ms,
-                    kind: EventKind::ThresholdFire { node },
+                    kind: EventKind::GatewayChanged {
+                        origin: node.id,
+                        zone: zone as u8,
+                        from: before[zone],
+                        to: gateways[zone],
+                    },
                 });
             }
         }
     }
 
-    async fn snapshot(&self) -> ClusterState {
+    /// The index of the zone whose name hashes to `hash`, through the
+    /// library's own zone hash.
+    fn zone_index(&self, hash: ZoneHash) -> Option<u8> {
+        self.zone_names
+            .iter()
+            .position(|zone| zone.hash() == hash)
+            .map(|index| index as u8)
+    }
+
+    /// The next instant some node's window of `key` drops a bucket that
+    /// holds hits: the fall-off of the oldest live bucket any node's count
+    /// table holds a count in, always after now. One probe per node and live
+    /// bucket, at most, and no allocation.
+    fn next_expiry_ms(&self, key: KeyHash) -> Option<u64> {
+        let (spec, now) = (self.spec, self.virtual_ms);
+        let current = spec.bucket_at(now);
+        let oldest = (0..spec.live_buckets.get()).rev().find(|&back| {
+            self.nodes.iter().any(|node| {
+                node.aggregate
+                    .table()
+                    .get(spec.fingerprint, key, current.back(back))
+                    .is_some_and(|cell| cell.count > 0)
+            })
+        })?;
+        Some(fall_off_ms(spec, now, oldest))
+    }
+
+    /// Whether some position of `from` has a path of links that do not
+    /// block into position `pos`: a reverse breadth-first search by frontier
+    /// sets that stops at the first such position, so nothing is queued or
+    /// allocated, and a cluster with no cut into `pos` answers in one round.
+    fn reaches(&self, from: NodeSet, pos: usize) -> bool {
+        let all = NodeSet::first(self.nodes.len());
+        let mut reach = NodeSet::EMPTY;
+        reach.insert(pos);
+        let mut frontier = reach;
+        loop {
+            let mut next = NodeSet::EMPTY;
+            for m in frontier.iter() {
+                next.union_assign(all.and_not(self.nodes[m].blocked_from));
+            }
+            let next = next.and_not(reach);
+            if next.intersects(&from) {
+                return true;
+            }
+            if next.is_empty() {
+                return false;
+            }
+            reach.union_assign(next);
+            frontier = next;
+        }
+    }
+
+    /// Every node's scalar state for `watch`'s key, plus the cells and peer
+    /// rows of `inspect` alone: the page shows one node's rows, and every
+    /// node's would cost a row per node pair each frame. Reads only: an open
+    /// sub-step stays open, so the snapshot shows its packets still held.
+    async fn snapshot(&self, inspect: Option<u32>, watch: Watch) -> ClusterState {
+        let spec = self.spec;
+        let key = watch.key;
+        let now = self.virtual_ms;
+        let current = spec.bucket_at(now);
+        let live = spec.live_buckets.get();
+        let in_window = |bucket: BucketEpoch| (0..live as i32).contains(&current.age_since(bucket));
+        let watched = |rule: u128, kh: KeyHash, bucket: BucketEpoch| {
+            rule == spec.fingerprint && kh == key && in_window(bucket)
+        };
+
+        // Every origin's in-window cells of the watched key, each the fullest
+        // copy a live node holds and the nodes holding it at that count. Only
+        // an origin counts its own hits, so while it lives the fullest copy is
+        // its own; once it has gone, its cells live on in the survivors'
+        // replicas until they leave the window, and still count against the
+        // limit. Each hit is thus counted once, and the sum is the
+        // ground-truth windowed total. Every copy at a count carries the date
+        // its origin gave that count, since a replica keeps the wire's. Each
+        // dump is dropped before the next is taken: a node's store holds a
+        // replica of every origin's cells, so keeping every dump would hold N
+        // stores at once.
+        let mut origins: Vec<OriginCell> = Vec::new();
+        let mut inspected_cells = None;
+        for (pos, handle) in self.nodes.iter().enumerate() {
+            let dump = cell_dump(&handle.admin_tx).await;
+            for cell in dump.iter().flat_map(|d| &d.cells) {
+                let Some(origin) = cell.origin_node_id else {
+                    continue;
+                };
+                if !watched(cell.rule_fingerprint, cell.key_hash, cell.bucket) {
+                    continue;
+                }
+                let copy = OriginCell {
+                    node_id: origin,
+                    bucket: cell.bucket,
+                    count: cell.count,
+                    updated_ms: cell.last_update_millis,
+                    holders: NodeSet::EMPTY,
+                };
+                let at = origins
+                    .binary_search_by_key(&(origin, cell.bucket.0), |c| (c.node_id, c.bucket.0));
+                let held = match at {
+                    Ok(i) if cell.count > origins[i].count => {
+                        origins[i] = copy;
+                        &mut origins[i]
+                    }
+                    Ok(i) if cell.count == origins[i].count => &mut origins[i],
+                    Ok(_) => continue,
+                    Err(i) => {
+                        origins.insert(i, copy);
+                        &mut origins[i]
+                    }
+                };
+                held.holders.insert(pos);
+            }
+            if inspect == Some(handle.id) {
+                inspected_cells = dump
+                    .as_ref()
+                    .map(|d| self.cells_from_dump(handle.identity, d));
+            }
+        }
+
+        let mut oracle_buckets = vec![0; live as usize];
+        for cell in &origins {
+            let age = current.age_since(cell.bucket) as usize;
+            oracle_buckets[live as usize - 1 - age] += cell.count;
+        }
+        let oracle_total = oracle_buckets.iter().sum();
+
+        // Each origin's gateways, inverted: how many origins route through
+        // each node.
+        let mut gateway_for = vec![0u32; self.nodes.len()];
+        for origin in &self.nodes {
+            for &g in origin.gateways[..self.zone_names.len()].iter().flatten() {
+                if let Some(pos) = position_of(&self.nodes, g) {
+                    gateway_for[pos] += 1;
+                }
+            }
+        }
         let mut nodes = Vec::with_capacity(self.nodes.len());
-        // Insertion order, so a node's position in `nodes` is its rank — the
-        // frontend turns that into a ring slot, while `id` stays its identity.
-        for handle in &self.nodes {
-            let cells = match cell_dump(&handle.admin_tx).await {
-                Some(dump) => self.cells_from_dump(handle.identity, &dump),
-                None => Vec::new(),
+        let mut window_buckets = Vec::with_capacity(self.nodes.len() * live as usize);
+        let mut inspected = None;
+        // Ascending id order, the order the page lays the nodes out in.
+        for (pos, handle) in self.nodes.iter().enumerate() {
+            // gabion's `window_total`, summed from the row it probes, so each
+            // live bucket is probed once.
+            let table = handle.aggregate.table();
+            let row = window_buckets.len();
+            window_buckets.extend((0..live).rev().map(|back| {
+                table
+                    .get(spec.fingerprint, key, current.back(back))
+                    .map_or(0, |cell| cell.count)
+            }));
+            let window_total = window_buckets[row..]
+                .iter()
+                .fold(0, |total: u64, &count| total.saturating_add(count));
+            // The oldest change the node lacks was made no later than its
+            // cell's last update at the origin, so the time since that update
+            // never overstates how long the node has been behind.
+            let lacking = || origins.iter().filter(|cell| !cell.holders.contains(pos));
+            let lag = match lacking().map(|cell| cell.updated_ms).min() {
+                None => Lag::CaughtUp,
+                Some(updated) => {
+                    let missing_for_ms = now.saturating_sub(updated);
+                    let mut holders = NodeSet::EMPTY;
+                    for cell in lacking() {
+                        holders.union_assign(cell.holders);
+                    }
+                    if self.reaches(holders, pos) {
+                        Lag::Behind { missing_for_ms }
+                    } else {
+                        Lag::Stranded { missing_for_ms }
+                    }
+                }
             };
             // `node_id` / `incarnation` come from the engine's own record of
-            // the node, so they survive even if the runtime has
-            // already stopped and the admin round-trip returns
-            // `None` (defaults for the rest).
+            // the node, so they survive even if the runtime has already
+            // stopped and the admin round-trip returns `None` (defaults for
+            // the rest).
             let snap = admin_snapshot(&handle.admin_tx).await;
-            let peers = snap
-                .as_ref()
-                .map(|s| self.peers_from_snapshot(s))
-                .unwrap_or_default();
+            if inspect == Some(handle.id) {
+                inspected = Some(Inspected {
+                    id: handle.id,
+                    cells: inspected_cells.take().unwrap_or_default(),
+                    peers: snap
+                        .as_ref()
+                        .map(|s| self.peers_from_snapshot(handle.zone, s))
+                        .unwrap_or_default(),
+                    next_send: decide(spec, table, key, now, window_total, watch.probe_hits),
+                });
+            }
+            let counters = snap.as_ref().map(|s| s.counters).unwrap_or_default();
             nodes.push(NodeState {
                 id: handle.id,
+                zone: handle.zone,
                 node_id: handle.identity.node_id.0,
                 incarnation: handle.identity.incarnation,
-                aggregate_total: handle.aggregate.total(),
-                ticks_total: snap.as_ref().map_or(0, |s| s.ticks_total),
-                threshold_fires: snap.as_ref().map_or(0, |s| s.threshold_fires),
-                dirty_ticks: snap.as_ref().map_or(0, |s| s.dirty_ticks),
-                effective_fanout: snap.as_ref().map_or(0, |s| s.last_effective_fanout as u32),
-                peak_fanout: snap.as_ref().map_or(0, |s| s.peak_effective_fanout as u32),
+                window_total,
+                brim: decide(spec, table, key, now, window_total, NonZeroU64::MIN),
+                lag,
+                next_heartbeat_ms: handle.next_heartbeat,
+                admitted_hits: handle.admitted_hits,
+                rejected_hits: handle.rejected_hits,
+                rounds_heartbeat: counters.rounds_heartbeat,
+                gateway_failovers: counters.gateway_failovers,
+                gap_reports_sent: counters.gap_reports_sent,
+                rto_rewinds_own: counters.rto_rewinds_own,
+                rto_rewinds_relay: counters.rto_rewinds_relay,
+                sweeps_served: counters.sweeps_served,
+                gateway_for: gateway_for[pos],
+                own_data_bytes: handle.own_data_bytes,
                 error_budget: snap.as_ref().map_or(0, |s| s.last_error_budget),
-                local_dirty_len: snap.as_ref().map_or(0, |s| s.local_dirty_len),
-                forwarded_dirty_len: snap.as_ref().map_or(0, |s| s.forwarded_dirty_len),
-                send_pending_depth: snap.as_ref().map_or(0, |s| s.send_pending_depth as u64),
-                max_send_pending_depth: snap
-                    .as_ref()
-                    .map_or(0, |s| s.max_send_pending_depth as u64),
-                decode_reject_count: snap.as_ref().map_or(0, |s| s.decode_reject_count),
                 store_stats: snap
                     .as_ref()
                     .map(|s| s.store_stats.into())
                     .unwrap_or_default(),
-                cells,
-                peers,
             });
         }
-        // The ground-truth windowed total, derived from the live CRDT cells
-        // rather than a monotonic accumulator: sum every node's
-        // locally-originated cells for the watched rule. Each hit is recorded
-        // once at its origin (`merge_remote` preserves the wire origin, so a
-        // forwarded replica is never `is_local` on a non-origin holder), so the
-        // sum counts each hit exactly once — and it decays with the window as
-        // cells age out, which a monotonic counter never did. This is the
-        // honest target the convergence fan races toward.
-        let fingerprint = self.config.rule_fingerprint;
-        let oracle_total: u64 = nodes
+        // The oldest live bucket any node holds a count in, as
+        // `next_expiry_ms` finds it, read from the rows already probed.
+        let width = live as usize;
+        let next_expiry_ms = (0..width)
+            .find(|&i| {
+                window_buckets[i..]
+                    .iter()
+                    .step_by(width)
+                    .any(|&count| count > 0)
+            })
+            .map(|i| fall_off_ms(spec, now, (width - 1 - i) as u32));
+        let live_by_zone = self.live_by_zone();
+        let zones = ZONE_NAMES[..self.zone_names.len()]
             .iter()
-            .flat_map(|node| &node.cells)
-            .filter(|cell| cell.is_local && cell.rule == fingerprint)
-            .map(|cell| cell.count)
-            .sum();
-        let rd = self.rule_descriptor();
+            .zip(live_by_zone)
+            .map(|(&name, live)| ZoneView { name, live })
+            .collect();
         ClusterState {
-            virtual_ms: self.virtual_ms,
-            tick: self.current_tick(),
+            virtual_ms: now,
             nodes,
+            inspected,
+            zones,
+            bytes_by_tier: self.bytes_by_tier,
             oracle_total,
+            oracle_buckets,
+            window_buckets,
+            admitted_hits: self.admitted_hits,
+            rejected_hits: self.rejected_hits,
+            next_expiry_ms,
             // The CRDT's own window position at this instant — the Strata
             // right-anchors its fixed-width grid on this epoch instead of
             // recomputing the boundary in TypeScript.
-            bucket_epoch_now: rd.current_epoch(self.virtual_ms),
+            bucket_epoch_now: current.0,
         }
     }
 
@@ -852,8 +1497,8 @@ impl EngineState {
             .iter()
             .map(|cell| CellView {
                 rule: cell.rule_fingerprint,
-                key: cell.key_hash,
-                bucket: cell.bucket,
+                key: cell.key_hash.0,
+                bucket: cell.bucket.0,
                 count: cell.count,
                 age_ms: self.virtual_ms.saturating_sub(cell.last_update_millis),
                 origin: cell
@@ -864,13 +1509,26 @@ impl EngineState {
             .collect()
     }
 
-    fn peers_from_snapshot(&self, snap: &AdminSnapshot) -> Vec<PeerView> {
+    /// Node `own_zone`'s peer rows. `PeerZone::Same` means the observer knows
+    /// its own zone, which happens only in `Configured`, where the reported
+    /// zone is the placement.
+    fn peers_from_snapshot(&self, own_zone: u8, snap: &AdminSnapshot) -> Vec<PeerView> {
         let addresses = self.addresses.borrow();
         snap.peers
             .iter()
             .map(|peer| PeerView {
-                id: addresses.get(&peer.addr).copied(),
+                id: addresses.get(&peer.addr).map(|member| member.id),
+                zone: match peer.zone {
+                    PeerZone::Unknown => None,
+                    PeerZone::Same => Some(own_zone),
+                    PeerZone::Other(hash) => self.zone_index(hash),
+                },
                 node_id: peer.node_id.map(|id| id.0),
+                role: peer.role,
+                answer: peer.answer,
+                unanswered_ms: peer.unanswered_ms,
+                own_unacked: peer.own_unacked,
+                relay_unacked: peer.relay_unacked,
             })
             .collect()
     }
@@ -892,13 +1550,115 @@ impl EngineState {
 /// It is therefore also the address a newcomer bootstraps against and the one a
 /// removal unbinds, with no lookup needed.
 fn addr_of_id(id: u32) -> SocketAddr {
+    debug_assert!(id <= MAX_ID, "add_node spends no id past MAX_ID");
     SocketAddr::from(([127, 0, 0, 1], BASE_PORT + id as u16))
+}
+
+/// One origin's own in-window cell of the watched key, as the snapshot
+/// reads it.
+struct OriginCell {
+    /// The origin's gossip identity.
+    node_id: u128,
+    bucket: BucketEpoch,
+    count: u64,
+    /// When its origin last recorded into it, in virtual ms.
+    updated_ms: u64,
+    /// The positions that hold it at its count.
+    holders: NodeSet,
+}
+
+/// The instant the bucket `back` buckets before the one `now` falls in
+/// leaves `spec`'s window of live buckets.
+fn fall_off_ms(spec: RuleSpec, now: u64, back: u32) -> u64 {
+    let bucket_ms = spec.bucket_millis.get();
+    let current = now / bucket_ms;
+    (current.saturating_sub(u64::from(back)) + u64::from(spec.live_buckets.get()))
+        .saturating_mul(bucket_ms)
+}
+
+/// The fewest yields a drain spends, however few nodes it waits for.
+const MIN_DRAIN_YIELDS: usize = 16;
+
+/// Node `id`'s heartbeat phase within a period of `period_ms`: the integer
+/// Weyl sequence `((id · 0x9E37_79B9 mod 2³²) · period) >> 32`, which spreads
+/// ids 0 to 11 over twelve distinct phases at every period from 50 to 1,000
+/// ms, as production's unrelated process starts spread theirs. Node 0's phase
+/// is 0. The product is taken in `u128` because the period has no upper bound.
+fn heartbeat_phase(id: u32, period_ms: u64) -> u64 {
+    let weyl = u128::from(id.wrapping_mul(0x9E37_79B9));
+    ((weyl * u128::from(period_ms)) >> 32) as u64
+}
+
+/// The first instant strictly after `now` at node `id`'s heartbeat phase.
+fn first_heartbeat(id: u32, period_ms: u64, now: u64) -> u64 {
+    let phase = heartbeat_phase(id, period_ms);
+    if now < phase {
+        return phase;
+    }
+    let periods = (now - phase) / period_ms + 1;
+    phase.saturating_add(periods.saturating_mul(period_ms))
+}
+
+/// A node's decision on a request of `hits` when its window holds `total`
+/// of `key`: gabion's own comparison, [`RuleSpec::admits`]. A request heavier
+/// than the limit never fits; otherwise the reopening time is the library's
+/// sliding-window walk, and since `hits ≤ limit` makes the excess over the
+/// limit at most `total`, the walk always finds the bucket whose fall-off
+/// admits it and never falls back to a whole window.
+fn decide(
+    spec: RuleSpec,
+    table: AggregateTable<'_>,
+    key: KeyHash,
+    now: u64,
+    total: u64,
+    hits: NonZeroU64,
+) -> Admission {
+    let hits = hits.get();
+    if spec.admits(total, hits) {
+        return Admission::Admitted {
+            total_before: total,
+        };
+    }
+    let reopens = if hits > spec.limit {
+        Reopens::Never
+    } else {
+        Reopens::In {
+            ms: table.time_until_admit_millis(spec, key, now, total, hits),
+        }
+    };
+    Admission::Rejected { total, reopens }
+}
+
+/// Whether `policy` stops every packet, so waiting cannot carry a change
+/// across the link: a block, or certain loss.
+fn blocks(policy: LinkPolicyKind) -> bool {
+    match policy {
+        LinkPolicyKind::Block => true,
+        LinkPolicyKind::DropProb { p } => p >= 1.0,
+        LinkPolicyKind::Pass | LinkPolicyKind::DropFirst { .. } => false,
+    }
+}
+
+/// Position in `nodes` of the live node with stable id `id`, or `None` if no
+/// live node has it; `nodes` is sorted by id (see `NodeHandle`).
+fn position_of(nodes: &[NodeHandle], id: u32) -> Option<usize> {
+    nodes.binary_search_by_key(&id, |h| h.id).ok()
 }
 
 /// One `Snapshot` admin round-trip. `None` if the runtime has already stopped.
 async fn admin_snapshot(tx: &mpsc::Sender<AdminCommand>) -> Option<AdminSnapshot> {
     let (reply_tx, reply_rx) = oneshot::channel();
     tx.send(AdminCommand::Snapshot { reply: reply_tx })
+        .await
+        .ok()?;
+    reply_rx.await.ok()
+}
+
+/// One `Counters` admin round-trip, which allocates one `oneshot`. `None` if
+/// the runtime has already stopped.
+async fn counters(tx: &mpsc::Sender<AdminCommand>) -> Option<GossipCounters> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send(AdminCommand::Counters { reply: reply_tx })
         .await
         .ok()?;
     reply_rx.await.ok()

@@ -10,31 +10,27 @@
 //! way out (see [`crate::hex`]); request keys come in as small dense `u64`
 //! ids, widened to `u128`.
 //!
-//! # Runtime on wasm32 (plan risk R2 — resolved)
+//! # Runtime on wasm32
 //!
-//! `spawn_local` composes fine under the browser/node microtask queue; the one
-//! thing that could not run on `wasm32-unknown-unknown` was tokio's *time*
-//! machinery — `tokio::time::clock::now` calls `std::time::Instant::now`,
-//! which is unimplemented on this target and panics. So neither
-//! `GossipRuntime`'s `tokio::time::interval` tick nor `tokio::time::advance`
-//! works here.
-//!
-//! The fix made the tick source injectable through the existing
-//! [`gabion::gossip::Clock`] trait (it gained an associated
-//! [`gabion::gossip::Ticker`]): production keeps a `tokio::time::interval`
-//! ticker (byte-identical), while [`crate::clock::ManualClock`] drives ticks
-//! and the bucket clock from engine-owned virtual time, touching no
-//! `tokio::time`. A node smoke test against the real wasm artifact now runs
-//! the full submit → gossip → converge → snapshot loop (see `smoke.cjs`). The
-//! code path has no browser-specific dependency — node and the browser share
-//! the same single-threaded wasm executor — but an in-browser check is still
-//! worth doing before the frontend phase relies on it.
+//! `spawn_local` runs on the browser's and node's microtask queue, but
+//! tokio's time machinery cannot: `tokio::time::clock::now` calls
+//! `std::time::Instant::now`, which panics on `wasm32-unknown-unknown`. So
+//! the tick source comes from the [`gabion::gossip::Clock`] trait, whose
+//! associated [`gabion::gossip::Ticker`] production fills with a
+//! `tokio::time::interval`, while [`crate::clock::ManualClock`] drives ticks
+//! and the bucket clock from the engine's virtual time, touching no
+//! `tokio::time`. `smoke.cjs` runs the full submit, gossip, converge and
+//! snapshot loop against the real wasm artifact; node and the browser share
+//! the same single-threaded wasm executor.
 
+use std::num::NonZeroU64;
+
+use gabion::crdt::KeyHash;
 use tokio::sync::{mpsc, oneshot};
 use wasm_bindgen::prelude::*;
 
-use crate::config::SimConfig;
-use crate::engine::{Command, LinkPolicyKind, run_engine};
+use crate::config::{MAX_ZONES, SimConfig};
+use crate::engine::{Command, EngineError, LinkPolicyKind, StepUntil, Watch, run_engine};
 
 /// A live simulation the page drives. Holds the sender end of the engine's
 /// command channel; every method round-trips one command and awaits its reply.
@@ -46,13 +42,13 @@ pub struct Sim {
 #[wasm_bindgen]
 impl Sim {
     /// Build the cluster and spawn its engine. `config` is a [`SimConfig`] as a
-    /// plain JS object; an invalid config **throws synchronously** so a typo in
-    /// a shared URL surfaces immediately instead of producing a quietly
-    /// different run.
+    /// plain JS object; an invalid config **throws synchronously** so a value
+    /// the page let through surfaces immediately instead of producing a
+    /// quietly different run.
     #[wasm_bindgen(constructor)]
     pub fn new(config: JsValue) -> Result<Sim, JsValue> {
         let config: SimConfig = serde_wasm_bindgen::from_value(config)?;
-        config
+        let valid = config
             .validate()
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
@@ -62,25 +58,32 @@ impl Sim {
         // test confirms the spawned task runs the full submit → gossip
         // → snapshot loop on the wasm microtask queue.
         wasm_bindgen_futures::spawn_local(async move {
-            let _ = run_engine(config, cmd_rx).await;
+            let _ = run_engine(valid, cmd_rx).await;
         });
         Ok(Sim { cmd_tx })
     }
 
-    /// Inject `hits` requests for `key_id` at `node`, at the current virtual
-    /// time. Resolves to the [`crate::event::EventBatch`] the injection
-    /// produced (the cell create/update events plus the reached virtual time).
+    /// A request of `hits` for `key_id` at `node`, at the current virtual
+    /// time. Resolves to the [`crate::event::EventBatch`] it produced: the
+    /// node's decision first, then, when admitted, its cell events and any
+    /// eager-flush packets, delivered at the same instant before it resolves,
+    /// with the receivers' cell events; with `until` (a [`StepUntil`], as
+    /// [`Sim::step`] takes it) `{ Event: { key } }`, a flush's wave is held
+    /// until the next command instead. Throws for zero hits.
     pub async fn submit_request(
         &self,
         node: u32,
         key_id: u64,
         hits: u64,
+        until: JsValue,
     ) -> Result<JsValue, JsValue> {
+        let until: StepUntil = serde_wasm_bindgen::from_value(until)?;
         let (reply, rx) = oneshot::channel();
         self.send(Command::SubmitRequest {
             node,
-            key: key_id as u128,
-            hits,
+            key: KeyHash(u128::from(key_id)),
+            hits: nonzero_hits(hits)?,
+            until,
             reply,
         })
         .await?;
@@ -118,10 +121,10 @@ impl Sim {
         Ok(())
     }
 
-    /// Restore every directed link to lossless `Pass` — undo any partition or
-    /// per-link drop policy across the whole cluster. Engine-driven: it sweeps
-    /// the *live* link set in one round-trip, so it stays correct after nodes
-    /// have joined or left (the caller no longer tracks the node count).
+    /// Restore the configured network, uniform loss included, on every
+    /// directed link — undo any partition or per-link policy across the whole
+    /// cluster. Engine-driven: it sweeps the *live* link set in one
+    /// round-trip, so it stays correct after nodes have joined or left.
     pub async fn heal(&self) -> Result<(), JsValue> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::Heal { reply }).await?;
@@ -131,11 +134,16 @@ impl Sim {
     /// Add a fresh cold-start node to the live cluster. It joins by gossip and
     /// catches up by anti-entropy — no rebuild. Resolves to the
     /// [`crate::event::EventBatch`] the join produced; the new node's stable id
-    /// appears in the next [`Sim::snapshot`].
-    pub async fn add_node(&self) -> Result<JsValue, JsValue> {
+    /// appears in the next [`Sim::snapshot`]. It joins zone `zone`, or the zone
+    /// with the fewest live members; an index past the last zone throws
+    /// [`crate::engine::EngineError::UnknownZone`].
+    pub async fn add_node(&self, zone: Option<u32>) -> Result<JsValue, JsValue> {
         let (reply, rx) = oneshot::channel();
-        self.send(Command::AddNode { reply }).await?;
-        let batch = rx.await.map_err(|_| engine_gone())?;
+        self.send(Command::AddNode { zone, reply }).await?;
+        let batch = rx
+            .await
+            .map_err(|_| engine_gone())?
+            .map_err(|err| JsValue::from_str(&err.to_string()))?;
         to_js(&batch)
     }
 
@@ -153,10 +161,18 @@ impl Sim {
         to_js(&batch)
     }
 
-    /// Advance virtual time by `delta_ms`, resolving to the events produced.
-    pub async fn step(&self, delta_ms: u64) -> Result<JsValue, JsValue> {
+    /// Advance virtual time by at most `delta_ms`, stopping where `until`
+    /// (`"Time"` or `{ Event: { key } }`, a [`StepUntil`]) says, resolving to
+    /// the events produced.
+    pub async fn step(&self, delta_ms: u64, until: JsValue) -> Result<JsValue, JsValue> {
+        let until: StepUntil = serde_wasm_bindgen::from_value(until)?;
         let (reply, rx) = oneshot::channel();
-        self.send(Command::Step { delta_ms, reply }).await?;
+        self.send(Command::Step {
+            delta_ms,
+            until,
+            reply,
+        })
+        .await?;
         let batch = rx.await.map_err(|_| engine_gone())?;
         to_js(&batch)
     }
@@ -169,10 +185,27 @@ impl Sim {
         to_js(&batch)
     }
 
-    /// Pull the full per-node cluster state for a seek / re-render.
-    pub async fn snapshot(&self) -> Result<JsValue, JsValue> {
+    /// Pull every node's state of key `key_id` for a re-render, with the
+    /// cells and peer rows of the node with stable id `inspect` alone, and
+    /// that node's decision on a request of `probe_hits`. Throws for zero
+    /// hits.
+    pub async fn snapshot(
+        &self,
+        inspect: Option<u32>,
+        key_id: u64,
+        probe_hits: u64,
+    ) -> Result<JsValue, JsValue> {
         let (reply, rx) = oneshot::channel();
-        self.send(Command::Snapshot { reply }).await?;
+        let watch = Watch {
+            key: KeyHash(u128::from(key_id)),
+            probe_hits: nonzero_hits(probe_hits)?,
+        };
+        self.send(Command::Snapshot {
+            inspect,
+            watch,
+            reply,
+        })
+        .await?;
         let state = rx.await.map_err(|_| engine_gone())?;
         to_js(&state)
     }
@@ -193,8 +226,8 @@ impl Sim {
         self.cmd_tx.send(cmd).await.map_err(|_| engine_gone())
     }
 
-    /// One `SetLinkPolicy` round-trip, shared by `set_link_policy`,
-    /// `partition`, and `heal`.
+    /// One `SetLinkPolicy` round-trip, shared by `set_link_policy` and
+    /// `partition`.
     async fn apply_link(&self, src: u32, dst: u32, policy: LinkPolicyKind) -> Result<(), JsValue> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::SetLinkPolicy {
@@ -218,6 +251,18 @@ impl Sim {
 #[wasm_bindgen]
 pub fn default_config() -> Result<JsValue, JsValue> {
     to_js(&SimConfig::default())
+}
+
+/// The most zones a session places nodes in: the zone stepper's ceiling.
+#[wasm_bindgen]
+pub fn max_zones() -> u32 {
+    MAX_ZONES as u32
+}
+
+/// A request's weight as the engine takes it: zero hits throws, as
+/// [`EngineError::NoHits`].
+fn nonzero_hits(hits: u64) -> Result<NonZeroU64, JsValue> {
+    NonZeroU64::new(hits).ok_or_else(|| JsValue::from_str(&EngineError::NoHits.to_string()))
 }
 
 /// Serialize an owned reply into a plain JS object.

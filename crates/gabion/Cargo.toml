@@ -10,27 +10,22 @@ license.workspace = true
 # the wasm build entirely.
 ahash = { workspace = true, optional = true }
 async-stream.workspace = true
-bon.workspace = true
-educe.workspace = true
 either.workspace = true
 futures.workspace = true
-getrandom.workspace = true
-hmac.workspace = true
 humantime.workspace = true
 k8s-openapi = { workspace = true, optional = true }
 kube = { workspace = true, optional = true }
-serde.workspace = true
-sha2.workspace = true
+libc = { workspace = true, optional = true }
+# The `loom` feature swaps the aggregate table's slot atomics for loom's;
+# `gabion-nginx`'s `make loom` only.
+loom = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+socket2 = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 twox-hash.workspace = true
-
-# On wasm32 the `getrandom` backend is the browser's, selected by the
-# `wasm_js` feature (getrandom 0.4 needs no RUSTFLAGS cfg for this). Scoped to
-# the wasm target so native builds keep the OS (`sys_rng`) backend.
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { workspace = true, features = ["wasm_js"] }
+whoami = { workspace = true, optional = true }
 
 [features]
 # Default features keep the production adapters (gabiond, nginx) building
@@ -39,21 +34,33 @@ getrandom = { workspace = true, features = ["wasm_js"] }
 # UDP transport, neither of which compiles for wasm32.
 default = ["discovery-kubernetes", "transport-udp"]
 # Kubernetes EndpointSlice peer discovery. Pulls `kube` + `k8s-openapi`,
-# which transitively need `hyper`/`rustls`/`tower-http` — host-only.
-discovery-kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:ahash"]
-# The production UDP datagram transport (`UdpTransport`) and the
-# socket-binding runtime constructors. Needs `tokio/net`.
-transport-udp = ["tokio/net"]
+# which transitively need `hyper`/`rustls`/`tower-http` — host-only;
+# `whoami` reads the host name that finds the node's own EndpointSlice entry.
+discovery-kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:ahash", "dep:whoami"]
+# The production UDP datagram transport (`UdpTransport`), the socket-binding
+# runtime constructors and the host identity (`gabion::identity`). Needs
+# `tokio/net`; `socket2` sizes the socket's kernel buffers, `libc` names
+# `ENOBUFS` and `whoami` reads the hostname.
+transport-udp = ["tokio/net", "dep:libc", "dep:socket2", "dep:whoami"]
+# `Serialize` for the admin snapshot and the rules, for an adapter that serves
+# them as JSON. The library never deserialises.
+serde = ["dep:serde"]
 # Per-cell admin dump (`AdminCommand::CellDump`). Built inside the gossip
 # task and used by the visualizer to render every node's CRDT cells. Off by
 # default so the production runtime never compiles the cell-iteration path.
 cell-dump = []
+loom = ["dep:loom"]
 
 [dev-dependencies]
 criterion.workspace = true
 quickcheck.workspace = true
 quickcheck_macros.workspace = true
+tracing-subscriber.workspace = true
 
 [[bench]]
 name = "crdt"
+harness = false
+
+[[bench]]
+name = "gossip"
 harness = false

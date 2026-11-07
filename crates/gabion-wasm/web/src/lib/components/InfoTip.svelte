@@ -7,15 +7,7 @@
   // links it to the trigger with `aria-describedby` so assistive tech announces
   // it. The trigger wears the conventional help affordance: a dotted underline
   // and `cursor: help`.
-  // `align` decides which edge the bubble grows from: left by default (grows
-  // rightward, for terms in the left of the panel), or right for a term near the
-  // panel's right edge so the bubble grows inward and isn't clipped by the
-  // inspector's `overflow` box.
-  let {
-    text,
-    align = 'left',
-    children,
-  }: { text: string; align?: 'left' | 'right'; children: Snippet } = $props();
+  let { text, children }: { text: string; children: Snippet } = $props();
 
   // Per-instance id tying the trigger to its description. Generated once at
   // construction — stable for the component's life.
@@ -24,7 +16,7 @@
 
 <button class="term" type="button" aria-describedby={id}>
   {@render children()}
-  <span class="bubble" class:right={align === 'right'} role="tooltip" {id}>{text}</span>
+  <span class="bubble" role="tooltip" {id}>{text}</span>
 </button>
 
 <style>
@@ -36,7 +28,7 @@
     margin: 0;
     padding: 0;
     border: none;
-    border-bottom: 1px dotted var(--ink-faint);
+    border-bottom: 1px dotted var(--color-fg-muted);
     background: none;
     font: inherit;
     color: inherit;
@@ -47,43 +39,28 @@
   .bubble {
     position: absolute;
     left: 0;
-    top: calc(100% + var(--space-1));
+    top: calc(100% + var(--gap-xs));
     z-index: 10;
     width: max-content;
     max-width: 15rem;
-    padding: var(--space-2);
+    padding: var(--gap-sm);
     border-radius: var(--radius);
-    background: var(--ink);
-    color: var(--on-disc);
-    font-size: var(--text-xs);
+    background: var(--surface-popover);
+    color: var(--color-fg);
+    border: 1px solid var(--color-border-line);
+    font-size: var(--font-size-caption-sm);
     font-weight: 400;
     line-height: 1.4;
     letter-spacing: 0;
     text-transform: none;
-    box-shadow: 0 2px 8px rgb(27 35 48 / 18%);
-    /* Hidden but kept in the DOM so `aria-describedby` can still reach it. */
-    opacity: 0;
-    visibility: hidden;
-    transition: opacity 120ms ease;
-  }
-
-  /* Grow inward from the right edge — keeps a right-side term's bubble inside
-     the inspector's overflow box. */
-  .bubble.right {
-    left: auto;
-    right: 0;
+    box-shadow: var(--shadow-popover);
+    /* Hidden but kept in the DOM so `aria-describedby` can still reach it,
+       and out of the layout, so a term near an edge never widens the page. */
+    display: none;
   }
 
   .term:hover .bubble,
   .term:focus-visible .bubble {
-    opacity: 1;
-    visibility: visible;
-  }
-
-  /* Reduced motion: no fade, just appear. */
-  @media (prefers-reduced-motion: reduce) {
-    .bubble {
-      transition: none;
-    }
+    display: block;
   }
 </style>

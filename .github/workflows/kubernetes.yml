@@ -205,16 +205,20 @@ jobs:
           path: /tmp/cores
           if-no-files-found: ignore
 
-  kubernetes-gossip-bench:
+  # Three zones, one kind worker each (deploy/kubernetes/kind-zones.yaml):
+  # gabiond only, since the mixed job covers the adapters. Builds only the
+  # gabiond image, read-only from its registry cache.
+  kubernetes-zones-test:
     needs: plan
     if: >-
       contains(fromJSON(needs.plan.outputs.required-work), 'kube-smoke') ||
       contains(fromJSON(needs.plan.outputs.required-work), 'ci')
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      # Best-effort GHCR login so the buildx cache-from steps can read the
+      # Best-effort GHCR login so the buildx cache-from step can read the
       # private buildcache; forks miss and cold-compile (continue-on-error).
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         continue-on-error: true
@@ -222,53 +226,19 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.15'
       - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
           cluster_name: gabion
+          config: deploy/kubernetes/kind-zones.yaml
           wait: 120s
-      - name: enable host core dumps
+      - name: build gabiond image
         run: |
-          sudo mkdir -p /tmp/cores
-          sudo chmod 1777 /tmp/cores
-          sudo sysctl -w kernel.core_pattern='/tmp/cores/core.%e.%p'
-      # Warm both smoke images from their canonical `build` caches
-      # (read-only; a miss degrades to today's cold build). `docker build`
-      # can't consume a registry cache, so use `docker buildx build
-      # --load`. Tagged as the names `kind load` + the smoke scripts expect.
-      - name: build images
-        run: |
-          docker buildx build \
-            --load \
-            --target smoke \
-            --build-arg NGINX_BASE_IMAGE=nginx:stable-alpine \
-            --cache-from type=registry,ref=ghcr.io/${{ github.repository }}/nginx:buildcache-nginx-stable-alpine-amd64 \
-            -f deploy/nginx/Dockerfile \
-            -t nginx-nginx-module-request-smoke:latest \
-            .
           docker buildx build \
             --load \
             --cache-from type=registry,ref=ghcr.io/${{ github.repository }}/gabiond:buildcache-gabiond-default-amd64 \
             -f deploy/gabiond/Dockerfile \
             -t gabiond:local \
             .
-      - name: load images into kind
-        run: |
-          kind load docker-image nginx-nginx-module-request-smoke:latest --name gabion
-          kind load docker-image gabiond:local --name gabion
-      - run: make kubernetes-gossip-bench
-      # Cores copied out by `kubectl cp` (or written by root-owned
-      # smokes via the host's core_pattern) may be read-locked against
-      # the runner user. Relax perms so upload-artifact can zip them.
-      - name: relax core perms for upload
-        if: failure()
-        run: sudo chmod -R a+r /tmp/cores 2>/dev/null || true
-      - name: upload cores on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: cores-${{ github.job }}-${{ github.run_attempt }}
-          path: /tmp/cores
-          if-no-files-found: ignore
+      - name: load image into kind
+        run: kind load docker-image gabiond:local --name gabion
+      - run: make kubernetes-zones-test

@@ -34,7 +34,8 @@ cleanup() {
     # but a generic "rollout timed out" message.
     if [ "${cleanup_dump:-1}" = "1" ] && [ -n "${namespace:-}" ]; then
         printf '\n--- cleanup diagnostic dump (namespace=%s) ---\n' "$namespace" >&2
-        kubectl -n "$namespace" get pods,events --sort-by=.lastTimestamp -o wide >&2 || true
+        kubectl -n "$namespace" get pods -o wide >&2 || true
+        kubectl -n "$namespace" get events --sort-by=.metadata.creationTimestamp >&2 || true
         kubectl -n "$namespace" describe pods -l app=gabiond >&2 || true
         kubectl -n "$namespace" describe pods -l app=gabion-nginx >&2 || true
         # --tail=1000 because the smoke-with-bt wrapper prints a full
@@ -66,44 +67,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# CI has already built both images and loaded them into kind.
-if [ "${GABION_SKIP_IMAGE_BUILD:-0}" != 1 ]; then
-    docker compose --profile module -f deploy/nginx/docker-compose.yml build nginx-module-request-smoke
-    docker build -f deploy/gabiond/Dockerfile -t gabiond:local .
-fi
+build_and_load_images nginx-nginx-module-request-smoke:latest gabiond:local
+
+# kind's node carries no zone label; the EndpointSlice controller copies it
+# into each pod's entry, where both adapters read their zone.
+label_unzoned_nodes kind-a
 
 kubectl create namespace "$namespace"
+apply_gabion_rbac
 
 kubectl -n "$namespace" apply -f - <<YAML
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: gabion
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: gabion-endpointslice-reader
-rules:
-  - apiGroups: [""]
-    resources: ["pods", "services"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["discovery.k8s.io"]
-    resources: ["endpointslices"]
-    verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: gabion-endpointslice-reader
-subjects:
-  - kind: ServiceAccount
-    name: gabion
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: gabion-endpointslice-reader
----
 # gabiond server config in the new \`AppConfig\` schema. Admin HTTP at :9090,
 # envoy gRPC at :8081, gossip UDP at :9000.
 apiVersion: v1
@@ -116,32 +89,36 @@ data:
     admin_bind: 0.0.0.0:9090
     storage:
       max_cells: 4096
-      rule_dictionary_capacity: 64
-      node_dictionary_capacity: 256
-      local_dirty_capacity: 2048
-      forwarded_dirty_capacity: 8192
-      peer_capacity: 64
       max_descriptor_count: 16
       max_descriptor_bytes: 512
       max_key_bytes: 128
-    runtime:
-      rng_seed: 12345
     discovery:
       namespace_allow: ["$namespace"]
       service_allow: ["gabiond", "gabion-nginx"]
     gossip:
       bind: 0.0.0.0:9000
       tick_interval: 100ms
-      fanout: 6
       max_payload_bytes: 1400
-      max_cells_per_frame: 1024
-      max_cells_per_tick: 1024
-      send_queue_capacity: 32
       limit_queue_capacity: 1024
       cluster_id_hash: 1
       target_err_bps: 100
       min_emit_interval: 5ms
+    # The NGINX config's three rules in the opposite order; each pair counts
+    # as one rule across the two adapters.
     limits:
+      - name: acme_only
+        domain: nginx
+        descriptors:
+          - key: tenant
+            value: acme
+        rate: 2r/m
+        bucket: 1s
+      - name: per_client
+        domain: nginx
+        descriptors:
+          - key: client
+        rate: 3r/m
+        bucket: 1s
       - name: nginx_uri
         domain: nginx
         descriptors:
@@ -168,9 +145,10 @@ data:
     http {
         gabion_limit_zone zone=api:128m;
         gabion_limit_rule uri_api \$uri rate=2r/m bucket=1s;
+        gabion_limit_rule per_client client:\$arg_c rate=3r/m bucket=1s;
+        gabion_limit_rule acme_only tenant:\$arg_t rate=2r/m bucket=1s value=tenant:acme;
         gabion_gossip_bind 0.0.0.0:9000;
         gabion_gossip_cluster 1;
-        gabion_gossip_fanout 6;
         gabion_discovery_namespace_allow $namespace;
 
         server {
@@ -184,6 +162,16 @@ data:
             location /off/ {
                 gabion_limit uri_api;
                 gabion off;
+                alias /usr/share/nginx/html/;
+            }
+
+            location /client/ {
+                gabion_limit per_client;
+                alias /usr/share/nginx/html/;
+            }
+
+            location /acme/ {
+                gabion_limit acme_only;
                 alias /usr/share/nginx/html/;
             }
         }
@@ -303,6 +291,82 @@ drive_nginx_traffic() {
     done
 }
 
+# nginx_hit <path>: one request through NGINX; prints its HTTP status.
+nginx_hit() {
+    curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080$1"
+}
+
+# counter <name>: one of the forwarded gabiond's /snapshot counters.
+counter() {
+    curl -fsS "http://127.0.0.1:19090/snapshot" | python3 -c '
+import json, sys
+print(json.load(sys.stdin)["counters"][sys.argv[1]])
+' "$1"
+}
+
+# merged_past <count>: gabiond has merged more than <count> cells, so it holds
+# the NGINX hit sent after it read <count>; nothing else changes a cell here.
+merged_past() {
+    curl -fsS "http://127.0.0.1:19090/snapshot" | python3 -c '
+import json, sys
+sys.exit(json.load(sys.stdin)["counters"]["cells_merged"] <= int(sys.argv[1]))
+' "$1" 2>/dev/null
+}
+
+# acked_after <heartbeats>: gabiond has run a heartbeat round since it had run
+# <heartbeats>, which sends its hit, and every peer has acked its own stream,
+# so the NGINX leader holds the hit.
+acked_after() {
+    curl -fsS "http://127.0.0.1:19090/snapshot" | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+sent = s["counters"]["rounds_heartbeat"] > int(sys.argv[1])
+sys.exit(not (sent and all(p["own_unacked"] == 0 for p in s["peers"])))
+' "$1" 2>/dev/null
+}
+
+# shared_limit <limit> <nginx path> <domain> <key> <value>: alternate hits on
+# one key between NGINX and gabiond, each held by the other adapter before the
+# next. The two adapters count one rule, so the first <limit> hits pass and
+# each adapter refuses the next.
+shared_limit() {
+    limit="$1"
+    path="$2"
+    shift 2
+    hit=1
+    while [ "$hit" -le "$limit" ]; do
+        allowed=0
+        hit_ms="$(now_ms)"
+        if [ $((hit % 2)) -eq 1 ]; then
+            merged="$(counter cells_merged)"
+            answer="NGINX $(nginx_hit "$path")"
+            [ "$answer" = "NGINX 429" ] || allowed=1
+            held=merged_past floor="$merged"
+        else
+            answer="gabiond $(gabiond_hit 18081 "$@")"
+            [ "$answer" != "gabiond OK" ] || allowed=1
+            held=acked_after floor="$(counter rounds_heartbeat)"
+        fi
+        if [ "$allowed" = 0 ]; then
+            printf 'FAIL: hit %s of %s on %s was refused (%s) before the shared limit\n' \
+                "$hit" "$limit" "$path" "$answer" >&2
+            exit 1
+        fi
+        retry 30 "$held" "$floor"
+        printf '%s hit %s held by the other adapter after %s ms\n' \
+            "${answer% *}" "$hit" "$(($(now_ms) - hit_ms))"
+        hit=$((hit + 1))
+    done
+    status="$(nginx_hit "$path")"
+    code="$(gabiond_hit 18081 "$@")"
+    if [ "$status" != 429 ] || [ "$code" != OVER_LIMIT ]; then
+        printf 'FAIL: after %s hits split between NGINX and gabiond on %s, NGINX answered %s and gabiond %s; both must refuse, or the two adapters count the rule separately\n' \
+            "$limit" "$path" "$status" "$code" >&2
+        exit 1
+    fi
+    printf 'one limit of %s across NGINX and gabiond on %s\n' "$limit" "$path"
+}
+
 port_forwards_ready() {
     curl -fsS -o /dev/null "http://127.0.0.1:19090/snapshot" \
         && curl -fsS -o /dev/null "http://127.0.0.1:18080/off/index.html"
@@ -317,16 +381,27 @@ gossip_settled() {
         | python3 -c '
 import json, sys
 s = json.load(sys.stdin)
-sys.exit(len(s["peers"]) < int(sys.argv[1]) or s["store"]["aggregate_rows"] == 0)
+sys.exit(len(s["peers"]) < int(sys.argv[1]) or s["aggregate_rows"] == 0)
 ' "$1" 2>/dev/null
+}
+
+# nginx_zones_known: every live NGINX pod logged learning its zone from its
+# EndpointSlice entry.
+nginx_zones_known() {
+    live_pods gabion-nginx | while read -r pod _ _; do
+        kubectl -n "$namespace" logs "$pod" \
+            | grep -E 'code="?zone_known' | grep -q 'endpoint_slice' || return 1
+    done
 }
 
 kubectl -n "$namespace" rollout status deployment/gabiond --timeout=180s
 kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=180s
+assert_pods_run_image app=gabiond gabiond:local
+assert_pods_run_image app=gabion-nginx nginx-nginx-module-request-smoke:latest
 wait_for_endpoint_count gabiond 2
 wait_for_endpoint_count gabion-nginx 2
 
-kubectl -n "$namespace" port-forward service/gabiond 19090:9090 \
+kubectl -n "$namespace" port-forward service/gabiond 19090:9090 18081:8081 \
     >/tmp/gabiond-admin-port-forward.log 2>&1 &
 admin_forward_pid="$!"
 kubectl -n "$namespace" port-forward service/gabion-nginx 18080:8080 \
@@ -339,6 +414,10 @@ retry 60 port_forwards_ready
 dump_snapshot "before traffic"
 
 retry 60 gossip_settled 1
+assert_zone_from_endpoint_slice gabiond
+retry 60 nginx_zones_known
+printf 'every gabion-nginx pod learned its zone from its EndpointSlice entry\n'
+print_own_entry_wait gabiond
 
 # Now scale both deployments and confirm discovery + gossip still convergent.
 kubectl -n "$namespace" scale deployment/gabiond --replicas=3
@@ -348,8 +427,15 @@ kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=180s
 wait_for_endpoint_count gabiond 3
 wait_for_endpoint_count gabion-nginx 3
 
-# gabiond peers with every other pod: 3 before the scale-out, 5 after.
+# gabiond peers with every other pod, never itself: 3 before the scale-out,
+# 5 after.
 retry 60 gossip_settled 5
+
+# Each rule is one limit across both adapters. Fresh keys: the traffic above
+# spent /api/index.html's budget.
+shared_limit 2 /api/parity nginx uri /api/parity
+shared_limit 3 '/client/index.html?c=parity' nginx client parity
+shared_limit 2 '/acme/index.html?t=acme' nginx tenant acme
 
 dump_snapshot "after traffic + scale-out"
 

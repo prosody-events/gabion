@@ -1,0 +1,41 @@
+{
+  "id": "az-partition",
+  "description": "prod-typical with availability zone 0 cut off from the other two for 30 s (all datagrams between it and the rest dropped), then healed; measures divergence during the partition, reconvergence after heal, and repair bytes.",
+  "duration_s": 110,
+  "warmup_s": 20,
+  "nodes": 80,
+  "rule": {
+    "limit": 100,
+    "window_ms": 10000,
+    "bucket_ms": 1000
+  },
+  "traffic": {
+    "site_rate_rps": 650,
+    "site_period_ms": 3200,
+    "site_jitter": 0.5,
+    "hot_keys": [
+      {
+        "limit_multiple": 1.5
+      },
+      {
+        "limit_multiple": 3.0
+      }
+    ],
+    "bursts": [
+      {
+        "rate_rps": 90,
+        "start_s": 40,
+        "duration_s": 20
+      }
+    ]
+  },
+  "churn": {
+    "partitions": [
+      {
+        "at_s": 40,
+        "heal_s": 70,
+        "az": 0
+      }
+    ]
+  }
+}

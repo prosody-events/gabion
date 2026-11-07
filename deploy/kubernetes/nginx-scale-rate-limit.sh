@@ -33,7 +33,8 @@ cleanup() {
     # the rationale.
     if [ -n "${namespace:-}" ]; then
         printf '\n--- cleanup diagnostic dump (namespace=%s) ---\n' "$namespace" >&2
-        kubectl -n "$namespace" get pods,events --sort-by=.lastTimestamp -o wide >&2 || true
+        kubectl -n "$namespace" get pods -o wide >&2 || true
+        kubectl -n "$namespace" get events --sort-by=.metadata.creationTimestamp >&2 || true
         kubectl -n "$namespace" describe pods -l app=gabion-nginx >&2 || true
         # --tail=1000 because the smoke-with-bt wrapper emits a full gdb
         # backtrace on a native SIGSEGV that easily exceeds the prior
@@ -60,48 +61,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# CI has already built the image and loaded it into kind.
-if [ "${GABION_SKIP_IMAGE_BUILD:-0}" != 1 ]; then
-    docker compose --profile module -f deploy/nginx/docker-compose.yml build nginx-module-request-smoke
-fi
+build_and_load_images nginx-nginx-module-request-smoke:latest
 
 kubectl create namespace "$namespace"
 
+apply_gabion_rbac
 kubectl -n "$namespace" apply -f - <<'YAML'
-# Bind watch permissions to the namespace's `default` ServiceAccount.
-# kubelet always mounts the default SA's token into pods that don't set
-# `serviceAccountName`, so no custom SA is needed — but the API server
-# still authenticates each request as `system:serviceaccount:<ns>:default`,
-# and that identity has zero permissions out of the box. The Role +
-# RoleBinding below grants exactly the verbs `EndpointSliceDiscovery`
-# uses (`crates/gabion/src/discovery/kubernetes.rs::watch_services` and
-# `watch_target`). Discovery itself falls through env→DNS bootstrap so
-# no `serviceAccountName` line, no `env` directive in nginx.smoke.conf,
-# and no kubeconfig is needed inside the pod.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: gabion-endpointslice-reader
-rules:
-  - apiGroups: [""]
-    resources: ["services"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["discovery.k8s.io"]
-    resources: ["endpointslices"]
-    verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: gabion-endpointslice-reader
-subjects:
-  - kind: ServiceAccount
-    name: default
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: gabion-endpointslice-reader
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -116,6 +81,7 @@ spec:
       labels:
         app: gabion-nginx
     spec:
+      serviceAccountName: gabion
       containers:
         - name: nginx
           image: nginx-nginx-module-request-smoke:latest
@@ -435,6 +401,7 @@ summarize_pod() {
 }
 
 kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=120s
+assert_pods_run_image app=gabion-nginx nginx-nginx-module-request-smoke:latest
 wait_for_endpoint_count gabion-nginx 1
 pods="$(wait_for_pods 1)"
 for pod in $pods; do
@@ -448,6 +415,7 @@ wait_for_endpoint_count gabion-nginx 0
 
 kubectl -n "$namespace" scale deployment/gabion-nginx --replicas=3
 kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=120s
+assert_pods_run_image app=gabion-nginx nginx-nginx-module-request-smoke:latest
 wait_for_endpoint_count gabion-nginx 3
 pods="$(wait_for_pods 3)"
 

@@ -1,0 +1,109 @@
+{
+  "cross_zone_share_at_30s": {
+    "no_zone": 0.7273,
+    "steady_state": 0.1818
+  },
+  "data_waves_per_period": {
+    "no_zone": 1.5,
+    "steady_state": 3.0
+  },
+  "floor_ms": 5,
+  "gateway_cut": {
+    "failover_ms": 2741,
+    "zone_caught_up_ms": 2746
+  },
+  "gateway_failure": {
+    "failover_ms": 2500,
+    "zone_caught_up_ms": 2505
+  },
+  "heartbeat_ms": 500,
+  "packet_loss": {
+    "agreed_ms": 4736,
+    "quiet_ms": 6741
+  },
+  "propagation": {
+    "by_node": [
+      {
+        "agreed_ms": 505,
+        "own_ms": 500,
+        "quiet_ms": 972,
+        "relay_ms": 505
+      },
+      {
+        "agreed_ms": 314,
+        "own_ms": 309,
+        "quiet_ms": 781,
+        "relay_ms": 314
+      },
+      {
+        "agreed_ms": 123,
+        "own_ms": 118,
+        "quiet_ms": 590,
+        "relay_ms": 123
+      },
+      {
+        "agreed_ms": 432,
+        "own_ms": 427,
+        "quiet_ms": 899,
+        "relay_ms": 432
+      },
+      {
+        "agreed_ms": 241,
+        "own_ms": 236,
+        "quiet_ms": 663,
+        "relay_ms": 241
+      },
+      {
+        "agreed_ms": 50,
+        "own_ms": 45,
+        "quiet_ms": 500,
+        "relay_ms": 50
+      },
+      {
+        "agreed_ms": 359,
+        "own_ms": 354,
+        "quiet_ms": 809,
+        "relay_ms": 359
+      },
+      {
+        "agreed_ms": 168,
+        "own_ms": 163,
+        "quiet_ms": 618,
+        "relay_ms": 168
+      },
+      {
+        "agreed_ms": 477,
+        "own_ms": 472,
+        "quiet_ms": 927,
+        "relay_ms": 477
+      },
+      {
+        "agreed_ms": 286,
+        "own_ms": 281,
+        "quiet_ms": 736,
+        "relay_ms": 286
+      },
+      {
+        "agreed_ms": 95,
+        "own_ms": 90,
+        "quiet_ms": 545,
+        "relay_ms": 95
+      },
+      {
+        "agreed_ms": 404,
+        "own_ms": 399,
+        "quiet_ms": 854,
+        "relay_ms": 404
+      }
+    ],
+    "relays_per_own_round": 6,
+    "send_at_ms": 3000
+  },
+  "rate_limiting": {
+    "agreed_ms": 5,
+    "own_ms": 0,
+    "quiet_ms": 472,
+    "relay_ms": 5
+  },
+  "suspect_after_ms": 2000
+}

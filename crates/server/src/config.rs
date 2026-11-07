@@ -1,274 +1,218 @@
 //! Configuration for the `gabiond` binary.
 //!
-//! Configuration is layered (each later source overrides earlier ones):
+//! Every scalar setting is a row of the library's table
+//! ([`gabion::settings::Setting`]), which names it, parses it and validates
+//! it for both adapters. For each row the loader reads, in order of
+//! precedence:
 //!
-//! 1. Built-in defaults from the per-struct `Default` impls below.
-//! 2. An optional YAML file passed on the command line.
-//! 3. Environment variables — see [`ENV_BINDINGS`] for the full list.
+//! 1. its `GABION_*` environment variable (a list setting splits on commas),
+//! 2. else its dotted key in the optional YAML file,
+//! 3. else the built-in default,
 //!
-//! ## Environment variables
+//! and passes the text to [`Settings::apply`]. The YAML tree is walked once:
+//! a scalar under a list setting counts as a one-item list, and a value of a
+//! shape its setting cannot take (a table, a misplaced list, a fraction)
+//! fails. A YAML key the table and a `limits:` entry do not know stops
+//! startup, as does any value that fails to parse or validate, before gabiond
+//! binds a socket.
 //!
-//! Every overridable config field is mapped to a single env var. There is
-//! no automatic `STRUCT__FIELD` nesting — each binding is explicit so the
-//! variable names operators type are flat and unambiguous (no
-//! double-underscores).
-//!
-//! Examples:
-//!
-//! - `GABION_STORAGE_MAX_CELLS=131072`
-//! - `GABION_GOSSIP_BIND=0.0.0.0:9090`
-//! - `GABION_GOSSIP_TICK_INTERVAL=100ms`
-//! - `GABION_DISCOVERY_NAMESPACE_WHITELIST=ns-a,ns-b` (comma-separated)
-//!
-//! Structured lists (notably `limits`, where each entry is itself a
-//! struct with nested fields and durations) cannot be expressed through
-//! env vars and must come from the YAML file.
-//!
-//! The library itself knows nothing about YAML or env — every field below
-//! is server-only. Parsing produces typed primitives that the binary's
-//! startup code feeds into [`gabion::rules::Rule::new`],
-//! [`gabion::gossip::GossipConfig`], and so on.
+//! The `limits` list, where each entry is itself a struct with nested fields
+//! and durations, cannot be expressed through environment variables and must
+//! come from the YAML file.
 
-use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-use config::{Config, ConfigBuilder, File, FileFormat, Value, builder::DefaultState};
+use config::{Config, File, FileFormat, Map, Value, ValueKind};
 use serde::Deserialize;
 use thiserror::Error;
 
-use gabion::crdt::{CellStoreConfig, NodeIdentity};
-use gabion::defaults;
-use gabion::discovery::DiscoveryConfig;
-use gabion::gossip::GossipConfig;
-use gabion::rules::{
-    DescriptorPattern, EnforcementMode, RateResolveError, Rule, RuleId, RuleTable, parse_rate,
-    resolve_rate,
-};
-use gabion::wire::FrameLimits;
+use gabion::crdt::ValidStorageConfig;
+use gabion::gossip::ValidGossipConfig;
+use gabion::rules::{EnforcementMode, RuleDef, RuleError, RuleTable};
+use gabion::settings::{Setting, SettingError, Settings};
 
-use crate::admission::CardinalityLimits;
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
+/// The loaded configuration: every setting, validated once, and the rules.
+#[derive(Clone, Debug)]
 pub struct AppConfig {
-    pub envoy_bind: Option<SocketAddr>,
-    pub admin_bind: Option<SocketAddr>,
-    pub storage: StorageConfig,
-    pub limits: Vec<LimitRuleConfig>,
-    pub runtime: RuntimeTuningConfig,
-    pub discovery: DiscoveryConfig,
-    pub gossip: GossipSettings,
+    /// The values as loaded, for what the validated configs do not carry:
+    /// the Envoy and admin binds, the node id seed, and the startup line.
+    pub settings: Settings,
+    pub gossip: ValidGossipConfig,
+    pub storage: ValidStorageConfig,
+    /// The `limits:` entries, each built through the library's one rule
+    /// constructor, in declaration order.
+    pub rules: RuleTable,
 }
 
-/// Whether an env var value should be parsed as a scalar string or a
-/// comma-separated list. Comma-separated lists feed `Vec<String>` /
-/// `Vec<SocketAddr>` fields; lists of nested structs (like `limits`) are
-/// not env-configurable and must come from the YAML file.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EnvValueKind {
-    Scalar,
-    List,
-}
-
-/// How a single env var maps onto a config field.
-#[derive(Clone, Copy, Debug)]
-pub struct EnvBinding {
-    /// Exact env var name. Always upper-snake_case, single underscores.
-    pub env_name: &'static str,
-    /// Dotted path into the [`AppConfig`] tree, e.g. `storage.max_cells`.
-    pub config_path: &'static str,
-    /// How to interpret the raw env value.
-    pub kind: EnvValueKind,
-}
-
-impl EnvBinding {
-    /// Bind an env var to a scalar field.
-    pub const fn scalar(env_name: &'static str, config_path: &'static str) -> Self {
-        Self {
-            env_name,
-            config_path,
-            kind: EnvValueKind::Scalar,
-        }
-    }
-
-    /// Bind an env var to a comma-separated list field.
-    pub const fn list(env_name: &'static str, config_path: &'static str) -> Self {
-        Self {
-            env_name,
-            config_path,
-            kind: EnvValueKind::List,
-        }
-    }
-}
-
-/// Every overridable config field, paired with the env var that overrides
-/// it. Names use single underscores throughout — there is no nesting
-/// separator, just an explicit table. To add a new env-overridable field:
-/// add an entry here and confirm `config_path` matches the field path in
-/// the YAML schema.
-pub const ENV_BINDINGS: &[EnvBinding] = &[
-    // Top-level binds.
-    EnvBinding::scalar("GABION_ENVOY_BIND", "envoy_bind"),
-    EnvBinding::scalar("GABION_ADMIN_BIND", "admin_bind"),
-    // storage.*
-    EnvBinding::scalar("GABION_STORAGE_MAX_CELLS", "storage.max_cells"),
-    EnvBinding::scalar(
-        "GABION_STORAGE_RULE_DICTIONARY_CAPACITY",
-        "storage.rule_dictionary_capacity",
-    ),
-    EnvBinding::scalar(
-        "GABION_STORAGE_NODE_DICTIONARY_CAPACITY",
-        "storage.node_dictionary_capacity",
-    ),
-    EnvBinding::scalar(
-        "GABION_STORAGE_LOCAL_DIRTY_CAPACITY",
-        "storage.local_dirty_capacity",
-    ),
-    EnvBinding::scalar(
-        "GABION_STORAGE_FORWARDED_DIRTY_CAPACITY",
-        "storage.forwarded_dirty_capacity",
-    ),
-    EnvBinding::scalar("GABION_STORAGE_PEER_CAPACITY", "storage.peer_capacity"),
-    EnvBinding::scalar(
-        "GABION_STORAGE_MAX_DESCRIPTOR_COUNT",
-        "storage.max_descriptor_count",
-    ),
-    EnvBinding::scalar(
-        "GABION_STORAGE_MAX_DESCRIPTOR_BYTES",
-        "storage.max_descriptor_bytes",
-    ),
-    EnvBinding::scalar("GABION_STORAGE_MAX_KEY_BYTES", "storage.max_key_bytes"),
-    // runtime.*
-    EnvBinding::scalar("GABION_RUNTIME_NODE_ID_SEED", "runtime.node_id_seed"),
-    EnvBinding::scalar("GABION_RUNTIME_RNG_SEED", "runtime.rng_seed"),
-    // gossip.*
-    EnvBinding::scalar("GABION_GOSSIP_BIND", "gossip.bind"),
-    EnvBinding::scalar("GABION_GOSSIP_TICK_INTERVAL", "gossip.tick_interval"),
-    EnvBinding::scalar("GABION_GOSSIP_FANOUT", "gossip.fanout"),
-    EnvBinding::scalar(
-        "GABION_GOSSIP_MAX_PAYLOAD_BYTES",
-        "gossip.max_payload_bytes",
-    ),
-    EnvBinding::scalar(
-        "GABION_GOSSIP_MAX_CELLS_PER_FRAME",
-        "gossip.max_cells_per_frame",
-    ),
-    EnvBinding::scalar(
-        "GABION_GOSSIP_MAX_CELLS_PER_TICK",
-        "gossip.max_cells_per_tick",
-    ),
-    EnvBinding::scalar(
-        "GABION_GOSSIP_SEND_QUEUE_CAPACITY",
-        "gossip.send_queue_capacity",
-    ),
-    EnvBinding::scalar(
-        "GABION_GOSSIP_LIMIT_QUEUE_CAPACITY",
-        "gossip.limit_queue_capacity",
-    ),
-    EnvBinding::scalar("GABION_GOSSIP_CLUSTER_ID_HASH", "gossip.cluster_id_hash"),
-    EnvBinding::scalar("GABION_GOSSIP_TARGET_ERR_BPS", "gossip.target_err_bps"),
-    EnvBinding::scalar(
-        "GABION_GOSSIP_MIN_EMIT_INTERVAL",
-        "gossip.min_emit_interval",
-    ),
-    // discovery.*
-    EnvBinding::scalar("GABION_DISCOVERY_SELF_ADDR", "discovery.self_addr"),
-    EnvBinding::list(
-        "GABION_DISCOVERY_NAMESPACE_ALLOW",
-        "discovery.namespace_allow",
-    ),
-    EnvBinding::list("GABION_DISCOVERY_SERVICE_ALLOW", "discovery.service_allow"),
+/// The fields of one `limits:` entry, and of one of its descriptors.
+const LIMIT_FIELDS: [&str; 7] = [
+    "name",
+    "domain",
+    "descriptors",
+    "rate",
+    "window",
+    "bucket",
+    "mode",
 ];
+const DESCRIPTOR_FIELDS: [&str; 2] = ["key", "value"];
 
 impl AppConfig {
-    /// Build the final config from defaults → YAML → env. If `yaml_path`
-    /// is `None`, the YAML layer is skipped and the server can be
-    /// configured purely from env vars and built-in defaults.
+    /// Load the environment over the optional YAML file over the defaults,
+    /// and validate the result. If `yaml_path` is `None`, the server is
+    /// configured purely from the environment and the defaults.
     pub fn load(yaml_path: Option<&Path>) -> Result<Self, ConfigError> {
         let mut builder = Config::builder();
         if let Some(path) = yaml_path {
             builder = builder.add_source(File::new(&path.to_string_lossy(), FileFormat::Yaml));
         }
-        finalize(builder)
+        Self::from_yaml(builder.build().map_err(ConfigError::Config)?)
     }
 
-    /// Parse YAML text directly, ignoring any env layering. Retained for
-    /// tests; production paths should use [`Self::load`].
-    pub fn parse_yaml(text: &str) -> Result<Self, ConfigError> {
-        serde_yaml::from_str(text).map_err(ConfigError::Yaml)
-    }
-
-    /// Test-only loader that takes inline YAML instead of a file path.
-    /// Same env-layering semantics as [`Self::load`].
-    #[cfg(test)]
-    fn load_with_yaml_str(yaml: &str) -> Result<Self, ConfigError> {
-        let builder = Config::builder().add_source(File::from_str(yaml, FileFormat::Yaml));
-        finalize(builder)
-    }
-
-    pub fn cardinality_limits(&self) -> CardinalityLimits {
-        CardinalityLimits {
-            max_descriptor_count: self.storage.max_descriptor_count,
-            max_descriptor_bytes: self.storage.max_descriptor_bytes,
-            max_key_bytes: self.storage.max_key_bytes,
-        }
-    }
-
-    /// Construct the runtime [`RuleTable`]. Rule ids are assigned in
-    /// declaration order starting at 1.
-    pub fn rule_table(&self) -> Result<RuleTable, ConfigError> {
-        let mut rules = Vec::with_capacity(self.limits.len());
-        for (i, limit) in self.limits.iter().enumerate() {
-            if self.limits[..i]
-                .iter()
-                .any(|earlier| earlier.name == limit.name)
-            {
-                return Err(ConfigError::DuplicateRule {
-                    name: limit.name.to_string(),
-                });
+    fn from_yaml(yaml: Config) -> Result<Self, ConfigError> {
+        let mut root = yaml.cache.into_table().map_err(ConfigError::Config)?;
+        let limits: Vec<LimitRuleConfig> = match root.remove("limits") {
+            None => Vec::new(),
+            Some(limits) => {
+                if let ValueKind::Array(entries) = &limits.kind
+                    && let Some(key) = entries.iter().enumerate().find_map(|(i, entry)| {
+                        unknown_fields(entry, &LIMIT_FIELDS, &format!("limits[{i}]"))
+                    })
+                {
+                    return Err(ConfigError::UnknownKey(key));
+                }
+                limits.try_deserialize().map_err(ConfigError::Config)?
             }
-            rules.push(limit.to_rule(i as RuleId + 1)?);
+        };
+        let mut settings = Settings::default();
+        apply_yaml(&mut settings, root, "")?;
+        for &setting in Setting::ALL {
+            let Some(raw) = read_env(setting.env_var())? else {
+                continue;
+            };
+            if setting.is_list() {
+                let mut applied = false;
+                for item in raw.split(',').filter(|item| !item.trim().is_empty()) {
+                    settings.apply(setting, item)?;
+                    applied = true;
+                }
+                // A list variable set but empty fails to load, as a scalar
+                // does, instead of silently dropping the YAML list.
+                if !applied {
+                    settings.apply(setting, &raw)?;
+                }
+            } else {
+                settings.apply(setting, &raw)?;
+            }
         }
-        Ok(RuleTable::new(rules))
-    }
-
-    pub fn cell_store_config(&self) -> CellStoreConfig {
-        let max_cells = self
-            .storage
-            .max_cells
-            .unwrap_or(defaults::STORAGE_MAX_CELLS);
-        CellStoreConfig {
-            cell_capacity: max_cells.max(1) as u32,
-            rule_dictionary_capacity: self.storage.rule_dictionary_capacity,
-            node_dictionary_capacity: self.storage.node_dictionary_capacity,
-            local_dirty_capacity: self.storage.local_dirty_capacity,
-            forwarded_dirty_capacity: self.storage.forwarded_dirty_capacity,
-            peer_capacity: self.storage.peer_capacity,
-        }
+        let (gossip, storage) = settings.validate()?;
+        let rules = limits
+            .iter()
+            .map(|limit| {
+                let patterns: Box<[(&str, &str)]> = limit
+                    .descriptors
+                    .iter()
+                    .map(|d| (&*d.key, &*d.value))
+                    .collect();
+                RuleDef {
+                    name: &limit.name,
+                    domain: &limit.domain,
+                    patterns: &patterns,
+                    rate: &limit.rate,
+                    window: limit.window,
+                    bucket: limit.bucket,
+                    mode: limit.mode.into(),
+                }
+                .build(&storage.cardinality)
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            settings,
+            gossip,
+            storage,
+            rules: RuleTable::new(rules, storage.rule_dictionary_capacity())?,
+        })
     }
 }
 
-/// Apply env overrides from [`ENV_BINDINGS`] on top of a builder already
-/// seeded with defaults and (optionally) a YAML file, then deserialize.
-fn finalize(mut builder: ConfigBuilder<DefaultState>) -> Result<AppConfig, ConfigError> {
-    for binding in ENV_BINDINGS {
-        let Some(raw) = read_env(binding.env_name)? else {
+/// Apply every setting under `table`, at dotted path `prefix`, whose
+/// environment variable is unset. A key that is neither a setting nor a block
+/// of settings fails, as does a value of a shape its setting cannot take.
+fn apply_yaml(
+    settings: &mut Settings,
+    table: Map<String, Value>,
+    prefix: &str,
+) -> Result<(), ConfigError> {
+    for (key, value) in table {
+        let path = if prefix.is_empty() {
+            key
+        } else {
+            format!("{prefix}.{key}")
+        };
+        if let Some(&setting) = Setting::ALL.iter().find(|s| s.yaml_key() == path) {
+            // The environment variable wins; the env pass applies it.
+            if std::env::var_os(setting.env_var()).is_some() {
+                continue;
+            }
+            let items = match value.kind {
+                ValueKind::Array(items) if setting.is_list() => items,
+                ValueKind::Array(_) => {
+                    return Err(ConfigError::WrongShape {
+                        setting,
+                        found: "a list",
+                    });
+                }
+                _ => vec![value],
+            };
+            for item in items {
+                let found = match item.kind {
+                    ValueKind::Nil => continue,
+                    ValueKind::Float(_) => "a fractional number",
+                    ValueKind::Table(_) => "a table",
+                    ValueKind::Array(_) => "a list",
+                    _ => {
+                        settings
+                            .apply(setting, &item.into_string().map_err(ConfigError::Config)?)?;
+                        continue;
+                    }
+                };
+                return Err(ConfigError::WrongShape { setting, found });
+            }
             continue;
-        };
-        let value = match binding.kind {
-            EnvValueKind::Scalar => Value::from(raw),
-            EnvValueKind::List => Value::from(parse_csv(&raw)),
-        };
-        builder = builder
-            .set_override(binding.config_path, value)
-            .map_err(ConfigError::Config)?;
+        }
+        match value.kind {
+            ValueKind::Table(inner) => apply_yaml(settings, inner, &path)?,
+            ValueKind::Nil
+                if Setting::ALL.iter().any(|s| {
+                    s.yaml_key()
+                        .strip_prefix(path.as_str())
+                        .is_some_and(|rest| rest.starts_with('.'))
+                }) => {}
+            _ => return Err(ConfigError::UnknownKey(path)),
+        }
     }
-    builder
-        .build()
-        .map_err(ConfigError::Config)?
-        .try_deserialize()
-        .map_err(ConfigError::Config)
+    Ok(())
+}
+
+/// The first field of the table `value` not in `known`, as `path.field`, or
+/// of one of its `descriptors`.
+fn unknown_fields(value: &Value, known: &[&str], path: &str) -> Option<String> {
+    let ValueKind::Table(fields) = &value.kind else {
+        return None;
+    };
+    fields.iter().find_map(|(field, value)| match &value.kind {
+        _ if !known.contains(&field.as_str()) => Some(format!("{path}.{field}")),
+        ValueKind::Array(descriptors) if field == "descriptors" => {
+            descriptors.iter().enumerate().find_map(|(j, descriptor)| {
+                unknown_fields(
+                    descriptor,
+                    &DESCRIPTOR_FIELDS,
+                    &format!("{path}.descriptors[{j}]"),
+                )
+            })
+        }
+        _ => None,
+    })
 }
 
 /// Read an env var, distinguishing unset (`Ok(None)`) from non-UTF-8 (error).
@@ -280,278 +224,34 @@ fn read_env(name: &'static str) -> Result<Option<String>, ConfigError> {
     }
 }
 
-/// Split a comma-separated env value, trimming whitespace and skipping empty
-/// segments so a trailing comma or double comma never produces a phantom
-/// element.
-fn parse_csv(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect()
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(default)]
-pub struct StorageConfig {
-    /// CRDT cell-store capacity. Caps the number of distinct
-    /// `(rule, key, bucket, origin)` cells held locally.
-    pub max_cells: Option<usize>,
-    pub rule_dictionary_capacity: u16,
-    pub node_dictionary_capacity: u16,
-    pub local_dirty_capacity: usize,
-    pub forwarded_dirty_capacity: usize,
-    pub peer_capacity: u16,
-
-    pub max_descriptor_count: usize,
-    pub max_descriptor_bytes: usize,
-    pub max_key_bytes: usize,
-}
-
-impl Default for StorageConfig {
-    fn default() -> Self {
-        Self {
-            max_cells: None,
-            rule_dictionary_capacity: defaults::STORAGE_RULE_DICTIONARY_CAPACITY,
-            node_dictionary_capacity: defaults::STORAGE_NODE_DICTIONARY_CAPACITY,
-            local_dirty_capacity: defaults::STORAGE_LOCAL_DIRTY_CAPACITY,
-            forwarded_dirty_capacity: defaults::STORAGE_FORWARDED_DIRTY_CAPACITY,
-            peer_capacity: defaults::STORAGE_PEER_CAPACITY,
-            max_descriptor_count: defaults::STORAGE_MAX_DESCRIPTOR_COUNT,
-            max_descriptor_bytes: defaults::STORAGE_MAX_DESCRIPTOR_BYTES,
-            max_key_bytes: defaults::STORAGE_MAX_KEY_BYTES,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct RuntimeTuningConfig {
-    /// Optional seed for the node id. Falls back to
-    /// `whoami::hostname()` then a fixed constant.
-    pub node_id_seed: Option<Box<str>>,
-    /// Optional deterministic peer-sampling seed. When unset, startup draws
-    /// fresh OS entropy.
-    pub rng_seed: Option<u64>,
-}
-
-/// Deserialize a `u128` from whatever shape the layered config sources
-/// hand us. The `config` crate normalises YAML/env values into its own
-/// `Value` type before serde sees them, and that pipeline never invokes
-/// `Visitor::visit_u128` — YAML integer literals arrive as `i64`/`u64`,
-/// env vars arrive as `String`. The default serde derive only accepts
-/// `visit_u128`, so a bare `cluster_id_hash: 1` in YAML panics at boot
-/// with "u128 is not supported for key 'gossip.cluster_id_hash'".
-///
-/// This visitor accepts any non-zero id, matching `gabion_gossip_cluster`:
-///   - YAML integers (`cluster_id_hash: 12345`)
-///   - decimal strings (`cluster_id_hash: "12345"`)
-///   - `0x`-prefixed hex strings (`cluster_id_hash: "0xdeadbeef"`)
-///   - `visit_u128` directly, for completeness.
-///
-/// Used only by [`GossipSettings::cluster_id_hash`].
-mod u128_any {
-    use std::fmt;
-    use std::num::NonZeroU128;
-
-    use serde::de::{self, Deserializer, Visitor};
-
-    pub fn deserialize<'de, D>(d: D) -> Result<u128, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct U128Any;
-
-        impl<'de> Visitor<'de> for U128Any {
-            type Value = u128;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a non-zero integer, a decimal string, or a `0x`-prefixed hex string")
-            }
-
-            fn visit_u64<E: de::Error>(self, v: u64) -> Result<u128, E> {
-                self.visit_u128(u128::from(v))
-            }
-
-            fn visit_u128<E: de::Error>(self, v: u128) -> Result<u128, E> {
-                if v == 0 {
-                    return Err(de::Error::invalid_value(de::Unexpected::Unsigned(0), &self));
-                }
-                Ok(v)
-            }
-
-            fn visit_i64<E: de::Error>(self, v: i64) -> Result<u128, E> {
-                match u128::try_from(v) {
-                    Ok(v) => self.visit_u128(v),
-                    Err(_) => Err(de::Error::invalid_value(de::Unexpected::Signed(v), &self)),
-                }
-            }
-
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<u128, E> {
-                gabion::gossip::parse_cluster_id(v)
-                    .map(NonZeroU128::get)
-                    .ok_or_else(|| de::Error::invalid_value(de::Unexpected::Str(v), &self))
-            }
-
-            fn visit_string<E: de::Error>(self, v: String) -> Result<u128, E> {
-                self.visit_str(&v)
-            }
-        }
-
-        d.deserialize_any(U128Any)
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(default)]
-pub struct GossipSettings {
-    pub bind: Option<SocketAddr>,
-    #[serde(with = "humantime_serde")]
-    pub tick_interval: Duration,
-    pub fanout: usize,
-    pub max_payload_bytes: usize,
-    pub max_cells_per_frame: u32,
-    pub max_cells_per_tick: usize,
-    pub send_queue_capacity: usize,
-    pub limit_queue_capacity: usize,
-    #[serde(deserialize_with = "u128_any::deserialize")]
-    pub cluster_id_hash: u128,
-    /// Per-rule error budget for threshold-triggered anti-entropy, in
-    /// basis points of the rule's own limit. See
-    /// [`gabion::defaults::GOSSIP_TARGET_ERR_BPS`] for the derivation.
-    pub target_err_bps: u32,
-    /// Floor between two threshold-fire emissions. See
-    /// [`gabion::defaults::GOSSIP_MIN_EMIT_INTERVAL_MS`].
-    #[serde(with = "humantime_serde")]
-    pub min_emit_interval: Duration,
-}
-
-impl Default for GossipSettings {
-    fn default() -> Self {
-        Self {
-            bind: None,
-            tick_interval: Duration::from_millis(defaults::GOSSIP_TICK_INTERVAL_MILLIS),
-            fanout: defaults::GOSSIP_FANOUT,
-            max_payload_bytes: defaults::GOSSIP_MAX_PAYLOAD_BYTES,
-            max_cells_per_frame: defaults::GOSSIP_MAX_CELLS_PER_FRAME,
-            max_cells_per_tick: defaults::GOSSIP_MAX_CELLS_PER_TICK,
-            send_queue_capacity: defaults::GOSSIP_SEND_QUEUE_CAPACITY,
-            limit_queue_capacity: defaults::GOSSIP_LIMIT_QUEUE_CAPACITY,
-            cluster_id_hash: defaults::GOSSIP_CLUSTER_ID_HASH,
-            target_err_bps: defaults::GOSSIP_TARGET_ERR_BPS,
-            min_emit_interval: Duration::from_millis(defaults::GOSSIP_MIN_EMIT_INTERVAL_MS),
-        }
-    }
-}
-
-impl GossipSettings {
-    /// Translate the user-facing config into the runtime's [`GossipConfig`].
-    /// `bootstrap_peers` comes in from the discovery layer; we leave it
-    /// empty here and let the runtime's peer-event stream populate it.
-    pub fn into_runtime_config(self, identity: NodeIdentity, rng_seed: u64) -> GossipConfig {
-        GossipConfig {
-            local_identity: identity,
-            cluster_id_hash: self.cluster_id_hash,
-            bootstrap_peers: Vec::new(),
-            fanout: self.fanout,
-            max_cells_per_tick: self.max_cells_per_tick,
-            wire_limits: FrameLimits {
-                max_payload_bytes: self.max_payload_bytes,
-                max_cells: self.max_cells_per_frame,
-            },
-            send_queue_capacity: self.send_queue_capacity,
-            limit_queue_capacity: self.limit_queue_capacity,
-            tick_interval: self.tick_interval,
-            auth_key: None,
-            rng_seed,
-            target_err_bps: self.target_err_bps,
-            min_emit_interval: self.min_emit_interval,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct LimitRuleConfig {
-    pub name: Box<str>,
-    pub domain: Box<str>,
-    pub descriptors: Box<[DescriptorConfig]>,
+#[derive(Debug, Deserialize)]
+struct LimitRuleConfig {
+    name: Box<str>,
+    domain: Box<str>,
+    descriptors: Box<[DescriptorConfig]>,
     /// Operator-facing rate: `N` requests per period, e.g. `10r/s`,
     /// `100r/5m`, `1000r/h`. Mandatory. See `gabion::rules::parse_rate`.
-    pub rate: Box<str>,
+    rate: Box<str>,
     /// Optional window the rate is enforced over. Defaults to the rate's
     /// period when omitted. When set, the resolved internal limit scales
     /// up to `floor(rate_count * window_millis / period_millis)` — see
     /// the README's "Rate, window, and bucket" section.
     #[serde(default, with = "humantime_serde::option")]
-    pub window: Option<Duration>,
+    window: Option<Duration>,
     /// `bucket:` defaults to `window:` when omitted — one fixed-window
     /// bucket per rule. Set explicitly for finer sliding-window
     /// enforcement (e.g. `bucket: 1s` inside a `window: 60s` rule).
     #[serde(default, with = "humantime_serde::option")]
-    pub bucket: Option<Duration>,
+    bucket: Option<Duration>,
     #[serde(default)]
-    pub mode: EnforcementModeConfig,
+    mode: EnforcementModeConfig,
 }
 
-impl LimitRuleConfig {
-    pub fn to_rule(&self, id: RuleId) -> Result<Rule, ConfigError> {
-        if self.descriptors.is_empty() {
-            return Err(ConfigError::EmptyDescriptorSet(self.name.to_string()));
-        }
-        for descriptor in self.descriptors.iter() {
-            if !is_descriptor_key(&descriptor.key) {
-                return Err(ConfigError::InvalidDescriptorKey {
-                    rule: self.name.to_string(),
-                    key: descriptor.key.to_string(),
-                });
-            }
-        }
-        let (rate_count, period) =
-            parse_rate(&self.rate).map_err(|reason| ConfigError::InvalidRate {
-                name: self.name.to_string(),
-                reason,
-            })?;
-        let resolved =
-            resolve_rate(rate_count, period, self.window, self.bucket).map_err(|err| {
-                ConfigError::ResolveRate {
-                    name: self.name.to_string(),
-                    source: err,
-                }
-            })?;
-        let descriptors = self
-            .descriptors
-            .iter()
-            .map(|d| DescriptorPattern {
-                key: d.key.clone(),
-                value: d.value.clone(),
-            })
-            .collect();
-        Ok(Rule::new(
-            id,
-            self.domain.to_string(),
-            descriptors,
-            resolved.limit,
-            resolved.window_millis,
-            resolved.bucket_millis,
-            self.mode.into(),
-        ))
-    }
-}
-
-/// Match a descriptor key against `[A-Za-z_][A-Za-z0-9_.-]*`. Mirrors the
-/// nginx adapter's `is_descriptor_key` so two nodes with the same logical
-/// rule produce identical descriptor identifiers.
-fn is_descriptor_key(s: &str) -> bool {
-    let mut chars = s.chars();
-    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
-        && chars.all(|c| c == '_' || c == '.' || c == '-' || c.is_ascii_alphanumeric())
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct DescriptorConfig {
-    pub key: Box<str>,
+#[derive(Debug, Deserialize)]
+struct DescriptorConfig {
+    key: Box<str>,
     #[serde(default = "any_value")]
-    pub value: Box<str>,
+    value: Box<str>,
 }
 
 fn any_value() -> Box<str> {
@@ -560,7 +260,7 @@ fn any_value() -> Box<str> {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum EnforcementModeConfig {
+enum EnforcementModeConfig {
     #[default]
     Enforce,
     DryRun,
@@ -579,30 +279,43 @@ impl From<EnforcementModeConfig> for EnforcementMode {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("config error: {0}")]
-    Config(#[source] config::ConfigError),
-    #[error("yaml parse error: {0}")]
-    Yaml(#[source] serde_yaml::Error),
-    #[error("rule {0} has no descriptors")]
-    EmptyDescriptorSet(String),
-    #[error("rule `{name}` is declared more than once; rule names must be unique")]
-    DuplicateRule { name: String },
+    #[error(transparent)]
+    Setting(#[from] SettingError),
+    #[error(transparent)]
+    Rule(#[from] RuleError),
     #[error(
-        "rule `{name}` has an invalid `rate:` value: {reason}. Use e.g. `rate: 100r/s` or `rate: \
-         10r/5m`."
+        "The configuration file sets `{0}`, which gabiond does not know. This key was removed or \
+         renamed in this release, or it is misspelled; see the release notes for its replacement."
     )]
-    InvalidRate { name: String, reason: &'static str },
-    #[error("rule `{name}`: {source}")]
-    ResolveRate {
-        name: String,
-        #[source]
-        source: RateResolveError,
+    UnknownKey(String),
+    /// A YAML value of a shape its setting cannot take.
+    #[error(
+        "The configuration file sets {setting} to {found}, which gabiond cannot read as its \
+         value. Usually the value is indented under the wrong key, or it is a number above \
+         9223372036854775807 left unquoted, which YAML reads as a fraction and rounds. Correct \
+         it, quoting a large number, or remove it to use the default."
+    )]
+    WrongShape {
+        setting: Setting,
+        found: &'static str,
     },
-    #[error("rule `{rule}` descriptor key `{key}` must match `[A-Za-z_][A-Za-z0-9_.-]*`")]
-    InvalidDescriptorKey { rule: String, key: String },
-    #[error("gossip.bind is required")]
+    #[error(
+        "gabiond could not read its configuration: {0}. Settings come from built-in defaults, \
+         then the YAML file given as the first argument, then `GABION_*` environment variables, \
+         which win over the file, so the value may come from either. See \"How configuration \
+         layers\" in the gabiond README."
+    )]
+    Config(config::ConfigError),
+    #[error(
+        "gabiond cannot start: it has no gossip address to listen on, and other gabion nodes need \
+         one to reach it. Set `gossip.bind` in the YAML file (for example `0.0.0.0:9000`) or \
+         export `GABION_GOSSIP_BIND`."
+    )]
     MissingGossipBind,
-    #[error("environment variable {0} is not valid UTF-8")]
+    #[error(
+        "`{0}` contains bytes that are not valid UTF-8, which gabiond cannot read. Set it again \
+         as plain text."
+    )]
     NonUtf8EnvVar(&'static str),
 }
 

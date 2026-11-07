@@ -4,15 +4,16 @@
 //! rather than abstract "warm vs cold" knobs:
 //!
 //! * `ingest_local/steady_state`  — 95% updates on existing cells + 5% inserts;
-//!   traffic Pareto-distributed across 8 rules and 4 active buckets.
+//!   traffic Pareto-distributed across 8 rules and 4 active buckets. Each raise
+//!   also moves the cell to the own list's tail.
 //! * `ingest_local/traffic_burst` — 99% updates on a tight hot subset; a
 //!   Slashdot/spike pattern under one rule.
 //! * `ingest_local/cold_start`    — empty store filling under realistic key
 //!   distribution (per-window startup).
 //!
-//! * `merge_remote/digest_repair` — what a digest-driven repair frame looks
-//!   like: 50% no-op (we are ahead) + 40% real update + 10% insert, across 8
-//!   peers.
+//! * `merge_remote/mixed_frame`   — a frame that partly repeats what this node
+//!   holds (a resend after a lost ack, a sweep page over the streams): 50%
+//!   no-op (we are ahead) + 40% real update + 10% insert, across 8 peers.
 //! * `merge_remote/bulk_fan_in`   — multiple peers gossiping overlapping cells
 //!   (max-merge collapses duplicates).
 //! * `merge_remote/all_noop`      — peer is behind us on every row.
@@ -22,24 +23,39 @@
 //! * `find/miss`                  — pure miss path, for the Robin Hood
 //!   early-exit baseline.
 //!
-//! * `fill_gossip_frame/steady_state` — moderately loaded node: some dirty
-//!   entries + repair lane filling the rest of a 128-cell frame budget.
-//! * `fill_gossip_frame/repair_only`  — dirty rings empty (gossip went idle);
-//!   pure repair sweep.
+//! * `stream/after`               — reading one peer's own-stream frame from
+//!   the own list in a production-sized store holding `prod-peak`'s 20,070 and
+//!   `prod-4x`'s 79,440 own cells: the steady state (`sent` two below the head,
+//!   the walk back from the tail) and a stream rewound to 0 (the walk from the
+//!   head, one quantum of 1,024 cells).
 //!
 //! * `expire/window_turnover`     — one bucket out of four ages out per call;
 //!   the steady-state expiry pattern.
 //! * `expire/no_expirations`      — scan-only cost, no frees.
+//! * `expire/bucket_boundary`     — a production-sized bucket ages out and is
+//!   freed in the runtime's batches.
+//!
+//! * `aggregate/window_total_95_5` — the aggregate table both adapters read on
+//!   admission, in production steady state: one request's window total over 10
+//!   buckets, 95% for a key active in the window, 5% for a key never seen.
+//! * `aggregate/apply_one_second`  — the table's writer for one second of that
+//!   traffic: 650 inserts plus 650 expiries.
 
 use std::hint::black_box;
+use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
+use gabion::aggregate::Aggregate;
 use gabion::crdt::{
-    BucketEpoch, CellHandle, CellStore, CellStoreConfig, CompactCellKey, DeltaSink, ExpirationSink,
-    Incarnation, KeyHash, NodeId, NodeIdentity, NodeSlot, Observation, ObservationBatch,
-    RuleDescriptor,
+    BucketEpoch, CellHandle, CellIdentity, CellStore, CompactCellKey, DeltaSink, ExpirationSink,
+    Expiry, Incarnation, KeyHash, NodeId, NodeIdentity, NodeSlot, Observation, ObservationBatch,
+    RelayMark, RuleAge, RuleSlot, Stream, ValidStorageConfig,
 };
+use gabion::defaults::{GOSSIP_EXPIRATION_BATCH, GOSSIP_MAX_PAYLOAD_BYTES};
+use gabion::gossip::AggregateStore;
+use gabion::rules::{EnforcementMode, RuleDef, RuleSpec, RuleTable};
+use gabion::settings::Settings;
 
 /// Build an `Observation` row with positional args. Used by the bench
 /// fixtures, where the field-named struct literal would be very verbose.
@@ -52,7 +68,7 @@ fn obs_row(
     incarnation: Incarnation,
     count: u32,
     last_update_millis: u64,
-) -> Observation<u32> {
+) -> Observation {
     Observation {
         rule_fingerprint,
         key_hash,
@@ -63,10 +79,12 @@ fn obs_row(
         last_update_millis,
     }
 }
-use gabion::wire::{FrameLimits, Header, PacketBuf, Packets, WireScratch, decode_unauth};
+use gabion::wire::{
+    AckInfo, CellPayload, FrameLimits, Header, PacketBuf, Packets, WireScratch, decode,
+};
 
 // ---------------------------------------------------------------------------
-// SplitMix64 RNG. Deterministic so iteration order is reproducible.
+// A splitmix RNG. Deterministic so iteration order is reproducible.
 // ---------------------------------------------------------------------------
 
 struct Rng(u64);
@@ -97,8 +115,6 @@ impl Rng {
 const CELL_CAPACITY: u32 = 16_384;
 const RULE_CAPACITY: u16 = 64;
 const NODE_CAPACITY: u16 = 64; // 1 local + ~63 peers
-const DIRTY_CAPACITY: usize = 256;
-const PEER_CAPACITY: u16 = 32;
 
 /// Distinct rate-limit rules a node enforces. Production fleets typically
 /// have anywhere from a handful to a few hundred; 8 is enough to exercise
@@ -124,31 +140,39 @@ fn local_identity() -> NodeIdentity {
     NodeIdentity::new(LOCAL_NODE, LOCAL_INCARNATION)
 }
 
-fn config() -> CellStoreConfig {
-    CellStoreConfig {
-        cell_capacity: CELL_CAPACITY,
-        rule_dictionary_capacity: RULE_CAPACITY,
-        node_dictionary_capacity: NODE_CAPACITY,
-        local_dirty_capacity: DIRTY_CAPACITY,
-        forwarded_dirty_capacity: DIRTY_CAPACITY,
-        peer_capacity: PEER_CAPACITY,
-    }
+fn config() -> ValidStorageConfig {
+    let nz = "bench capacities are non-zero";
+    let settings = Settings {
+        max_cells: CELL_CAPACITY.try_into().expect(nz),
+        rule_dictionary_capacity: Some(RULE_CAPACITY.try_into().expect(nz)),
+        node_dictionary_capacity: Some(NODE_CAPACITY.try_into().expect(nz)),
+        peer_capacity: (NODE_CAPACITY - 1).try_into().expect(nz),
+        ..Settings::default()
+    };
+    settings.validate().expect("bench settings validate").1
 }
 
-fn rule_fingerprint(i: usize) -> u128 {
-    // Distinct, deterministic per-rule fingerprints.
-    0xC0FE_BEEF_DEAD_F00D_0000_0000_0000_0000_u128 ^ ((i as u128) << 64) ^ (i as u128)
-}
-
-fn rule_descriptor(fp: u128, local_rule_id: u32) -> RuleDescriptor {
-    RuleDescriptor {
-        fingerprint: fp,
-        window_millis: 60_000,
-        bucket_millis: 15_000,
-        limit: 1_000_000,
-        flags: 0,
-        local_rule_id,
-    }
+/// `n` rules of `rate` in `bucket`s, each on its own key, built as the
+/// adapters build theirs.
+fn rules(n: usize, rate: &str, bucket: Duration, storage: &ValidStorageConfig) -> RuleTable {
+    let keys: Vec<String> = (0..n).map(|i| format!("key{i}")).collect();
+    let rules = keys
+        .iter()
+        .map(|key| {
+            RuleDef {
+                name: key,
+                domain: "bench",
+                patterns: &[(key, "*")],
+                rate,
+                window: None,
+                bucket: Some(bucket),
+                mode: EnforcementMode::Enforce,
+            }
+            .build(&storage.cardinality)
+            .expect("bench rule builds")
+        })
+        .collect();
+    RuleTable::new(rules, storage.rule_dictionary_capacity()).expect("bench rules fit")
 }
 
 fn peer_node(i: usize) -> NodeId {
@@ -157,8 +181,9 @@ fn peer_node(i: usize) -> NodeId {
 
 /// A pre-built, populated store the bench can clone per-iteration.
 struct Fixture {
-    store: CellStore<u32>,
+    store: CellStore,
     rule_fps: Vec<u128>,
+    rule_slots: Vec<RuleSlot>,
     local_node_slot: NodeSlot,
     hot_keys: Vec<u128>,
     warm_keys: Vec<u128>,
@@ -176,34 +201,30 @@ struct RemoteRow {
     peer_idx: u32,
 }
 
-/// Build a fresh store, intern N rules, and return the seed material the
-/// benches share.
-fn new_store() -> (CellStore<u32>, Vec<u128>, NodeSlot) {
-    let mut store = CellStore::<u32>::new(config(), local_identity());
-    let mut rule_fps = Vec::with_capacity(NUM_RULES);
-    for i in 0..NUM_RULES {
-        let fp = rule_fingerprint(i);
-        store
-            .intern_rule(rule_descriptor(fp, i as u32))
-            .expect("rule interned");
-        rule_fps.push(fp);
-    }
+/// Build a fresh store with N rules of a 60 s window in 15 s buckets, and
+/// return the seed material the benches share.
+fn new_store() -> (CellStore, Vec<u128>, Vec<RuleSlot>, NodeSlot) {
+    let table = rules(NUM_RULES, "1000000r/m", Duration::from_secs(15), &config());
+    let store = CellStore::new(config(), local_identity(), &table);
+    let rule_fps: Vec<u128> = table
+        .rules()
+        .iter()
+        .map(|rule| rule.fingerprint())
+        .collect();
+    let rule_slots = rule_fps
+        .iter()
+        .map(|&fp| store.rule_dictionary().find(fp).expect("rule interned"))
+        .collect();
     let local_node_slot = store.local_node_slot();
-    (store, rule_fps, local_node_slot)
+    (store, rule_fps, rule_slots, local_node_slot)
 }
 
 /// Seed `count` cells under the local origin, sampling rule and bucket
 /// from the realistic Pareto-shaped distributions.
-fn seed_local(
-    store: &mut CellStore<u32>,
-    rule_fps: &[u128],
-    keys: &[u128],
-    count: usize,
-    seed: u64,
-) {
+fn seed_local(store: &mut CellStore, rule_fps: &[u128], keys: &[u128], count: usize, seed: u64) {
     let mut rng = Rng::new(seed);
-    let mut obs = ObservationBatch::<u32>::with_capacity(count);
-    let mut sink = DeltaSink::<u32>::with_capacity(count);
+    let mut obs = ObservationBatch::with_capacity(count);
+    let mut sink = DeltaSink::with_capacity(count);
     for i in 0..count {
         // Walk keys deterministically so every key gets exactly one cell;
         // rotate rule/bucket to spread the population.
@@ -226,7 +247,7 @@ fn seed_local(
 /// Seed `count` cells under remote origins. Returns the rows so the
 /// benchmark can re-target the same cells.
 fn seed_remote(
-    store: &mut CellStore<u32>,
+    store: &mut CellStore,
     rule_fps: &[u128],
     keys: &[u128],
     peers: &[(NodeId, Incarnation)],
@@ -235,8 +256,8 @@ fn seed_remote(
     seed: u64,
 ) -> Vec<RemoteRow> {
     let mut rng = Rng::new(seed);
-    let mut obs = ObservationBatch::<u32>::with_capacity(count);
-    let mut sink = DeltaSink::<u32>::with_capacity(count);
+    let mut obs = ObservationBatch::with_capacity(count);
+    let mut sink = DeltaSink::with_capacity(count);
     let mut rows = Vec::with_capacity(count);
     for i in 0..count {
         let key = keys[i % keys.len()];
@@ -260,7 +281,7 @@ fn seed_remote(
             0,
         ));
     }
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(&obs, &mut sink, RelayMark::Clear);
     rows
 }
 
@@ -278,11 +299,11 @@ fn pick_rule(rng: &mut Rng) -> u32 {
 fn pick_bucket(rng: &mut Rng) -> BucketEpoch {
     let r = rng.range(100);
     if r < 90 {
-        0
+        BucketEpoch(0)
     } else if r < 98 {
-        1
+        BucketEpoch(1)
     } else {
-        rng.range(NUM_BUCKETS as u32)
+        BucketEpoch(rng.range(NUM_BUCKETS as u32))
     }
 }
 
@@ -302,7 +323,7 @@ fn fresh_key(rng: &mut Rng) -> u128 {
 }
 
 fn build_fixture() -> Fixture {
-    let (mut store, rule_fps, local_node_slot) = new_store();
+    let (mut store, rule_fps, rule_slots, local_node_slot) = new_store();
 
     // Pre-generate the key universe deterministically.
     let mut key_rng = Rng::new(0xA110_CA7E_FACE_BEEF);
@@ -344,6 +365,7 @@ fn build_fixture() -> Fixture {
     Fixture {
         store,
         rule_fps,
+        rule_slots,
         local_node_slot,
         hot_keys,
         warm_keys,
@@ -371,8 +393,8 @@ fn bench_ingest_local(c: &mut Criterion) {
                 || {
                     (
                         fixture.store.clone(),
-                        ObservationBatch::<u32>::with_capacity(batch),
-                        DeltaSink::<u32>::with_capacity(batch),
+                        ObservationBatch::with_capacity(batch),
+                        DeltaSink::with_capacity(batch),
                         Rng::new(0x1234_5678),
                     )
                 },
@@ -415,8 +437,8 @@ fn bench_ingest_local(c: &mut Criterion) {
         group.throughput(Throughput::Elements(batch as u64));
         group.bench_function(BenchmarkId::new("traffic_burst", batch), |b| {
             let mut store = fixture.store.clone();
-            let mut obs = ObservationBatch::<u32>::with_capacity(batch);
-            let mut sink = DeltaSink::<u32>::with_capacity(batch);
+            let mut obs = ObservationBatch::with_capacity(batch);
+            let mut sink = DeltaSink::with_capacity(batch);
             let mut rng = Rng::new(0xCAFE_F00D);
             b.iter(|| {
                 obs.clear();
@@ -426,7 +448,7 @@ fn bench_ingest_local(c: &mut Criterion) {
                     obs.push(obs_row(
                         fixture.rule_fps[0],
                         KeyHash(key),
-                        0,
+                        BucketEpoch(0),
                         LOCAL_NODE,
                         LOCAL_INCARNATION,
                         1,
@@ -453,8 +475,8 @@ fn bench_ingest_local(c: &mut Criterion) {
                     || {
                         (
                             fixture.store.clone(),
-                            ObservationBatch::<u32>::with_capacity(batch),
-                            DeltaSink::<u32>::with_capacity(batch),
+                            ObservationBatch::with_capacity(batch),
+                            DeltaSink::with_capacity(batch),
                             Rng::new(0x7E57_7E57),
                             vec![0_u32; 64].into_boxed_slice(),
                         )
@@ -479,7 +501,7 @@ fn bench_ingest_local(c: &mut Criterion) {
                             // compare's side effects are observed via
                             // `black_box`.
                             if let Some(slot) = store.rule_dictionary().find(fp) {
-                                let idx = slot as usize;
+                                let idx = slot.index();
                                 let p = pending[idx].saturating_add(1);
                                 pending[idx] = p;
                                 let epsilon = (1_000_000_u64 * 100) / (10_000 * 8);
@@ -514,8 +536,8 @@ fn bench_ingest_local(c: &mut Criterion) {
     group.throughput(Throughput::Elements(128));
     group.bench_function("threshold_trigger_burst", |b| {
         let mut store = fixture.store.clone();
-        let mut obs = ObservationBatch::<u32>::with_capacity(128);
-        let mut sink = DeltaSink::<u32>::with_capacity(128);
+        let mut obs = ObservationBatch::with_capacity(128);
+        let mut sink = DeltaSink::with_capacity(128);
         let mut rng = Rng::new(0xB0_B0_B0);
         let mut pending = vec![0_u32; 64].into_boxed_slice();
         b.iter(|| {
@@ -525,7 +547,7 @@ fn bench_ingest_local(c: &mut Criterion) {
                 let key = burst_keys[rng.range(burst_keys.len() as u32) as usize];
                 let fp = fixture.rule_fps[0];
                 if let Some(slot) = store.rule_dictionary().find(fp) {
-                    let idx = slot as usize;
+                    let idx = slot.index();
                     let p = pending[idx].saturating_add(1);
                     pending[idx] = p;
                     let epsilon = 1_u64; // saturated case
@@ -534,7 +556,7 @@ fn bench_ingest_local(c: &mut Criterion) {
                 obs.push(obs_row(
                     fp,
                     KeyHash(key),
-                    0,
+                    BucketEpoch(0),
                     LOCAL_NODE,
                     LOCAL_INCARNATION,
                     1,
@@ -551,7 +573,7 @@ fn bench_ingest_local(c: &mut Criterion) {
     // empty fixture so the freelist actually has room across many
     // iterations.
     let empty = {
-        let (store, rule_fps, _) = new_store();
+        let (store, rule_fps, ..) = new_store();
         (store, rule_fps)
     };
     group.throughput(Throughput::Elements(32));
@@ -560,8 +582,8 @@ fn bench_ingest_local(c: &mut Criterion) {
             || {
                 (
                     empty.0.clone(),
-                    ObservationBatch::<u32>::with_capacity(32),
-                    DeltaSink::<u32>::with_capacity(32),
+                    ObservationBatch::with_capacity(32),
+                    DeltaSink::with_capacity(32),
                     Rng::new(0xC01D_57A7),
                 )
             },
@@ -599,19 +621,20 @@ fn bench_merge_remote(c: &mut Criterion) {
 
     let fixture = build_fixture();
 
-    // ─── digest_repair ──────────────────────────────────────────────────
-    // What an incoming digest-repair frame looks like: 50% no-op (we are
-    // ahead), 40% real update (peer is ahead), 10% insert (cell new to
-    // us). Multi-peer, multi-rule.
+    // ─── mixed_frame ────────────────────────────────────────────────────
+    // A frame that partly repeats what we hold, as a resend after a lost ack
+    // or a sweep page over the streams does: 50% no-op (we are ahead), 40%
+    // real update (peer is ahead), 10% insert (cell new to us). Multi-peer,
+    // multi-rule.
     for &batch in &[64usize, 128] {
         group.throughput(Throughput::Elements(batch as u64));
-        group.bench_function(BenchmarkId::new("digest_repair", batch), |b| {
+        group.bench_function(BenchmarkId::new("mixed_frame", batch), |b| {
             b.iter_batched_ref(
                 || {
                     (
                         fixture.store.clone(),
-                        ObservationBatch::<u32>::with_capacity(batch),
-                        DeltaSink::<u32>::with_capacity(batch),
+                        ObservationBatch::with_capacity(batch),
+                        DeltaSink::with_capacity(batch),
                         Rng::new(0xBEEF_F00D),
                     )
                 },
@@ -649,7 +672,7 @@ fn bench_merge_remote(c: &mut Criterion) {
                             0,
                         ));
                     }
-                    store.merge_remote(black_box(obs), black_box(sink));
+                    store.merge_remote(black_box(obs), black_box(sink), RelayMark::Clear);
                 },
                 BatchSize::SmallInput,
             );
@@ -664,8 +687,8 @@ fn bench_merge_remote(c: &mut Criterion) {
         group.throughput(Throughput::Elements(batch as u64));
         group.bench_function(BenchmarkId::new("bulk_fan_in", batch), |b| {
             let mut store = fixture.store.clone();
-            let mut obs = ObservationBatch::<u32>::with_capacity(batch);
-            let mut sink = DeltaSink::<u32>::with_capacity(batch);
+            let mut obs = ObservationBatch::with_capacity(batch);
+            let mut sink = DeltaSink::with_capacity(batch);
             let mut rng = Rng::new(0xFA10_1110);
             let mut counter: u32 = 200;
             b.iter(|| {
@@ -689,7 +712,7 @@ fn bench_merge_remote(c: &mut Criterion) {
                     ));
                 }
                 counter = counter.wrapping_add(1).max(200);
-                store.merge_remote(black_box(&obs), black_box(&mut sink));
+                store.merge_remote(black_box(&obs), black_box(&mut sink), RelayMark::Clear);
             });
         });
     }
@@ -700,8 +723,8 @@ fn bench_merge_remote(c: &mut Criterion) {
     group.throughput(Throughput::Elements(128));
     group.bench_function("all_noop", |b| {
         let mut store = fixture.store.clone();
-        let mut obs = ObservationBatch::<u32>::with_capacity(128);
-        let mut sink = DeltaSink::<u32>::with_capacity(128);
+        let mut obs = ObservationBatch::with_capacity(128);
+        let mut sink = DeltaSink::with_capacity(128);
         let mut rng = Rng::new(0x4E0E_4E0E);
         b.iter(|| {
             obs.clear();
@@ -719,7 +742,7 @@ fn bench_merge_remote(c: &mut Criterion) {
                     0,
                 ));
             }
-            store.merge_remote(black_box(&obs), black_box(&mut sink));
+            store.merge_remote(black_box(&obs), black_box(&mut sink), RelayMark::Clear);
         });
     });
 
@@ -756,12 +779,9 @@ fn bench_find(c: &mut Criterion) {
                 let bucket = pick_bucket(&mut rng);
                 (key, rule_idx, bucket)
             } else {
-                (fresh_key(&mut rng), 0, 0)
+                (fresh_key(&mut rng), 0, BucketEpoch(0))
             };
-            let rule_slot = fixture
-                .store
-                .find_rule(fixture.rule_fps[rule_idx])
-                .expect("rule");
+            let rule_slot = fixture.rule_slots[rule_idx];
             let h = fixture.store.find(black_box(CompactCellKey {
                 rule: rule_slot,
                 key_hash: KeyHash(key),
@@ -776,13 +796,13 @@ fn bench_find(c: &mut Criterion) {
     // ─── miss ───────────────────────────────────────────────────────────
     // Pure miss path — Robin Hood early-exit baseline.
     group.bench_function("miss", |b| {
-        let rule_slot = fixture.store.find_rule(fixture.rule_fps[0]).expect("rule");
+        let rule_slot = fixture.rule_slots[0];
         let mut rng = Rng::new(0xDEAD_BEEF);
         b.iter(|| {
             let h = fixture.store.find(black_box(CompactCellKey {
                 rule: rule_slot,
                 key_hash: KeyHash(fresh_key(&mut rng)),
-                bucket: 0,
+                bucket: BucketEpoch(0),
                 origin: fixture.local_node_slot,
                 incarnation: LOCAL_INCARNATION,
             }));
@@ -831,12 +851,9 @@ fn bench_admission_headers(c: &mut Criterion) {
                 let bucket = pick_bucket(&mut rng);
                 (key, rule_idx, bucket)
             } else {
-                (fresh_key(&mut rng), 0, 0)
+                (fresh_key(&mut rng), 0, BucketEpoch(0))
             };
-            let rule_slot = fixture
-                .store
-                .find_rule(fixture.rule_fps[rule_idx])
-                .expect("rule");
+            let rule_slot = fixture.rule_slots[rule_idx];
             let h = fixture.store.find(black_box(CompactCellKey {
                 rule: rule_slot,
                 key_hash: KeyHash(key),
@@ -865,12 +882,9 @@ fn bench_admission_headers(c: &mut Criterion) {
                 let bucket = pick_bucket(&mut rng);
                 (key, rule_idx, bucket)
             } else {
-                (fresh_key(&mut rng), 0, 0)
+                (fresh_key(&mut rng), 0, BucketEpoch(0))
             };
-            let rule_slot = fixture
-                .store
-                .find_rule(fixture.rule_fps[rule_idx])
-                .expect("rule");
+            let rule_slot = fixture.rule_slots[rule_idx];
             let handle = fixture.store.find(black_box(CompactCellKey {
                 rule: rule_slot,
                 key_hash: KeyHash(key),
@@ -882,12 +896,15 @@ fn bench_admission_headers(c: &mut Criterion) {
             // enough for the cost we want to measure — the bench is
             // about the header math, not about an exact admission walk.
             let total: u64 = handle
-                .and_then(|h| fixture.store.count_of(h))
-                .map(u64::from)
+                .and_then(|h| fixture.store.get(h))
+                .map(|row| u64::from(row.count))
                 .unwrap_or(0);
             let hits: u64 = 1;
             let remaining = RULE_LIMIT.saturating_sub(total).saturating_sub(hits);
-            let delta = gabion::window::time_until_next_bucket_boundary_millis(now, BUCKET_MILLIS);
+            let delta = gabion::window::time_until_next_bucket_boundary_millis(
+                now,
+                BUCKET_MILLIS.try_into().unwrap(),
+            );
             let reset = gabion::window::reset_unix_seconds(now, delta);
             // Format the three header values into a scratch buffer so the
             // bench measures the same Display passes the production
@@ -929,61 +946,113 @@ impl std::fmt::Write for SliceWriter<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// fill_gossip_frame — outbound gossip composition.
+// stream/after — one peer's own-stream frame.
 // ---------------------------------------------------------------------------
 
-fn bench_fill_gossip_frame(c: &mut Criterion) {
-    let mut group = c.benchmark_group("crdt/fill_gossip_frame");
-    group.throughput(Throughput::Elements(128));
+/// The quantum at the default `storage.max_cells`: ⌈131,072 / 128⌉ cells.
+const QUANTUM: usize = 1_024;
 
-    let fixture = build_fixture();
-
-    // ─── steady_state ───────────────────────────────────────────────────
-    // Moderately loaded node: dirty rings contain ~64 recent updates;
-    // repair lane fills the remaining 64 slots of a 128-handle frame.
-    let mut steady = fixture.store.clone();
-    {
-        // Generate ~64 recent local updates so local_dirty has entries.
-        let mut rng = Rng::new(0xD1_D1_D1);
-        let mut obs = ObservationBatch::<u32>::with_capacity(64);
-        let mut sink = DeltaSink::<u32>::with_capacity(64);
-        for _ in 0..64 {
-            let key = pareto_key(&mut rng, &fixture.hot_keys, &fixture.warm_keys);
-            let rule_idx = pick_rule(&mut rng) as usize;
+fn bench_stream_after(c: &mut Criterion) {
+    let mut group = c.benchmark_group("stream/after");
+    let settings = Settings::default();
+    let (_, storage) = settings.validate().expect("default settings validate");
+    let rules = rules(1, "100r/s", Duration::from_secs(1), &storage);
+    let fingerprint = rules.rules()[0].fingerprint();
+    for own_cells in [20_070_u32, 79_440] {
+        let mut store = CellStore::new(storage, local_identity(), &rules);
+        let mut obs = ObservationBatch::with_capacity(1);
+        let mut sink = DeltaSink::with_capacity(1);
+        for key in 0..own_cells {
+            obs.clear();
+            sink.clear();
             obs.push(obs_row(
-                fixture.rule_fps[rule_idx],
-                KeyHash(key),
-                0,
+                fingerprint,
+                KeyHash(u128::from(key)),
+                BucketEpoch(0),
                 LOCAL_NODE,
                 LOCAL_INCARNATION,
                 1,
                 0,
             ));
+            store.ingest_local(&obs, &mut sink);
         }
-        steady.ingest_local(&obs, &mut sink);
+        let head = store.head(Stream::Own);
+        let mut out = Vec::<CellHandle>::with_capacity(QUANTUM);
+        // Cell `k` carries sequence `k`, so `draining` is a drain's second
+        // round: one quantum already sent above a rewind to 0.
+        let cases = [
+            ("steady", head - 2),
+            ("rewound", 0),
+            ("draining", QUANTUM as u64),
+        ];
+        for (case, sent) in cases {
+            store.stream_after(Stream::Own, sent, QUANTUM, &mut out);
+            group.throughput(Throughput::Elements(out.len() as u64));
+            group.bench_function(BenchmarkId::new(case, own_cells), |b| {
+                b.iter(|| {
+                    store.stream_after(Stream::Own, black_box(sent), QUANTUM, black_box(&mut out))
+                });
+            });
+        }
     }
-    group.bench_function("steady_state", |b| {
-        // fill_gossip_frame only mutates selection_marks (per-frame
-        // ephemeral) and repair_cursor (advances round-robin); over many
-        // iterations the repair cursor wraps but no identity changes ⇒
-        // iter without cloning.
-        let mut out = Vec::<CellHandle>::with_capacity(128);
-        b.iter(|| {
-            steady.fill_gossip_frame(black_box(128), black_box(&mut out));
-        });
-    });
+    group.finish();
+}
 
-    // ─── repair_only ────────────────────────────────────────────────────
-    // Dirty rings drained; frame composition is entirely the repair scan.
-    let mut repair = fixture.store.clone();
-    repair.clear_dirty();
-    group.bench_function("repair_only", |b| {
-        let mut out = Vec::<CellHandle>::with_capacity(128);
+/// `stream/merge_relay`: a gateway at `prod-peak` occupancy (20,070 live
+/// cells) merging a two-cell flagged packet from a cross-zone origin. `fresh`
+/// raises both counts and marks both cells for relay; `resend` repeats the
+/// counts, so the changed-only mark touches nothing.
+fn bench_merge_relay(c: &mut Criterion) {
+    let mut group = c.benchmark_group("stream/merge_relay");
+    let (_, storage) = Settings::default()
+        .validate()
+        .expect("default settings validate");
+    let rules = rules(1, "100r/s", Duration::from_secs(1), &storage);
+    let fingerprint = rules.rules()[0].fingerprint();
+    let mut store = CellStore::new(storage, NodeIdentity::new(peer_node(1), 1), &rules);
+    let mut obs = ObservationBatch::with_capacity(2);
+    let mut sink = DeltaSink::with_capacity(2);
+    for key in 0..20_070_u128 {
+        obs.clear();
+        sink.clear();
+        obs.push(obs_row(
+            fingerprint,
+            KeyHash(key),
+            BucketEpoch(0),
+            peer_node(2 + key as usize % 60),
+            1,
+            1,
+            0,
+        ));
+        store.merge_remote(&obs, &mut sink, RelayMark::Clear);
+    }
+    group.throughput(Throughput::Elements(2));
+    let mut count = 1;
+    group.bench_function("fresh", |b| {
         b.iter(|| {
-            repair.fill_gossip_frame(black_box(128), black_box(&mut out));
-        });
+            count += 1;
+            obs.clear();
+            sink.clear();
+            for key in [1, 2] {
+                obs.push(obs_row(
+                    fingerprint,
+                    KeyHash(key),
+                    BucketEpoch(0),
+                    LOCAL_NODE,
+                    1,
+                    count,
+                    0,
+                ));
+            }
+            store.merge_remote(black_box(&obs), black_box(&mut sink), RelayMark::All);
+        })
     });
-
+    group.bench_function("resend", |b| {
+        b.iter(|| {
+            sink.clear();
+            store.merge_remote(black_box(&obs), black_box(&mut sink), RelayMark::Changed);
+        })
+    });
     group.finish();
 }
 
@@ -1003,22 +1072,17 @@ fn bench_expire(c: &mut Criterion) {
     group.bench_function("window_turnover", |b| {
         // Build current_epoch / live_buckets such that bucket 3 is just
         // past the live window (it ages out), buckets 0..3 remain.
-        let mut current_epoch = vec![0_u32; RULE_CAPACITY as usize];
-        let mut live_buckets = vec![0_u32; RULE_CAPACITY as usize];
-        for i in 0..NUM_RULES {
-            current_epoch[i] = NUM_BUCKETS as u32; // 4
-            live_buckets[i] = (NUM_BUCKETS as u32) - 1; // 3
-        }
-        let mut sink = ExpirationSink::<u32>::with_capacity(fixture.store.capacity() as usize);
+        let mut ages = vec![RuleAge::Unused; RULE_CAPACITY as usize];
+        ages[..NUM_RULES].fill(RuleAge::Epoch {
+            current: BucketEpoch(NUM_BUCKETS as u32), // 4
+            live: (NUM_BUCKETS as u32) - 1,           // 3
+        });
+        let mut sink = ExpirationSink::with_capacity(fixture.store.capacity() as usize);
         b.iter_batched_ref(
             || fixture.store.clone(),
             |store| {
                 sink.clear();
-                store.expire(
-                    black_box(&current_epoch),
-                    black_box(&live_buckets),
-                    black_box(&mut sink),
-                );
+                store.expire(black_box(&ages), black_box(&mut sink))
             },
             BatchSize::SmallInput,
         );
@@ -1027,26 +1091,62 @@ fn bench_expire(c: &mut Criterion) {
     // ─── no_expirations ─────────────────────────────────────────────────
     // Live window covers every bucket. Pure scan cost.
     group.bench_function("no_expirations", |b| {
-        let mut current_epoch = vec![0_u32; RULE_CAPACITY as usize];
-        let mut live_buckets = vec![0_u32; RULE_CAPACITY as usize];
-        for i in 0..NUM_RULES {
-            current_epoch[i] = 0;
-            live_buckets[i] = 1000;
-        }
-        let mut sink = ExpirationSink::<u32>::with_capacity(fixture.store.capacity() as usize);
+        let mut ages = vec![RuleAge::Unused; RULE_CAPACITY as usize];
+        ages[..NUM_RULES].fill(RuleAge::Epoch {
+            current: BucketEpoch(0),
+            live: 1000,
+        });
+        let mut sink = ExpirationSink::with_capacity(fixture.store.capacity() as usize);
         b.iter_batched_ref(
             || fixture.store.clone(),
             |store| {
                 sink.clear();
-                store.expire(
-                    black_box(&current_epoch),
-                    black_box(&live_buckets),
-                    black_box(&mut sink),
-                );
+                store.expire(black_box(&ages), black_box(&mut sink))
             },
             BatchSize::SmallInput,
         );
     });
+
+    // ─── bucket_boundary ────────────────────────────────────────────────
+    // What the runtime does when a bucket ages out under load: a
+    // production-sized store holding 11 live one-second buckets of one rule,
+    // the oldest of which expires, freed in batches of the runtime's sink
+    // until `Done`. `prod_peak` frees 1,825 cells (one batch), `prod_4x`
+    // 7,222 (two).
+    for (name, cells) in [("prod_peak", 20_075_usize), ("prod_4x", 79_442)] {
+        let (_, storage) = Settings::default().validate().expect("defaults validate");
+        let table = rules(1, "1000000r/10s", Duration::from_secs(1), &storage);
+        let mut store = CellStore::new(storage, local_identity(), &table);
+        let rule = &table.rules()[0];
+        let mut obs = ObservationBatch::with_capacity(cells);
+        for i in 0..cells {
+            let bucket = BucketEpoch((i % 11) as u32);
+            obs.push(obs_row(
+                rule.fingerprint(),
+                KeyHash(i as u128),
+                bucket,
+                LOCAL_NODE,
+                LOCAL_INCARNATION,
+                1,
+                0,
+            ));
+        }
+        store.ingest_local(&obs, &mut DeltaSink::with_capacity(cells));
+        let mut sink = ExpirationSink::with_capacity(GOSSIP_EXPIRATION_BATCH);
+        group.throughput(Throughput::Elements(cells.div_ceil(11) as u64));
+        group.bench_function(BenchmarkId::new("bucket_boundary", name), |b| {
+            b.iter_batched_ref(
+                || store.clone(),
+                |store| {
+                    while store.expire_at(black_box(11_000), &mut sink) == Expiry::More {
+                        sink.clear();
+                    }
+                    sink.clear();
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
 
     group.finish();
 }
@@ -1055,17 +1155,15 @@ fn bench_expire(c: &mut Criterion) {
 // wire — gossip frame encode / decode.
 // ---------------------------------------------------------------------------
 
-fn wire_header() -> Header {
+fn wire_header() -> Header<CellPayload> {
     Header {
-        cluster_id_hash: 0xC0FE_FACE_DEAD_BEEF_1234_5678_9ABC_DEF0,
-        sender_node_id: LOCAL_NODE.0,
-        sender_incarnation: LOCAL_INCARNATION,
-        count_width: 0,
-        cell_count: 0,
-        body_len: 0,
-        min_origin_sequence: 0,
-        max_origin_sequence: 0,
-        flags: 0,
+        cluster_id_hash: 0xC0FE_FACE_DEAD_BEEF_1234_5678_9ABC_DEF0_u128
+            .try_into()
+            .expect("non-zero"),
+        sender: local_identity(),
+        sender_zone: None,
+        acks: AckInfo::default(),
+        payload: CellPayload::Sweep,
     }
 }
 
@@ -1079,23 +1177,20 @@ fn bench_wire(c: &mut Criterion) {
     // ─── encode_128 ────────────────────────────────────────────────────
     // Compose a 128-cell frame from the fixture, then encode into a
     // pre-allocated buffer. Resembles the runtime's per-tick send path.
-    let mut encode_store = fixture.store.clone();
-    let mut handles = Vec::<CellHandle>::with_capacity(128);
-    encode_store.fill_gossip_frame(128, &mut handles);
-    let handles = handles; // freeze for the closure
+    let encode_store = fixture.store.clone();
+    let handles: Vec<CellHandle> = encode_store.active_handles(0).take(128).collect();
     group.bench_function("encode_128", |b| {
         let mut scratch = WireScratch::for_store(&encode_store);
         let mut buf = PacketBuf::for_limits(limits);
         b.iter(|| {
-            let mut packets = Packets::<u32>::unauth(
+            let mut packets = Packets::new(
                 wire_header(),
                 black_box(&encode_store),
                 black_box(&handles),
                 &mut scratch,
                 limits,
-            )
-            .expect("ctor");
-            while let Some(pkt) = packets.next_into(&mut buf).expect("encode") {
+            );
+            while let Some(pkt) = packets.next_into(&mut buf) {
                 black_box(pkt);
                 black_box(buf.as_bytes());
             }
@@ -1103,31 +1198,25 @@ fn bench_wire(c: &mut Criterion) {
     });
 
     // ─── encode_multi_packet_4096 ─────────────────────────────────────
-    // 4096-cell fixture under a 64 KiB UDP-style budget. Measures the
-    // steady-state multi-packet emission rate — drains the full handle
-    // list across however many packets it takes (target ~9–10).
-    let mut multi_store = fixture.store.clone();
-    let mut multi_handles = Vec::<CellHandle>::with_capacity(4096);
-    multi_store.fill_gossip_frame(4096, &mut multi_handles);
-    let multi_handles = multi_handles;
-    let multi_limits = FrameLimits {
-        max_payload_bytes: 64 * 1024,
-        max_cells: 4096,
-    };
+    // 4096-cell fixture under the production 1,400-byte budget, at most 33
+    // cells a packet. Measures the steady-state multi-packet emission rate —
+    // drains the full handle list across however many packets it takes.
+    let multi_store = fixture.store.clone();
+    let multi_handles: Vec<CellHandle> = multi_store.active_handles(0).take(4096).collect();
+    let multi_limits = FrameLimits::new(GOSSIP_MAX_PAYLOAD_BYTES).unwrap();
     // Sanity-check the bench actually exercises the multi-packet path.
     {
         let mut scratch = WireScratch::for_store(&multi_store);
         let mut buf = PacketBuf::for_limits(multi_limits);
-        let mut packets = Packets::<u32>::unauth(
+        let mut packets = Packets::new(
             wire_header(),
             &multi_store,
             &multi_handles,
             &mut scratch,
             multi_limits,
-        )
-        .expect("ctor");
+        );
         let mut n_packets = 0;
-        while packets.next_into(&mut buf).expect("encode").is_some() {
+        while packets.next_into(&mut buf).is_some() {
             n_packets += 1;
         }
         assert!(
@@ -1141,15 +1230,14 @@ fn bench_wire(c: &mut Criterion) {
         let mut scratch = WireScratch::for_store(&multi_store);
         let mut buf = PacketBuf::for_limits(multi_limits);
         b.iter(|| {
-            let mut packets = Packets::<u32>::unauth(
+            let mut packets = Packets::new(
                 wire_header(),
                 black_box(&multi_store),
                 black_box(&multi_handles),
                 &mut scratch,
                 multi_limits,
-            )
-            .expect("ctor");
-            while let Some(pkt) = packets.next_into(&mut buf).expect("encode") {
+            );
+            while let Some(pkt) = packets.next_into(&mut buf) {
                 black_box(pkt);
                 black_box(buf.as_bytes());
             }
@@ -1161,36 +1249,163 @@ fn bench_wire(c: &mut Criterion) {
 
     // ─── decode_128 ────────────────────────────────────────────────────
     // Pre-encode one 128-cell packet, then decode it into a recycled
-    // ObservationBatch on every iteration.
+    // ObservationBatch on every iteration, as the runtime's inbound arm does.
     let mut preflight_scratch = WireScratch::for_store(&encode_store);
     let mut preflight_buf = PacketBuf::for_limits(limits);
     {
-        let mut packets = Packets::<u32>::unauth(
+        let mut packets = Packets::new(
             wire_header(),
             &encode_store,
             &handles,
             &mut preflight_scratch,
             limits,
-        )
-        .expect("preflight ctor");
-        packets
+        );
+        let cells = packets
             .next_into(&mut preflight_buf)
-            .expect("preflight encode")
             .expect("at least one packet");
-        // 128 cells fits in the default 256 KiB budget, so it's one packet.
-        assert_eq!(packets.remaining(), 0);
+        // 128 cells fits one packet at the default limits.
+        assert_eq!(cells, 128);
     }
     let frame_buf: Vec<u8> = preflight_buf.as_bytes().to_vec();
+    let cluster = wire_header().cluster_id_hash;
     group.bench_function("decode_128", |b| {
-        let mut obs = ObservationBatch::<u32>::with_capacity(128);
+        let mut obs = ObservationBatch::with_capacity(128);
         b.iter(|| {
             obs.clear();
-            let summary =
-                decode_unauth::<u32>(black_box(&frame_buf), limits, &mut obs).expect("decode");
-            black_box(summary);
+            let header = decode(black_box(&frame_buf), limits, cluster, |cell| {
+                obs.push(cell)
+            })
+            .expect("decode");
+            black_box(header);
         });
     });
 
+    group.finish();
+}
+
+// ─── aggregate ──────────────────────────────────────────────────────────
+// The table in production steady state, modelled on a measured fleet: a
+// `rate=20r/s window=10s bucket=1s` rule, about 650 distinct keys a second
+// drawn from 2,200 active over ten seconds, and the CRDT keeping 11 buckets
+// live per key, so about 7,000 live cells in a 16,384-slot table. Each
+// second the writer inserts the new bucket's cells and expires the bucket
+// that aged out. Warm-up runs two minutes of that churn first, so the table
+// holds the residue of ~80,000 cells.
+
+const AGGREGATE_SLOTS: u32 = 16_384;
+const ACTIVE_KEYS: u64 = 2_200;
+const KEYS_PER_SECOND: usize = 650;
+const AGGREGATE_LIVE_BUCKETS: u32 = 11;
+
+struct Traffic {
+    rng: u64,
+    aggregate: Aggregate,
+    rule: RuleSpec,
+    second: u32,
+    deltas: DeltaSink,
+    expirations: ExpirationSink,
+    /// The keys written in each live bucket, by `bucket % LIVE_BUCKETS`.
+    history: Vec<Vec<KeyHash>>,
+}
+
+impl Traffic {
+    fn new() -> Self {
+        let settings = Settings {
+            max_cells: AGGREGATE_SLOTS.try_into().expect("non-zero"),
+            ..Settings::default()
+        };
+        let (_, storage) = settings.validate().expect("bench settings validate");
+        let mut traffic = Self {
+            rng: 0x9E37_79B9_7F4A_7C15,
+            aggregate: Aggregate::new(&storage),
+            rule: rules(1, "200r/10s", Duration::from_secs(1), &storage).rules()[0].spec(),
+            second: AGGREGATE_LIVE_BUCKETS,
+            deltas: DeltaSink::with_capacity(KEYS_PER_SECOND),
+            expirations: ExpirationSink::with_capacity(KEYS_PER_SECOND),
+            history: vec![Vec::with_capacity(KEYS_PER_SECOND); AGGREGATE_LIVE_BUCKETS as usize],
+        };
+        for _ in 0..120 {
+            traffic.advance();
+        }
+        traffic
+    }
+
+    fn next(&mut self) -> u64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        self.rng
+    }
+
+    fn active_key(&mut self) -> KeyHash {
+        KeyHash(u128::from(self.next() % ACTIVE_KEYS) * 0x9E37_79B9_7F4A_7C15)
+    }
+
+    fn cell(&self, key_hash: KeyHash, bucket: BucketEpoch) -> CellIdentity {
+        CellIdentity {
+            rule_fingerprint: self.rule.fingerprint,
+            key_hash,
+            bucket,
+        }
+    }
+
+    /// One second: expire the bucket that aged out, record the new one.
+    fn advance(&mut self) {
+        self.second += 1;
+        let slot = (self.second % AGGREGATE_LIVE_BUCKETS) as usize;
+        let expired = self.second - AGGREGATE_LIVE_BUCKETS;
+        let mut keys = std::mem::take(&mut self.history[slot]);
+        self.deltas.clear();
+        self.expirations.clear();
+        for &key_hash in &keys {
+            let key = self.cell(key_hash, BucketEpoch(expired));
+            self.expirations.handles.push(CellHandle::default());
+            self.expirations.keys.push(key);
+            self.expirations.last_counts.push(1);
+            self.expirations.last_update_millis.push(0);
+            self.expirations.applies_locally.push(1);
+        }
+        keys.clear();
+        for _ in 0..KEYS_PER_SECOND {
+            let key_hash = self.active_key();
+            keys.push(key_hash);
+            let key = self.cell(key_hash, BucketEpoch(self.second));
+            self.deltas.handles.push(CellHandle::default());
+            self.deltas.keys.push(key);
+            self.deltas.previous.push(0);
+            self.deltas.current.push(1);
+            self.deltas.deltas.push(1);
+            self.deltas.applies_locally.push(1);
+        }
+        self.history[slot] = keys;
+        self.aggregate.apply(&self.deltas, &self.expirations);
+    }
+}
+
+fn bench_aggregate(c: &mut Criterion) {
+    let mut group = c.benchmark_group("aggregate");
+    let mut traffic = Traffic::new();
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("window_total_95_5", |b| {
+        b.iter(|| {
+            let key = if traffic.next().is_multiple_of(20) {
+                KeyHash(u128::from(traffic.next()) << 64)
+            } else {
+                traffic.active_key()
+            };
+            let now = u64::from(traffic.second) * 1_000;
+            black_box(
+                traffic
+                    .aggregate
+                    .table()
+                    .window_total(traffic.rule, key, now),
+            )
+        });
+    });
+
+    group.throughput(Throughput::Elements(2 * KEYS_PER_SECOND as u64));
+    group.bench_function("apply_one_second", |b| b.iter(|| traffic.advance()));
     group.finish();
 }
 
@@ -1200,8 +1415,10 @@ criterion_group!(
     bench_merge_remote,
     bench_find,
     bench_admission_headers,
-    bench_fill_gossip_frame,
+    bench_stream_after,
+    bench_merge_relay,
     bench_expire,
     bench_wire,
+    bench_aggregate,
 );
 criterion_main!(benches);

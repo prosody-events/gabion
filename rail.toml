@@ -54,9 +54,18 @@ scope = "repository"
 paths = [
     "crates/gabion-wasm/**",
     "crates/gabion/src/**",
+    "docs/study/dashboard/**",
+    "docs/study/data/**",
     "crates/gabion/Cargo.toml",
     "Cargo.toml",
     "Cargo.lock",
+]
+
+[plan.work.study]
+scope = "repository"
+paths = [
+    "docs/study/**",
+    "crates/gabion-wasm/web/src/tokens.css",
 ]
 
 [plan.work.nginx-asan]

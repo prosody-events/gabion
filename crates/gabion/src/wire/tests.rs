@@ -1,20 +1,25 @@
 //! End-to-end wire codec tests.
 
+use std::collections::HashSet;
+use std::num::NonZeroU128;
+
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 
 use crate::crdt::{
-    BucketEpoch, CellHandle, CellStore, CellStoreConfig, Count, DeltaSink, Incarnation, KeyHash,
-    NodeId, NodeIdentity, Observation, ObservationBatch,
+    BucketEpoch, CellHandle, CellStore, DeltaSink, KeyHash, NodeId, NodeIdentity, Observation,
+    ObservationBatch, RelayMark, Stream,
 };
+use crate::settings::mock::{rules, storage};
 
 use super::{
-    DecodeError, DecodedSummary, EncodeError, FLAG_AUTHENTICATED, FLAG_MORE, FrameLimits,
-    HEADER_LEN, Header, HmacKey, PacketBuf, Packets, WireCell, WireScratch, decode_auth,
-    decode_auth_visit, decode_unauth, decode_unauth_visit,
+    AckInfo, CellPayload, DecodeError, FrameLimits, HEADER_LEN, Header, MAGIC, MIN_PAYLOAD_BYTES,
+    PacketBuf, Packets, Payload, StreamRange, WireScratch, decode, write_header,
 };
 
 const MAX_ROWS: usize = 32;
+const CLUSTER: NonZeroU128 = NonZeroU128::new(0x1234_5678_9ABC_DEF0_1122_3344_5566_7788).unwrap();
+const FOREIGN: NonZeroU128 = NonZeroU128::new(0xC2).unwrap();
 
 #[derive(Clone, Debug)]
 struct RawRow {
@@ -51,73 +56,64 @@ impl Arbitrary for Rows {
     }
 }
 
+/// `n` rows of one rule and one origin, so a packet holds the most cells.
+fn dense_rows(n: u128) -> Vec<RawRow> {
+    (0..n)
+        .map(|i| RawRow {
+            rule_fingerprint: 0xAA,
+            key_hash: 0xBEEF + i,
+            bucket: 0,
+            origin_node_id: 0x1_0000,
+            origin_incarnation: 1,
+            count: 1,
+            last_update_millis: 1_000,
+        })
+        .collect()
+}
+
 fn local_identity() -> NodeIdentity {
     NodeIdentity::new(NodeId(0x4242), 1)
 }
 
-fn sample_header() -> Header {
+/// The header every test packet carries, as sent or as decoded.
+fn sample_header<P: From<CellPayload>>() -> Header<P> {
     Header {
-        cluster_id_hash: 0x1234_5678_9ABC_DEF0_1122_3344_5566_7788,
-        sender_node_id: 0xAAAA_BBBB_CCCC_DDDD_EEEE_FFFF_0011_2233,
-        sender_incarnation: 17,
-        count_width: 0,
-        cell_count: 0,
-        body_len: 0,
-        min_origin_sequence: 0,
-        max_origin_sequence: 0,
-        flags: 0,
+        cluster_id_hash: CLUSTER,
+        sender: NodeIdentity::new(NodeId(0xAAAA_BBBB_CCCC_DDDD_EEEE_FFFF_0011_2233), 17),
+        sender_zone: None,
+        acks: AckInfo::default(),
+        payload: CellPayload::Sweep.into(),
     }
 }
 
-fn store_with_cap<C: Count>(cells: u32, dicts: u16) -> CellStore<C> {
-    CellStore::<C>::new(
-        CellStoreConfig {
-            cell_capacity: cells.max(1),
-            rule_dictionary_capacity: dicts.max(1),
-            node_dictionary_capacity: dicts.max(1),
-            local_dirty_capacity: 128,
-            forwarded_dirty_capacity: 128,
-            peer_capacity: 64,
-        },
-        local_identity(),
-    )
+fn store_with_cap(cells: u32, dicts: u16) -> CellStore {
+    CellStore::new(storage(cells, dicts), local_identity(), &rules(dicts))
 }
 
 /// Build a store, ingest the rows as merge_remote observations (so each
 /// row's origin is its own peer), then return the store + ordered handle
 /// list.
-fn seed_store<C: Count>(
-    rows: &[RawRow],
-    to_count: impl Fn(u32) -> C,
-) -> (CellStore<C>, Vec<CellHandle>) {
+fn seed_store(rows: &[RawRow]) -> (CellStore, Vec<CellHandle>) {
     // Size dictionaries to comfortably hold every distinct identity in the
     // fixture.
-    let mut store = store_with_cap::<C>((rows.len() as u32).max(64), 256);
+    let mut store = store_with_cap((rows.len() as u32).max(64), 256);
 
-    let mut obs = ObservationBatch::<C>::with_capacity(rows.len());
-    let mut sink = DeltaSink::<C>::with_capacity(rows.len());
+    let mut obs = ObservationBatch::with_capacity(rows.len());
+    let mut sink = DeltaSink::with_capacity(rows.len());
     for r in rows {
         obs.push(Observation {
             rule_fingerprint: r.rule_fingerprint,
             key_hash: KeyHash(r.key_hash),
-            bucket: r.bucket as BucketEpoch,
+            bucket: BucketEpoch(r.bucket),
             origin: NodeId(r.origin_node_id),
-            incarnation: r.origin_incarnation as Incarnation,
-            count: to_count(r.count),
+            incarnation: r.origin_incarnation,
+            count: r.count,
             last_update_millis: r.last_update_millis,
         });
     }
-    store.merge_remote(&obs, &mut sink);
-
-    let mut handles = Vec::with_capacity(store.active_len() as usize);
-    for h in store.active_handles() {
-        handles.push(h);
-    }
+    store.merge_remote(&obs, &mut sink, RelayMark::Clear);
+    let handles = store.active_handles(0).collect();
     (store, handles)
-}
-
-fn cell_set<C: Count>(cells: &[WireCell<C>]) -> std::collections::HashSet<CellKey> {
-    cells.iter().map(CellKey::from_wire).collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -127,26 +123,24 @@ struct CellKey {
     bucket: u32,
     origin_node_id: u128,
     origin_incarnation: u32,
-    count: u64,
+    count: u32,
     last_update_millis: u64,
-    origin_sequence: u64,
 }
 
 impl CellKey {
-    fn from_wire<C: Count>(cell: &WireCell<C>) -> Self {
+    fn from_wire(cell: &Observation) -> Self {
         Self {
             rule_fingerprint: cell.rule_fingerprint,
             key_hash: cell.key_hash.0,
-            bucket: cell.bucket,
-            origin_node_id: cell.origin_node_id.0,
-            origin_incarnation: cell.origin_incarnation,
-            count: cell.count.into(),
+            bucket: cell.bucket.0,
+            origin_node_id: cell.origin.0,
+            origin_incarnation: cell.incarnation,
+            count: cell.count,
             last_update_millis: cell.last_update_millis,
-            origin_sequence: cell.origin_sequence,
         }
     }
 
-    fn from_store<C: Count>(store: &CellStore<C>, handle: CellHandle) -> Self {
+    fn from_store(store: &CellStore, handle: CellHandle) -> Self {
         let row = store.get(handle).expect("handle valid");
         let rule = store
             .rule_dictionary()
@@ -159,204 +153,120 @@ impl CellKey {
         Self {
             rule_fingerprint: rule.fingerprint,
             key_hash: row.key.key_hash.0,
-            bucket: row.key.bucket,
+            bucket: row.key.bucket.0,
             origin_node_id: node.node_id.0,
             origin_incarnation: row.key.incarnation,
-            count: row.count.into(),
+            count: row.count,
             last_update_millis: row.last_update_millis,
-            origin_sequence: row.origin_sequence,
         }
     }
 }
 
-/// Drain a `Packets` iterator into a `Vec<Vec<u8>>`, one entry per emitted
-/// packet. Test-only helper — production callers send directly from the
-/// `PacketBuf`.
-fn drain_packets<C: Count>(mut packets: Packets<'_, C>, buf: &mut PacketBuf) -> Vec<Vec<u8>> {
+/// Encode `handles` within `limits`, one entry per packet. Test-only
+/// helper — production callers send directly from the `PacketBuf`.
+fn encode(store: &CellStore, handles: &[CellHandle], limits: FrameLimits) -> Vec<Vec<u8>> {
+    let mut scratch = WireScratch::for_store(store);
+    let mut buf = PacketBuf::for_limits(limits);
+    let mut packets = Packets::new(sample_header(), store, handles, &mut scratch, limits);
     let mut out = Vec::new();
-    while packets.next_into(buf).expect("encode").is_some() {
+    while packets.next_into(&mut buf).is_some() {
         out.push(buf.as_bytes().to_vec());
     }
     out
 }
 
+fn decode_cells(frame: &[u8], limits: FrameLimits) -> Result<Vec<Observation>, DecodeError> {
+    let mut cells = Vec::new();
+    let header = decode(frame, limits, CLUSTER, |cell| cells.push(cell))?;
+    assert_eq!(header, sample_header::<Payload>());
+    Ok(cells)
+}
+
+/// The byte offset of the first cell's `rule_slot`.
+fn rule_slot_offset(frame: &[u8]) -> usize {
+    let rule_dict_len = usize::from(frame[HEADER_LEN]);
+    let node_dict_len_off = HEADER_LEN + 1 + 16 * rule_dict_len;
+    node_dict_len_off + 1 + 16 * usize::from(frame[node_dict_len_off])
+}
+
 // -- Roundtrip --------------------------------------------------------------
 
-fn run_unauth_roundtrip<C: Count>(
-    rows: &[RawRow],
-    to_count: impl Fn(u32) -> C,
-) -> Result<(), String> {
-    let (store, handles) = seed_store::<C>(rows, &to_count);
-    let mut scratch = WireScratch::for_store(&store);
+/// Every cell of a frame arrives in exactly one packet, unchanged, with the
+/// header it was sent with.
+#[quickcheck]
+fn packets_round_trip(rows: Rows) -> Result<(), String> {
+    let (store, handles) = seed_store(&rows.0);
     let limits = FrameLimits::default();
-    let mut buf = PacketBuf::for_limits(limits);
-    let packets = Packets::<C>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
-        .map_err(|e| format!("ctor: {e:?}"))?;
-    let frames = drain_packets(packets, &mut buf);
-
-    let want: std::collections::HashSet<CellKey> = handles
+    let want: HashSet<CellKey> = handles
         .iter()
         .map(|&h| CellKey::from_store(&store, h))
         .collect();
-
-    let mut got: std::collections::HashSet<CellKey> = std::collections::HashSet::new();
-    for (i, frame) in frames.iter().enumerate() {
-        let mut visited: Vec<WireCell<C>> = Vec::new();
-        let summary = decode_unauth_visit::<C>(frame, limits, |_| true, |c| visited.push(c))
-            .map_err(|e| format!("decode visit: {e:?}"))?;
-        let last = i + 1 == frames.len();
-        let more = summary.flags & FLAG_MORE != 0;
-        if last && more {
-            return Err("final packet has FLAG_MORE set".into());
-        }
-        if !last && !more {
-            return Err("non-final packet missing FLAG_MORE".into());
-        }
-        if summary.cell_count as usize != visited.len() {
-            return Err("summary cell_count vs visited mismatch".into());
-        }
-        for key in cell_set::<C>(&visited) {
-            if !got.insert(key) {
+    let mut got = HashSet::new();
+    for frame in encode(&store, &handles, limits) {
+        let cells = decode_cells(&frame, limits).map_err(|e| format!("decode: {e:?}"))?;
+        for cell in &cells {
+            if !got.insert(CellKey::from_wire(cell)) {
                 return Err("cell appeared in two packets".into());
             }
         }
     }
-
     if got != want {
-        let diff: Vec<_> = want.difference(&got).collect();
+        let missing: Vec<_> = want.difference(&got).collect();
         let extra: Vec<_> = got.difference(&want).collect();
-        return Err(format!("missing={diff:?} extra={extra:?}"));
-    }
-
-    // Allocating path: decode each frame into a shared ObservationBatch.
-    let mut obs = ObservationBatch::<C>::with_capacity(handles.len());
-    for frame in &frames {
-        decode_unauth::<C>(frame, limits, &mut obs).map_err(|e| format!("decode into: {e:?}"))?;
-    }
-    if obs.len() != handles.len() {
-        return Err(format!(
-            "allocating len mismatch {} vs {}",
-            obs.len(),
-            handles.len()
-        ));
+        return Err(format!("missing={missing:?} extra={extra:?}"));
     }
     Ok(())
 }
 
-#[quickcheck]
-fn roundtrip_unauth_u32(rows: Rows) -> bool {
-    run_unauth_roundtrip::<u32>(&rows.0, |c| c).is_ok()
-}
-
-#[quickcheck]
-fn roundtrip_unauth_u16(rows: Rows) -> bool {
-    run_unauth_roundtrip::<u16>(&rows.0, |c| (c & 0xFFFF) as u16).is_ok()
-}
-
-#[quickcheck]
-fn roundtrip_unauth_u64(rows: Rows) -> bool {
-    run_unauth_roundtrip::<u64>(&rows.0, |c| c as u64).is_ok()
-}
-
-#[quickcheck]
-fn roundtrip_auth_u32(rows: Rows, key_bytes: Vec<u8>) -> bool {
-    let mut k = [0u8; 32];
-    for (slot, src) in k.iter_mut().zip(key_bytes.iter()) {
-        *slot = *src;
-    }
-    let key = HmacKey(k);
-    let (store, handles) = seed_store::<u32>(&rows.0, |c| c);
-    let mut scratch = WireScratch::for_store(&store);
-    let limits = FrameLimits::default();
-    let mut buf = PacketBuf::for_limits(limits);
-    let packets = Packets::<u32>::auth(
-        sample_header(),
-        &store,
-        &handles,
-        &key,
-        &mut scratch,
-        limits,
-    )
-    .expect("ctor");
-    let frames = drain_packets(packets, &mut buf);
-
-    let mut obs = ObservationBatch::<u32>::with_capacity(handles.len());
-    for frame in &frames {
-        if decode_auth::<u32>(frame, &key, limits, &mut obs).is_err() {
-            return false;
-        }
-    }
-    obs.len() == handles.len()
-}
-
-#[quickcheck]
-fn tampering_rejects(rows: Rows, byte_idx: usize) -> bool {
-    if rows.0.is_empty() {
-        return true;
-    }
-    let key = HmacKey([5u8; 32]);
-    let (store, handles) = seed_store::<u32>(&rows.0, |c| c);
-    let mut scratch = WireScratch::for_store(&store);
-    let limits = FrameLimits::default();
-    let mut buf = PacketBuf::for_limits(limits);
-    let packets = Packets::<u32>::auth(
-        sample_header(),
-        &store,
-        &handles,
-        &key,
-        &mut scratch,
-        limits,
-    )
-    .expect("ctor");
-    let mut frames = drain_packets(packets, &mut buf);
-    if frames.is_empty() {
-        return true;
-    }
-    // Tamper with one byte in the first emitted packet.
-    let frame = &mut frames[0];
-    if frame.is_empty() {
-        return true;
-    }
-    let i = byte_idx % frame.len();
-    frame[i] ^= 0xA5;
-    let mut obs = ObservationBatch::<u32>::with_capacity(rows.0.len());
-    matches!(
-        decode_auth::<u32>(frame, &key, limits, &mut obs),
-        Err(DecodeError::AuthenticationFailed),
-    )
+/// Each body column sits where the wire format puts it.
+#[test]
+fn body_layout_is_pinned() {
+    let row = RawRow {
+        rule_fingerprint: 0xA1,
+        key_hash: 0xB2,
+        bucket: 0xC3,
+        origin_node_id: 0xD4,
+        origin_incarnation: 0xE5,
+        count: 0xF6,
+        last_update_millis: 0x17,
+    };
+    let (store, handles) = seed_store(&[row]);
+    let packet = encode(&store, &handles, FrameLimits::default()).remove(0);
+    let mut body = vec![1];
+    body.extend(0xA1_u128.to_le_bytes());
+    body.push(1);
+    body.extend(0xD4_u128.to_le_bytes());
+    body.push(0);
+    body.extend(0xB2_u128.to_le_bytes());
+    body.extend(0xC3_u32.to_le_bytes());
+    body.push(0);
+    body.extend(0xE5_u32.to_le_bytes());
+    body.extend(0x17_u64.to_le_bytes());
+    body.extend(0xF6_u32.to_le_bytes());
+    assert_eq!(packet[HEADER_LEN..], body);
 }
 
 // -- Multi-packet boundaries -------------------------------------------------
 
 /// Build a store with `n` distinct origin nodes (one cell each) so the
 /// 255-slot node-dict cap forces a packet split.
-fn build_many_origins(n: u32) -> (CellStore<u32>, Vec<CellHandle>) {
-    let mut store = CellStore::<u32>::new(
-        CellStoreConfig {
-            cell_capacity: n.max(1) * 2,
-            rule_dictionary_capacity: 4,
-            node_dictionary_capacity: ((n as u16) + 8).max(2),
-            local_dirty_capacity: 256,
-            forwarded_dirty_capacity: 256,
-            peer_capacity: 64,
-        },
-        local_identity(),
-    );
-    let mut obs = ObservationBatch::<u32>::with_capacity(n as usize);
-    let mut sink = DeltaSink::<u32>::with_capacity(n as usize);
+fn build_many_origins(n: u32) -> (CellStore, Vec<CellHandle>) {
+    let mut store = CellStore::new(storage(n * 2, n as u16 + 8), local_identity(), &rules(4));
+    let mut obs = ObservationBatch::with_capacity(n as usize);
+    let mut sink = DeltaSink::with_capacity(n as usize);
     for i in 0..n {
         obs.push(Observation {
             rule_fingerprint: 0xAA_u128, // single shared rule fingerprint
             key_hash: KeyHash(0xBEEF + i as u128),
-            bucket: 0,
+            bucket: BucketEpoch(0),
             origin: NodeId(0x1_0000 + i as u128), // distinct origin per row
             incarnation: 1,
             count: 1 + i,
             last_update_millis: 1_000 + i as u64,
         });
     }
-    store.merge_remote(&obs, &mut sink);
-    let handles: Vec<CellHandle> = store.active_handles().collect();
+    store.merge_remote(&obs, &mut sink, RelayMark::Clear);
+    let handles: Vec<CellHandle> = store.active_handles(0).collect();
     (store, handles)
 }
 
@@ -366,44 +276,24 @@ fn packets_split_on_intern_cap() {
     let (store, handles) = build_many_origins(n);
     assert_eq!(handles.len() as u32, n);
 
-    let mut scratch = WireScratch::for_store(&store);
-    let limits = FrameLimits {
-        max_payload_bytes: 256 * 1024,
-        max_cells: 4096,
-    };
-    let mut buf = PacketBuf::for_limits(limits);
-    let packets = Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
-        .expect("ctor");
-    let frames = drain_packets(packets, &mut buf);
+    let limits = FrameLimits::default();
+    let frames = encode(&store, &handles, limits);
     assert!(
         frames.len() >= 2,
         "expected ≥2 packets, got {}",
         frames.len()
     );
 
-    let mut total_cells = 0_u32;
-    for (i, frame) in frames.iter().enumerate() {
-        let mut cells: Vec<WireCell<u32>> = Vec::new();
-        let summary =
-            decode_unauth_visit::<u32>(frame, limits, |_| true, |c| cells.push(c)).expect("decode");
-        // Each packet must declare a node_dict with <=255 slots; reading
-        // the body re-validates this via slot-index bounds checks during
-        // the visit above, which never panicked. As a stronger structural
-        // check, peek at the dict length byte after the header.
-        let body_start = HEADER_LEN;
-        // body layout: rule_dict_len, rule_dict, node_dict_len, node_dict, ...
-        let rule_dict_len = frame[body_start] as usize;
-        let node_dict_len_off = body_start + 1 + 16 * rule_dict_len;
-        let node_dict_len = frame[node_dict_len_off] as usize;
-        assert!(node_dict_len <= 255);
-        assert!(rule_dict_len <= 255);
-
-        total_cells += cells.len() as u32;
-        let last = i + 1 == frames.len();
-        let more = summary.flags & FLAG_MORE != 0;
-        assert_eq!(more, !last, "FLAG_MORE mismatch on packet {i}");
+    let mut total_cells = 0;
+    for frame in &frames {
+        total_cells += decode_cells(frame, limits).expect("decode").len();
     }
-    assert_eq!(total_cells, n);
+    assert_eq!(total_cells, n as usize);
+    assert_eq!(
+        frames[0][HEADER_LEN + 17],
+        255,
+        "the origin dictionary's cap split the frame"
+    );
 }
 
 #[test]
@@ -412,459 +302,286 @@ fn packets_split_on_udp_budget() {
     let (store, handles) = build_many_origins(n);
     assert_eq!(handles.len() as u32, n);
 
-    // Hand-pick a budget that fits ~32 cells per packet so we get many
-    // packets. Cells contribute 42+4=46 bytes plus dict cost; for the
-    // wide-fanout fixture each cell carries a unique node id (16 B), so
-    // per-cell amortized cost is ~62 bytes once the rule slot is shared.
-    // Set a budget around 2 KiB and let the encoder choose.
-    let limits = FrameLimits {
-        max_payload_bytes: 2048,
-        max_cells: 4096,
-    };
-    let mut scratch = WireScratch::for_store(&store);
-    let mut buf = PacketBuf::for_limits(limits);
-    let packets = Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
-        .expect("ctor");
-    let frames = drain_packets(packets, &mut buf);
+    // Each cell carries a unique node id here, so it costs its 38 bytes plus
+    // 16 of dictionary; a 2 KiB budget splits the frame into many packets.
+    let limits = FrameLimits::new(2048).unwrap();
+    let frames = encode(&store, &handles, limits);
     assert!(
         frames.len() >= 2,
         "expected ≥2 packets, got {}",
         frames.len()
     );
 
-    let mut total_cells = 0_u32;
-    for (i, frame) in frames.iter().enumerate() {
+    let mut total_cells = 0;
+    for frame in &frames {
         assert!(frame.len() <= limits.max_payload_bytes);
-        let mut cells: Vec<WireCell<u32>> = Vec::new();
-        let summary =
-            decode_unauth_visit::<u32>(frame, limits, |_| true, |c| cells.push(c)).expect("decode");
-        total_cells += cells.len() as u32;
-        let last = i + 1 == frames.len();
-        let more = summary.flags & FLAG_MORE != 0;
-        assert_eq!(more, !last);
+        total_cells += decode_cells(frame, limits).expect("decode").len();
     }
-    assert_eq!(total_cells, n);
+    assert_eq!(total_cells, n as usize);
 }
 
+/// A cell costs 38 bytes, so a 1,400-byte packet holds 33 cells of one rule
+/// and one origin, and `cell_bound` says so. A packet claiming one cell
+/// more than its bytes hold fails the exact-length check.
 #[test]
-fn flag_more_unset_on_only_packet() {
-    let rows: Vec<RawRow> = (0..2)
-        .map(|i| RawRow {
-            rule_fingerprint: 0xAB + i as u128,
-            key_hash: 1 + i as u128,
-            bucket: 0,
-            origin_node_id: 0x500 + i as u128,
-            origin_incarnation: 1,
-            count: 1,
-            last_update_millis: 1000,
-        })
-        .collect();
-    let (store, handles) = seed_store::<u32>(&rows, |c| c);
-    let limits = FrameLimits::default();
+fn cell_costs_38_bytes_and_packet_holds_33() {
+    let (store, handles) = seed_store(&dense_rows(64));
+    let limits = FrameLimits::new(1400).unwrap();
     let mut scratch = WireScratch::for_store(&store);
     let mut buf = PacketBuf::for_limits(limits);
-    {
-        let mut packets =
-            Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
-                .expect("ctor");
-        let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
-        assert_eq!(pkt.flags & FLAG_MORE, 0);
-        assert_eq!(pkt.cells_emitted, handles.len() as u32);
-        assert_eq!(packets.remaining(), 0);
+    let mut packets = Packets::new(sample_header(), &store, &handles, &mut scratch, limits);
+    assert_eq!(packets.next_into(&mut buf), Some(33));
+    assert_eq!(buf.as_bytes().len(), 86 + 34 + 33 * 38);
+    // The bound steps at 120 + 38k bytes: 1,411 holds 33 cells, 1,412 holds 34.
+    for (bytes, cells) in [(1400, 33), (1411, 33), (1412, 34)] {
+        assert_eq!(FrameLimits::new(bytes).unwrap().cell_bound(), cells);
     }
+
+    let one = encode(&store, &handles[..1], limits);
+    let two = encode(&store, &handles[..2], limits);
+    assert_eq!(two[0].len() - one[0].len(), 38);
+
+    let mut padded = buf.as_bytes().to_vec();
+    padded[48..50].copy_from_slice(&34_u16.to_le_bytes());
+    padded.resize(1400, 0);
+    assert_eq!(
+        decode(&padded, limits, CLUSTER, |_| {}),
+        Err(DecodeError::BodyLength)
+    );
 }
 
-#[test]
-fn mid_batch_packet_decodes_in_isolation() {
-    // Use the high-fanout fixture so the split happens by node-dict cap.
-    let n: u32 = 300;
-    let (store, handles) = build_many_origins(n);
-    let limits = FrameLimits::default();
-    let mut scratch = WireScratch::for_store(&store);
-    let mut buf = PacketBuf::for_limits(limits);
-    let packets = Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
-        .expect("ctor");
-    let frames = drain_packets(packets, &mut buf);
-    assert!(frames.len() >= 2);
-
-    // Decode only the second packet — it must be fully usable on its own.
-    let frame = &frames[1];
-    let mut obs = ObservationBatch::<u32>::with_capacity(n as usize);
-    let summary = decode_unauth::<u32>(frame, limits, &mut obs).expect("isolated decode ok");
-    assert!(summary.cell_count > 0);
-    assert_eq!(obs.len(), summary.cell_count as usize);
-}
-
+/// An out-of-range slot drops the packet before any of its cells is handed
+/// over, wherever the slot sits.
 #[test]
 fn decoder_rejects_bad_slot() {
-    let rows: Vec<RawRow> = (0..3)
-        .map(|i| RawRow {
-            rule_fingerprint: 0x1234,
-            key_hash: i as u128,
-            bucket: 0,
-            origin_node_id: 0x7777,
-            origin_incarnation: 1,
-            count: 1,
-            last_update_millis: 100,
-        })
-        .collect();
-    let (store, handles) = seed_store::<u32>(&rows, |c| c);
+    let (store, handles) = seed_store(&dense_rows(3));
     let limits = FrameLimits::default();
-    let mut scratch = WireScratch::for_store(&store);
-    let mut buf = PacketBuf::for_limits(limits);
-    {
-        let mut packets =
-            Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
-                .expect("ctor");
-        packets.next_into(&mut buf).expect("encode").expect("some");
-        assert_eq!(packets.remaining(), 0);
+    let frame = encode(&store, &handles, limits).remove(0);
+    let offset = rule_slot_offset(&frame);
+    let node_dict_len = frame[HEADER_LEN + 1 + 16 * usize::from(frame[HEADER_LEN])];
+    // The first cell's rule_slot set to R; the last cell's node_slot set to D.
+    for (at, slot) in [
+        (offset, frame[HEADER_LEN]),
+        (offset + 21 * 3 + 2, node_dict_len),
+    ] {
+        let mut bad = frame.clone();
+        bad[at] = slot;
+        let mut seen = 0;
+        assert_eq!(
+            decode(&bad, limits, CLUSTER, |_| seen += 1),
+            Err(DecodeError::BadSlot)
+        );
+        assert_eq!(seen, 0, "no cell is handed over before the error");
     }
-    let mut frame = buf.as_bytes().to_vec();
-
-    // Reach the rule_slot column. Body starts at HEADER_LEN; layout is:
-    // [rule_dict_len][rule_dict_bytes][node_dict_len][node_dict_bytes][rule_slot×N]...
-    let body_start = HEADER_LEN;
-    let rule_dict_len = frame[body_start] as usize;
-    let node_dict_len_off = body_start + 1 + 16 * rule_dict_len;
-    let node_dict_len = frame[node_dict_len_off] as usize;
-    let rule_slot_off = node_dict_len_off + 1 + 16 * node_dict_len;
-    // Set first cell's rule_slot to R (out of range).
-    frame[rule_slot_off] = rule_dict_len as u8;
-
-    let mut obs = ObservationBatch::<u32>::with_capacity(rows.len());
-    let err = decode_unauth::<u32>(&frame, limits, &mut obs).unwrap_err();
-    assert_eq!(err, DecodeError::BadSlot);
 }
 
 #[test]
 fn decoder_rejects_truncated_dict() {
-    let rows: Vec<RawRow> = (0..2)
-        .map(|i| RawRow {
-            rule_fingerprint: 0x9999,
-            key_hash: i as u128,
-            bucket: 0,
-            origin_node_id: 0x1234,
-            origin_incarnation: 1,
-            count: 1,
-            last_update_millis: 100,
-        })
-        .collect();
-    let (store, handles) = seed_store::<u32>(&rows, |c| c);
+    let (store, handles) = seed_store(&dense_rows(2));
     let limits = FrameLimits::default();
-    let mut scratch = WireScratch::for_store(&store);
-    let mut buf = PacketBuf::for_limits(limits);
-    {
-        let mut packets =
-            Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
-                .expect("ctor");
-        packets.next_into(&mut buf).expect("encode").expect("some");
-        assert_eq!(packets.remaining(), 0);
-    }
-    let mut frame = buf.as_bytes().to_vec();
-    // Drop one byte from the dict region — header.body_len now disagrees
-    // with the actual length.
-    let drop_at = HEADER_LEN + 2; // middle of rule_dict
-    frame.remove(drop_at);
-    // Patch body_len in the header to match actual length so the outer
-    // total-required check passes; the inner dict slicing will fail.
-    let new_body_len = (frame.len() - HEADER_LEN) as u32;
-    frame[52..56].copy_from_slice(&new_body_len.to_le_bytes());
-
-    let mut obs = ObservationBatch::<u32>::with_capacity(rows.len());
-    let err = decode_unauth::<u32>(&frame, limits, &mut obs).unwrap_err();
-    assert_eq!(err, DecodeError::BodyLenMismatch);
+    let mut frame = encode(&store, &handles, limits).remove(0);
+    // Drop one byte from the middle of the rule dictionary.
+    frame.remove(HEADER_LEN + 2);
+    assert_eq!(
+        decode(&frame, limits, CLUSTER, |_| {}),
+        Err(DecodeError::BodyLength)
+    );
 }
 
+// -- Decode order -----------------------------------------------------------
+
+/// Each row breaks two checks; the decoder reports the earlier one.
 #[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "Packets dropped with")]
-fn packets_drop_undrained_panics_in_debug() {
-    let rows: Vec<RawRow> = (0..4)
-        .map(|i| RawRow {
-            rule_fingerprint: 0xAA,
-            key_hash: i as u128,
-            bucket: 0,
-            origin_node_id: 0xBB,
-            origin_incarnation: 1,
-            count: 1,
-            last_update_millis: 0,
-        })
-        .collect();
-    let (store, handles) = seed_store::<u32>(&rows, |c| c);
+fn decode_checks_run_in_order() {
+    let foreign = |cells| {
+        write_header(
+            &Header {
+                cluster_id_hash: FOREIGN,
+                ..sample_header::<CellPayload>()
+            },
+            cells,
+        )
+        .to_vec()
+    };
+    let set = |mut bytes: Vec<u8>, at: usize, value: &[u8]| {
+        bytes[at..at + value.len()].copy_from_slice(value);
+        bytes
+    };
+    let version_1 = 1_u16.to_le_bytes();
+    let (store, handles) = seed_store(&dense_rows(1));
+    let mut bad_slot_and_trailing = encode(&store, &handles, FrameLimits::default()).remove(0);
+    let offset = rule_slot_offset(&bad_slot_and_trailing);
+    bad_slot_and_trailing[offset] = 1;
+    bad_slot_and_trailing.push(0);
+
     let limits = FrameLimits::default();
-    let mut scratch = WireScratch::for_store(&store);
-    let _packets = Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
-        .expect("ctor");
-    // Drop without calling next_into — Drop's debug-assert must fire.
+    let rows: [(&str, FrameLimits, Vec<u8>, DecodeError); 9] = [
+        (
+            "too large and bad magic",
+            FrameLimits::new(MIN_PAYLOAD_BYTES).unwrap(),
+            vec![0; MIN_PAYLOAD_BYTES + 1],
+            DecodeError::PayloadTooLarge,
+        ),
+        (
+            "too short and bad magic",
+            limits,
+            vec![0; 10],
+            DecodeError::TooShort,
+        ),
+        (
+            "bad magic and version 1",
+            limits,
+            set(set(foreign(0), 0, &[0; 4]), 4, &version_1),
+            DecodeError::BadMagic,
+        ),
+        (
+            "version 1 and kind 9",
+            limits,
+            set(set(foreign(0), 6, &[9]), 4, &version_1),
+            DecodeError::BadVersion { found: 1 },
+        ),
+        (
+            "kind 7 and foreign cluster",
+            limits,
+            set(foreign(0), 6, &[7]),
+            DecodeError::BadKind,
+        ),
+        (
+            "reserved flag and foreign cluster",
+            limits,
+            set(foreign(0), 7, &[0x80]),
+            DecodeError::BadFlags,
+        ),
+        (
+            "ranged sweep and foreign cluster",
+            limits,
+            set(foreign(0), 70, &1_u64.to_le_bytes()),
+            DecodeError::BadRange,
+        ),
+        (
+            "foreign cluster and a missing body",
+            limits,
+            foreign(1),
+            DecodeError::ForeignCluster {
+                found: FOREIGN.get(),
+            },
+        ),
+        (
+            "trailing byte and bad slot",
+            limits,
+            bad_slot_and_trailing,
+            DecodeError::BodyLength,
+        ),
+    ];
+    for (name, limits, bytes, expected) in rows {
+        assert_eq!(
+            decode(&bytes, limits, CLUSTER, |_| {}),
+            Err(expected),
+            "{name}"
+        );
+    }
+}
+
+/// A version 1 packet is reported as another version, not as garbage.
+#[test]
+fn v1_packet_is_bad_version_not_garbage() {
+    let mut packet = Vec::with_capacity(152);
+    packet.extend_from_slice(&MAGIC.to_le_bytes());
+    packet.extend_from_slice(&1_u16.to_le_bytes()); // version
+    packet.extend_from_slice(&0_u16.to_le_bytes()); // flags
+    packet.extend_from_slice(&CLUSTER.get().to_le_bytes());
+    packet.extend_from_slice(&0xAAAA_u128.to_le_bytes()); // sender node id
+    packet.extend_from_slice(&7_u32.to_le_bytes()); // sender incarnation
+    packet.extend_from_slice(&4_u32.to_le_bytes()); // count width
+    packet.extend_from_slice(&1_u32.to_le_bytes()); // cell count
+    packet.extend_from_slice(&80_u32.to_le_bytes()); // body length
+    packet.extend_from_slice(&[0; 16]); // min and max origin sequence
+    packet.push(1); // one rule
+    packet.extend_from_slice(&0xAA_u128.to_le_bytes());
+    packet.push(1); // one origin
+    packet.extend_from_slice(&0xAAAA_u128.to_le_bytes());
+    packet.resize(152, 0); // one 46-byte cell
+    assert_eq!(
+        decode(&packet, FrameLimits::default(), CLUSTER, |_| {}),
+        Err(DecodeError::BadVersion { found: 1 })
+    );
 }
 
 // -- Outer guardrails -------------------------------------------------------
 
 #[test]
-fn budget_too_small_rejected_at_constructor() {
-    let rows: Vec<RawRow> = vec![RawRow {
-        rule_fingerprint: 1,
-        key_hash: 2,
-        bucket: 0,
-        origin_node_id: 3,
-        origin_incarnation: 1,
-        count: 4,
-        last_update_millis: 5,
-    }];
-    let (store, handles) = seed_store::<u32>(&rows, |c| c);
-    let mut scratch = WireScratch::for_store(&store);
-    let limits = FrameLimits {
-        max_payload_bytes: HEADER_LEN, // no room for body
-        max_cells: 4,
-    };
-    match Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits) {
-        Err(EncodeError::BudgetTooSmall) => {}
-        Ok(_) => panic!("expected BudgetTooSmall"),
-    }
-}
-
-#[test]
 fn empty_handles_emits_zero_packets() {
-    let store = store_with_cap::<u32>(8, 8);
-    let mut scratch = WireScratch::for_store(&store);
-    let limits = FrameLimits::default();
-    let mut buf = PacketBuf::for_limits(limits);
-    let mut packets =
-        Packets::<u32>::unauth(sample_header(), &store, &[], &mut scratch, limits).expect("ctor");
-    assert!(packets.next_into(&mut buf).expect("encode").is_none());
+    let store = store_with_cap(8, 8);
+    assert!(encode(&store, &[], FrameLimits::default()).is_empty());
 }
 
+/// An own-stream frame's packets tile its range: the first starts at the
+/// frame's lower end, each starts where the one before ended and ends just
+/// below the next packet's first cell, and the last ends at the frame's upper
+/// end, so a lost packet leaves a gap the receiver sees. A stale handle at a
+/// packet's end closes nothing past the packet, and every packet carries the
+/// frame's flags.
 #[test]
-fn count_width_mismatch_is_rejected() {
-    let rows = vec![RawRow {
-        rule_fingerprint: 0xAB,
-        key_hash: 0xCD,
-        bucket: 0,
-        origin_node_id: 0xE0,
-        origin_incarnation: 1,
-        count: 7,
-        last_update_millis: 99,
-    }];
-    let (store, handles) = seed_store::<u32>(&rows, |c| c);
-    let limits = FrameLimits::default();
-    let mut scratch = WireScratch::for_store(&store);
-    let mut buf = PacketBuf::for_limits(limits);
-    {
-        let mut packets =
-            Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
-                .expect("ctor");
-        packets.next_into(&mut buf).expect("encode").expect("some");
-        assert_eq!(packets.remaining(), 0);
-    }
-    let mut obs = ObservationBatch::<u64>::with_capacity(1);
-    let err = decode_unauth::<u64>(buf.as_bytes(), limits, &mut obs).unwrap_err();
-    assert_eq!(err, DecodeError::BadCountWidth);
-}
-
-#[test]
-fn visitor_accept_header_short_circuit() {
-    let rows = vec![RawRow {
-        rule_fingerprint: 1,
-        key_hash: 2,
-        bucket: 0,
-        origin_node_id: 3,
-        origin_incarnation: 1,
-        count: 4,
-        last_update_millis: 5,
-    }];
-    let (store, handles) = seed_store::<u32>(&rows, |c| c);
-    let limits = FrameLimits::default();
-    let mut scratch = WireScratch::for_store(&store);
-    let mut buf = PacketBuf::for_limits(limits);
-    {
-        let mut packets =
-            Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
-                .expect("ctor");
-        let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
-        assert_eq!(pkt.cells_emitted, 1);
-        assert_eq!(packets.remaining(), 0);
-    }
-    let mut visited = 0_usize;
-    let _summary: DecodedSummary =
-        decode_unauth_visit::<u32>(buf.as_bytes(), limits, |_h| false, |_c| visited += 1)
-            .expect("decode");
-    assert_eq!(visited, 0);
-}
-
-#[test]
-fn frame_too_short_reported() {
-    let mut obs = ObservationBatch::<u32>::with_capacity(0);
-    let limits = FrameLimits::default();
-    let err = decode_unauth::<u32>(&[0u8; HEADER_LEN - 1], limits, &mut obs).unwrap_err();
-    assert_eq!(err, DecodeError::TooShort);
-}
-
-#[test]
-fn frame_too_large_reported() {
-    let limits = FrameLimits {
-        max_payload_bytes: 16,
-        max_cells: 4,
-    };
-    let mut obs = ObservationBatch::<u32>::with_capacity(0);
-    let err = decode_unauth::<u32>(&[0u8; 128], limits, &mut obs).unwrap_err();
-    assert_eq!(err, DecodeError::PayloadTooLarge);
-}
-
-#[test]
-fn body_len_mismatch_reported() {
-    let rows = vec![RawRow {
-        rule_fingerprint: 1,
-        key_hash: 2,
-        bucket: 0,
-        origin_node_id: 3,
-        origin_incarnation: 1,
-        count: 4,
-        last_update_millis: 5,
-    }];
-    let (store, handles) = seed_store::<u32>(&rows, |c| c);
-    let limits = FrameLimits::default();
-    let mut scratch = WireScratch::for_store(&store);
-    let mut buf = PacketBuf::for_limits(limits);
-    {
-        let mut packets =
-            Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
-                .expect("ctor");
-        packets.next_into(&mut buf).expect("encode").expect("some");
-        assert_eq!(packets.remaining(), 0);
-    }
-    let mut frame = buf.as_bytes().to_vec();
-    frame.pop();
-    let mut obs = ObservationBatch::<u32>::with_capacity(0);
-    let err = decode_unauth::<u32>(&frame, limits, &mut obs).unwrap_err();
-    assert!(matches!(
-        err,
-        DecodeError::BodyLenMismatch | DecodeError::Trailing
-    ));
-}
-
-#[test]
-fn header_flags_track_auth() {
-    let rows: Vec<RawRow> = (0..2)
-        .map(|i| RawRow {
-            rule_fingerprint: 0xAABB ^ i as u128,
-            key_hash: 1 + i as u128,
-            bucket: 0,
-            origin_node_id: 0x500 + i as u128,
-            origin_incarnation: 1,
+fn own_frame_packets_tile_its_range() {
+    let mut store = store_with_cap(128, 8);
+    let mut obs = ObservationBatch::with_capacity(70);
+    for key in 0..70 {
+        obs.push(Observation {
+            rule_fingerprint: 0xAA,
+            key_hash: KeyHash(key),
+            bucket: BucketEpoch(0),
+            origin: NodeId(0),
+            incarnation: 0,
             count: 1,
-            last_update_millis: 1000,
-        })
-        .collect();
-    let (store, handles) = seed_store::<u32>(&rows, |c| c);
-    let key = HmacKey([3u8; 32]);
-    let limits = FrameLimits::default();
-    let mut scratch = WireScratch::for_store(&store);
-    let mut buf = PacketBuf::for_limits(limits);
-    {
-        let mut packets = Packets::<u32>::auth(
-            sample_header(),
-            &store,
-            &handles,
-            &key,
-            &mut scratch,
-            limits,
-        )
-        .expect("ctor");
-        let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
-        assert_eq!(pkt.flags & FLAG_AUTHENTICATED, FLAG_AUTHENTICATED);
-        assert_eq!(pkt.flags & FLAG_MORE, 0);
-        assert_eq!(packets.remaining(), 0);
+            last_update_millis: 1_000,
+        });
     }
-
-    let mut obs = ObservationBatch::<u32>::with_capacity(2);
-    let summary = decode_auth::<u32>(buf.as_bytes(), &key, limits, &mut obs).expect("decode");
-    assert_eq!(
-        summary.header.flags & FLAG_AUTHENTICATED,
-        FLAG_AUTHENTICATED
+    store.ingest_local(&obs, &mut DeltaSink::with_capacity(70));
+    let mut handles = Vec::with_capacity(71);
+    store.stream_after(Stream::Own, 0, 70, &mut handles);
+    // A stale twin of the fifth cell, just after the first packet's four.
+    handles.insert(
+        4,
+        CellHandle {
+            generation: handles[4].generation.wrapping_add(1),
+            ..handles[4]
+        },
     );
-    assert_eq!(summary.flags & FLAG_MORE, 0);
-}
-
-#[test]
-fn auth_visit_works() {
-    let key = HmacKey([9u8; 32]);
-    let rows: Vec<RawRow> = (0..3)
-        .map(|i| RawRow {
-            rule_fingerprint: i as u128,
-            key_hash: (i as u128) + 1,
-            bucket: i,
-            origin_node_id: 0x500 + i as u128,
-            origin_incarnation: 1,
-            count: 1 + i,
-            last_update_millis: 1234,
-        })
-        .collect();
-    let (store, handles) = seed_store::<u32>(&rows, |c| c);
-    let limits = FrameLimits::default();
+    // Four cells a packet: the header, both dictionaries and four cells.
+    let limits = FrameLimits::new(HEADER_LEN + 2 + 32 + 4 * 38).unwrap();
+    let header = Header {
+        payload: CellPayload::Own {
+            range: StreamRange::new(0, 80).unwrap(),
+            relay_into_zone: true,
+            probe: true,
+        },
+        ..sample_header::<CellPayload>()
+    };
     let mut scratch = WireScratch::for_store(&store);
+    let mut packets = Packets::new(header, &store, &handles, &mut scratch, limits);
     let mut buf = PacketBuf::for_limits(limits);
-    {
-        let mut packets = Packets::<u32>::auth(
-            sample_header(),
-            &store,
-            &handles,
-            &key,
-            &mut scratch,
-            limits,
-        )
-        .expect("ctor");
-        packets.next_into(&mut buf).expect("encode").expect("some");
-        assert_eq!(packets.remaining(), 0);
-    }
-
-    let mut count = 0_usize;
-    let summary =
-        decode_auth_visit::<u32>(buf.as_bytes(), &key, limits, |_h| true, |_c| count += 1)
-            .expect("decode");
-    assert_eq!(count, summary.cell_count as usize);
-    assert_eq!(count, rows.len());
-}
-
-#[test]
-fn visitor_matches_allocating_for_curated_rows() {
-    let rows: Vec<RawRow> = (0..5)
-        .map(|i| RawRow {
-            rule_fingerprint: 100 + i as u128,
-            key_hash: 200 + i as u128,
-            bucket: i,
-            origin_node_id: 0x1000 + i as u128,
-            origin_incarnation: 1,
-            count: 7 + i,
-            last_update_millis: 9000 + i as u64,
+    let mut lower = 0;
+    let mut sent = 0;
+    while packets.next_into(&mut buf).is_some() {
+        let mut last_key = 0;
+        let decoded = decode(buf.as_bytes(), limits, CLUSTER, |cell| {
+            last_key = cell.key_hash.0 as u64;
+            sent += 1;
         })
-        .collect();
-    let (store, handles) = seed_store::<u32>(&rows, |c| c);
-    let limits = FrameLimits::default();
-    let mut scratch = WireScratch::for_store(&store);
-    let mut buf = PacketBuf::for_limits(limits);
-    {
-        let mut packets =
-            Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
-                .expect("ctor");
-        packets.next_into(&mut buf).expect("encode").expect("some");
-        assert_eq!(packets.remaining(), 0);
+        .unwrap();
+        let Payload::Cells(CellPayload::Own {
+            range,
+            relay_into_zone: true,
+            probe: true,
+        }) = decoded.payload
+        else {
+            panic!("an own frame's packets carry its flags: {decoded:?}");
+        };
+        assert_eq!(range.lower(), lower);
+        // Key `k` was the (k + 1)th cell issued.
+        let expected = if sent == 70 { 80 } else { last_key + 1 };
+        assert_eq!(range.upper(), expected);
+        lower = range.upper();
     }
-
-    let mut visited: Vec<WireCell<u32>> = Vec::new();
-    decode_unauth_visit::<u32>(buf.as_bytes(), limits, |_h| true, |c| visited.push(c))
-        .expect("decode");
-
-    let mut obs = ObservationBatch::<u32>::with_capacity(5);
-    decode_unauth::<u32>(buf.as_bytes(), limits, &mut obs).expect("decode");
-
-    assert_eq!(visited.len(), obs.len());
-    for (i, cell) in visited.iter().enumerate() {
-        assert_eq!(cell.rule_fingerprint, obs.rule_fingerprints[i]);
-        assert_eq!(cell.key_hash, obs.key_hashes[i]);
-        assert_eq!(cell.bucket, obs.buckets[i]);
-        assert_eq!(cell.origin_node_id, obs.origin_node_ids[i]);
-        assert_eq!(cell.origin_incarnation, obs.incarnations[i]);
-        assert_eq!(cell.count, obs.counts[i]);
-        assert_eq!(cell.last_update_millis, obs.last_update_millis[i]);
-    }
+    assert_eq!((sent, lower, packets.closed_through()), (70, 80, 80));
 }

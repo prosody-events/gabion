@@ -1,12 +1,18 @@
 use super::*;
 
+const SECOND: NonZeroU64 = NonZeroU64::new(1_000).unwrap();
+
+fn live(buckets: u32) -> NonZeroU32 {
+    NonZeroU32::new(buckets).unwrap()
+}
+
 /// Build a closure backed by an inline `(bucket, count)` table. Returns
-/// `0` for any bucket not listed — matches the SHM/DashMap "no row" case.
-fn counts_from(table: &[(BucketEpoch, u64)]) -> impl Fn(BucketEpoch) -> u64 + '_ {
+/// `0` for any bucket not listed — matches the aggregate table's "no row" case.
+fn counts_from(table: &[(u32, u64)]) -> impl Fn(BucketEpoch) -> u64 + '_ {
     move |bucket| {
         table
             .iter()
-            .find_map(|(b, c)| if *b == bucket { Some(*c) } else { None })
+            .find_map(|(b, c)| if *b == bucket.0 { Some(*c) } else { None })
             .unwrap_or(0)
     }
 }
@@ -14,7 +20,7 @@ fn counts_from(table: &[(BucketEpoch, u64)]) -> impl Fn(BucketEpoch) -> u64 + '_
 #[test]
 fn already_admittable_returns_zero() {
     // total + hits <= limit: no waiting needed.
-    let delta = time_until_admit_millis(10_000, 1_000, 5, 10, 5, 3, counts_from(&[(6, 5)]));
+    let delta = time_until_admit_millis(10_000, SECOND, live(5), 10, 5, 3, counts_from(&[(6, 5)]));
     assert_eq!(delta, 0);
 }
 
@@ -23,7 +29,7 @@ fn single_bucket_window_falls_off_at_end_of_current() {
     // live_buckets = 1: equivalent to a fixed window.
     // current = now / bm = 500 / 1000 = 0. Bucket 0 falls off at
     // (0 + 1) * 1000 = 1000 ms; delta from now (500) is 500.
-    let delta = time_until_admit_millis(500, 1_000, 1, 10, 10, 1, counts_from(&[(0, 10)]));
+    let delta = time_until_admit_millis(500, SECOND, live(1), 10, 10, 1, counts_from(&[(0, 10)]));
     assert_eq!(delta, 500);
 }
 
@@ -34,8 +40,8 @@ fn oldest_bucket_alone_covers_need() {
     // fall-off: (6+5)*1000 - 10000 = 1000.
     let delta = time_until_admit_millis(
         10_000,
-        1_000,
-        5,
+        SECOND,
+        live(5),
         20,
         30,
         1,
@@ -50,8 +56,8 @@ fn empty_oldest_skips_to_next_non_empty() {
     // which alone covers need=11. Delta = (7+5)*1000 - 10000 = 2000.
     let delta = time_until_admit_millis(
         10_000,
-        1_000,
-        5,
+        SECOND,
+        live(5),
         20,
         30,
         1,
@@ -66,8 +72,8 @@ fn need_accumulates_across_multiple_buckets() {
     // after aging both 6 and 7 off. Delta = (7+5)*1000 - 10000 = 2000.
     let delta = time_until_admit_millis(
         10_000,
-        1_000,
-        5,
+        SECOND,
+        live(5),
         20,
         25,
         1,
@@ -82,8 +88,8 @@ fn multi_hit_request_needs_more_aged_off() {
     // (bucket 6) has 4, which alone covers it.
     let delta = time_until_admit_millis(
         10_000,
-        1_000,
-        5,
+        SECOND,
+        live(5),
         20,
         18,
         5,
@@ -100,8 +106,8 @@ fn saturated_walk_falls_back_to_full_window() {
     // bound (live * bm = 5 * 1000 = 5000) from `now`.
     let delta = time_until_admit_millis(
         10_000,
-        1_000,
-        5,
+        SECOND,
+        live(5),
         10,
         30,
         1,
@@ -115,7 +121,7 @@ fn limit_zero_returns_full_window_fallback() {
     // limit=0 means no request can ever be admitted from current state;
     // every bucket is empty so aged_off stays at 0 and we fall back to
     // the full-window upper bound.
-    let delta = time_until_admit_millis(10_000, 1_000, 5, 0, 0, 1, counts_from(&[]));
+    let delta = time_until_admit_millis(10_000, SECOND, live(5), 0, 0, 1, counts_from(&[]));
     assert_eq!(delta, 5_000);
 }
 
@@ -123,7 +129,8 @@ fn limit_zero_returns_full_window_fallback() {
 fn now_off_bucket_boundary_subtracts_exactly() {
     // now=10_500 -> current=10, window=[6..10]. Oldest covers need.
     // Delta = (6+5)*1000 - 10_500 = 500 (not rounded to 1000).
-    let delta = time_until_admit_millis(10_500, 1_000, 5, 10, 20, 1, counts_from(&[(6, 20)]));
+    let delta =
+        time_until_admit_millis(10_500, SECOND, live(5), 10, 20, 1, counts_from(&[(6, 20)]));
     assert_eq!(delta, 500);
 }
 
@@ -152,29 +159,39 @@ fn reset_anchors_on_now_seconds_plus_retry_after() {
 }
 
 #[test]
-fn limit_remaining_saturates_at_zero() {
-    assert_eq!(limit_remaining(10, 4), 6);
-    assert_eq!(limit_remaining(10, 10), 0);
-    assert_eq!(limit_remaining(10, 25), 0);
-}
-
-#[test]
 fn next_bucket_boundary_is_full_bucket_at_boundary() {
     // now exactly on the boundary -> a full bucket until the next one.
-    assert_eq!(time_until_next_bucket_boundary_millis(0, 1_000), 1_000);
-    assert_eq!(time_until_next_bucket_boundary_millis(10_000, 1_000), 1_000);
+    assert_eq!(time_until_next_bucket_boundary_millis(0, SECOND), 1_000);
+    assert_eq!(
+        time_until_next_bucket_boundary_millis(10_000, SECOND),
+        1_000
+    );
 }
 
 #[test]
 fn next_bucket_boundary_off_boundary_subtracts_remainder() {
     // 500ms into a 1000ms bucket leaves 500ms.
-    assert_eq!(time_until_next_bucket_boundary_millis(500, 1_000), 500);
+    assert_eq!(time_until_next_bucket_boundary_millis(500, SECOND), 500);
     // 1_234ms into a 250ms bucket: 234 % 250 = 234 -> 16ms left.
-    assert_eq!(time_until_next_bucket_boundary_millis(1_234, 250), 16);
+    assert_eq!(
+        time_until_next_bucket_boundary_millis(1_234, NonZeroU64::new(250).unwrap()),
+        16
+    );
 }
 
+/// The walk runs on unwrapped buckets and only the lookup wraps, so a
+/// window straddling the u32 epoch wrap finds its counts and fall-off.
 #[test]
-fn next_bucket_boundary_handles_zero_bucket() {
-    // Defensive: treat 0 as 1ms (same convention as time_until_admit_millis).
-    assert_eq!(time_until_next_bucket_boundary_millis(10, 0), 1);
+fn window_straddling_the_epoch_wrap_finds_its_counts() {
+    let ms = NonZeroU64::new(1).unwrap();
+    let delta = time_until_admit_millis(
+        (1 << 32) + 1,
+        ms,
+        live(3),
+        10,
+        10,
+        1,
+        counts_from(&[(0, 10)]),
+    );
+    assert_eq!(delta, 2);
 }

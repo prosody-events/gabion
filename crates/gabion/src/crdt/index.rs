@@ -22,10 +22,9 @@ impl CellIndex {
     /// Construct an index with `capacity` buckets. `capacity` must be a power
     /// of two greater than zero.
     pub fn with_capacity(capacity: u32) -> Self {
-        assert!(capacity > 0, "CellIndex capacity must be > 0");
-        assert!(
+        debug_assert!(
             capacity.is_power_of_two(),
-            "CellIndex capacity must be power of two"
+            "CellIndex capacity must be a power of two"
         );
         Self {
             slot_indexes: vec![EMPTY_INDEX_SLOT; capacity as usize].into_boxed_slice(),
@@ -34,18 +33,6 @@ impl CellIndex {
             capacity,
             mask: capacity - 1,
         }
-    }
-
-    pub fn capacity(&self) -> u32 {
-        self.capacity
-    }
-
-    pub fn len(&self) -> u32 {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 
     #[inline(always)]
@@ -86,8 +73,8 @@ impl CellIndex {
     /// Insert `(hash, slot_index)`. Caller must have already verified that
     /// the entry is not already present.
     pub fn insert_unchecked(&mut self, hash: u64, slot_index: u32) {
-        assert!(slot_index != EMPTY_INDEX_SLOT, "slot index reserved");
-        assert!(self.len < self.capacity, "CellIndex full");
+        debug_assert!(slot_index != EMPTY_INDEX_SLOT, "slot index reserved");
+        debug_assert!(self.len < self.capacity, "CellIndex full");
         let mut slot = (hash as u32) & self.mask;
         let mut cur_hash = hash;
         let mut cur_slot_idx = slot_index;
@@ -165,28 +152,9 @@ impl CellIndex {
             slot = next;
         }
     }
-
-    pub fn clear(&mut self) {
-        self.slot_indexes
-            .iter_mut()
-            .for_each(|s| *s = EMPTY_INDEX_SLOT);
-        self.hashes.iter_mut().for_each(|h| *h = 0);
-        self.len = 0;
-    }
-
-    /// Maximum probe distance currently in use. O(capacity).
-    pub fn max_probe_distance(&self) -> u32 {
-        let mut max = 0_u32;
-        for slot in 0..self.capacity {
-            let stored = self.slot_indexes[slot as usize];
-            if stored == EMPTY_INDEX_SLOT {
-                continue;
-            }
-            let d = self.probe_distance(slot, self.hashes[slot as usize]);
-            if d > max {
-                max = d;
-            }
-        }
-        max
-    }
 }
+
+#[cfg(test)]
+mod mock;
+#[cfg(test)]
+mod tests;

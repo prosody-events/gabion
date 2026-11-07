@@ -13,9 +13,10 @@
 //! `need = total + hits - limit`.
 //!
 //! All math is allocation-free and saturating; the helpers are pure
-//! functions over caller-supplied closures so both the nginx seqlocked SHM
-//! table and the server's DashMap reader can feed them without forcing
-//! materialisation of every bucket's count.
+//! functions over caller-supplied closures so the shared aggregate table can
+//! feed them without materialising every bucket's count.
+
+use std::num::{NonZeroU32, NonZeroU64};
 
 use crate::crdt::BucketEpoch;
 
@@ -27,11 +28,11 @@ use crate::crdt::BucketEpoch;
 /// buckets in `[current - live_buckets + 1, current]`.
 ///
 /// Returns `0` if a request would already be admitted (defensive — callers
-/// already gate on `total + hits > limit`).
+/// already gate on [`RuleSpec::admits`](crate::rules::RuleSpec::admits)).
 pub fn time_until_admit_millis<F>(
     now_millis: u64,
-    bucket_millis: u64,
-    live_buckets: u32,
+    bucket_millis: NonZeroU64,
+    live_buckets: NonZeroU32,
     limit: u64,
     total: u64,
     hits: u64,
@@ -40,32 +41,31 @@ pub fn time_until_admit_millis<F>(
 where
     F: FnMut(BucketEpoch) -> u64,
 {
-    let bm = bucket_millis.max(1);
-    let live = live_buckets.max(1);
+    let bm = bucket_millis.get();
+    let live = u64::from(live_buckets.get());
     let need = total.saturating_add(hits).saturating_sub(limit);
     if need == 0 {
         return 0;
     }
-    let current = (now_millis / bm) as u32;
-    let oldest = current.saturating_sub(live - 1);
+    // Walk unwrapped `u64` epochs; a stored epoch is the same number cut to
+    // `u32`, so the walk and the fall-off times hold across the `u32` wrap.
+    let current = now_millis / bm;
+    let fall_off = |bucket: u64| {
+        (bucket + live)
+            .saturating_mul(bm)
+            .saturating_sub(now_millis)
+    };
     let mut aged_off: u64 = 0;
-    let mut bucket = oldest;
-    loop {
-        aged_off = aged_off.saturating_add(count_for(bucket));
+    for bucket in current.saturating_sub(live - 1)..=current {
+        aged_off = aged_off.saturating_add(count_for(BucketEpoch::wrap(bucket)));
         if aged_off >= need {
-            let fall_off = (bucket as u64 + live as u64).saturating_mul(bm);
-            return fall_off.saturating_sub(now_millis);
+            return fall_off(bucket);
         }
-        if bucket == current {
-            break;
-        }
-        bucket = bucket.saturating_add(1);
     }
     // Newest bucket falls off at (current + live) * bm — full-window
     // fallback covers degenerate cases (limit == 0, sum disagrees with
     // breakdown, etc.).
-    let fall_off = (current as u64 + live as u64).saturating_mul(bm);
-    fall_off.saturating_sub(now_millis)
+    fall_off(current)
 }
 
 /// `Retry-After` per RFC 7231 §7.1.3. Rounds up so a client retrying at
@@ -82,12 +82,6 @@ pub fn reset_unix_seconds(now_millis: u64, delta_millis: u64) -> u64 {
     (now_millis / 1_000).saturating_add(retry_after_seconds(delta_millis))
 }
 
-/// `X-RateLimit-Remaining` floor. On the reject path this is always 0; on
-/// the (future) allow-success path it's `limit - total` saturated at u64.
-pub fn limit_remaining(limit: u64, total: u64) -> u64 {
-    limit.saturating_sub(total)
-}
-
 /// Wall-clock ms until the next bucket boundary — equivalently, until the
 /// oldest live bucket ages off in gabion's uniform sliding window.
 ///
@@ -101,9 +95,8 @@ pub fn limit_remaining(limit: u64, total: u64) -> u64 {
 /// where it answers a different question ("when can *this* client retry
 /// without being rejected again") that depends on the actual per-bucket
 /// distribution.
-pub fn time_until_next_bucket_boundary_millis(now_millis: u64, bucket_millis: u64) -> u64 {
-    let bm = bucket_millis.max(1);
-    bm - (now_millis % bm)
+pub fn time_until_next_bucket_boundary_millis(now_millis: u64, bucket_millis: NonZeroU64) -> u64 {
+    bucket_millis.get() - now_millis % bucket_millis
 }
 
 #[cfg(test)]

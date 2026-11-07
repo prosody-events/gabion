@@ -1,83 +1,69 @@
 //! Rule and node identity dictionaries.
 
+use std::num::{NonZeroU16, NonZeroU32};
+
 use super::hash::{hash_fingerprint, hash_node_identity};
 use super::index::CellIndex;
 use super::{BucketEpoch, Incarnation, NodeId, NodeSlot, RuleSlot};
 
 const EMPTY_DICT_SLOT: u16 = u16::MAX;
 
+/// The most entries a dictionary holds: its slots are numbered by a `u16`
+/// whose largest value marks an empty slot.
+pub(crate) const MAX_DICTIONARY_CAPACITY: u16 = EMPTY_DICT_SLOT - 1;
+
 /// Descriptor stored per interned rule slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuleDescriptor {
-    /// Canonical hash of the rule shape and parameters.
+    /// The rule's identity: a hash of its domain, descriptor patterns, window
+    /// and bucket (`rules::RuleDef::build`).
     pub fingerprint: u128,
     pub window_millis: u32,
     pub bucket_millis: u32,
     pub limit: u64,
-    pub flags: u32,
-    /// `u32::MAX` means the rule is known on the wire only — cells are stored,
-    /// dirty-tracked, and expired the same way, but
-    /// [`super::CellDelta::applies_locally`] is `false` so the local
-    /// rate-limit aggregator ignores them.
-    pub local_rule_id: u32,
+    /// `false` for a rule known on the wire only: its cells are stored,
+    /// forwarded and expired, but [`super::DeltaSink::applies_locally`] is
+    /// `false` so the local rate-limit aggregator ignores them.
+    pub applies_locally: bool,
 }
 
 impl Default for RuleDescriptor {
     fn default() -> Self {
         Self {
             fingerprint: 0,
-            // Unknown wire-only rules still need a bounded lifetime. A zero
-            // bucket/window disables expiration in CellStore::expire_at, which
-            // lets stale peer cells accumulate forever when a node has not
-            // registered the rule locally.
+            // How long a wire-only rule's cell lives past its last update
+            // (`RuleAge::Idle`).
             window_millis: 60_000,
             bucket_millis: 1_000,
             limit: 0,
-            flags: 0,
-            local_rule_id: u32::MAX,
+            applies_locally: false,
         }
     }
 }
 
 impl RuleDescriptor {
-    pub fn applies_locally(&self) -> bool {
-        self.local_rule_id != u32::MAX
-    }
-
     /// The bucket epoch `now_millis` falls in: `now_millis / bucket_millis`.
     /// The single source of truth for this floor used by both
-    /// [`super::CellStore::expire_at`] and the visualizer. Returns `0` for
-    /// a wire-only rule (`bucket_millis == 0`), matching the "never expire"
-    /// path in `expire_at`.
+    /// [`super::CellStore::expire_at`] and the visualizer. `0` for a zero
+    /// bucket, which no built rule has; only the visualizer's sizing reads it
+    /// before validation.
     pub fn current_epoch(&self, now_millis: u64) -> BucketEpoch {
         if self.bucket_millis == 0 {
-            0
+            BucketEpoch(0)
         } else {
-            (now_millis / (self.bucket_millis as u64)) as BucketEpoch
+            BucketEpoch::wrap(now_millis / u64::from(self.bucket_millis))
         }
     }
 
     /// Number of live buckets in the window: `ceil(window_millis /
-    /// bucket_millis)`, at least 1. Returns `0` for a wire-only rule
-    /// (`bucket_millis == 0`); paired with [`Self::current_epoch`]'s `0`,
-    /// `expire_at` then reads `bucket + 0 >= 0` as "never expire" — so here
-    /// `0` means *unbounded*, not *none*.
+    /// bucket_millis)`, at least 1. `0` for a zero bucket, which no built
+    /// rule has; only the visualizer's sizing reads it before validation.
     pub fn live_buckets(&self) -> u32 {
         if self.bucket_millis == 0 {
             0
         } else {
             self.window_millis.div_ceil(self.bucket_millis).max(1)
         }
-    }
-
-    /// Oldest epoch still retained at `now_millis`:
-    /// `current_epoch(now) - live_buckets()`. A cell is kept while
-    /// `bucket >= oldest_live_epoch`, matching `expire_at`'s keep set. The
-    /// `saturating_sub(0)` for a wire-only rule yields `current`, i.e. retains
-    /// everything from epoch `current` downward — the unbounded behavior.
-    pub fn oldest_live_epoch(&self, now_millis: u64) -> BucketEpoch {
-        self.current_epoch(now_millis)
-            .saturating_sub(self.live_buckets())
     }
 }
 
@@ -94,13 +80,13 @@ pub struct RuleDictionary {
 }
 
 impl RuleDictionary {
-    pub fn with_capacity(capacity: u16) -> Self {
-        assert!(capacity > 0, "RuleDictionary capacity must be > 0");
-        assert!(
+    pub(crate) fn with_capacity(capacity: NonZeroU16) -> Self {
+        let index_cap = pow2_index_capacity_for(capacity.into());
+        let capacity = capacity.get();
+        debug_assert!(
             capacity < EMPTY_DICT_SLOT,
-            "RuleDictionary capacity must be < u16::MAX"
+            "`Settings::validate` bounds RuleDictionary capacity below u16::MAX"
         );
-        let index_cap = pow2_index_capacity_for(capacity as u32);
         let mut free_next = vec![EMPTY_DICT_SLOT; capacity as usize].into_boxed_slice();
         for i in 0..capacity {
             free_next[i as usize] = if i + 1 < capacity {
@@ -133,15 +119,11 @@ impl RuleDictionary {
     }
 
     pub fn descriptor(&self, slot: RuleSlot) -> Option<&RuleDescriptor> {
-        if (slot as u32) < self.capacity as u32 && self.refcounts[slot as usize] > 0 {
-            Some(&self.descriptors[slot as usize])
-        } else {
-            None
-        }
+        (self.refcount(slot) > 0).then(|| &self.descriptors[slot.index()])
     }
 
     pub fn refcount(&self, slot: RuleSlot) -> u32 {
-        self.refcounts.get(slot as usize).copied().unwrap_or(0)
+        self.refcounts.get(slot.index()).copied().unwrap_or(0)
     }
 
     /// Look up an existing rule by fingerprint, without inserting.
@@ -152,16 +134,16 @@ impl RuleDictionary {
             .find(h, |slot| {
                 descriptors[slot as usize].fingerprint == fingerprint
             })
-            .map(|s| s as RuleSlot)
+            .map(|s| RuleSlot(s as u16))
     }
 
     /// Find or create a rule slot. Refcount is unchanged — callers manage it
     /// through [`super::CellStore`].
     pub(super) fn intern(&mut self, descriptor: RuleDescriptor) -> Option<RuleSlot> {
         if let Some(slot) = self.find(descriptor.fingerprint) {
-            // Replace descriptor metadata (e.g. local_rule_id may have
+            // Replace descriptor metadata (e.g. `applies_locally` may have
             // changed).
-            self.descriptors[slot as usize] = descriptor;
+            self.descriptors[slot.index()] = descriptor;
             return Some(slot);
         }
         if self.free_head == EMPTY_DICT_SLOT {
@@ -174,26 +156,26 @@ impl RuleDictionary {
         self.index
             .insert_unchecked(hash_fingerprint(descriptor.fingerprint), slot as u32);
         self.len += 1;
-        Some(slot)
+        Some(RuleSlot(slot))
     }
 
     pub(super) fn inc_ref(&mut self, slot: RuleSlot) {
-        self.refcounts[slot as usize] = self.refcounts[slot as usize].saturating_add(1);
+        self.refcounts[slot.index()] = self.refcounts[slot.index()].saturating_add(1);
     }
 
     pub(super) fn dec_ref(&mut self, slot: RuleSlot) {
-        let rc = &mut self.refcounts[slot as usize];
+        let rc = &mut self.refcounts[slot.index()];
         if *rc == 0 {
             return;
         }
         *rc -= 1;
         if *rc == 0 {
-            let fingerprint = self.descriptors[slot as usize].fingerprint;
+            let fingerprint = self.descriptors[slot.index()].fingerprint;
             self.index
-                .remove(hash_fingerprint(fingerprint), slot as u32);
-            self.descriptors[slot as usize] = RuleDescriptor::default();
-            self.free_next[slot as usize] = self.free_head;
-            self.free_head = slot;
+                .remove(hash_fingerprint(fingerprint), u32::from(slot.0));
+            self.descriptors[slot.index()] = RuleDescriptor::default();
+            self.free_next[slot.index()] = self.free_head;
+            self.free_head = slot.0;
             self.len -= 1;
         }
     }
@@ -220,13 +202,13 @@ pub struct NodeDictionary {
 }
 
 impl NodeDictionary {
-    pub fn with_capacity(capacity: u16) -> Self {
-        assert!(capacity > 0, "NodeDictionary capacity must be > 0");
-        assert!(
+    pub(crate) fn with_capacity(capacity: NonZeroU16) -> Self {
+        let index_cap = pow2_index_capacity_for(capacity.into());
+        let capacity = capacity.get();
+        debug_assert!(
             capacity < EMPTY_DICT_SLOT,
-            "NodeDictionary capacity must be < u16::MAX"
+            "`Settings::validate` bounds NodeDictionary capacity below u16::MAX"
         );
-        let index_cap = pow2_index_capacity_for(capacity as u32);
         let mut free_next = vec![EMPTY_DICT_SLOT; capacity as usize].into_boxed_slice();
         for i in 0..capacity {
             free_next[i as usize] = if i + 1 < capacity {
@@ -259,15 +241,11 @@ impl NodeDictionary {
     }
 
     pub fn descriptor(&self, slot: NodeSlot) -> Option<&NodeDescriptor> {
-        if (slot as u32) < self.capacity as u32 && self.refcounts[slot as usize] > 0 {
-            Some(&self.descriptors[slot as usize])
-        } else {
-            None
-        }
+        (self.refcount(slot) > 0).then(|| &self.descriptors[slot.index()])
     }
 
     pub fn refcount(&self, slot: NodeSlot) -> u32 {
-        self.refcounts.get(slot as usize).copied().unwrap_or(0)
+        self.refcounts.get(slot.index()).copied().unwrap_or(0)
     }
 
     pub fn find(&self, node_id: NodeId, incarnation: Incarnation) -> Option<NodeSlot> {
@@ -278,7 +256,7 @@ impl NodeDictionary {
                 let d = &descriptors[slot as usize];
                 d.node_id == node_id && d.incarnation == incarnation
             })
-            .map(|s| s as NodeSlot)
+            .map(|s| NodeSlot(s as u16))
     }
 
     pub(super) fn intern(&mut self, node_id: NodeId, incarnation: Incarnation) -> Option<NodeSlot> {
@@ -298,27 +276,29 @@ impl NodeDictionary {
         self.index
             .insert_unchecked(hash_node_identity(node_id, incarnation), slot as u32);
         self.len += 1;
-        Some(slot)
+        Some(NodeSlot(slot))
     }
 
     pub(super) fn inc_ref(&mut self, slot: NodeSlot) {
-        self.refcounts[slot as usize] = self.refcounts[slot as usize].saturating_add(1);
+        self.refcounts[slot.index()] = self.refcounts[slot.index()].saturating_add(1);
     }
 
     /// Decrement refcount. Returns `true` if the slot was freed.
     pub(super) fn dec_ref(&mut self, slot: NodeSlot) -> bool {
-        let rc = &mut self.refcounts[slot as usize];
+        let rc = &mut self.refcounts[slot.index()];
         if *rc == 0 {
             return false;
         }
         *rc -= 1;
         if *rc == 0 {
-            let d = self.descriptors[slot as usize];
-            self.index
-                .remove(hash_node_identity(d.node_id, d.incarnation), slot as u32);
-            self.descriptors[slot as usize] = NodeDescriptor::default();
-            self.free_next[slot as usize] = self.free_head;
-            self.free_head = slot;
+            let d = self.descriptors[slot.index()];
+            self.index.remove(
+                hash_node_identity(d.node_id, d.incarnation),
+                u32::from(slot.0),
+            );
+            self.descriptors[slot.index()] = NodeDescriptor::default();
+            self.free_next[slot.index()] = self.free_head;
+            self.free_head = slot.0;
             self.len -= 1;
             true
         } else {
@@ -327,8 +307,8 @@ impl NodeDictionary {
     }
 }
 
-pub(super) fn pow2_index_capacity_for(capacity: u32) -> u32 {
-    // Load factor target ~50%: index buckets = next_power_of_two(capacity) * 2.
-    let base = capacity.max(1).next_power_of_two();
-    base.saturating_mul(2).max(2)
+/// Index buckets for `capacity` entries: a power of two at a ~50% load
+/// factor. Cells are capped at 2^30, so the result fits a `u32`.
+pub(crate) fn pow2_index_capacity_for(capacity: NonZeroU32) -> u32 {
+    capacity.get().next_power_of_two() * 2
 }

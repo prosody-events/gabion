@@ -1,22 +1,48 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte';
+  import { onMount, untrack, type Snippet } from 'svelte';
   import uPlot from 'uplot';
+  import { fontsReady } from '../theme';
 
   // A thin Svelte shell around one uPlot instance. uPlot is imperative, so the
-  // component never re-renders it reactively: `version` (bumped by the owner on
-  // each new sample) drives `setData`, a ResizeObserver drives `setSize`, and
-  // `opts` changing (e.g. the node count on reset) rebuilds it. `data`'s inner
-  // arrays are mutated in place by `ChartHistory`, so it must NOT be tracked —
-  // `version` is the single redraw signal.
+  // component never re-renders it reactively: `stamp` (changed by the owner on
+  // each new sample) drives `setData`, a debounced ResizeObserver drives
+  // `setSize`, and `opts` changing rebuilds it. `data`'s inner arrays are
+  // mutated in place by `ChartHistory`, so it must NOT be tracked: `stamp` is
+  // the single redraw signal. The built chart is left on the plot element as
+  // `uplot`, which the design audit reads to check every mark lies inside its
+  // plot. It first measures once the page's faces have loaded (or failed),
+  // so its label boxes are the face's own.
   let {
     opts,
     data,
-    version,
-    label,
-  }: { opts: uPlot.Options; data: uPlot.AlignedData; version: number; label: string } = $props();
+    stamp,
+    height,
+    zone,
+    attrs,
+    caption,
+    note,
+  }: {
+    opts: uPlot.Options;
+    data: uPlot.AlignedData;
+    /** Anything that changes whenever the data should be redrawn: the owner's
+     *  sample counter and whatever else the drawing depends on. */
+    stamp: unknown;
+    /** The figure's height in px, fixed so charts never reflow as data arrives. */
+    height: number;
+    /** The zone a small-multiple panel shows, for the audit's order check. */
+    zone?: number;
+    /** Further attributes on the figure, such as published `data-*` values. */
+    attrs?: Record<string, string | undefined>;
+    caption: Snippet;
+    note?: Snippet;
+  } = $props();
+
+  // How long a resize waits for the next one before redrawing (design rule 26).
+  const RESIZE_DEBOUNCE_MS = 100;
 
   let host: HTMLDivElement;
   let chart: uPlot | null = null;
+  let ready = $state(false);
 
   function size(): { width: number; height: number } {
     const r = host.getBoundingClientRect();
@@ -26,35 +52,52 @@
   function build(): void {
     chart?.destroy();
     chart = new uPlot({ ...opts, ...size() }, data, host);
+    Object.assign(host, { uplot: chart });
   }
 
   onMount(() => {
-    const observer = new ResizeObserver(() => chart?.setSize(size()));
+    void fontsReady().then(() => (ready = true));
+    let timer = 0;
+    let measured = false;
+    const observer = new ResizeObserver(() => {
+      // The first measurement applies at once; later ones are debounced.
+      if (!measured) {
+        measured = true;
+        chart?.setSize(size());
+        return;
+      }
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => chart?.setSize(size()), RESIZE_DEBOUNCE_MS);
+    });
     observer.observe(host);
     return () => {
+      window.clearTimeout(timer);
       observer.disconnect();
       chart?.destroy();
       chart = null;
     };
   });
 
-  // Rebuild only when the option shape changes (node count on reset); reading
-  // `data` inside `build` is untracked so a sample doesn't trigger a teardown.
+  // Rebuild only when the option shape changes; reading `data` inside `build` is
+  // untracked so a sample doesn't trigger a teardown.
   $effect(() => {
     void opts;
-    untrack(build);
+    if (ready) untrack(build);
   });
 
   // Each new sample: hand uPlot the current columns. `data` is read untracked.
   $effect(() => {
-    void version;
+    void stamp;
     untrack(() => chart?.setData(data));
   });
 </script>
 
-<figure class="chart">
-  <figcaption>{label}</figcaption>
+<figure class="chart" {...attrs} data-zone={zone} style="height: {height}px">
+  <figcaption>{@render caption()}</figcaption>
   <div class="plot" bind:this={host}></div>
+  {#if note}
+    <p class="note">{@render note()}</p>
+  {/if}
 </figure>
 
 <style>
@@ -66,19 +109,23 @@
   }
 
   figcaption {
-    font-size: var(--text-xs);
+    font-size: var(--font-size-caption-sm);
     font-weight: 650;
     letter-spacing: 0.04em;
     text-transform: uppercase;
-    color: var(--ink-soft);
-    margin-bottom: var(--space-1);
+    color: var(--color-fg-muted);
+    margin-bottom: var(--gap-xs);
   }
 
-  /* uPlot draws axis ticks on the canvas, but the plot area inherits tabular
-     figures for any DOM text uPlot adds (and documents the intent). */
   .plot {
     flex: 1;
     min-height: 0;
-    font-variant-numeric: tabular-nums lining-nums;
+  }
+
+  .note {
+    margin: var(--gap-xs) 0 0;
+    max-width: 80ch;
+    font-size: var(--font-size-caption-sm);
+    color: var(--color-fg-muted);
   }
 </style>

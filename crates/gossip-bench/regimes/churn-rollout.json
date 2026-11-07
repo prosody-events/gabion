@@ -1,0 +1,47 @@
+{
+  "id": "churn-rollout",
+  "description": "prod-typical through a rollout wave that replaces 45 of the 80 pods (one new pod every 500 ms, the old pod leaves 5 s after its replacement starts) and one silent crash at 75 s.",
+  "duration_s": 110,
+  "warmup_s": 20,
+  "nodes": 80,
+  "rule": {
+    "limit": 100,
+    "window_ms": 10000,
+    "bucket_ms": 1000
+  },
+  "traffic": {
+    "site_rate_rps": 650,
+    "site_period_ms": 3200,
+    "site_jitter": 0.5,
+    "hot_keys": [
+      {
+        "limit_multiple": 1.5
+      },
+      {
+        "limit_multiple": 3.0
+      }
+    ],
+    "bursts": [
+      {
+        "rate_rps": 90,
+        "start_s": 40,
+        "duration_s": 20
+      }
+    ]
+  },
+  "churn": {
+    "rollouts": [
+      {
+        "at_s": 30,
+        "count": 45,
+        "interval_ms": 500,
+        "overlap_ms": 5000
+      }
+    ],
+    "crashes": [
+      {
+        "at_s": 75
+      }
+    ]
+  }
+}

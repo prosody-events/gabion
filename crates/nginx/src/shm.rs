@@ -2,8 +2,10 @@
 //!
 //! One `MAP_SHARED | MAP_ANONYMOUS` region is mmap'd by the nginx master in
 //! the config phase; every worker inherits the mapping at fork. Every
-//! cross-process structure lives in this module, communicates via atomics,
-//! and uses `#[repr(C)]` so the offsets are stable across worker processes.
+//! cross-process structure is mapped here, communicates via atomics, and uses
+//! `#[repr(C)]` so the offsets are stable across worker processes: the
+//! header, lease, queue and statistics from this module, the aggregate slot
+//! from `gabion::aggregate`.
 
 pub mod aggregate;
 pub mod header;
@@ -13,37 +15,60 @@ pub(crate) mod mock;
 pub mod queue;
 pub mod stats;
 
-pub use aggregate::{AggregateSlot, AggregateTable, ShmAggregateStore};
+pub use aggregate::ShmAggregateStore;
 pub use header::{Header, NodeIdentityFields};
 pub use lease::LeaderLease;
 pub use queue::{QueueControl, QueueOverflow, QueueSlot, RequestQueue};
 pub use stats::Stats;
 
-/// Atomics and spin hints for the queue, lease and aggregate table. The
-/// `loom` feature (`make loom`) swaps in loom's model-checked ones for
-/// `tests/loom.rs`.
+use gabion::aggregate::{AggregateSlot, AggregateTable};
+
+/// Atomics and spin hints for the queue and lease. The `loom` feature
+/// (`make loom`) swaps in loom's model-checked ones for `tests/loom.rs`.
 #[cfg(feature = "loom")]
 use loom::{hint, sync::atomic};
 #[cfg(not(feature = "loom"))]
 use std::{hint, sync::atomic};
 
-/// Bytes of padding between regions; rounded up to the cacheline boundary.
-pub const CACHELINE: usize = 64;
+/// The span the zone keeps apart values that different paths write, and the
+/// boundary every region starts on: 128 bytes, the coherence line on Apple
+/// silicon and the line pair x86's adjacent-line prefetcher fetches together
+/// (crossbeam's `CachePadded` uses the same). Parts with 64-byte lines pay a
+/// few hundred bytes of zone for it, and nothing per request.
+pub const CACHELINE: usize = 128;
+
+/// A value alone on its `CACHELINE`, for one path's writes beside another
+/// path's: the queue's producer and consumer positions, and the start of the
+/// leader's statistics. Values written together on one path share a line
+/// instead (the workers' counters in `Stats`): padding them apart only adds
+/// line transfers.
+#[repr(C, align(128))]
+#[derive(Debug, Default)]
+pub struct CachePadded<T>(pub T);
+
+const _: () = assert!(align_of::<CachePadded<u8>>() == CACHELINE);
+
+impl<T> std::ops::Deref for CachePadded<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
 
 pub fn align_up(value: usize, align: usize) -> usize {
     let mask = align - 1;
     (value + mask) & !mask
 }
 
-/// Depth of the queue workers push hits onto for the leader to drain.
-const QUEUE_CAPACITY: usize = 2048;
-
 /// The fewest aggregate slots a zone may hold.
 pub const MIN_AGGREGATE_CAPACITY: usize = 1024;
 
 /// Lays out the SHM zone given capacity targets. Computed once per config
-/// load, from the zone's size; nginx reuses a zone across reload only when
-/// its size is unchanged, so a reused region keeps a matching layout.
+/// load, from the zone's size and `gabion_gossip_limit_queue_capacity`.
+/// nginx reuses a zone across reload when its name and size are unchanged,
+/// and a reused region keeps its layout, so `init_zone` refuses a reload
+/// that would change it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Layout {
     pub queue_capacity: usize,
@@ -77,8 +102,7 @@ impl Layout {
             align_up(queue_control_offset + size_of::<QueueControl>(), CACHELINE);
         let queue_slots_bytes = queue_capacity.checked_mul(size_of::<QueueSlot>())?;
         let aggregate_slots_offset = align_up(queue_slots_offset + queue_slots_bytes, CACHELINE);
-        let aggregate_slots_bytes =
-            aggregate_capacity.checked_mul(size_of::<aggregate::AggregateSlot>())?;
+        let aggregate_slots_bytes = aggregate_capacity.checked_mul(size_of::<AggregateSlot>())?;
         let stats_offset = align_up(aggregate_slots_offset + aggregate_slots_bytes, CACHELINE);
         let total_bytes = align_up(stats_offset + size_of::<Stats>(), CACHELINE);
 
@@ -95,24 +119,41 @@ impl Layout {
         })
     }
 
-    /// Lay out a zone of `zone_bytes` on `page_bytes` pages: the fixed
-    /// queue plus the largest power-of-two aggregate table that fits, or
-    /// `None` below `MIN_AGGREGATE_CAPACITY` slots. nginx's slab pool keeps
-    /// a 24-byte descriptor per page (under 1/128 of the zone for pages of
-    /// 4 KiB or more) and loses up to a page each to its header, to
-    /// aligning its first page, and to rounding its page count down; our
-    /// block is rounded up to whole pages, which can cost one more.
-    pub fn for_zone(zone_bytes: usize, page_bytes: usize) -> Option<Self> {
-        let usable = zone_bytes.checked_sub(zone_bytes / 128 + 4 * page_bytes)?;
-        let mut capacity = 1 << (usable / size_of::<AggregateSlot>()).checked_ilog2()?;
-        while capacity >= MIN_AGGREGATE_CAPACITY {
-            let layout = Self::new(QUEUE_CAPACITY, capacity)?;
-            if layout.total_bytes <= usable {
-                return Some(layout);
+    /// Lay out a zone of `zone_bytes` on `page_bytes` pages: a queue of
+    /// `queue_capacity` rounded up to a power of two, plus the largest
+    /// power-of-two aggregate table that fits. A zone too small for the
+    /// queue and `MIN_AGGREGATE_CAPACITY` slots returns the smallest zone
+    /// that fits them. nginx's slab pool keeps a 24-byte descriptor per page
+    /// (under 1/128 of the zone for pages of 4 KiB or more) and loses up to
+    /// a page each to its header, to aligning its first page, and to
+    /// rounding its page count down; our block is rounded up to whole pages,
+    /// which can cost one more.
+    pub fn for_zone(
+        zone_bytes: usize,
+        page_bytes: usize,
+        queue_capacity: usize,
+    ) -> Result<Self, usize> {
+        let queue = queue_capacity.next_power_of_two();
+        let fit = || {
+            let usable = zone_bytes.checked_sub(zone_bytes / 128 + 4 * page_bytes)?;
+            let mut capacity = 1 << (usable / size_of::<AggregateSlot>()).checked_ilog2()?;
+            while capacity >= MIN_AGGREGATE_CAPACITY {
+                let layout = Self::new(queue, capacity)?;
+                if layout.total_bytes <= usable {
+                    return Some(layout);
+                }
+                capacity /= 2;
             }
-            capacity /= 2;
-        }
-        None
+            None
+        };
+        fit().ok_or_else(|| {
+            let smallest = Self::new(queue, MIN_AGGREGATE_CAPACITY)
+                .map_or(usize::MAX, |layout| layout.total_bytes);
+            smallest
+                .saturating_add(4 * page_bytes)
+                .saturating_mul(128)
+                .div_ceil(127)
+        })
     }
 }
 
@@ -134,7 +175,7 @@ pub struct ShmRegion {
 // mappings in place. Crucially, every byte inside the region is only
 // accessed through atomics or seqlock-protected slots defined on the contained
 // `#[repr(C)]` types (see `shm/header.rs`, `shm/lease.rs`, `shm/queue.rs`,
-// `shm/aggregate.rs`, `shm/stats.rs`). No code ever materialises a `&mut T`
+// `gabion::aggregate`, `shm/stats.rs`). No code ever materialises a `&mut T`
 // into the mapping after `initialize` returns, so handing the wrapper to
 // another thread (Send) or sharing `&ShmRegion` across threads (Sync) cannot
 // introduce a data race. See the Nomicon chapter "Send and Sync".
@@ -151,9 +192,9 @@ impl ShmRegion {
     /// * `base` is non-null and points at a fresh, writable mapping of at least
     ///   `layout.total_bytes` bytes. In practice this is a block of the nginx
     ///   shared zone the master maps before any worker is forked.
-    /// * `base` is aligned at least to `CACHELINE` (64). The zone's slab
-    ///   allocator returns page-aligned blocks, which satisfies the alignment
-    ///   requirements of every `#[repr(C)]` sub-structure stored in the region.
+    /// * `base` is aligned to `CACHELINE` bytes, the alignment of `Stats` and
+    ///   of the queue positions (`CachePadded`), the largest of any stored
+    ///   type. nginx's slab allocator hands out page-aligned blocks.
     /// * `layout` is the value computed by `Layout::new`, and its offsets/sizes
     ///   describe the actual mapping.
     /// * The caller has *exclusive* access to the mapping for the duration of
@@ -161,6 +202,10 @@ impl ShmRegion {
     ///   subsequent `write_bytes` and `ptr::write`s cannot race.
     /// * The mapping must outlive every copy of the returned `ShmRegion`.
     pub unsafe fn initialize(base: *mut u8, layout: Layout) -> Self {
+        debug_assert!(
+            base.addr().is_multiple_of(CACHELINE),
+            "the zone must start on a cache line"
+        );
         // SAFETY: The caller of this `unsafe fn` upholds the preconditions
         // above. Specifically:
         // * `write_bytes(base, 0, total_bytes)` is valid because `base` is
@@ -170,11 +215,12 @@ impl ShmRegion {
         //   `#[repr(C)]` composites of atomics / integers / arrays of bytes).
         // * Each `ptr::write(p, value)` overwrites a `#[repr(C)]` POD at the
         //   offset computed by `Layout::new`; `Layout::new` rounds every offset
-        //   up to `CACHELINE`, which exceeds the alignment of every stored
-        //   type, so the destination pointer is properly aligned. `Layout::new`
-        //   also guarantees `offset + size_of::<T>() <= total_bytes`, so each
-        //   write stays in-bounds of the one mapping (Nomicon: "Working with
-        //   raw pointers" / `pointer::add` rules).
+        //   up to `CACHELINE`, which is at least the alignment of every stored
+        //   type, and `base` is `CACHELINE`-aligned (caller precondition), so
+        //   the destination pointer is properly aligned. `Layout::new` also
+        //   guarantees `offset + size_of::<T>() <= total_bytes`, so each write
+        //   stays in-bounds of the one mapping (Nomicon: "Working with raw
+        //   pointers" / `pointer::add` rules).
         // * The queue/aggregate loops only index `0..capacity`, matching the
         //   per-slot bounds checked by the private `*_slot_ptr` helpers.
         // * No `&mut T` to any region byte escapes this function, so the
@@ -191,15 +237,15 @@ impl ShmRegion {
             );
             std::ptr::write(
                 region.queue_control_ptr() as *mut QueueControl,
-                QueueControl::new(layout.queue_capacity),
+                QueueControl::default(),
             );
             for i in 0..layout.queue_capacity {
                 let slot = region.queue_slot_ptr(i) as *mut QueueSlot;
                 std::ptr::write(slot, QueueSlot::empty(i as u64));
             }
             for i in 0..layout.aggregate_capacity {
-                let slot = region.aggregate_slot_ptr(i) as *mut aggregate::AggregateSlot;
-                std::ptr::write(slot, aggregate::AggregateSlot::empty());
+                let slot = region.aggregate_slot_ptr(i) as *mut AggregateSlot;
+                std::ptr::write(slot, AggregateSlot::empty());
             }
             std::ptr::write(region.stats_ptr() as *mut Stats, Stats::default());
             region
@@ -334,16 +380,6 @@ impl ShmRegion {
         // <= total_bytes` per `Layout::new`.
         unsafe { self.base.add(self.layout.stats_offset) }
     }
-}
-
-/// Read-side cell summary used by the access path.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct AggregateCell {
-    pub rule_fingerprint: u128,
-    pub key_hash: u128,
-    pub bucket: u32,
-    pub count: u64,
-    pub last_update_millis: u64,
 }
 
 #[cfg(test)]

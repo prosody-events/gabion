@@ -1,85 +1,98 @@
-// Scenario presets — the canned starting conditions the control rail offers.
+// Scenario presets: the canned starting conditions the control rail offers,
+// in four groups: what gabion does (Rate limiting, Propagation, Sustained
+// overload), what faults do to it (Zone partition, Packet loss, Gateway
+// failure, Gateway cut), the study's measurement (Steady state, No zone
+// configured) and Sandbox.
 //
-// A preset is a config plus an `async seed(sim)` that fires its opening
-// commands against a freshly built, not-yet-advanced cluster (partitions, seed
-// bursts). It is deliberately *not* a timed script: every preset's initial
-// state is "build the cluster, run these t=0 commands"; the partition→heal
-// narrative is a user gesture during play (the rail's Heal button), not a
-// scripted timeline. A timed-event driver only becomes load-bearing for the
-// scrubber's replay-from-zero, so it waits for that phase.
+// A preset is a config, its feed, the charts its pane shows, the story its
+// caption tells (`lib/next.ts`), the scenario its story hands over to, and an
+// `async seed(sim, config, gateways)` that fires its opening commands (cuts,
+// seed requests) against a freshly built cluster. It is not a timed script:
+// the reader drives every step the caption names.
 //
-// Most presets pin the rule limit high (`NARRATIVE_LIMIT`, 1 000 000) on
-// purpose — well above the seeded volumes. A burst then stays well under
-// gabion's threshold anti-entropy budget (ε ≈ limit·bps/(10⁴·N), ~833 at this
-// limit with N=12), so it spreads by lazy heartbeat over several rounds: the
-// multi-hop propagation these views exist to show. The viz-friendly default
-// limit (1 000, see `SimConfig::default` in `config.rs`) gives ε ≈ 0.83, so
-// every hit would eager-flush and a burst would flood at t=0 — which is why the
-// narrative presets override it back up. The default limit's limit-crossing
-// story is told instead by the `overload` and `sandbox` presets.
+// Every preset opens on a warmed, settled cluster (`warm`): before its seed,
+// the page steps whole heartbeat periods until every node has a gateway into
+// every other zone and one period has passed with no packet, so nothing left
+// over from the cold start is drawn when the reader first presses anything. The
+// gateway map `warm` gathers is how the gateway presets name the node they
+// fault.
 //
-// A real rate limiter is never idle, and neither is the demo: every narrative
-// preset carries a low, *uncapped* background `traffic` feed (a few hits/sec,
-// spread round-robin). It keeps ≥1 bucket live at all times, so the gossip
-// runtime never hits its empty-store guard and beams flow perpetually — instead
-// of the cluster falling silent once the opening burst ages out of the window.
-// The feed is a faint hum the preset's distinctive event (the burst spike, the
-// partition, the isolation) layers on top of. Because the convergence oracle is
-// now windowed (sum of live local cells, `engine.rs`), the feed plateaus at
-// `rate · window` rather than climbing forever.
+// Rate limiting, Zone partition and Sustained overload set a low limit, so
+// the vessels draw it and admission refuses past it; at limit 100 with twelve
+// nodes gabion's error budget ε is 1, so every Send of two hits or more is
+// flushed at once to the node's zone and one gateway in each other zone. The
+// rest pin the limit far off (`NARRATIVE_LIMIT`, 1 000 000), where ε is in the
+// hundreds, so a request waits for its node's next heartbeat: the propagation
+// story.
 //
-// The `overload` preset tells the opposite — and the reason gabion exists —
-// story. A single burst that approaches the limit can't: to keep each node's
-// local delta under ε while twelve nodes' sum exceeds the limit you'd need
-// L/N < ε = L·bps/(10⁴·N), i.e. bps > 10⁴, an absurd error budget. So overload
-// feeds the cluster fast against a low limit, so the windowed aggregate plateaus
-// well inside the REJECTING band (≈ `rate · window` ≈ 2× the limit). There,
-// eager threshold flushing is the healthy behavior on display — every node's
-// view tracks the aggregate tightly — and `showsLimitChart` surfaces the
-// Aggregate-vs-Limit panel. The `sandbox` preset is the complement: *no* feed at
-// all, a blank cluster the user drives by hand (inject + Step) to watch one cell
-// gossip out, converge, and age back to quiet.
-//
-// Every feed is folded into the play loop as a carry-save rate (App.svelte), not
-// a timed script: the total injected by virtual time T is exactly ⌊rate·T⌋
-// regardless of how play chunked the steps, so it stays deterministic without
-// the scrubber's driver.
+// The feed exists only where traffic is the subject: Steady state, No zone
+// configured and Sustained overload, plus Gateway cut's trickle at node 0,
+// which keeps node 0 sending data that a gateway cut off from its zone must
+// answer with "cannot relay". A feed injects ⌊rate·T⌋ one-hit requests by
+// virtual time T, counted from the moment the build is handed to the reader,
+// so it is deterministic under Step and repeatable from load.
 
-import type { Sim } from './sim/sim';
-import type { SimConfig } from './sim/types';
+import type { PresetId, Story } from './next';
+import type { Member, Sim } from './sim/sim';
+import type { SimConfig, SimEvent, ZoneMode } from './sim/types';
 
-/** The single watched rule's key. Every preset seed and every interactive burst
- *  (stage click, rail Send) targets this key, so they all grow the same
- *  counter and the convergence story stays about one number. */
+/** The single watched rule's key. Every preset seed and every Send targets
+ *  this key, so they all grow the same counter and the story stays about one
+ *  number. */
 export const WATCHED_KEY = 1;
 
-/** The cluster size the presets build. A ring of 12 reads cleanly and gabion's
- *  gossip still saturates it in a couple of rounds (coverage fanout ⌈ln(11)+c⌉
- *  reaches most peers each tick). */
+/** The cluster size the presets build: three zones of four. */
 const NODES = 12;
 
-/** The rule limit the narrative presets pin (burst, steady, partition, loss,
- *  isolation). Far above their seeded volumes, so ε stays large and a burst
- *  spreads lazily by heartbeat — the convergence story. Overrides the much
- *  lower viz-friendly default (`SimConfig::default`), which exists for the
- *  limit-crossing story the `overload` preset and the no-preset path tell. */
+/** The zones the presets place the cluster in. */
+const ZONES = 3;
+
+/** Hits in the request the seeded presets open with. */
+const SEED_HITS = 50;
+
+/** The node every preset selects on load, and the node the seeded presets
+ *  seed and read the gateways of. */
+export const ORIGIN = 0;
+
+/** The limit the far-off presets pin: far above their volumes, so ε stays
+ *  large and a request spreads by heartbeat. */
 const NARRATIVE_LIMIT = 1_000_000;
 
-/** The faint background feed every narrative preset carries (hits/sec, spread
- *  round-robin). Low enough that the preset's headline event still dominates,
- *  but enough to keep the window populated so gossip never falls silent. The
- *  windowed oracle plateaus at roughly `rate · window_seconds` ≈ 30 hits. */
+/** Hits per Send every preset opens with, and the range the field accepts. */
+export const BURST_HITS = 25;
+export const BURST_HITS_MIN = 1;
+export const BURST_HITS_MAX = 1000;
+
+/** The limit Rate limiting and Zone partition enforce: four Sends of
+ *  `BURST_HITS` reach it exactly. */
+const RATE_LIMIT = 4 * BURST_HITS;
+
+/** The highest rule limit the Tune controls accept. */
+export const RULE_LIMIT_MAX = 1_000_000;
+
+/** Steady state's and No zone configured's feed (hits/sec, round-robin over
+ *  the live nodes). The windowed oracle plateaus at roughly
+ *  `rate · window_seconds` ≈ 30 hits. */
 const BACKGROUND_RATE_PER_SEC = 3;
 
-/** The `overload` preset's feed (hits/sec). Uncapped against the low overload
- *  limit, so the windowed aggregate plateaus at ≈ `rate · window_seconds` ≈ 800
- *  — twice the 400 limit, well inside the REJECTING band, and perpetually so. */
+/** The `overload` preset's feed (hits/sec). It offers ≈ `rate · window` ≈ 800
+ *  hits a window, twice the 400 limit; each node admits what expiry frees and
+ *  rejects the rest. */
 const OVERLOAD_RATE_PER_SEC = 80;
 
-/** The subset of `SimConfig` the rebuild sliders own. */
+/** Gateway cut's trickle at node 0 (hits/sec), so node 0 keeps sending data
+ *  its cut gateway answers with "cannot relay". */
+const TRICKLE_RATE_PER_SEC = 2;
+
+/** The most heartbeat periods `warm` and `settle` step: best effort, so a lossy
+ *  or tiny cluster still opens. A healthy cluster needs a handful. */
+const WARM_PERIODS_MAX = 40;
+
+/** The subset of `SimConfig` the rebuild controls own. */
 export interface Knobs {
   nodes: number;
-  fanout: number;
+  zones: number;
+  zone_mode: ZoneMode;
   target_err_bps: number;
   uniform_loss: number;
   rule_limit: number;
@@ -87,18 +100,20 @@ export interface Knobs {
   tick_interval_ms: number;
 }
 
-/** Seat the sliders from a preset: its pinned fields win, and every field it
+/** Seat the controls from a preset: its pinned fields win, and every field it
  *  leaves open falls to the Rust-reported `defaults` (`Sim.defaultConfig()`), so
- *  a slider at rest builds the same cluster as an omitted field and the rest
+ *  a control at rest builds the same cluster as an omitted field and the rest
  *  positions follow `gabion::defaults` with no hand-typed mirror. Only `nodes`
- *  falls to a local constant (`NODES`, the presets' ring size — a viz choice, not
- *  a Rust tunable). The bucket width is not a knob; it tracks `defaults.rule_bucket_ms`
- *  directly in `App.svelte` so the window-is-whole-buckets invariant holds.
- *  Called on every preset switch (e.g. Packet loss seats the loss slider at 0.3). */
+ *  falls to a local constant (`NODES`, the presets' cluster size: a viz choice,
+ *  not a Rust tunable). The bucket width is not a knob; it tracks
+ *  `defaults.rule_bucket_ms` directly in `App.svelte` so the
+ *  window-is-whole-buckets invariant holds. Called on every preset switch (e.g.
+ *  Packet loss seats the loss slider at 0.3). */
 export function knobsFromPreset(preset: Preset, defaults: SimConfig): Knobs {
   return {
     nodes: preset.config.nodes ?? NODES,
-    fanout: preset.config.fanout ?? defaults.fanout,
+    zones: preset.config.zones ?? defaults.zones,
+    zone_mode: preset.config.zone_mode ?? defaults.zone_mode,
     target_err_bps: preset.config.target_err_bps ?? defaults.target_err_bps,
     uniform_loss: preset.config.uniform_loss ?? defaults.uniform_loss,
     rule_limit: preset.config.rule_limit ?? defaults.rule_limit,
@@ -107,144 +122,239 @@ export function knobsFromPreset(preset: Preset, defaults: SimConfig): Knobs {
   };
 }
 
-/** A steady, uncapped traffic feed the play loop drives while a preset is active
- *  — the background hum that keeps the cluster alive (and the engine of the
- *  overload story). The hits are spread round-robin across the cluster (by
- *  global hit index, so the spread is chunk-independent), targeting the watched
- *  key. App.svelte folds `rate_per_sec` into each advance as a carry-save
- *  accumulator, so ⌊rate·T⌋ hits have landed by virtual time T regardless of
- *  step chunking — deterministic, and it composes with scrub-from-zero. There is
- *  no cap: the windowed oracle (`engine.rs`) decays with expiry, so the
- *  aggregate plateaus at ≈ `rate · window_seconds` on its own. */
+/** A steady, uncapped feed of one-hit requests for the watched key: round-robin
+ *  over the live nodes by global hit index (`'every-node'`), or all at one node
+ *  (a node that has left takes none). ⌊rate·T⌋ hits are injected by virtual
+ *  time T since the build was handed to the reader, so the feed is the same
+ *  however play or Step chunks time. There is no cap: the windowed oracle
+ *  (`engine.rs`) decays with expiry, so the aggregate plateaus at
+ *  ≈ `rate · window_seconds` on its own. */
 export interface SustainedTraffic {
   readonly rate_per_sec: number;
+  readonly at: 'every-node' | { readonly node: number };
 }
 
-export interface Preset {
-  readonly id: string;
+/** `gateways[node][zone]`: the gateway each built node's runtime reported into
+ *  each other zone while the cluster warmed up. */
+export type Gateways = ReadonlyArray<ReadonlyArray<number | undefined>>;
+
+/** A chart the detail pane shows, by what it plots: the share of data bytes
+ *  that crossed zones, the agreement and disagreement panels, and the cluster
+ *  total against the limit. */
+export type ChartId = 'share' | 'agreement' | 'spread' | 'limit';
+
+export type Preset = {
+  readonly id: PresetId;
   readonly label: string;
-  readonly blurb: string;
+  /** The rail's group: what gabion does, faults, measurement, Sandbox. */
+  readonly group: 0 | 1 | 2 | 3;
   readonly config: Partial<SimConfig>;
-  /** Whether the scenario severs links (a partition or isolation) — the rail
-   *  surfaces its Heal control only for these, where it does something. */
-  readonly usesNetwork?: boolean;
-  /** A steady background feed the play loop drives. Present on every narrative
-   *  preset (a faint hum that keeps gossip perpetual) and the overload preset
-   *  (a flood); absent only on the user-driven `sandbox`. */
+  /** The feed the play loop and Step drive, where traffic is the subject (the
+   *  module header names them). */
   readonly traffic?: SustainedTraffic;
-  /** Surfaces the Aggregate-vs-Limit dashboard panel. Only legible when the
-   *  scenario drives the aggregate toward a *low* limit (the overload preset),
-   *  so it is decoupled from `traffic` — every narrative preset now has a feed,
-   *  but against a 1 000 000 limit the panel would read as a flat line. */
-  readonly showsLimitChart?: boolean;
-  /** Fire the preset's opening commands at the current (t = 0) virtual time. */
-  seed(sim: Sim): Promise<void>;
+  /** The charts the detail pane shows, in order. */
+  readonly charts: readonly ChartId[];
+  /** The story the caption tells, as it opens, with the scenario it hands
+   *  over to. */
+  readonly story: Story;
+  /** Fire the preset's opening commands on the warmed cluster, at the current
+   *  virtual time. */
+  seed(sim: Sim, config: SimConfig, gateways: Gateways): Promise<void>;
+};
+
+/** The nodes a build places: node `i` in zone `i mod zones`. */
+export function buildNodes(c: SimConfig): Member[] {
+  return Array.from({ length: c.nodes }, (_, id) => ({ id, zone: id % c.zones }));
 }
 
-/** Even split of `0..NODES` into two halves, for the partition preset. */
-function halves(): [number[], number[]] {
-  const mid = Math.floor(NODES / 2);
-  const all = Array.from({ length: NODES }, (_, i) => i);
-  return [all.slice(0, mid), all.slice(mid)];
+/** The node that seeds zone `z` in the spread-out presets: the zone's `z`-th
+ *  member, so the seeds sit at different ranks around the stage (nodes 0, 4 and
+ *  8 of twelve in three zones). */
+function seedNode(c: SimConfig, z: number): number {
+  const zone = buildNodes(c).filter((n) => n.zone === z);
+  return zone[z]?.id ?? zone[0]?.id ?? z;
 }
 
+/** Step whole heartbeat periods, at most `WARM_PERIODS_MAX`, until a period
+ *  that sent or lost no packet ends with `enough` true. `enough` sees every
+ *  period's events. Returns at the cap all the same. */
+async function quiet(sim: Sim, c: SimConfig, enough: (events: readonly SimEvent[]) => boolean): Promise<void> {
+  for (let period = 0; period < WARM_PERIODS_MAX; period++) {
+    const { events } = await sim.step(c.tick_interval_ms);
+    const done = enough(events);
+    if (done && !events.some((e) => e.kind.type === 'PacketSent' || e.kind.type === 'PacketDropped')) return;
+  }
+}
+
+/** Warm a freshly built cluster: step until every built node has a gateway
+ *  into every other non-empty zone (none with no zone configured) and the
+ *  cluster has gone quiet, reading the gateways from the steps' own
+ *  `GatewayChanged` events, and return them. */
+export async function warm(sim: Sim, c: SimConfig): Promise<Gateways> {
+  const gateways = Array.from({ length: c.nodes }, () => new Array<number | undefined>(c.zones).fill(undefined));
+  const need = c.zone_mode === 'Configured' ? c.nodes * (Math.min(c.zones, c.nodes) - 1) : 0;
+  let found = 0;
+  await quiet(sim, c, (events) => {
+    for (const { kind } of events) {
+      if (kind.type !== 'GatewayChanged') continue;
+      const row = gateways[kind.origin];
+      if (row === undefined) continue;
+      found += Number(kind.to !== undefined) - Number(row[kind.zone] !== undefined);
+      row[kind.zone] = kind.to;
+    }
+    return found === need;
+  });
+  return gateways;
+}
+
+/** Step until one heartbeat period passes with no packet, so a seed has spread
+ *  and been acknowledged before the first paint. */
+const settle = (sim: Sim, c: SimConfig): Promise<void> => quiet(sim, c, () => true);
+
+/** Throw: node 0 never found a gateway into zone `zone`. */
+function noGateway(zone: number): never {
+  throw new Error(
+    `node ${ORIGIN} found no gateway into zone ${String.fromCharCode(97 + zone)} while the cluster warmed up, ` +
+      `so the gateway scenario cannot start. A zone needs at least one live node that node ${ORIGIN} can hear; ` +
+      'rebuild with more nodes or fewer zones.',
+  );
+}
+
+const CHARTS: readonly ChartId[] = ['share', 'agreement', 'spread'];
+const LIMIT_FIRST: readonly ChartId[] = ['limit', 'share', 'agreement', 'spread'];
+
+/** The scenarios, in the rail's order. */
 export const PRESETS: readonly Preset[] = [
   {
-    id: 'burst',
-    label: 'Traffic burst',
-    blurb:
-      'One node takes a 50-hit burst on top of a faint background hum. Play to watch the burst gossip out — and the cluster keep gossiping long after it ages out.',
-    config: { nodes: NODES, rng_seed: 1, rule_limit: NARRATIVE_LIMIT },
-    traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC },
-    async seed(sim) {
-      await sim.submitRequest(0, WATCHED_KEY, 50);
+    id: 'rate-limiting',
+    label: 'Rate limiting',
+    group: 0,
+    config: { nodes: NODES, zones: ZONES, rule_limit: RATE_LIMIT },
+    charts: LIMIT_FIRST,
+    story: { kind: 'rate-limiting', next: 'partition', act: 'open', zones: 0, sendBucket: null },
+    async seed() {
+      // Opens settled at 0: the reader's Sends are the story.
     },
   },
   {
-    id: 'steady',
-    label: 'Steady state',
-    blurb: 'Light traffic, scattered across the cluster. It converges at once — the calm baseline.',
-    config: { nodes: NODES, rng_seed: 1, rule_limit: NARRATIVE_LIMIT },
-    traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC },
-    async seed(sim) {
-      for (const node of [0, 3, 6, 9]) {
-        await sim.submitRequest(node, WATCHED_KEY, 10);
-      }
+    id: 'propagation',
+    label: 'Propagation',
+    group: 0,
+    config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
+    charts: CHARTS,
+    story: { kind: 'propagation', next: 'rate-limiting', act: 'open' },
+    async seed(sim, c) {
+      await sim.submitRequest(ORIGIN, WATCHED_KEY, SEED_HITS);
+      await settle(sim, c);
     },
   },
   {
     id: 'overload',
     label: 'Sustained overload',
-    blurb:
-      'Steady traffic floods the cluster against a low limit. Play to watch the aggregate climb past it and stay in the rejecting band.',
-    // A low limit so the aggregate crosses it within seconds; the default
-    // budget then keeps ε well under 1, so eager flushing tracks the climb
-    // tightly. The uncapped feed plateaus at ≈ rate·window ≈ 800 — twice the
-    // limit — once expiry balances injection, so it sits in the band perpetually.
-    config: { nodes: NODES, rng_seed: 1, rule_limit: 400 },
-    traffic: { rate_per_sec: OVERLOAD_RATE_PER_SEC },
-    showsLimitChart: true,
+    group: 0,
+    // A low limit so the window fills within seconds; ε is then 1, so eager
+    // flushing keeps every node's view close behind the truth. The feed offers
+    // ≈ rate·window ≈ 800 hits a window, twice the limit, so once the window
+    // fills each node admits what expiry frees and rejects the rest.
+    config: { nodes: NODES, zones: ZONES, rule_limit: 400 },
+    traffic: { rate_per_sec: OVERLOAD_RATE_PER_SEC, at: 'every-node' },
+    charts: LIMIT_FIRST,
+    story: { kind: 'watch', watched: 'overload', next: 'rate-limiting' },
     async seed() {
-      // No opening burst: the sustained feed (driven during play) is the story.
+      // No opening request: the sustained feed (driven during play) is the story.
     },
   },
   {
     id: 'partition',
-    label: 'Network partition',
-    blurb:
-      'The cluster splits in two; one half bursts. The severed half never hears the burst — heal the network to watch the halves reconcile.',
-    config: { nodes: NODES, rng_seed: 1, rule_limit: NARRATIVE_LIMIT },
-    usesNetwork: true,
-    traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC },
-    async seed(sim) {
-      const [a, b] = halves();
-      await sim.partition(a, b);
-      await sim.submitRequest(a[0], WATCHED_KEY, 50);
+    label: 'Zone partition',
+    group: 1,
+    config: { nodes: NODES, zones: ZONES, rule_limit: RATE_LIMIT },
+    charts: LIMIT_FIRST,
+    story: { kind: 'partition', next: 'gateway-failure', act: 'open' },
+    async seed(sim, c) {
+      await sim.cut({ kind: 'zone', zone: c.zones - 1 }, buildNodes(c));
     },
   },
   {
     id: 'loss',
     label: 'Packet loss',
-    blurb: 'Every link drops 30% of packets. Convergence still arrives — just over more rounds.',
-    config: { nodes: NODES, rng_seed: 1, uniform_loss: 0.3, rule_limit: NARRATIVE_LIMIT },
-    traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC },
+    group: 1,
+    config: { nodes: NODES, zones: ZONES, uniform_loss: 0.3, rule_limit: NARRATIVE_LIMIT },
+    charts: CHARTS,
+    story: { kind: 'watch', watched: 'loss', next: 'rate-limiting' },
     async seed(sim) {
-      await sim.submitRequest(0, WATCHED_KEY, 50);
+      await sim.submitRequest(ORIGIN, WATCHED_KEY, SEED_HITS);
     },
   },
   {
-    id: 'isolation',
-    label: 'Node isolation & heal',
-    blurb:
-      'One node is cut off while a burst spreads. Heal it and it re-syncs by gossip catch-up — it kept its state, so no counts are lost.',
-    config: { nodes: NODES, rng_seed: 1, rule_limit: NARRATIVE_LIMIT },
-    usesNetwork: true,
-    traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC },
-    async seed(sim) {
-      const isolated = NODES - 1;
-      const rest = Array.from({ length: NODES - 1 }, (_, i) => i);
-      await sim.partition([isolated], rest);
-      await sim.submitRequest(0, WATCHED_KEY, 50);
+    id: 'gateway-failure',
+    label: 'Gateway failure',
+    group: 1,
+    config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
+    charts: CHARTS,
+    story: { kind: 'watch', watched: 'gateway-failure', next: 'gateway-cut' },
+    async seed(sim, c, gateways) {
+      const g = gateways[ORIGIN]?.[1] ?? noGateway(1);
+      await sim.cut({ kind: 'silenced', node: g }, buildNodes(c));
+      await sim.submitRequest(ORIGIN, WATCHED_KEY, SEED_HITS);
+    },
+  },
+  {
+    id: 'gateway-cut',
+    label: 'Gateway cut',
+    group: 1,
+    config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
+    traffic: { rate_per_sec: TRICKLE_RATE_PER_SEC, at: { node: ORIGIN } },
+    charts: CHARTS,
+    story: { kind: 'watch', watched: 'gateway-cut', next: 'sandbox' },
+    async seed(sim, c, gateways) {
+      const g = gateways[ORIGIN]?.[1] ?? noGateway(1);
+      await sim.cut({ kind: 'unheard-in-zone', node: g, zone: 1 }, buildNodes(c));
+      await sim.submitRequest(ORIGIN, WATCHED_KEY, SEED_HITS);
+    },
+  },
+  {
+    id: 'steady',
+    label: 'Steady state',
+    group: 2,
+    config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
+    traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC, at: 'every-node' },
+    charts: CHARTS,
+    story: { kind: 'watch', watched: 'steady', next: 'rate-limiting' },
+    async seed(sim, c) {
+      for (let z = 0; z < c.zones; z++) await sim.submitRequest(seedNode(c, z), WATCHED_KEY, 10);
+    },
+  },
+  {
+    id: 'no-zone',
+    label: 'No zone configured',
+    group: 2,
+    config: { nodes: NODES, zones: ZONES, zone_mode: 'Unset', rule_limit: NARRATIVE_LIMIT },
+    traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC, at: 'every-node' },
+    charts: CHARTS,
+    story: { kind: 'watch', watched: 'no-zone', next: 'rate-limiting' },
+    async seed(sim, c) {
+      for (let z = 0; z < c.zones; z++) await sim.submitRequest(seedNode(c, z), WATCHED_KEY, 10);
     },
   },
   {
     id: 'sandbox',
     label: 'Sandbox',
-    blurb:
-      'A blank, quiet cluster — no background traffic. Click a node (or Send a burst), then Step to gossip the cell out one round at a time: watch it spread hop by hop, converge, and age back to quiet once the window slides past it. You drive every tick.',
-    // No traffic feed and an empty seed: the cluster starts silent and the user
-    // drives every hit by hand, advancing one gossip tick at a time with Step.
-    // The narrative limit (not the low default) so the eager threshold flush
-    // never fires — a single burst then spreads *only* on Step, one lazy
-    // heartbeat round per tick, which is the whole point of this scenario. (The
-    // limit-crossing / rejection story is the `overload` preset's job, where the
-    // aggregate genuinely climbs past a low limit.)
-    config: { nodes: NODES, rng_seed: 1, rule_limit: NARRATIVE_LIMIT },
+    group: 3,
+    // No feed and an empty seed: the cluster starts silent and the reader
+    // drives every hit. The far-off limit, so a request spreads at its node's
+    // next heartbeat, one event at a time under Step.
+    config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
+    charts: CHARTS,
+    story: { kind: 'sandbox' },
     async seed() {
-      // Deliberately empty — the user injects the first hit.
+      // Deliberately empty: the reader sends the first hit.
     },
   },
 ];
 
-/** The preset the page opens on. */
+/** The preset the page opens on: the product's job, first. */
 export const DEFAULT_PRESET = PRESETS[0];
+
+/** The preset with id `id`. */
+export const presetById = (id: PresetId): Preset => PRESETS.find((p) => p.id === id) ?? DEFAULT_PRESET;

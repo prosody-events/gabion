@@ -10,58 +10,67 @@ service, and an in-process NGINX module. Both share the same admission
 hot path, the same CRDT, the same wire codec, the same rule machinery.
 
 Cluster-wide counts are eventually consistent. Admission is local and
-allocation-free; an operator under heavy load pays for one atomic read of
-SHM (nginx) or one `DashMap` lookup (server), no syscalls, no allocations.
+allocation-free; an operator under heavy load pays for a short probe of
+the seqlocked aggregate table (in SHM for nginx, on the heap for
+`gabiond`), no syscalls, no allocations.
 
 ## Crate layout
 
 The workspace lives under `crates/`:
 
 - **`gabion`** — the library. Pure Rust, no transport bindings. Modules:
-  - `crdt` — per-origin counter store, dirty rings, peer frontier,
-    delta/expiration sinks. Bounded; zero allocation after construction.
+  - `crdt` — per-origin counter store and its delta/expiration sinks.
+    Bounded; zero allocation after construction.
+  - `aggregate` — the cluster-aggregate table admission reads; the
+    gossip runtime is its only writer.
   - `gossip` — anti-entropy runtime (`GossipRuntime`), `GossipClient`,
     `Clock`, `GossipTransport`, the deterministic `sim::SimTransport`
     used in tests, and the admin/peer interface.
-  - `wire` — the on-the-wire codec for gossip frames (header, body,
-    HMAC auth). Each UDP packet is self-describing and independently
+  - `wire` — the on-the-wire codec for gossip frames (header and
+    body). Each UDP packet is self-describing and independently
     decodable.
   - `rules` — `Rule` / `RuleTable` / `Descriptor` / stable fingerprint
     hashing. Shared by both adapters so two nodes with identical rules
     emit identical identifiers.
   - `discovery` — `PeerDiscovery` trait and the Kubernetes EndpointSlice
     implementation.
+  - `identity` — this process's node id and per-start incarnation.
+  - `zone` — zone names and the zone hash every gossip header carries.
+  - `settings` — every scalar operator setting, named, parsed and
+    validated once for both adapters.
   - `defaults` — the production tunables both adapters consume.
 
 - **`server`** (`gabion-server`) — the `gabiond` binary. Tonic gRPC
   rate-limit service speaking Envoy's
   `envoy.service.ratelimit.v3` protocol, plus a small admin HTTP
-  endpoint. `SharedLimiter<C>` is the admission entry point;
-  `DashMapStore<C>` is the cluster-aggregate read surface.
+  endpoint. `SharedLimiter` is the admission entry point;
+  `gabion::aggregate::Aggregate` is the cluster-aggregate read surface.
 
 - **`nginx`** (`gabion-nginx`) — the NGINX module. Two execution
   contexts share one `mmap`'d SHM zone: every worker runs the access
   phase (read aggregate, decide, push to SHM queue), and every worker
   runs a leader thread that campaigns for the SHM lease; the holder
   drains the queue, drives `GossipRuntime`, and writes deltas back into
-  the SHM aggregate. The library half (`access`, `headers`, `identity`,
-  `leader`, `rules`, `shm`) builds and tests without the `ngx-module`
+  the SHM aggregate. The library half (`access`, `headers`, `leader`,
+  `rules`, `shm`) builds and tests without the `ngx-module`
   feature; FFI glue is gated behind it.
 
 - **`loader`** — a load generator. Drives the gRPC service (or an HTTP
   endpoint sitting in front of nginx) with a configurable tenant /
   hit-rate mix; used in `make kubernetes-*` smoke tests.
 
-- **`gossip-bench`** — gossip propagation simulator. Runs scenario JSON
-  specs through `gossip::sim::SimTransport` and emits result JSON;
-  `bench/plot.py` produces the convergence plots. See
+- **`gossip-bench`** — the study harness: a deterministic simulator of a
+  gabion cluster, an oracle that scores every node against the true
+  count, and the Python judge and regression gate (`make sim-smoke`,
+  `make sim-gate`). Outside `src/harness/adapter.rs` it names only the
+  library's gossip and discovery traits. See
   `crates/gossip-bench/README.md`.
 
 Deployment manifests, NGINX docker-compose, Kubernetes smoke harnesses,
 and the cross-version NGINX/OpenResty build matrices live under
-`deploy/`. The gossip protocol explainer, operator-knob reference, and
-benchmark results live in `crates/gabion/README.md`; the CRDT design
-deep-dive lives in `crates/gabion/CRDT.md`.
+`deploy/`. The gossip protocol explainer and operator-knob reference
+live in `crates/gabion/README.md`; the CRDT design deep-dive lives in
+`crates/gabion/CRDT.md`.
 
 ## How a request flows
 
@@ -73,9 +82,10 @@ deep-dive lives in `crates/gabion/CRDT.md`.
    `(rule_fingerprint, key_hash, bucket, hits, now_millis)` record into
    the local SHM queue (nginx) or hand it to `GossipClient::record`
    (server).
-4. The gossip runtime folds local records into its `CellStore`, gossips
-   dirty rows to peers every tick, applies inbound deltas to the local
-   aggregate, and ages out expired buckets.
+4. The gossip runtime folds local records into its `CellStore`, streams
+   its changed cells to every peer in its zone and to one gateway in each
+   other zone, applies inbound deltas to the local aggregate, and ages out
+   expired buckets.
 
 The library knows nothing about YAML, gRPC, or nginx. Adapters bridge
 their own config to library types and own their own transport.
@@ -113,20 +123,20 @@ in the same commit that touches the surrounding code.
 ## No allocation on the hot path
 
 The per-request decision path and the CRDT mutation path must not allocate.
-Pre-size everything up front; carry stack-resident bounded collections
-(`arrayvec::ArrayVec`) through the request; iterate `RuleTable::matching`
-without `collect`ing; read SHM aggregates through atomic loads only.
+Pre-size everything up front; iterate `RuleTable::matching` without
+`collect`ing; read aggregates through atomic loads only.
 
-- A `Vec` that occasionally grows is acceptable for caller-owned buffers
-  that the hot path reuses across requests (e.g. the gRPC `mapped`
-  descriptor scratch) — but pre-allocate with `with_capacity` from the
-  call site so steady state is allocation-free.
-- Hard caps on per-request work live in `gabion::defaults` and feed both
-  adapters' `ArrayVec` sizings. Touching one without the other is a bug.
+- Per-request scratch is a caller-owned buffer the hot path reuses across
+  requests (each nginx worker's and each `gabiond` runtime thread's
+  admission events), reserved once with `with_capacity` for the most
+  rules a request can count, so steady state is allocation-free.
+- The per-request caps are settings in `gabion::settings`, with their
+  defaults in `gabion::defaults`; both adapters read them from there.
+  Giving one adapter a cap the other lacks is a bug.
 - The CRDT `CellStore` allocates only at construction. Every later
-  mutation reuses pre-sized columns, dictionaries, dirty rings, and the
-  freelist; if you find yourself adding a `push` that may grow, redesign
-  around a bounded structure.
+  mutation reuses pre-sized columns, dictionaries, and the freelist; if
+  you find yourself adding a `push` that may grow, redesign around a
+  bounded structure.
 
 ## Minimize copies
 
@@ -182,7 +192,7 @@ yes, do that instead of adding a flag.
 
 Public functions that can fail return `Result<_, E>` with a `thiserror`
 enum tailored to the call site (`ServeError`, `ConfigError`,
-`GossipError`, `EncodeError`, etc.). Errors carry context, not a
+`GossipError`, `DecodeError`, etc.). Errors carry context, not a
 stringified original. Internal infallible code returns plain values —
 don't wrap success-only paths in `Result` for symmetry.
 
@@ -292,8 +302,8 @@ Other rules:
 - **Attach structured fields** (`domain = ..., descriptor_count = ...,
   failed_total = ...`) so logs are filterable. Don't bake values into
   the prose if a field will do.
-- **Rate-limit chatty warnings** with the power-of-two pattern in
-  `crates/server/src/lib.rs`. A bad client at 50k rps should produce
+- **Rate-limit chatty warnings** through `gabion::throttle`, the one
+  power-of-two helper. A bad client at 50k rps should produce
   ~log₂(N) lines, not 50k.
 - **Name the knob.** If raising a limit fixes it, name the constant
   (`STORAGE_MAX_MATCHED_RULES`) or the config key
@@ -337,6 +347,22 @@ the relevant README and link it from the surrounding context.
   for reviewer testing. `release-please` only runs on `main`; merging
   is what triggers the release PR loop. Direct pushes to `main` skip
   review and bypass every gate above.
+- **Clean every worktree when disk space runs low.** A full build
+  here is 5–12 GiB, and parallel agents each build in a worktree of
+  their own, so a busy machine can fill its disk within an hour.
+  Before you start a build, check free space with `df -h .`. If less
+  than 30 GiB is free, run `cargo clean` in every worktree of this
+  repository, the main checkout included, before you build:
+
+  ```sh
+  git worktree list --porcelain | awk '/^worktree /{print $2}' |
+    while read -r wt; do (cd "$wt" && cargo clean); done
+  ```
+
+  Skip a worktree only while a build is running in it: cleaning it
+  then breaks that build. An agent that builds in a worktree of its
+  own runs `cargo clean` there when it finishes, whatever the free
+  space.
 - **`cargo nextest` is the only sanctioned test runner.** Do not
   invoke `cargo test`. Nextest is faster, supports per-test timeouts,
   surfaces failures earlier, and is what CI runs. If you write a new
@@ -369,6 +395,6 @@ the relevant README and link it from the surrounding context.
 - The library crate (`gabion`) knows nothing about YAML, gRPC, or
   nginx. Adapters bridge their own config to library types.
 - High-volume operator warnings (cardinality rejects, gossip record
-  failures, matched-rule overflows) use the power-of-two rate-limited
-  `tracing::warn!` pattern in `crates/server/src/lib.rs` — copy it
-  rather than inventing another throttle.
+  failures, matched-rule overflows) count each occurrence with
+  `gabion::throttle` and log only when it returns `Some`; never write
+  another throttle.

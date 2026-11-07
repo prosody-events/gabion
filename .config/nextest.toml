@@ -1,0 +1,13 @@
+# A defect in a spin loop (a ring whose mask is off, a lease nobody can
+# take) makes a test spin forever instead of failing, and a hung test holds
+# a CI job until the runner's own six-hour limit. Nextest kills any test
+# still running after `period * terminate-after` and reports it as failed.
+# The slowest test takes seconds; the 300-node validation epidemic takes
+# about 78 s unoptimised, so three minutes is far from a healthy run.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# `cargo miri nextest` selects this profile. Miri runs the same tests one to
+# two orders of magnitude slower; the slowest takes about 16 s.
+[profile.default-miri]
+slow-timeout = { period = "60s", terminate-after = 5 }
