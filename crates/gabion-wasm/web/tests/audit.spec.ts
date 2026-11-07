@@ -26,10 +26,10 @@ import {
 import { DROP_STOPS, MARK, RING_BEHIND, RING_CAUGHT_UP, STOP_BAR, type BeamPool, type GlyphTable } from '../src/lib/stage/renderer';
 import { VESSEL_SCALE } from '../src/lib/limit';
 import { zoneAt } from '../src/lib/format';
-import { PRESETS } from '../src/lib/presets';
+import { PRESETS, WATCHED_KEY } from '../src/lib/presets';
 import { BAND_ALPHA, BEAM_ALPHA, readTheme, type Theme } from '../src/lib/theme';
 import timings from './phase-timings.json' with { type: 'json' };
-import { PERIOD_MS, WATCH, period, refusal, send, sendButton, setSpeed, step, stepUntil, still, virtualMs } from './drive';
+import { PERIOD_MS, period, refusal, send, sendButton, setSpeed, step, stepUntil, still, virtualMs } from './drive';
 
 // How far a node's ring and its selection outline reach outside its disc,
 // summed from the gap and stroke each is drawn with rather than read from the
@@ -80,7 +80,7 @@ const field = (page: Page, name: string): Locator => page.locator(`[data-field="
 /** The page's engine, snapshotted: every node's state, or with `inspect` that
  *  node's rows too. */
 const snapshot = (page: Page, inspect: number | null = null): Promise<ClusterState> =>
-  page.evaluate(([id, watch]) => window.sim!.snapshot(id, watch), [inspect, WATCH] as const);
+  page.evaluate(([id, key]) => window.sim!.snapshot(id, key), [inspect, WATCHED_KEY] as const);
 
 /** Load the page, wait for the stage, and open the rail where it folds away. */
 async function open(page: Page): Promise<Locator> {
@@ -500,10 +500,10 @@ async function checkHeading(page: Page, where: string, snap: ClusterState): Prom
     expect(printed.includes(`All ${nodes.length} nodes`), `${where}: "${printed}" says every node`).toBe(true);
   }
   const selected = Number(await text(page.locator('.pane-title [data-field="node"]')));
-  const next = (await snapshot(page, selected)).inspected?.next_send;
+  const brim = (await snapshot(page, selected)).nodes.find((n) => n.id === selected)?.brim;
   const reopens = await claims('reopens');
-  if (id === 'rl-3' && next?.kind === 'Rejected' && next.reopens.kind === 'In') {
-    expect(reopens, `${where}: the countdown`).toEqual([`${(Math.floor(next.reopens.ms / 100) / 10).toFixed(1)} s`]);
+  if (id === 'rl-3' && brim?.kind === 'Rejected') {
+    expect(reopens, `${where}: the countdown`).toEqual([`${(Math.floor(brim.reopens_ms / 100) / 10).toFixed(1)} s`]);
   } else {
     expect(reopens, `${where}: no countdown while node ${selected} admits`).toEqual([]);
   }
@@ -1644,9 +1644,9 @@ test('a Send runs only the time it needs (A46)', async ({ page }, info) => {
   await open(page);
   await setSpeed(page, 4);
   const pane = page.locator('.stage-pane');
-  const hits = page.locator('#burst-hits');
-  await hits.fill('100');
-  await hits.press('Enter');
+  const requests = page.locator('#burst-requests');
+  await requests.fill('100');
+  await requests.press('Enter');
   await logPackets(page);
   await send(page, 0);
   await expect(pane).toHaveAttribute('data-clock', 'paused');

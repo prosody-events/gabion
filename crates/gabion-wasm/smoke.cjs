@@ -19,8 +19,8 @@ async function main() {
     "virtual_ms:", stepBatch.virtual_ms,
   );
 
-  console.log("snapshot(null, 1, 1)...");
-  const snap = await sim.snapshot(null, 1n, 1n);
+  console.log("snapshot(null, 1)...");
+  const snap = await sim.snapshot(null, 1n);
   console.log(
     "snapshot -> nodes:", snap.nodes.length,
     "oracle_total:", snap.oracle_total,

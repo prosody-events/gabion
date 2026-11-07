@@ -5,7 +5,7 @@
 
 import init, { Sim as WasmSim, default_config, max_zones } from '../../wasm/gabion_wasm.js';
 import type { Cut } from '../cuts';
-import type { ClusterState, EventBatch, LinkPolicyKind, SimConfig, StepUntil, Watch } from './types';
+import type { ClusterState, EventBatch, LinkPolicyKind, SimConfig, StepUntil } from './types';
 
 /** A live node as a fault reads it: its id and zone. */
 export interface Member {
@@ -80,14 +80,15 @@ export class Sim {
     return max_zones();
   }
 
-  /** A request of `hits` for `key` at `node`, at the current virtual time: the
-   *  node decides it first (the batch's `Decided` event), and an admitted
-   *  request's eager flush is delivered at the same instant before it
-   *  resolves: its packets and the receivers' cell events are in the batch.
-   *  With `until` an `Event`, a flush's wave is held, as a step by event
-   *  holds one, until the next call. Throws for zero hits. */
-  async submitRequest(node: number, key: number, hits: number, until: StepUntil = 'Time'): Promise<EventBatch> {
-    const batch = (await this.#inner.submit_request(node, BigInt(key), BigInt(hits), until)) as EventBatch;
+  /** A burst of `requests` one-hit requests for `key` at `node`, at the
+   *  current virtual time: the node decides them in order first (the batch's
+   *  `Decided` event), and the admitted requests' eager flush is delivered at
+   *  the same instant before it resolves: its packets and the receivers' cell
+   *  events are in the batch. With `until` an `Event`, a flush's wave is
+   *  held, as a step by event holds one, until the next call. Throws for zero
+   *  requests. */
+  async submitRequest(node: number, key: number, requests: number, until: StepUntil = 'Time'): Promise<EventBatch> {
+    const batch = (await this.#inner.submit_request(node, BigInt(key), BigInt(requests), until)) as EventBatch;
     assertBoundary(batch);
     return batch;
   }
@@ -107,14 +108,10 @@ export class Sim {
     return batch;
   }
 
-  /** Pull every node's state of `watch.key` for a re-render, with the cells,
-   *  peer rows and next-send decision of node `inspect` alone. */
-  async snapshot(inspect: number | null, watch: Watch): Promise<ClusterState> {
-    return (await this.#inner.snapshot(
-      inspect,
-      BigInt(watch.key),
-      BigInt(watch.probe_hits),
-    )) as ClusterState;
+  /** Pull every node's state of `key` for a re-render, with the cells and
+   *  peer rows of node `inspect` alone. */
+  async snapshot(inspect: number | null, key: number): Promise<ClusterState> {
+    return (await this.#inner.snapshot(inspect, BigInt(key))) as ClusterState;
   }
 
   /** The faults made since the last heal. */

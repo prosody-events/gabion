@@ -176,8 +176,8 @@ export interface Roles {
 export interface Scale {
   limit: number;
   onScale: boolean;
-  /** Hits per Send: whether a request's stratum is tall enough to draw. */
-  hits: number;
+  /** Requests per Send: whether a Send's stratum is tall enough to draw. */
+  requests: number;
   buckets: number;
 }
 
@@ -350,6 +350,9 @@ export class GlyphTable {
   bounce = -1;
   bandTop = Number.NaN;
   bandBottom = Number.NaN;
+  /** The heartbeat sweep's segments shown, −1 while the selection outline
+   *  shows whole (always under reduced motion). */
+  sweep = -1;
   /** The selected and the previewed node's slots, −1 for none, and the dash
    *  pattern the preview is drawn with. */
   selected = -1;
@@ -418,7 +421,7 @@ export class StageRenderer {
   #cluster: ClusterState | null = null;
   #roles: Roles | null = null;
   #faults: ReadonlyMap<number, Fault> = new Map();
-  #scale: Scale = { limit: 1, onScale: false, hits: 1, buckets: 1 };
+  #scale: Scale = { limit: 1, onScale: false, requests: 1, buckets: 1 };
   // A lag younger than this does not open a ring: the feed's newest hits.
   #grace = 0;
   // Rings sweeping now, so a frame with none visits no node.
@@ -650,8 +653,10 @@ export class StageRenderer {
     this.#sweep.visible = sweep;
     const selected = this.#roles === null ? undefined : this.#nodes.get(this.#roles.selected);
     if (selected !== undefined) selected.selection.visible = !sweep;
+    this.#glyphs.sweep = -1;
     if (!sweep) return;
     const shown = Math.ceil(Math.min(Math.max(fraction, 0), 1) * SWEEP_SEGMENTS);
+    this.#glyphs.sweep = shown;
     for (let i = 0; i < SWEEP_SEGMENTS; i++) this.#segments[i].visible = i < shown;
   }
 
@@ -1085,7 +1090,7 @@ export class StageRenderer {
     // Strata: a gap between each pair of non-empty buckets, oldest lowest,
     // where the inside is tall enough and a request's stratum would show.
     let strata = 0;
-    if (inner >= STRATA_MIN_INNER && (inner * scale.hits) / full >= STRATUM_MIN) {
+    if (inner >= STRATA_MIN_INNER && (inner * scale.requests) / full >= STRATUM_MIN) {
       let below = 0;
       for (let b = 0; b < gfx.rowLen; b++) {
         const hits = gfx.row[b];

@@ -1,16 +1,8 @@
-<script module lang="ts">
-  /** A node's decision on a Send: how many hits, and whether it admitted. */
-  export interface Decision {
-    readonly hits: number;
-    readonly admitted: boolean;
-  }
-</script>
-
 <script lang="ts">
   import { claim, fmtCount, fmtDuration, noun, zoneLabel } from '../format';
   import type { LabelBox, Roles } from '../stage/renderer';
   import { HIT_MIN, RING_REACH, type StageLayout } from '../stage/layout';
-  import { missingFor, type ClusterState } from '../sim/types';
+  import { admittedOf, missingFor, type Burst, type ClusterState } from '../sim/types';
   import RoleGlyph from './RoleGlyph.svelte';
   import Sentence from './Sentence.svelte';
 
@@ -57,7 +49,7 @@
     /** Nodes gliding to a new slot, whose counts hide while they move. */
     gliding: readonly number[];
     /** Each node's decision on the last Send, until it is cleared. */
-    decisions: ReadonlyMap<number, Decision>;
+    decisions: ReadonlyMap<number, Burst>;
     /** The stage's name boxes, which a decision keeps clear of. */
     labelBoxes: readonly LabelBox[];
     phone: boolean;
@@ -176,8 +168,13 @@
     return crosses || right.x + w > width ? { left: row.x - reach - w, flipped: true } : { left: right.x, flipped: false };
   }
 
-  const decisionText = (d: Decision): string =>
-    phone ? (d.admitted ? `+${d.hits}` : `${d.hits}`) : d.admitted ? `+${d.hits} admitted` : `${d.hits} rejected`;
+  /** A burst's decision as its text: the admitted part, the rejected part,
+   *  or both, joined by " · "; below 640 px the numbers alone. */
+  function decisionText(admitted: number, rejected: number): string {
+    const yes = admitted === 0 ? '' : phone ? `+${admitted}` : `+${admitted} admitted`;
+    const no = rejected === 0 ? '' : phone ? `${rejected}` : `${rejected} rejected`;
+    return yes !== '' && no !== '' ? `${yes} · ${no}` : yes + no;
+  }
 
   /** The cell's accessible name: the live sentence for the cell in the tab order
    *  (the one a screen reader lands on), the bare identity for the rest, so a
@@ -266,22 +263,18 @@
           </div>
           {@const d = decisions.get(row.id)}
           {#if d !== undefined && showCounts && !gliding.includes(row.id)}
-            {@const text = decisionText(d)}
-            {@const at = decisionLeft(row, text)}
-            <span
-              class="decision"
-              class:rejected={!d.admitted}
-              class:flipped={at.flipped}
-              data-node={row.id}
-              style="left: {at.left}px; top: {row.y}px"
-              ><Sentence
-                parts={phone
-                  ? [d.admitted ? '+' : '', claim(d.hits, row.id, d.admitted ? 'admitted' : 'rejected')]
-                  : d.admitted
-                    ? ['+', claim(d.hits, row.id, 'admitted'), ' admitted']
-                    : [claim(d.hits, row.id, 'rejected'), ' rejected']}
-                field="decision"
-              />{#if phone && !d.admitted}<RoleGlyph kind="rejected" />{/if}</span
+            {@const admitted = admittedOf(d)}
+            {@const rejected = d.kind === 'Rejected' ? d.rejected : 0}
+            {@const at = decisionLeft(row, decisionText(admitted, rejected))}
+            <span class="decision" class:flipped={at.flipped} data-node={row.id} style="left: {at.left}px; top: {row.y}px"
+              >{#if admitted > 0}<Sentence
+                  parts={['+', claim(admitted, row.id, 'admitted'), phone ? '' : ' admitted']}
+                  field="decision"
+                />{/if}{#if admitted > 0 && rejected > 0}<span>&nbsp;·&nbsp;</span>{/if}{#if rejected > 0}<span class="rejected"
+                  ><Sentence parts={[claim(rejected, row.id, 'rejected'), phone ? '' : ' rejected']} field="decision" />{#if phone}<RoleGlyph
+                      kind="rejected"
+                    />{/if}</span
+                >{/if}</span
             >
           {/if}
         {/each}
@@ -408,7 +401,10 @@
     -webkit-text-stroke: 3px var(--color-bg);
   }
 
-  .decision.rejected {
+  .decision .rejected {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
     color: var(--color-bad);
   }
 

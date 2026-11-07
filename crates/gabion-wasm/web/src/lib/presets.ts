@@ -19,11 +19,12 @@
 //
 // Rate limiting, Zone partition and Sustained overload set a low limit, so
 // the vessels draw it and admission refuses past it; at limit 100 with twelve
-// nodes gabion's error budget ε is 1, so every Send of two hits or more is
+// nodes gabion's error budget ε is 1, so every Send admitting two or more is
 // flushed at once to the node's zone and one gateway in each other zone. The
 // rest pin the limit far off (`NARRATIVE_LIMIT`, 1 000 000), where ε is in the
-// hundreds, so a request waits for its node's next heartbeat: the propagation
-// story.
+// hundreds, so a Send's hits wait for its node's next heartbeat: the
+// propagation story. A seed reports the hits it leaves waiting at the selected
+// node, so the page shows that node's heartbeat coming from the first frame.
 //
 // The feed exists only where traffic is the subject: Steady state, No zone
 // configured and Sustained overload, plus Gateway cut's trickle at node 0,
@@ -34,7 +35,7 @@
 
 import type { PresetId, Story } from './next';
 import type { Member, Sim } from './sim/sim';
-import type { SimConfig, SimEvent, ZoneMode } from './sim/types';
+import { waves, type SimConfig, type SimEvent, type ZoneMode } from './sim/types';
 
 /** The single watched rule's key. Every preset seed and every Send targets
  *  this key, so they all grow the same counter and the story stays about one
@@ -47,8 +48,8 @@ const NODES = 12;
 /** The zones the presets place the cluster in. */
 const ZONES = 3;
 
-/** Hits in the request the seeded presets open with. */
-const SEED_HITS = 50;
+/** Requests in the Send the seeded presets open with. */
+const SEED_REQUESTS = 50;
 
 /** The node every preset selects on load, and the node the seeded presets
  *  seed and read the gateways of. */
@@ -58,14 +59,15 @@ export const ORIGIN = 0;
  *  large and a request spreads by heartbeat. */
 const NARRATIVE_LIMIT = 1_000_000;
 
-/** Hits per Send every preset opens with, and the range the field accepts. */
-export const BURST_HITS = 25;
-export const BURST_HITS_MIN = 1;
-export const BURST_HITS_MAX = 1000;
+/** Requests per Send every preset opens with, and the range the field
+ *  accepts. Each request is one hit. */
+export const BURST_REQUESTS = 25;
+export const BURST_REQUESTS_MIN = 1;
+export const BURST_REQUESTS_MAX = 1000;
 
-/** The limit Rate limiting and Zone partition enforce: four Sends of
- *  `BURST_HITS` reach it exactly. */
-const RATE_LIMIT = 4 * BURST_HITS;
+/** The limit Rate limiting and Zone partition enforce: four default Sends
+ *  reach it exactly. */
+const RATE_LIMIT = 4 * BURST_REQUESTS;
 
 /** The highest rule limit the Tune controls accept. */
 export const RULE_LIMIT_MAX = 1_000_000;
@@ -138,6 +140,12 @@ export interface SustainedTraffic {
  *  each other zone while the cluster warmed up. */
 export type Gateways = ReadonlyArray<ReadonlyArray<number | undefined>>;
 
+/** Hits admitted at `node` that wait for its next heartbeat. */
+export interface Held {
+  readonly node: number;
+  readonly hits: number;
+}
+
 /** A chart the detail pane shows, by what it plots: the share of data bytes
  *  that crossed zones, the agreement and disagreement panels, and the cluster
  *  total against the limit. */
@@ -158,8 +166,9 @@ export type Preset = {
    *  over to. */
   readonly story: Story;
   /** Fire the preset's opening commands on the warmed cluster, at the current
-   *  virtual time. */
-  seed(sim: Sim, config: SimConfig, gateways: Gateways): Promise<void>;
+   *  virtual time, and report the hits they leave held for the selected
+   *  node's heartbeat, or null. */
+  seed(sim: Sim, config: SimConfig, gateways: Gateways): Promise<Held | null>;
 };
 
 /** The nodes a build places: node `i` in zone `i mod zones`. */
@@ -211,6 +220,13 @@ export async function warm(sim: Sim, c: SimConfig): Promise<Gateways> {
  *  and been acknowledged before the first paint. */
 const settle = (sim: Sim, c: SimConfig): Promise<void> => quiet(sim, c, () => true);
 
+/** Send `requests` at `node`: the hits it holds for its next heartbeat when
+ *  they wait for it, or null when they flushed at once. */
+async function opening(sim: Sim, node: number, requests: number): Promise<Held | null> {
+  const batch = await sim.submitRequest(node, WATCHED_KEY, requests);
+  return waves(batch) === 0 ? { node, hits: requests } : null;
+}
+
 /** Throw: node 0 never found a gateway into zone `zone`. */
 function noGateway(zone: number): never {
   throw new Error(
@@ -218,6 +234,14 @@ function noGateway(zone: number): never {
       `so the gateway scenario cannot start. A zone needs at least one live node that node ${ORIGIN} can hear; ` +
       'rebuild with more nodes or fewer zones.',
   );
+}
+
+/** Steady state's and No zone configured's seed: ten requests at one node of
+ *  each zone, the first at node 0, whose held hits it reports. */
+async function spreadOut(sim: Sim, c: SimConfig): Promise<Held | null> {
+  const held = await opening(sim, seedNode(c, 0), 10);
+  for (let z = 1; z < c.zones; z++) await opening(sim, seedNode(c, z), 10);
+  return held;
 }
 
 const CHARTS: readonly ChartId[] = ['share', 'agreement', 'spread'];
@@ -234,6 +258,7 @@ export const PRESETS: readonly Preset[] = [
     story: { kind: 'rate-limiting', next: 'partition', act: 'open', zones: 0, sendBucket: null },
     async seed() {
       // Opens settled at 0: the reader's Sends are the story.
+      return null;
     },
   },
   {
@@ -244,8 +269,9 @@ export const PRESETS: readonly Preset[] = [
     charts: CHARTS,
     story: { kind: 'propagation', next: 'rate-limiting', act: 'open' },
     async seed(sim, c) {
-      await sim.submitRequest(ORIGIN, WATCHED_KEY, SEED_HITS);
+      await sim.submitRequest(ORIGIN, WATCHED_KEY, SEED_REQUESTS);
       await settle(sim, c);
+      return null;
     },
   },
   {
@@ -262,6 +288,7 @@ export const PRESETS: readonly Preset[] = [
     story: { kind: 'watch', watched: 'overload', next: 'rate-limiting' },
     async seed() {
       // No opening request: the sustained feed (driven during play) is the story.
+      return null;
     },
   },
   {
@@ -273,6 +300,7 @@ export const PRESETS: readonly Preset[] = [
     story: { kind: 'partition', next: 'gateway-failure', act: 'open' },
     async seed(sim, c) {
       await sim.cut({ kind: 'zone', zone: c.zones - 1 }, buildNodes(c));
+      return null;
     },
   },
   {
@@ -282,9 +310,7 @@ export const PRESETS: readonly Preset[] = [
     config: { nodes: NODES, zones: ZONES, uniform_loss: 0.3, rule_limit: NARRATIVE_LIMIT },
     charts: CHARTS,
     story: { kind: 'watch', watched: 'loss', next: 'rate-limiting' },
-    async seed(sim) {
-      await sim.submitRequest(ORIGIN, WATCHED_KEY, SEED_HITS);
-    },
+    seed: (sim) => opening(sim, ORIGIN, SEED_REQUESTS),
   },
   {
     id: 'gateway-failure',
@@ -296,7 +322,7 @@ export const PRESETS: readonly Preset[] = [
     async seed(sim, c, gateways) {
       const g = gateways[ORIGIN]?.[1] ?? noGateway(1);
       await sim.cut({ kind: 'silenced', node: g }, buildNodes(c));
-      await sim.submitRequest(ORIGIN, WATCHED_KEY, SEED_HITS);
+      return opening(sim, ORIGIN, SEED_REQUESTS);
     },
   },
   {
@@ -310,7 +336,7 @@ export const PRESETS: readonly Preset[] = [
     async seed(sim, c, gateways) {
       const g = gateways[ORIGIN]?.[1] ?? noGateway(1);
       await sim.cut({ kind: 'unheard-in-zone', node: g, zone: 1 }, buildNodes(c));
-      await sim.submitRequest(ORIGIN, WATCHED_KEY, SEED_HITS);
+      return opening(sim, ORIGIN, SEED_REQUESTS);
     },
   },
   {
@@ -321,9 +347,7 @@ export const PRESETS: readonly Preset[] = [
     traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC, at: 'every-node' },
     charts: CHARTS,
     story: { kind: 'watch', watched: 'steady', next: 'rate-limiting' },
-    async seed(sim, c) {
-      for (let z = 0; z < c.zones; z++) await sim.submitRequest(seedNode(c, z), WATCHED_KEY, 10);
-    },
+    seed: spreadOut,
   },
   {
     id: 'no-zone',
@@ -333,9 +357,7 @@ export const PRESETS: readonly Preset[] = [
     traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC, at: 'every-node' },
     charts: CHARTS,
     story: { kind: 'watch', watched: 'no-zone', next: 'rate-limiting' },
-    async seed(sim, c) {
-      for (let z = 0; z < c.zones; z++) await sim.submitRequest(seedNode(c, z), WATCHED_KEY, 10);
-    },
+    seed: spreadOut,
   },
   {
     id: 'sandbox',
@@ -349,6 +371,7 @@ export const PRESETS: readonly Preset[] = [
     story: { kind: 'sandbox' },
     async seed() {
       // Deliberately empty: the reader sends the first hit.
+      return null;
     },
   },
 ];

@@ -6,14 +6,9 @@
 
 import { expect, type Locator, type Page } from '@playwright/test';
 import { WATCHED_KEY } from '../src/lib/presets';
-import type { Watch } from '../src/lib/sim/types';
 import { CONTROL } from '../src/lib/stage/layout';
 import type { BeamPool, GlyphTable } from '../src/lib/stage/renderer';
 import timings from './phase-timings.json' with { type: 'json' };
-
-/** What the specs' snapshots read: the watched key, deciding the default Send
- *  of 25 hits. */
-export const WATCH: Watch = { key: WATCHED_KEY, probe_hits: 25 };
 
 /** The heartbeat period every preset runs with, from the engine's timing
  *  record. */
@@ -78,10 +73,10 @@ export const pauseIfPlaying = (page: Page): Promise<void> =>
 export async function send(page: Page, node: number, pause = false): Promise<void> {
   await select(page, node);
   const decided = async (): Promise<number> =>
-    page.evaluate(async (w) => {
-      const s = await window.sim!.snapshot(null, w);
+    page.evaluate(async (key) => {
+      const s = await window.sim!.snapshot(null, key);
       return s.admitted_hits + s.rejected_hits;
-    }, WATCH);
+    }, WATCHED_KEY);
   const before = await decided();
   const playing = (await page.locator('.stage-pane').getAttribute('data-playing')) === '1';
   await sendButton(page).click();

@@ -70,7 +70,7 @@ fn phased_heartbeats_never_rewind_a_stream() {
 }
 
 async fn assert_no_rewinds(state: &EngineState, period: u64, script: &str) {
-    for node in state.snapshot(None, WATCH).await.nodes {
+    for node in state.snapshot(None, WATCHED).await.nodes {
         assert_eq!(
             (node.rto_rewinds_own, node.rto_rewinds_relay),
             (0, 0),
@@ -114,7 +114,7 @@ fn quiet_cost_by_counters() {
         let joiner = state.nodes.last().expect("the joiner").id;
         state.step(60_000, StepUntil::Time).await;
         let now = state.virtual_ms;
-        for node in state.snapshot(None, WATCH).await.nodes {
+        for node in state.snapshot(None, WATCHED).await.nodes {
             let spawned = if node.id == joiner { joined_at } else { 0 };
             assert_eq!(
                 node.rounds_heartbeat,
@@ -239,7 +239,7 @@ async fn timeline(state: &mut EngineState, node: u32, hits: u64) -> Timeline {
     let mut last = last_packet(&events);
     let agreed = loop {
         assert!(state.virtual_ms < deadline, "no agreement: {timeline:?}");
-        if caught_up(&state.snapshot(None, WATCH).await, |_| true) {
+        if caught_up(&state.snapshot(None, WATCHED).await, |_| true) {
             break state.virtual_ms;
         }
         let (events, wave) = next_stop(state, deadline).await;
@@ -382,7 +382,7 @@ async fn fail_over(
             out.failover_ms = failover(&events, 0, 1, g).map(|(at, _)| at - t0);
         }
         if out.failover_ms.is_some()
-            && caught_up(&state.snapshot(None, WATCH).await, |n| {
+            && caught_up(&state.snapshot(None, WATCHED).await, |n| {
                 n.zone == 1 && n.id != g
             })
         {
@@ -461,11 +461,11 @@ fn fed_record(config: SimConfig) -> (f64, f64) {
                 waves += 1;
             }
             if at_share_from.is_none() && state.virtual_ms == share_from {
-                at_share_from = Some(state.snapshot(None, WATCH).await.bytes_by_tier);
+                at_share_from = Some(state.snapshot(None, WATCHED).await.bytes_by_tier);
             }
         }
         let from = at_share_from.expect("the run passed 20 s");
-        let to = state.snapshot(None, WATCH).await.bytes_by_tier;
+        let to = state.snapshot(None, WATCHED).await.bytes_by_tier;
         let cross = to.cross_zone.data - from.cross_zone.data;
         let all = cross + to.in_zone.data - from.in_zone.data;
         let periods = (end - count_from) / P;

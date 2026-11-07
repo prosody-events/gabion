@@ -1,11 +1,11 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
 import type { ClusterState } from '../src/lib/sim/types';
-import type { GlyphTable } from '../src/lib/stage/renderer';
+import type { BeamPool, GlyphTable } from '../src/lib/stage/renderer';
 import { CROSS, RELAY, STRATA_MIN_INNER } from '../src/lib/stage/layout';
 import { readTheme } from '../src/lib/theme';
-import { WATCH, pauseIfPlaying, recordData, sendButton, setRange, setSpeed, step, still } from './drive';
+import { pauseIfPlaying, recordData, send, sendButton, setRange, setSpeed, step, still } from './drive';
 import { WATCHES } from '../src/lib/next';
-import { PRESETS, presetById } from '../src/lib/presets';
+import { PRESETS, WATCHED_KEY, presetById } from '../src/lib/presets';
 import { COMMANDS, clauses } from './next-actions';
 
 // Each scenario's story, walked the way a newcomer walks it: pressing only the
@@ -21,7 +21,7 @@ const squash = (s: string | null): string => (s ?? '').replace(/\s+/g, ' ').trim
 
 /** The page's engine, snapshotted, with node `inspect`'s rows. */
 const snapshot = (page: Page, inspect: number | null = null): Promise<ClusterState> =>
-  page.evaluate(([id, watch]) => window.sim!.snapshot(id, watch), [inspect, WATCH] as const);
+  page.evaluate(([id, key]) => window.sim!.snapshot(id, key), [inspect, WATCHED_KEY] as const);
 
 async function open(page: Page): Promise<void> {
   await page.goto('/');
@@ -243,8 +243,8 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
         // The one rejection template, naming the nodes that filled the window,
         // among the sentences said since the press.
         const said = await recorded(page, 'narrations');
-        const narration = said.find((t) => / rejected all 25/.test(t)) ?? said.join(' | ');
-        expect(narration, `${where}: the rejection`).toMatch(/^node \d+ rejected all 25: it sees 100/);
+        const narration = said.find((t) => / rejected all 25 requests/.test(t)) ?? said.join(' | ');
+        expect(narration, `${where}: the rejection`).toMatch(/^node \d+ rejected all 25 requests: it sees 100/);
         if (refusals === 1) expect(narration, `${where}: who filled the window`).toContain('admitted at nodes 0, 1 and 2');
       } else {
         admitted += 1;
@@ -552,22 +552,22 @@ test('Zone partition admits on each side, then counts all of it (A48)', async ({
   expect(over, 'every vessel draws over its brim').toEqual(healed.nodes.map(() => true));
 });
 
-test('Hits per Send is checked when committed, not while typed (A59, A50)', async ({ page }, info) => {
+test('Requests per Send is checked when committed, not while typed (A59, A50)', async ({ page }, info) => {
   test.skip(info.project.name !== 'audit-1440-light', 'the field, checked once');
   await open(page);
-  const field = page.locator('#burst-hits');
+  const field = page.locator('#burst-requests');
   const send = sendButton(page);
   await field.click();
   await field.press('ControlOrMeta+a');
   for (const key of ['5', 'Backspace', '5', '0']) {
     await field.press(key);
     await expect(primary(page), `after ${key}`).toHaveCount(1);
-    await expect(primary(page)).toHaveAttribute('id', 'burst-hits');
-    await expect(page.getByRole('button', { name: /^Use \d+ hits/ })).toHaveCount(0);
+    await expect(primary(page)).toHaveAttribute('id', 'burst-requests');
+    await expect(page.getByRole('button', { name: /^Use \d+ requests/ })).toHaveCount(0);
     await expect(send).toBeEnabled();
   }
   await field.press('Enter');
-  await expect(send).toHaveText(/Send a request of\s*50\s*hits/);
+  await expect(send).toHaveText(/Send\s*50\s*requests/);
   await field.fill('');
   await field.blur();
   await expect(send).toHaveText('Send');
@@ -576,27 +576,192 @@ test('Hits per Send is checked when committed, not while typed (A59, A50)', asyn
   await expect(reason).toBeVisible();
   const [a, b] = [await send.boundingBox(), await reason.boundingBox()];
   expect(Math.max(b!.x - (a!.x + a!.width), a!.x - (b!.x + b!.width), b!.y - (a!.y + a!.height), a!.y - (b!.y + b!.height)), 'the reason stands beside Send').toBeLessThanOrEqual(48);
-  const use = page.getByRole('button', { name: /^Use 25 hits/ });
+  const use = page.getByRole('button', { name: /^Use 25 requests/ });
   await expect(use).toHaveAttribute('data-primary', '');
   await use.click();
   await expect(send).toBeEnabled();
-  await expect(send).toHaveText(/25\s*hits/);
-  // Restart keeps a committed Hits per Send (A6).
+  await expect(send).toHaveText(/25\s*requests/);
+  // Restart keeps a committed Requests per Send (A6).
   await field.fill('30');
   await field.press('Enter');
   await page.getByRole('button', { name: 'Restart Rate limiting' }).click();
   await expect(page.locator('.narration')).toContainText('Paused at the start of Rate limiting');
-  await expect(send).toHaveText(/Send a request of\s*30\s*hits/);
+  await expect(send).toHaveText(/Send\s*30\s*requests/);
   await expect(field).toHaveValue('30');
-  // A request heavier than the limit is never admitted: the fix is Use 25
-  // hits, until the reader types, when the field is the next action.
-  await field.fill('200');
+});
+
+test('a Send of 250 at limit 100 admits 100 and rejects 150 (A60)', async ({ page }, info) => {
+  test.skip(info.project.name !== 'audit-1440-light', 'the burst, checked once');
+  await open(page);
+  const field = page.locator('#burst-requests');
+  await field.fill('250');
   await field.press('Enter');
+  const send = sendButton(page);
+  await expect(send).toHaveText(/Send\s*250\s*requests to node\s*0/);
+  // Recorded from the press: the decision text goes when the Send's run ends.
+  await record(page, 'narrations', '.narration');
+  await record(page, 'decisions', '.decision[data-node="0"]');
   await send.click();
-  await expect(page.getByRole('button', { name: /^Use 25 hits/ })).toHaveAttribute('data-primary', '');
-  await field.press('Backspace');
-  await expect(primary(page)).toHaveAttribute('id', 'burst-hits');
-  await expect(page.getByRole('button', { name: /^Use \d+ hits/ })).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => (window as unknown as { decisions: string[] }).decisions)).toContain('+100 admitted · 150 rejected');
+  // Rate limiting has no feed, and the run has ended: nothing changes the
+  // counts read below.
+  await still(page);
+  const said = await recorded(page, 'narrations');
+  expect(
+    said.some((t) => t.startsWith('node 0 admitted 100 of 250 requests and rejected 150: its window holds 100 of the 100 limit')),
+    `the verdict states the split: ${said.join(' | ')}`,
+  ).toBe(true);
+  const snap = await snapshot(page);
+  expect([snap.admitted_hits, snap.rejected_hits, snap.oracle_total]).toEqual([100, 150, 100]);
+  expect(snap.nodes.map((n) => n.window_total)).toEqual(snap.nodes.map(() => 100));
+  // After the first rejection the next action is Play (owner Q15).
+  expect(await checkState(page, 'after the split')).toBe('Play');
+});
+
+/** What Play shows 300 ms of simulated time after it is pressed. */
+interface Played {
+  /** Whether a stage mark changed: a node's count, a new line, a glyph (arc,
+   *  ring, fill, strata, cap, the heartbeat sweep, a refusal), the heading or
+   *  a decision; or a wait's meter rose. */
+  readonly changed: boolean;
+  /** The narration, without its countdown. */
+  readonly said: string;
+  /** The enabled filled control's label, or null when none is filled. */
+  readonly label: string | null;
+  readonly wallMs: number;
+  readonly ms: number;
+}
+
+/** Press Play and read the first frame at least 300 ms of simulated time
+ *  later: a stage mark changed by then, or the narration says nothing is
+ *  coming and quotes the filled control's label verbatim (A61). Simulated
+ *  time, not wall time, so the outcome is the same however loaded the
+ *  machine; the wall time is printed. The NEXT line, the narration and the
+ *  time readout are not marks. Pauses again after. */
+async function playChecks(page: Page, where: string): Promise<void> {
+  await page.mouse.move(0, 0);
+  const seen = await page.evaluate(
+    () =>
+      new Promise<Played>((resolve, reject) => {
+        const canvas = document.querySelector('.stage canvas') as HTMLCanvasElement & {
+          beams: BeamPool & { counted?: boolean };
+          glyphs: GlyphTable;
+        };
+        // Lines pushed, so a fading line can never count as a change.
+        const w = window as unknown as { arrivals: number };
+        const pool = canvas.beams;
+        if (pool.counted !== true) {
+          pool.counted = true;
+          w.arrivals = 0;
+          const push = pool.push.bind(pool);
+          pool.push = (path, sent, src, dst, flags) => {
+            w.arrivals += 1;
+            push(path, sent, src, dst, flags);
+          };
+        }
+        const text = (el: Element | null): string => (el?.textContent ?? '').replace(/\s+/g, ' ').trim();
+        const sig = (): string => {
+          const g = canvas.glyphs;
+          const marks: number[] = [w.arrivals, g.sweep, g.bounce];
+          for (let s = 0; s < g.len; s++) marks.push(g.arc[s], g.ring[s], g.fillTop[s], g.strata[s], g.cap[s]);
+          const counts = [...document.querySelectorAll('[data-field="node-view"]')].map(text);
+          const decisions = [...document.querySelectorAll('.decision')].map(text);
+          return JSON.stringify([marks, counts, decisions, text(document.querySelector('[data-template]'))]);
+        };
+        const ms = (): number => Number(document.querySelector<HTMLElement>('[data-field="virtual-time"]')?.dataset.ms);
+        const meter = (): number => Number(document.querySelector('#next-action [role="progressbar"]')?.getAttribute('aria-valuenow') ?? -1);
+        const play = [...document.querySelectorAll<HTMLButtonElement>('.transport button')].find((b) => b.textContent?.trim() === 'Play');
+        if (play === undefined) {
+          reject(new Error('no Play button'));
+          return;
+        }
+        const before = sig();
+        const from = ms();
+        const t0 = performance.now();
+        play.click();
+        let firstMeter = -1;
+        const timer = setTimeout(() => reject(new Error(`300 ms of simulated time did not pass in 15 s (${ms() - from} ms did)`)), 15_000);
+        const frame = (): void => {
+          const m = meter();
+          if (firstMeter < 0) firstMeter = m;
+          if (ms() < from + 300) {
+            requestAnimationFrame(frame);
+            return;
+          }
+          clearTimeout(timer);
+          const primary = document.querySelector<HTMLElement>('[data-primary]');
+          const enabled = primary !== null && !(primary as HTMLButtonElement).disabled;
+          resolve({
+            changed: sig() !== before || (firstMeter >= 0 && m > firstMeter),
+            said: text(document.querySelector('.narration [aria-live]')),
+            label: enabled ? primary.innerText.replace(/\s+/g, ' ').trim() : null,
+            wallMs: performance.now() - t0,
+            ms: ms() - from,
+          });
+        };
+        requestAnimationFrame(frame);
+      }),
+  );
+  console.log(`${where}: read ${seen.ms} ms simulated, ${Math.round(seen.wallMs)} ms wall after Play`);
+  const quoted = seen.label !== null && seen.said.includes('nothing is coming') && seen.said.includes(`“${seen.label}”`);
+  expect(
+    seen.changed || quoted,
+    `${where}: Play changed no mark, and the narration "${seen.said}" does not say nothing is coming, quoting "${seen.label}"`,
+  ).toBe(true);
+  await pauseIfPlaying(page);
+  await still(page);
+}
+
+/** Step while the run stands before a wave Step draws, at most `max` times. */
+async function stepWaves(page: Page, max = 8): Promise<void> {
+  for (let i = 0; i < max && (await page.locator('.stage-pane').getAttribute('data-clock')) === 'before-wave'; i++) await step(page);
+}
+
+test('Play is never silent (A61)', async ({ page }, info) => {
+  test.skip(info.project.name !== 'audit-1440-light-motion', 'Play, checked once with motion on');
+  test.setTimeout(180_000);
+  await open(page);
+  // Every scenario at load.
+  for (const preset of PRESETS) {
+    await loadPreset(page, preset.label);
+    await playChecks(page, `${preset.label} at load`);
+  }
+  // Each story's settled states.
+  const field = page.locator('#burst-requests');
+  const fill = async (requests: number): Promise<void> => {
+    await field.fill(String(requests));
+    await field.press('Enter');
+  };
+  await loadPreset(page, 'Rate limiting');
+  await send(page, 0);
+  await expect(primary(page)).toHaveText('Select node 1');
+  await playChecks(page, 'Rate limiting after the first Send');
+  await fill(250);
+  await page.getByRole('button', { name: 'Restart Rate limiting' }).click();
+  await expect(page.locator('.narration')).toContainText('Paused at the start of Rate limiting');
+  await send(page, 0);
+  await expect(primary(page)).toHaveText('Play');
+  await playChecks(page, 'Rate limiting after a Send of 250');
+
+  await loadPreset(page, 'Propagation');
+  await send(page, 0);
+  await stepWaves(page);
+  await expect(primary(page)).toHaveText('Step');
+  expect((await snapshot(page)).nodes.every((n) => n.lag.kind === 'CaughtUp'), 'every node has the hits').toBe(true);
+  await playChecks(page, "Propagation after its Send's waves");
+  for (let i = 0; i < 6 && (await snapshot(page)).oracle_total > 0; i++) await step(page);
+  await expect(primary(page)).toHaveText('Go to Rate limiting');
+  await playChecks(page, 'Propagation at its end');
+
+  await loadPreset(page, 'Zone partition');
+  await fill(250);
+  await send(page, 0);
+  await expect(primary(page)).toHaveText(/^Select node \d+$/);
+  await playChecks(page, 'Zone partition after a Send of 250');
+
+  await loadPreset(page, 'Sandbox');
+  await send(page, 0);
+  await playChecks(page, 'Sandbox after a Send');
 });
 
 test('while the simulator starts, the transport says so beside its controls (A50)', async ({ page }, info) => {

@@ -59,7 +59,7 @@ input[type='range'] {
 /* One button sheet (design language, "One style per role"). The next action
    alone is filled; every other action is a panel with a 1 px axis border
    (3:1 or more on the panel and the page); the help toggle alone is a dotted
-   underline. While Hits per Send is being typed it is the target: a 2 px ink
+   underline. While Requests per Send is being typed it is the target: a 2 px ink
    border, nothing filled. */
 button[data-primary] {
   border: 1px solid var(--color-fg);

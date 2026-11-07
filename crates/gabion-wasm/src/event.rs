@@ -32,13 +32,10 @@ pub struct Event {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "type")]
 pub enum EventKind {
-    /// `node` decided a request of `hits` against its own count table. Find
-    /// it by kind: a batch may open with an earlier wave's packets landing.
-    Decided {
-        node: u32,
-        hits: NonZeroU64,
-        admission: Admission,
-    },
+    /// `node` decided a burst of one-hit requests against its own count
+    /// table. Find it by kind: a batch may open with an earlier wave's packets
+    /// landing.
+    Decided { node: u32, burst: Burst },
     /// A heartbeat round ran on `node`.
     Tick { node: u32 },
     /// A threshold round ran on `node`.
@@ -167,27 +164,41 @@ pub struct EventBatch {
     pub virtual_ms: u64,
 }
 
-/// A node's decision on a request, admitted or rejected whole, against the
-/// node's own window, as gabion's adapters decide.
+/// A node's decisions on a burst of one-hit requests, taken in order against
+/// its own window, each with
+/// [`RuleSpec::admits`](gabion::rules::RuleSpec::admits), as gabion's adapters
+/// decide each request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind")]
+pub enum Burst {
+    /// Every request fit and was recorded; the window held `total_before`.
+    Admitted {
+        requests: NonZeroU64,
+        total_before: u64,
+    },
+    /// The first `admitted` requests fit and were recorded (none if the
+    /// window was already full); the other `rejected` would pass the limit,
+    /// so they were refused and never recorded. The window holds `total`
+    /// after the admitted ones, and one more request fits in `reopens_ms`.
+    Rejected {
+        admitted: u64,
+        rejected: NonZeroU64,
+        total: u64,
+        reopens_ms: u64,
+    },
+}
+
+/// A node's decision on one more request, of one hit, against its own
+/// window, as gabion's adapters decide.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind")]
 pub enum Admission {
-    /// Recorded: the window held `total_before`, and the request fits under
-    /// the limit on top of it.
+    /// It fits: the window holds `total_before`, under the limit.
     Admitted { total_before: u64 },
-    /// Refused whole and never recorded: the window holds `total`, and the
-    /// request would pass the limit.
-    Rejected { total: u64, reopens: Reopens },
-}
-
-/// When a rejected request would be admitted if sent again.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind")]
-pub enum Reopens {
-    /// In `ms`, once enough of the window's oldest hits leave it.
-    In { ms: u64 },
-    /// Never: the request alone is heavier than the limit (`hits > limit`).
-    Never,
+    /// It would pass the limit: the window holds `total`, and one more
+    /// request fits in `reopens_ms`, once enough of the window's oldest hits
+    /// leave it.
+    Rejected { total: u64, reopens_ms: u64 },
 }
 
 /// Whether a node holds every in-window change the cluster has made.
@@ -262,9 +273,6 @@ pub struct Inspected {
     pub id: u32,
     pub cells: Vec<CellView>,
     pub peers: Vec<PeerView>,
-    /// The decision this node would make now on a request of the watched
-    /// probe's weight.
-    pub next_send: Admission,
 }
 
 /// One zone and how many live nodes are placed in it.
@@ -329,9 +337,9 @@ pub struct NodeState {
     /// gabion's `window_total` of the watched key on this node's own count
     /// table: the number its admission reads.
     pub window_total: u64,
-    /// The decision a one-hit request would get here now: `Rejected` exactly
-    /// while the node's window has reached its limit (`window_total >=
-    /// limit`).
+    /// The decision one more request, of one hit, would get here now:
+    /// `Rejected` exactly while the node's window has reached its limit
+    /// (`window_total >= limit`).
     pub brim: Admission,
     /// Whether the node holds every in-window change, and if not, whether
     /// waiting can help.

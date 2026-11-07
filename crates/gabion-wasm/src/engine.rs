@@ -55,8 +55,8 @@ use tokio::task::{JoinHandle, LocalSet};
 use crate::clock::{ManualClock, SharedNow, Tickers};
 use crate::config::{MAX_NODES, MAX_ZONES, SimConfig, ValidSimConfig, ZONE_NAMES, ZoneMode};
 use crate::event::{
-    Admission, BytesByTier, CellView, ClusterState, Event, EventBatch, EventKind, Inspected, Lag,
-    NodeState, PacketKind, PeerView, Reopens, ZoneView,
+    Admission, Burst, BytesByTier, CellView, ClusterState, Event, EventBatch, EventKind, Inspected,
+    Lag, NodeState, PacketKind, PeerView, ZoneView,
 };
 use crate::shims::{
     AddressBook, EventEmittingAggregateStore, EventLog, LoggingSimTransport, Member,
@@ -125,14 +125,6 @@ pub enum StepUntil {
 /// A key as the page names it, a safe integer.
 fn key_from_u64<'de, D: Deserializer<'de>>(de: D) -> Result<KeyHash, D::Error> {
     u64::deserialize(de).map(|key| KeyHash(u128::from(key)))
-}
-
-/// The key the snapshot watches, and the weight of the request its
-/// inspected node's `next_send` decides.
-#[derive(Clone, Copy, Debug)]
-pub struct Watch {
-    pub key: KeyHash,
-    pub probe_hits: NonZeroU64,
 }
 
 /// Whether a sub-step's packets are still held. `Open` holds the router's
@@ -298,26 +290,26 @@ pub enum EngineError {
     #[error(transparent)]
     Setting(#[from] SettingError),
     #[error(
-        "a request must carry at least one hit: gabion admits or rejects a request whole by its \
-         weight, and a request of zero hits would count nothing. Set Hits per Send to a whole \
-         number of 1 or more."
+        "a Send must carry at least one request: a burst of zero requests decides nothing. Set \
+         Requests per Send to a whole number of 1 or more."
     )]
-    NoHits,
+    NoRequests,
 }
 
 /// A command sent into the engine. Each carries a `oneshot` the engine replies
 /// on once it has done the work; the reply ordering across commands is FIFO
 /// because the engine processes one at a time.
 pub enum Command {
-    /// A request of `hits` for `key` at node `node`, at the current virtual
-    /// time. The node decides it first, from its own count table; an admitted
-    /// request is recorded, and its eager-flush packets are delivered at the
-    /// same instant before the reply, or, with `until` a
-    /// [`StepUntil::Event`], held, as stepping by event holds a wave.
+    /// A burst of `requests` one-hit requests for `key` at node `node`, at
+    /// the current virtual time. The node decides them in order, from its own
+    /// count table; the admitted ones are recorded together, and their
+    /// eager-flush packets are delivered at the same instant before the
+    /// reply, or, with `until` a [`StepUntil::Event`], held, as stepping by
+    /// event holds a wave.
     SubmitRequest {
         node: u32,
         key: KeyHash,
-        hits: NonZeroU64,
+        requests: NonZeroU64,
         until: StepUntil,
         reply: oneshot::Sender<Result<EventBatch, EngineError>>,
     },
@@ -367,11 +359,11 @@ pub enum Command {
         virtual_ms: u64,
         reply: oneshot::Sender<EventBatch>,
     },
-    /// Per-node cluster snapshot of `watch`'s key, with the cells and peer
-    /// rows of node `inspect` alone.
+    /// Per-node cluster snapshot of `key`, with the cells and peer rows of
+    /// node `inspect` alone.
     Snapshot {
         inspect: Option<u32>,
-        watch: Watch,
+        key: KeyHash,
         reply: oneshot::Sender<ClusterState>,
     },
     /// End the session and shut every runtime down.
@@ -398,11 +390,11 @@ async fn engine_loop(
             Command::SubmitRequest {
                 node,
                 key,
-                hits,
+                requests,
                 until,
                 reply,
             } => {
-                let _ = reply.send(state.submit_request(node, key, hits, until).await);
+                let _ = reply.send(state.submit_request(node, key, requests, until).await);
             }
             Command::SetLinkPolicy {
                 src,
@@ -435,10 +427,10 @@ async fn engine_loop(
             }
             Command::Snapshot {
                 inspect,
-                watch,
+                key,
                 reply,
             } => {
-                let _ = reply.send(state.snapshot(inspect, watch).await);
+                let _ = reply.send(state.snapshot(inspect, key).await);
             }
             Command::Shutdown => break,
         }
@@ -797,17 +789,18 @@ impl EngineState {
         self.observe().await;
     }
 
-    /// Node `node` decides a request of `hits` for `key` from its own count
-    /// table, as the adapters decide. A rejected request is counted and
-    /// nothing else happens. An admitted one is recorded in one sub-step at
-    /// this instant, so its eager-flush packets land before this returns;
-    /// with `until` a [`StepUntil::Event`], a flush that sent a wave is held
-    /// instead, the sub-step left open.
+    /// Node `node` decides a burst of `requests` one-hit requests for `key`
+    /// from its own count table, as the adapters decide each request. A burst
+    /// it rejects whole is counted and nothing else happens. Its admitted
+    /// requests are recorded together in one sub-step at this instant, so
+    /// their eager-flush packets land before this returns; with `until` a
+    /// [`StepUntil::Event`], a flush that sent a wave is held instead, the
+    /// sub-step left open.
     async fn submit_request(
         &mut self,
         node: u32,
         key: KeyHash,
-        hits: NonZeroU64,
+        requests: NonZeroU64,
         until: StepUntil,
     ) -> Result<EventBatch, EngineError> {
         let pos = position_of(&self.nodes, node).ok_or(EngineError::UnknownNode { id: node })?;
@@ -815,57 +808,56 @@ impl EngineState {
         let (spec, now) = (self.spec, self.virtual_ms);
         let table = self.nodes[pos].aggregate.table();
         let total = table.window_total(spec, key, now);
-        let admission = decide(spec, table, key, now, total, hits);
+        let burst = decide_burst(spec, table, key, now, total, requests);
         let decided = Event {
             virtual_ms: now,
-            kind: EventKind::Decided {
-                node,
-                hits,
-                admission,
-            },
+            kind: EventKind::Decided { node, burst },
         };
-        let hits = hits.get();
-        match admission {
-            Admission::Rejected { .. } => {
-                self.outbox.push(decided);
-                let handle = &mut self.nodes[pos];
-                handle.rejected_hits = handle.rejected_hits.saturating_add(hits);
-                self.rejected_hits = self.rejected_hits.saturating_add(hits);
-            }
-            Admission::Admitted { .. } => {
-                // One sub-step at this instant: the eager flush's threshold
-                // round runs on the runtime's next turn with delivery
-                // deferred, and lands as a step's sub-step does.
-                self.hold();
-                self.touched.insert(pos);
-                let recorded = self.nodes[pos]
-                    .client
-                    .record(
-                        spec.fingerprint,
-                        key,
-                        spec.bucket_at(now),
-                        hits,
-                        spec.limit,
-                        now,
-                    )
-                    .await;
-                if let Err(source) = recorded {
-                    self.close_sub_step().await;
-                    return Err(EngineError::Gossip { node, source });
-                }
-                // Only a recorded request is reported admitted. An eager
-                // flush's threshold round runs on the runtime's next turn, so
-                // the drain puts its packets in this batch, after the decision.
-                self.outbox.push(decided);
-                let wave = self.drain_wave().await;
-                if !(wave && matches!(until, StepUntil::Event { .. })) {
-                    self.close_sub_step().await;
-                }
-                let handle = &mut self.nodes[pos];
-                handle.admitted_hits = handle.admitted_hits.saturating_add(hits);
-                self.admitted_hits = self.admitted_hits.saturating_add(hits);
+        let (admitted, rejected) = match burst {
+            Burst::Admitted { requests, .. } => (requests.get(), 0),
+            Burst::Rejected {
+                admitted, rejected, ..
+            } => (admitted, rejected.get()),
+        };
+        if admitted > 0 {
+            // One sub-step at this instant: the eager flush's threshold
+            // round runs on the runtime's next turn with delivery deferred,
+            // and lands as a step's sub-step does. One record of every
+            // admitted request is the sum the CRDT would hold after one record
+            // each, with the one threshold round they share at this instant.
+            self.hold();
+            self.touched.insert(pos);
+            let recorded = self.nodes[pos]
+                .client
+                .record(
+                    spec.fingerprint,
+                    key,
+                    spec.bucket_at(now),
+                    admitted,
+                    spec.limit,
+                    now,
+                )
+                .await;
+            if let Err(source) = recorded {
+                self.close_sub_step().await;
+                return Err(EngineError::Gossip { node, source });
             }
         }
+        // Only recorded requests are reported admitted. An eager flush's
+        // threshold round runs on the runtime's next turn, so the drain puts
+        // its packets in this batch, after the decision.
+        self.outbox.push(decided);
+        if admitted > 0 {
+            let wave = self.drain_wave().await;
+            if !(wave && matches!(until, StepUntil::Event { .. })) {
+                self.close_sub_step().await;
+            }
+        }
+        let handle = &mut self.nodes[pos];
+        handle.admitted_hits = handle.admitted_hits.saturating_add(admitted);
+        handle.rejected_hits = handle.rejected_hits.saturating_add(rejected);
+        self.admitted_hits = self.admitted_hits.saturating_add(admitted);
+        self.rejected_hits = self.rejected_hits.saturating_add(rejected);
         Ok(self.batch())
     }
 
@@ -1293,13 +1285,12 @@ impl EngineState {
         }
     }
 
-    /// Every node's scalar state for `watch`'s key, plus the cells and peer
+    /// Every node's scalar state for `key`, plus the cells and peer
     /// rows of `inspect` alone: the page shows one node's rows, and every
     /// node's would cost a row per node pair each frame. Reads only: an open
     /// sub-step stays open, so the snapshot shows its packets still held.
-    async fn snapshot(&self, inspect: Option<u32>, watch: Watch) -> ClusterState {
+    async fn snapshot(&self, inspect: Option<u32>, key: KeyHash) -> ClusterState {
         let spec = self.spec;
-        let key = watch.key;
         let now = self.virtual_ms;
         let current = spec.bucket_at(now);
         let live = spec.live_buckets.get();
@@ -1426,7 +1417,6 @@ impl EngineState {
                         .as_ref()
                         .map(|s| self.peers_from_snapshot(handle.zone, s))
                         .unwrap_or_default(),
-                    next_send: decide(spec, table, key, now, window_total, watch.probe_hits),
                 });
             }
             let counters = snap.as_ref().map(|s| s.counters).unwrap_or_default();
@@ -1436,7 +1426,7 @@ impl EngineState {
                 node_id: handle.identity.node_id.0,
                 incarnation: handle.identity.incarnation,
                 window_total,
-                brim: decide(spec, table, key, now, window_total, NonZeroU64::MIN),
+                brim: decide(spec, table, key, now, window_total),
                 lag,
                 next_heartbeat_ms: handle.next_heartbeat,
                 admitted_hits: handle.admitted_hits,
@@ -1599,34 +1589,65 @@ fn first_heartbeat(id: u32, period_ms: u64, now: u64) -> u64 {
     phase.saturating_add(periods.saturating_mul(period_ms))
 }
 
-/// A node's decision on a request of `hits` when its window holds `total`
-/// of `key`: gabion's own comparison, [`RuleSpec::admits`]. A request heavier
-/// than the limit never fits; otherwise the reopening time is the library's
-/// sliding-window walk, and since `hits ≤ limit` makes the excess over the
-/// limit at most `total`, the walk always finds the bucket whose fall-off
-/// admits it and never falls back to a whole window.
+/// A node's decision on one more request, of one hit, when its window holds
+/// `total` of `key`: gabion's own comparison, [`RuleSpec::admits`], and on a
+/// refusal the library's sliding-window walk to the instant one hit fits.
 fn decide(
     spec: RuleSpec,
     table: AggregateTable<'_>,
     key: KeyHash,
     now: u64,
     total: u64,
-    hits: NonZeroU64,
 ) -> Admission {
-    let hits = hits.get();
-    if spec.admits(total, hits) {
+    if spec.admits(total, 1) {
         return Admission::Admitted {
             total_before: total,
         };
     }
-    let reopens = if hits > spec.limit {
-        Reopens::Never
-    } else {
-        Reopens::In {
-            ms: table.time_until_admit_millis(spec, key, now, total, hits),
+    Admission::Rejected {
+        total,
+        reopens_ms: table.time_until_admit_millis(spec, key, now, total, 1),
+    }
+}
+
+/// A node's decisions on a burst of `requests` one-hit requests, in order,
+/// when its window holds `total`: each request is [`decide`]d against the
+/// window plus the requests admitted before it, so the burst admits exactly
+/// what the limit leaves. A refusal records nothing, so every later request
+/// would meet the same comparison with the same total: the first refusal
+/// decides the rest, and the loop runs at most `min(requests, room + 1)`
+/// times. The admitted requests are not in `table` yet, but they all fall in
+/// the current bucket, the last one the walk reaches, so the walk falls back
+/// to that bucket's fall-off exactly when they must leave for one more hit to
+/// fit.
+fn decide_burst(
+    spec: RuleSpec,
+    table: AggregateTable<'_>,
+    key: KeyHash,
+    now: u64,
+    total: u64,
+    requests: NonZeroU64,
+) -> Burst {
+    let mut admitted = 0;
+    loop {
+        let Some(rejected) = NonZeroU64::new(requests.get() - admitted) else {
+            return Burst::Admitted {
+                requests,
+                total_before: total,
+            };
+        };
+        match decide(spec, table, key, now, total.saturating_add(admitted)) {
+            Admission::Admitted { .. } => admitted += 1,
+            Admission::Rejected { total, reopens_ms } => {
+                return Burst::Rejected {
+                    admitted,
+                    rejected,
+                    total,
+                    reopens_ms,
+                };
+            }
         }
-    };
-    Admission::Rejected { total, reopens }
+    }
 }
 
 /// Whether `policy` stops every packet, so waiting cannot carry a change

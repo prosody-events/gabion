@@ -30,7 +30,7 @@ use tokio::sync::{mpsc, oneshot};
 use wasm_bindgen::prelude::*;
 
 use crate::config::{MAX_ZONES, SimConfig};
-use crate::engine::{Command, EngineError, LinkPolicyKind, StepUntil, Watch, run_engine};
+use crate::engine::{Command, EngineError, LinkPolicyKind, StepUntil, run_engine};
 
 /// A live simulation the page drives. Holds the sender end of the engine's
 /// command channel; every method round-trips one command and awaits its reply.
@@ -63,18 +63,19 @@ impl Sim {
         Ok(Sim { cmd_tx })
     }
 
-    /// A request of `hits` for `key_id` at `node`, at the current virtual
-    /// time. Resolves to the [`crate::event::EventBatch`] it produced: the
-    /// node's decision first, then, when admitted, its cell events and any
-    /// eager-flush packets, delivered at the same instant before it resolves,
-    /// with the receivers' cell events; with `until` (a [`StepUntil`], as
-    /// [`Sim::step`] takes it) `{ Event: { key } }`, a flush's wave is held
-    /// until the next command instead. Throws for zero hits.
+    /// A burst of `requests` one-hit requests for `key_id` at `node`, at the
+    /// current virtual time. Resolves to the [`crate::event::EventBatch`] it
+    /// produced: the node's decisions first, then, when it admitted any, their
+    /// cell events and any eager-flush packets, delivered at the same instant
+    /// before it resolves, with the receivers' cell events; with `until` (a
+    /// [`StepUntil`], as [`Sim::step`] takes it) `{ Event: { key } }`, a
+    /// flush's wave is held until the next command instead. Throws for zero
+    /// requests.
     pub async fn submit_request(
         &self,
         node: u32,
         key_id: u64,
-        hits: u64,
+        requests: u64,
         until: JsValue,
     ) -> Result<JsValue, JsValue> {
         let until: StepUntil = serde_wasm_bindgen::from_value(until)?;
@@ -82,7 +83,7 @@ impl Sim {
         self.send(Command::SubmitRequest {
             node,
             key: KeyHash(u128::from(key_id)),
-            hits: nonzero_hits(hits)?,
+            requests: nonzero_requests(requests)?,
             until,
             reply,
         })
@@ -186,23 +187,12 @@ impl Sim {
     }
 
     /// Pull every node's state of key `key_id` for a re-render, with the
-    /// cells and peer rows of the node with stable id `inspect` alone, and
-    /// that node's decision on a request of `probe_hits`. Throws for zero
-    /// hits.
-    pub async fn snapshot(
-        &self,
-        inspect: Option<u32>,
-        key_id: u64,
-        probe_hits: u64,
-    ) -> Result<JsValue, JsValue> {
+    /// cells and peer rows of the node with stable id `inspect` alone.
+    pub async fn snapshot(&self, inspect: Option<u32>, key_id: u64) -> Result<JsValue, JsValue> {
         let (reply, rx) = oneshot::channel();
-        let watch = Watch {
-            key: KeyHash(u128::from(key_id)),
-            probe_hits: nonzero_hits(probe_hits)?,
-        };
         self.send(Command::Snapshot {
             inspect,
-            watch,
+            key: KeyHash(u128::from(key_id)),
             reply,
         })
         .await?;
@@ -259,10 +249,10 @@ pub fn max_zones() -> u32 {
     MAX_ZONES as u32
 }
 
-/// A request's weight as the engine takes it: zero hits throws, as
-/// [`EngineError::NoHits`].
-fn nonzero_hits(hits: u64) -> Result<NonZeroU64, JsValue> {
-    NonZeroU64::new(hits).ok_or_else(|| JsValue::from_str(&EngineError::NoHits.to_string()))
+/// A burst's size as the engine takes it: zero requests throws, as
+/// [`EngineError::NoRequests`].
+fn nonzero_requests(requests: u64) -> Result<NonZeroU64, JsValue> {
+    NonZeroU64::new(requests).ok_or_else(|| JsValue::from_str(&EngineError::NoRequests.to_string()))
 }
 
 /// Serialize an owned reply into a plain JS object.

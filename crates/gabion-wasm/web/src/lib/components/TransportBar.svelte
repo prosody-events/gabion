@@ -5,7 +5,7 @@
   // speed. Whichever control the next action names is filled (`primary`); the
   // others are secondary. A disabled control says why beside it.
   import { fmtCount, fmtDuration, type Blurb } from '../format';
-  import { BURST_HITS_MAX } from '../presets';
+  import { BURST_REQUESTS_MAX } from '../presets';
   import type { Control } from '../next';
   import Icon from './Icon.svelte';
   import Sentence from './Sentence.svelte';
@@ -35,7 +35,7 @@
     heartbeatWallMs: number | null;
     /** Send's label at this width, from `sendLabel`. */
     sendLabel: Blurb;
-    /** Whether Hits per Send holds a valid committed value. */
+    /** Whether Requests per Send holds a valid committed value. */
     sendValid: boolean;
     /** The control the next action names, or null. */
     primary: Control | null;
@@ -94,8 +94,8 @@
     <span class="reason" id="transport-reason">starting the simulator…</span>
   {:else if !sendValid}
     <span class="reason" id="send-reason"
-      >Hits per Send must be a whole number from <span data-field="hits-min">{1}</span> to&nbsp;<span data-field="hits-max"
-        >{fmtCount(BURST_HITS_MAX)}</span
+      >Requests per Send must be a whole number from <span data-field="requests-min">{1}</span> to&nbsp;<span data-field="requests-max"
+        >{fmtCount(BURST_REQUESTS_MAX)}</span
       ></span
     >
   {/if}

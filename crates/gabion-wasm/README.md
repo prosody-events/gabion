@@ -33,9 +33,12 @@ it touched.
 
 Each node decides every request from its own count table: gabion's
 `window_total` on its `Aggregate` and `RuleSpec::admits`, the comparison the
-server and nginx make. A rejected request is counted, per node and for the
-cluster, and never recorded. An admitted one is recorded, and its eager flush
-runs as one sub-step at that instant, delivered before the command returns.
+server and nginx make. A `submit_request` is a burst of one-hit requests the
+node decides in order, each with `RuleSpec::admits` against the window plus the
+requests admitted before it, so a burst admits exactly what the window leaves.
+The rejected ones are counted, per node and for the cluster, and never
+recorded. The admitted ones are recorded together, and their eager flush runs
+as one sub-step at that instant, delivered before the command returns.
 `step` with `{ Event: { key } }` stops between the halves of the first sub-step
 that sends a wave of packets that carry cells, the wave held until the next
 command, or at the instant some node's window of `key` drops a bucket that
@@ -102,7 +105,7 @@ for (let s = 0; s < 5; s++) {
     const v = s * 1000 + Math.round((f * 1000) / 60);
     while (hit < Math.floor((v * 3) / 1000)) await sim.submit_request(hit++ % N, 1n, 1n, 'Time');
     let t = performance.now(); await sim.step_to(BigInt(v)); step += performance.now() - t;
-    t = performance.now(); await sim.snapshot(0, 1n, 25n); snap += performance.now() - t;
+    t = performance.now(); await sim.snapshot(0, 1n); snap += performance.now() - t;
   }
   out.push({ second: s, step, snap, total: step + snap });
 }

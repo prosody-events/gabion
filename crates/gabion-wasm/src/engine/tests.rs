@@ -17,11 +17,11 @@ use tokio::runtime::Builder;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::LocalSet;
 
-use super::{Command, EngineError, EngineState, LinkPolicyKind, StepUntil, Watch, run_engine};
+use super::{Command, EngineError, EngineState, LinkPolicyKind, StepUntil, run_engine};
 use crate::config::{MAX_NODES, SimConfig, ZoneMode};
 use crate::event::{
-    Admission, CellView, ClusterState, Event, EventBatch, EventKind, Inspected, Lag, PacketKind,
-    PeerView, Reopens, Tier,
+    Burst, CellView, ClusterState, Event, EventBatch, EventKind, Inspected, Lag, PacketKind,
+    PeerView, Tier,
 };
 
 mod admission;
@@ -30,18 +30,18 @@ mod phases;
 mod window;
 
 const WATCHED_KEY: u128 = 0x1;
-/// The snapshot's watch: the watched key, decided for one hit.
-const WATCH: Watch = watch(1);
+/// The watched key, as the snapshot takes it.
+const WATCHED: KeyHash = KeyHash(WATCHED_KEY);
 /// Step to the next event of the watched key.
 const EVENT: StepUntil = StepUntil::Event {
     key: KeyHash(WATCHED_KEY),
 };
 
-/// `n` hits, which must be at least one.
-const fn hits(n: u64) -> NonZeroU64 {
+/// A burst of `n` requests, which must be at least one.
+const fn requests(n: u64) -> NonZeroU64 {
     match NonZeroU64::new(n) {
-        Some(hits) => hits,
-        None => panic!("a request carries at least one hit"),
+        Some(requests) => requests,
+        None => panic!("a burst carries at least one request"),
     }
 }
 
@@ -115,7 +115,7 @@ async fn submit(tx: &mpsc::Sender<Command>, node: u32, key: u128, n: u64) -> Eve
     tx.send(Command::SubmitRequest {
         node,
         key: KeyHash(key),
-        hits: hits(n),
+        requests: requests(n),
         until: StepUntil::Time,
         reply,
     })
@@ -132,7 +132,7 @@ async fn snapshot_inspecting(tx: &mpsc::Sender<Command>, inspect: Option<u32>) -
     let (reply, rx) = oneshot::channel();
     tx.send(Command::Snapshot {
         inspect,
-        watch: WATCH,
+        key: WATCHED,
         reply,
     })
     .await
@@ -295,10 +295,10 @@ fn error_budget_and_gateway_counters_surface_in_snapshot() {
     };
     with_state(config, |mut state| async move {
         state
-            .submit_request(0, KeyHash(0), hits(7), StepUntil::Time)
+            .submit_request(0, KeyHash(0), requests(7), StepUntil::Time)
             .await
             .unwrap();
-        let origin = state.snapshot(None, WATCH).await.nodes.swap_remove(0);
+        let origin = state.snapshot(None, WATCHED).await.nodes.swap_remove(0);
         assert_eq!(origin.id, 0);
         assert!(
             origin.error_budget > 0,
@@ -309,14 +309,14 @@ fn error_budget_and_gateway_counters_surface_in_snapshot() {
         let g = gateway_of(&state, 0, 1).await;
         silence(&mut state, g).await;
         state
-            .submit_request(0, KeyHash(0), hits(1), StepUntil::Time)
+            .submit_request(0, KeyHash(0), requests(1), StepUntil::Time)
             .await
             .unwrap();
         state.step(T_U / 2 + T, StepUntil::Time).await;
 
         // Checkpoint A, the peer mirror: the rows the page shows are the rows
         // the runtime reports, read at the same virtual instant.
-        let snap = state.snapshot(Some(0), WATCH).await;
+        let snap = state.snapshot(Some(0), WATCHED).await;
         let direct = super::admin_snapshot(&state.nodes[0].admin_tx)
             .await
             .expect("node 0 runs");
@@ -352,7 +352,7 @@ fn error_budget_and_gateway_counters_surface_in_snapshot() {
         // Checkpoint B, the counter mirror: each node's counters are the
         // library's own fields.
         state.step(T_U + 3 * T, StepUntil::Time).await;
-        let snap = state.snapshot(None, WATCH).await;
+        let snap = state.snapshot(None, WATCHED).await;
         for (node, handle) in snap.nodes.iter().zip(&state.nodes) {
             let c = super::counters(&handle.admin_tx).await.expect("runs");
             assert_eq!(node.gateway_failovers, c.gateway_failovers);
@@ -883,19 +883,19 @@ fn one_heartbeat_reaches_the_zone_and_one_gateway_per_remote_zone() {
         warm(&mut state).await;
         send(&mut state, 0, 5).await;
         assert_eq!(
-            known(&state.snapshot(None, WATCH).await),
+            known(&state.snapshot(None, WATCHED).await),
             [0],
             "the submit alone gossips nothing"
         );
         state.step(T, StepUntil::Time).await;
         assert_eq!(
-            known(&state.snapshot(None, WATCH).await),
+            known(&state.snapshot(None, WATCHED).await),
             [0, 0, 0, 0, 1, 2],
             "the zone's four nodes and one gateway in each other zone"
         );
         state.step(T, StepUntil::Time).await;
         assert_eq!(
-            known(&state.snapshot(None, WATCH).await).len(),
+            known(&state.snapshot(None, WATCHED).await).len(),
             12,
             "the relays"
         );
@@ -978,15 +978,6 @@ fn propagation() -> SimConfig {
     }
 }
 
-/// A snapshot watch of the watched key, deciding `probe_hits` for the
-/// inspected node.
-const fn watch(probe_hits: u64) -> Watch {
-    Watch {
-        key: KeyHash(WATCHED_KEY),
-        probe_hits: hits(probe_hits),
-    }
-}
-
 /// Step one period at a time until a period passes with no packet sent or
 /// lost, and return every event. Panics after 40 periods with the count.
 async fn settle(state: &mut EngineState) -> Vec<Event> {
@@ -1025,24 +1016,22 @@ fn cell_nodes(events: &[Event]) -> BTreeSet<u32> {
         .collect()
 }
 
-/// Every node's decision on its requests in `events`, in order.
-fn decisions(events: &[Event]) -> Vec<(u32, Admission)> {
+/// Every node's decisions on its bursts in `events`, in order.
+fn decisions(events: &[Event]) -> Vec<(u32, Burst)> {
     events
         .iter()
         .filter_map(|e| match e.kind {
-            EventKind::Decided {
-                node, admission, ..
-            } => Some((node, admission)),
+            EventKind::Decided { node, burst } => Some((node, burst)),
             _ => None,
         })
         .collect()
 }
 
-/// Submit `n` hits of the watched key at `node`, which must be a live node,
-/// and return the batch.
+/// Submit a burst of `n` requests of the watched key at `node`, which must be
+/// a live node, and return the batch.
 async fn send(state: &mut EngineState, node: u32, n: u64) -> EventBatch {
     state
-        .submit_request(node, KeyHash(WATCHED_KEY), hits(n), StepUntil::Time)
+        .submit_request(node, KeyHash(WATCHED_KEY), requests(n), StepUntil::Time)
         .await
         .expect("a live node")
 }
@@ -1115,7 +1104,7 @@ async fn peers_of(state: &EngineState, id: u32) -> Vec<PeerView> {
 
 async fn inspected(state: &EngineState, id: u32) -> Inspected {
     state
-        .snapshot(Some(id), WATCH)
+        .snapshot(Some(id), WATCHED)
         .await
         .inspected
         .expect("a live node")
@@ -1236,7 +1225,7 @@ fn gateway_for_counts_the_origins_routing_through_each_node() {
         let g = gateway_of(&state, 0, 1).await;
         state.remove_node(g).await.unwrap();
         state.step(3 * T, StepUntil::Time).await;
-        let snap = state.snapshot(None, WATCH).await;
+        let snap = state.snapshot(None, WATCHED).await;
         let mut want = BTreeMap::new();
         for node in &snap.nodes {
             for peer in peers_of(&state, node.id).await {
@@ -1273,7 +1262,7 @@ fn zones_come_from_config_not_address() {
         warm(&mut state).await;
         send(&mut state, 0, 5).await;
         let events = state.step(T, StepUntil::Time).await.events;
-        let snap = state.snapshot(None, WATCH).await;
+        let snap = state.snapshot(None, WATCHED).await;
 
         let own = sent(&events, 0, PacketKind::Own);
         assert_eq!(
@@ -1327,7 +1316,7 @@ fn relay_follows_one_prompt_interval_after_the_gateway_hears() {
                 _ => None,
             })
             .expect("the gateway receives it");
-        let snap = state.snapshot(None, WATCH).await;
+        let snap = state.snapshot(None, WATCHED).await;
         let relays = sent(&events, g, PacketKind::Relay);
         assert_eq!(relays.len(), 3, "to the gateway's three zone peers");
         for (dst, _, at) in relays {
@@ -1361,7 +1350,7 @@ fn silent_gateway_fails_over_within_suspect_after() {
         assert_ne!(to, g);
 
         state.step(3 * T, StepUntil::Time).await;
-        let snap = state.snapshot(None, WATCH).await;
+        let snap = state.snapshot(None, WATCHED).await;
         for node in snap.nodes.iter().filter(|n| n.zone == 1 && n.id != g) {
             assert_eq!(node.window_total, snap.oracle_total, "node {}", node.id);
         }
@@ -1417,7 +1406,7 @@ fn one_way_cut_is_repaired_by_the_backstop() {
         assert!(failed_over, "the origin left the gateway that cannot relay");
         let t1 = t1.expect("the cut swallowed a relay, but none was dropped");
         assert_eq!(state.virtual_ms, t1 + T_U + 3 * T + 2 * F_R);
-        let snap = state.snapshot(None, WATCH).await;
+        let snap = state.snapshot(None, WATCHED).await;
         for node in snap.nodes.iter().filter(|n| n.zone == 1) {
             assert_eq!(node.window_total, snap.oracle_total, "node {}", node.id);
         }
@@ -1436,13 +1425,13 @@ fn one_way_cut_is_repaired_by_the_backstop() {
 fn zone_partition_heals_to_exact_counts() {
     with_state(zoned(5, 3), |mut state| async move {
         let mut all = warm(&mut state).await;
-        let lone = state.snapshot(None, WATCH).await.zones[2].live;
+        let lone = state.snapshot(None, WATCHED).await.zones[2].live;
         assert_eq!(lone, 1, "zone c's gateway has no replacement");
         cut_zone(&mut state, 2).await;
         all.extend(send(&mut state, 0, 3).await.events);
         all.extend(send(&mut state, 2, 4).await.events);
         all.extend(state.step(3_000, StepUntil::Time).await.events);
-        for node in &state.snapshot(None, WATCH).await.nodes {
+        for node in &state.snapshot(None, WATCHED).await.nodes {
             let side = if node.zone == 2 { 4 } else { 3 };
             assert_eq!(
                 node.window_total, side,
@@ -1452,7 +1441,7 @@ fn zone_partition_heals_to_exact_counts() {
         }
         state.heal().await;
         all.extend(state.step(3 * T, StepUntil::Time).await.events);
-        let snap = state.snapshot(None, WATCH).await;
+        let snap = state.snapshot(None, WATCHED).await;
         // Pinned to the 3 + 4 hits submitted, not to counts the cells derive,
         // so a hit lost at its origin or an oracle that sums replicas fails.
         assert_eq!(snap.oracle_total, 7, "the oracle counts both sides once");
@@ -1523,7 +1512,7 @@ fn unset_zone_mode_runs_as_one_zone() {
             let cross = own.iter().filter(|p| p.1 == Tier::CrossZone).count();
             assert_eq!(cross, 8, "node {node}: eight peers are in other zones");
         }
-        let snap = state.snapshot(None, WATCH).await;
+        let snap = state.snapshot(None, WATCHED).await;
         for node in 0..12 {
             assert!(
                 peers_of(&state, node)
@@ -1584,7 +1573,7 @@ fn gateway_events_fetch_snapshots_only_on_role_change() {
 fn joiner_goes_to_the_zone_it_asks_or_the_smallest() {
     with_state(zoned(5, 3), |mut state| async move {
         let live = |snap: &ClusterState| snap.zones.iter().map(|z| z.live).collect::<Vec<_>>();
-        let snap = state.snapshot(None, WATCH).await;
+        let snap = state.snapshot(None, WATCHED).await;
         assert_eq!(live(&snap), [2, 2, 1], "placement is node i mod 3");
         let names: Vec<_> = snap.zones.iter().map(|z| z.name).collect();
         assert_eq!(names, ["zone-a", "zone-b", "zone-c"]);
@@ -1593,7 +1582,7 @@ fn joiner_goes_to_the_zone_it_asks_or_the_smallest() {
         // there.
         for (ask, lands) in [(None, 2), (None, 0), (Some(0), 0)] {
             state.add_node(ask).await.expect("the node joins");
-            let snap = state.snapshot(None, WATCH).await;
+            let snap = state.snapshot(None, WATCHED).await;
             let joiner = snap.nodes.last().expect("a joiner");
             assert_eq!(joiner.zone, lands, "asked for {ask:?}");
         }
@@ -1616,7 +1605,7 @@ fn joiner_goes_to_the_zone_it_asks_or_the_smallest() {
             refused.err()
         );
         state.add_node(None).await.expect("the node joins");
-        let snap = state.snapshot(None, WATCH).await;
+        let snap = state.snapshot(None, WATCHED).await;
         assert_eq!(
             snap.nodes.last().map(|n| n.id),
             Some(8),
@@ -1723,7 +1712,7 @@ fn full_round_at_max_nodes_drops_nothing_under_pass() {
                     .submit_request(
                         node,
                         KeyHash(u128::from(node) << 8 | key),
-                        hits(1),
+                        requests(1),
                         StepUntil::Time,
                     )
                     .await
@@ -1782,17 +1771,20 @@ fn events_serialize_with_hex_identifiers() {
         virtual_ms: 300,
         kind: EventKind::Decided {
             node: 2,
-            hits: hits(150),
-            admission: Admission::Rejected {
-                total: 0,
-                reopens: Reopens::Never,
+            burst: Burst::Rejected {
+                admitted: 100,
+                rejected: requests(150),
+                total: 100,
+                reopens_ms: 9_000,
             },
         },
     };
     let json = serde_json::to_value(&decided).unwrap();
     assert_eq!(json["kind"]["type"], "Decided");
-    assert_eq!(json["kind"]["admission"]["kind"], "Rejected");
-    assert_eq!(json["kind"]["admission"]["reopens"]["kind"], "Never");
+    assert_eq!(json["kind"]["burst"]["kind"], "Rejected");
+    assert_eq!(json["kind"]["burst"]["admitted"], 100);
+    assert_eq!(json["kind"]["burst"]["rejected"], 150);
+    assert_eq!(json["kind"]["burst"]["reopens_ms"], 9000);
 }
 
 /// The derived per-node sizing (`SimConfig::settings`) is anchored on
@@ -2054,7 +2046,7 @@ fn snapshot_carries_only_the_inspected_nodes_rows() {
     with_state(zoned(6, 3), |mut state| async move {
         send(&mut state, 4, 3).await;
         warm(&mut state).await;
-        let snap = state.snapshot(Some(4), WATCH).await;
+        let snap = state.snapshot(Some(4), WATCHED).await;
         let rows = snap.inspected.expect("node 4 is live");
         assert_eq!(rows.id, 4);
         let peers: BTreeSet<_> = rows.peers.iter().filter_map(|p| p.id).collect();
@@ -2068,10 +2060,10 @@ fn snapshot_carries_only_the_inspected_nodes_rows() {
             !replica.is_empty() && replica.iter().all(|c| !c.is_local && c.origin == Some(4)),
             "node 0 holds node 4's cell as a replica: {replica:?}"
         );
-        assert!(state.snapshot(None, WATCH).await.inspected.is_none());
+        assert!(state.snapshot(None, WATCHED).await.inspected.is_none());
         state.remove_node(4).await.unwrap();
         assert!(
-            state.snapshot(Some(4), WATCH).await.inspected.is_none(),
+            state.snapshot(Some(4), WATCHED).await.inspected.is_none(),
             "a departed node has no rows"
         );
         state

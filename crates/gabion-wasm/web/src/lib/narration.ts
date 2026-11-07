@@ -20,34 +20,48 @@ export function idle(subject: number, gateways: readonly GatewayName[], onScale:
   return [...head, ...blurb` Its ports mark its gateways: node ${first.node} carries its hits into ${first.zone}`, ...more, '.'];
 }
 
-/** An admitted request whose hits left at once: an eager flush. */
-export function admittedEager(node: number, hits: number, before: number, limit: number): Blurb {
-  return blurb`node ${node} admitted ${hits} ${noun(hits, 'hit')}: ${before} + ${hits} is within the limit of ${limit}. It decided alone, and tells its zone and one node in each other zone at once.`;
+/** A Send admitted whole whose hits left at once: an eager flush. */
+export function admittedEager(node: number, requests: number, before: number, limit: number): Blurb {
+  return blurb`node ${node} admitted ${requests} ${noun(requests, 'request')}: ${before} + ${requests} is within the limit of ${limit}. It decided alone, and tells its zone and one node in each other zone at once.`;
 }
 
-/** An admitted request too small to send at once: it waits for the node's
+/** A Send admitted whole too small to send at once: it waits for the node's
  *  heartbeat, counted down beside the sentence. Under the error budget of
  *  `bps` basis points of the limit, the budget is why. */
-export function admittedWaiting(node: number, hits: number, limit: number, bps: number): Blurb {
+export function admittedWaiting(node: number, requests: number, limit: number, bps: number): Blurb {
   const small: Blurb =
-    hits * 10_000 < limit * bps ? blurb` · that is under ${bps / 100} % of the limit, so it waits for its next heartbeat` : [' · it waits for its next heartbeat'];
-  return [...blurb`node ${node} admitted ${hits} ${noun(hits, 'hit')}`, ...small];
+    requests * 10_000 < limit * bps ? blurb` · that is under ${bps / 100} % of the limit, so it waits for its next heartbeat` : [' · it waits for its next heartbeat'];
+  return [...blurb`node ${node} admitted ${requests} ${noun(requests, 'request')}`, ...small];
 }
 
-/** The one rejection: a whole request refused, with the nodes whose hits fill
- *  the window when the node sees them all and more than one sent them. */
-export function rejected(node: number, hits: number, view: number, limit: number, senders: readonly number[] | null): Blurb {
+/** A Send split by the limit: the requests that fit were admitted, the rest
+ *  rejected, and the node's window now holds `total`. */
+export function split(node: number, admitted: number, rejected: number, total: number, limit: number): Blurb {
+  return blurb`node ${node} admitted ${admitted} of ${admitted + rejected} requests and rejected ${rejected}: its window holds ${total} of the ${limit} limit`;
+}
+
+/** A Send rejected whole, with the nodes whose hits fill the window when the
+ *  node sees them all and more than one sent them. */
+export function rejected(node: number, requests: number, view: number, limit: number, senders: readonly number[] | null): Blurb {
+  const what: Blurb = requests === 1 ? ['its request'] : blurb`all ${requests} requests`;
   const by: Blurb = senders === null ? [] : [', admitted at nodes ', ...joined(senders.map((s) => [s])), ','];
-  return [
-    ...blurb`node ${node} rejected all ${hits}: it sees ${view}`,
-    ...by,
-    ...blurb` and ${view} + ${hits} would pass the limit of ${limit} · nothing was counted or sent`,
-  ];
+  return [...blurb`node ${node} rejected `, ...what, ...blurb`: it sees ${view}`, ...by, ...blurb` and the limit is ${limit} · nothing was counted or sent`];
 }
 
-/** A request heavier than the limit: no window can ever hold it. */
-export function never(node: number, hits: number, limit: number): Blurb {
-  return blurb`node ${node} can never admit a request of ${hits}: the limit is ${limit} · lower Hits per Send`;
+/** Node `node` holds `hits` admitted hits for its next heartbeat, counted
+ *  down beside the sentence. */
+export function holding(node: number, hits: number): Blurb {
+  return blurb`node ${node} holds ${hits} admitted ${noun(hits, 'hit')} and sends them at its next heartbeat`;
+}
+
+/** Time runs and nothing is coming: says so, and quotes the next action's
+ *  control `label`. With `leaving` hits in the window, the first thing that
+ *  will happen is that they leave it, counted down beside the sentence. */
+export function nothingComing(label: Blurb, leaving: number | null): Blurb {
+  const press: Blurb = ['press “', ...label, '”'];
+  if (leaving === null) return ['Time is running, but nothing is coming · ', ...press];
+  const verb = leaving === 1 ? 'leaves' : 'leave';
+  return ['Time is running · ', ...press, ...blurb`: nothing is coming before ${leaving} ${noun(leaving, 'hit')} ${verb} the window`];
 }
 
 /** The first wave of the selected node's own packets, on Step: to its zone
@@ -91,9 +105,9 @@ export function cappedStop(periods: number, node: number): Blurb {
 }
 
 /** Hits leaving the window: all of them, or the oldest bucket's, and whether
- *  the selected node admits its next Send again. */
-export function expiry(left: number, emptied: boolean, windowS: number, subject: number, admits: number | null): Blurb {
-  const again: Blurb = admits === null ? [] : emptied ? blurb` · node ${subject} admits again` : blurb` · node ${subject} admits ${admits} again`;
+ *  the selected node admits again. */
+export function expiry(left: number, emptied: boolean, windowS: number, subject: number, reopened: boolean): Blurb {
+  const again: Blurb = reopened ? blurb` · node ${subject} admits again` : [];
   return emptied
     ? [...blurb`the ${left} ${noun(left, 'hit')} left the ${windowS} s window · every node stopped counting them at the same instant, without a packet`, ...again]
     : [...blurb`the oldest ${left} ${noun(left, 'hit')} left the window`, ...again];

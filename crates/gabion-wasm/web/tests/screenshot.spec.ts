@@ -1,7 +1,8 @@
 import { expect, test as base, type Page } from '@playwright/test';
 import { CARRIES_CELLS, type AnswerState, type ClusterState, type EventBatch } from '../src/lib/sim/types';
+import { WATCHED_KEY } from '../src/lib/presets';
 import { CONTROL } from '../src/lib/stage/layout';
-import { WATCH, pauseIfPlaying, select, send, sendButton, setRange, setSpeed, step, stepUntil, virtualMs } from './drive';
+import { pauseIfPlaying, select, send, sendButton, setRange, setSpeed, step, stepUntil, virtualMs } from './drive';
 
 /** Every test fails on an error the page throws. */
 const test = base.extend<{ page: Page }>({
@@ -16,10 +17,10 @@ const test = base.extend<{ page: Page }>({
 // Every node holds Propagation's settled seed at load.
 const SEED_TOTAL = '50';
 const NODES = 12;
-// Hits per Send every scenario opens with.
-const BURST_HITS = '25';
+// Requests per Send every scenario opens with, one hit each.
+const BURST_REQUESTS = '25';
 // A node's count after one Send on top of the seed.
-const SENT_TOTAL = String(Number(SEED_TOTAL) + Number(BURST_HITS));
+const SENT_TOTAL = String(Number(SEED_TOTAL) + Number(BURST_REQUESTS));
 
 // Every node is read from the page's own DOM: its grid cell (`gridcell`) for
 // geometry and its "Show as table" row for numbers, because the canvas is opaque
@@ -64,7 +65,7 @@ const num = (text: string | null): number => Number((text ?? '0').replace(/,/g, 
 
 /** The page's engine, snapshotted, with node `inspect`'s rows. */
 const snapshot = (page: Page, inspect: number | null = null): Promise<ClusterState> =>
-  page.evaluate(([id, watch]) => window.sim!.snapshot(id, watch), [inspect, WATCH] as const);
+  page.evaluate(([id, key]) => window.sim!.snapshot(id, key), [inspect, WATCHED_KEY] as const);
 
 /** Click the middle of node `id`'s disc. The grid cell has no pointer events, so
  *  the click reaches the stage's own hit test, as a user's would. */
@@ -160,13 +161,13 @@ test('the transport Send sends to the selection', async ({ page }) => {
   await setSpeed(page, 0.5);
   await clickNode(page, 3);
   await expect(title(page)).toHaveText('3');
-  await expect(sendButton(page)).toHaveText(/Send a request of\s*25\s*hits to node\s*3/);
+  await expect(sendButton(page)).toHaveText(/Send\s*25\s*requests to node\s*3/);
 
   await sendButton(page).click();
-  await expect(page.locator('[role="gridcell"][data-node="3"] .count')).toHaveText(BURST_HITS);
+  await expect(page.locator('[role="gridcell"][data-node="3"] .count')).toHaveText(BURST_REQUESTS);
   await expect(page.locator('.decision[data-node="3"]')).toHaveText('+25 admitted');
   await expect(page.getByRole('button', { name: 'Pause' })).toBeVisible();
-  await expect(page.locator('.count')).toHaveText(Array(NODES).fill(BURST_HITS), { timeout: 15_000 });
+  await expect(page.locator('.count')).toHaveText(Array(NODES).fill(BURST_REQUESTS), { timeout: 15_000 });
   await expect(page.getByRole('button', { name: 'Play' })).toBeVisible({ timeout: 15_000 });
   await expect(page.locator('.stage-pane')).toHaveAttribute('data-clock', 'paused');
 });
@@ -189,13 +190,13 @@ test("removing the selected node selects the scenario's fallback", async ({ page
   await boot(page);
   await loadPreset(page, 'Sandbox');
   await send(page, 0);
-  await expect(page.locator(COUNTS)).toHaveText(Array(NODES).fill(BURST_HITS), { timeout: 15_000 });
+  await expect(page.locator(COUNTS)).toHaveText(Array(NODES).fill(BURST_REQUESTS), { timeout: 15_000 });
   await page.locator('.pane-foot').getByRole('button', { name: 'Remove node 0' }).click();
   await expect(cell(page, 0)).toHaveCount(0);
   await expect(title(page)).toHaveText('3');
   await expect(sendButton(page)).toHaveText(/node\s*3$/);
   const heading = page.locator('[data-template] [data-noun="view"]').first();
-  await expect(heading, 'the departed node\'s hits still count').toHaveText(BURST_HITS);
+  await expect(heading, 'the departed node\'s hits still count').toHaveText(BURST_REQUESTS);
 });
 
 // The stage heading states the cluster at load: every node at 0 of the limit.
@@ -217,10 +218,10 @@ test('a Send runs its waves and pauses itself; Step after Send goes one wave at 
   await expect(view(page, 0)).toHaveText('0');
 
   await send(page, 0);
-  await expect(page.locator(COUNTS)).toHaveText(Array(NODES).fill(BURST_HITS));
+  await expect(page.locator(COUNTS)).toHaveText(Array(NODES).fill(BURST_REQUESTS));
   await expect(page.getByRole('button', { name: 'Play' })).toBeVisible();
   const strata = page.locator('.strata');
-  await expect(strata.locator('.sigma-value')).toHaveText(BURST_HITS);
+  await expect(strata.locator('.sigma-value')).toHaveText(BURST_REQUESTS);
 
   // Paused at once, the next Send waits for node 0's heartbeat; each Step
   // then lands one wave, so node 6 (a zone peer) counts it before node 1
@@ -228,7 +229,7 @@ test('a Send runs its waves and pauses itself; Step after Send goes one wave at 
   await send(page, 0, true);
   await expect(view(page, 0)).toHaveText('50');
   await stepUntil(page, async () => (await view(page, 6).textContent()) === '50', 4, 'wave 1 reached node 6');
-  expect(await view(page, 1).textContent(), 'the relays wait for their own Step').toBe(BURST_HITS);
+  expect(await view(page, 1).textContent(), 'the relays wait for their own Step').toBe(BURST_REQUESTS);
   await step(page);
   await expect(view(page, 1)).toHaveText('50');
 
@@ -556,10 +557,10 @@ test('a Send that flushes at once draws its packets as it sends', async ({ page 
       return batch;
     };
     const submit = sim.submitRequest.bind(sim);
-    sim.submitRequest = async (node, key, hits, until) => {
-      const batch = await submit(node, key, hits, until);
+    sim.submitRequest = async (node, key, requests, until) => {
+      const batch = await submit(node, key, requests, until);
       // The reader's Send, not one of the feed's one-hit requests.
-      if (hits > 1) log.send = routesOf(batch);
+      if (requests > 1) log.send = routesOf(batch);
       return record(batch);
     };
     const step = sim.step.bind(sim);
@@ -577,7 +578,7 @@ test('a Send that flushes at once draws its packets as it sends', async ({ page 
   await sendButton(page).click();
   await expect
     .poll(async () => Number(await view(page, 0).textContent()), { message: "node 0 holds the Send's hits" })
-    .toBeGreaterThanOrEqual(Number(BURST_HITS));
+    .toBeGreaterThanOrEqual(Number(BURST_REQUESTS));
   await pauseIfPlaying(page);
   const routes = (): Promise<{ sent: string[]; drawn: string[]; send: string[] }> =>
     page.evaluate(() => {
@@ -625,7 +626,7 @@ test('zone partition splits zone c off until healed', async ({ page }) => {
   await page.getByRole('button', { name: 'Cut zone c off' }).click();
 
   await send(page, 0);
-  for (const id of [0, 3, 1, 4]) await expect(view(page, id), `node ${id} heard node 0`).toHaveText(BURST_HITS);
+  for (const id of [0, 3, 1, 4]) await expect(view(page, id), `node ${id} heard node 0`).toHaveText(BURST_REQUESTS);
   for (const id of [2, 5, 8, 11]) await expect(view(page, id), `node ${id} across the cut`).toHaveText('0');
   await expect(page.locator('.stage-heading .repair')).toHaveText('Reconnect zone c');
   expect((await lede(page).textContent())?.split('zone c cut off').length, 'the lede names the cut once').toBe(2);
@@ -633,7 +634,7 @@ test('zone partition splits zone c off until healed', async ({ page }) => {
 
   // Heal runs until every node has the hits.
   await page.getByRole('button', { name: 'Heal network' }).click();
-  await expect(page.locator(COUNTS)).toHaveText(Array(NODES).fill(BURST_HITS), { timeout: 15_000 });
+  await expect(page.locator(COUNTS)).toHaveText(Array(NODES).fill(BURST_REQUESTS), { timeout: 15_000 });
   await expect(lede(page)).not.toContainText('cut off');
   await page.screenshot({ path: 'screenshots/ring-healed.png' });
 });
@@ -647,13 +648,13 @@ test('a node that joins a cut zone is cut off with it (A6)', async ({ page }) =>
   await expect(page.locator('.stage-pane')).toHaveAttribute('data-clock', 'paused', { timeout: 15_000 });
   // The joiner's own hits reach its zone and stop at the cut.
   await send(page, 12);
-  for (const id of [2, 5, 8, 11]) await expect(view(page, id), `node ${id} heard the joiner`).toHaveText(BURST_HITS);
+  for (const id of [2, 5, 8, 11]) await expect(view(page, id), `node ${id} heard the joiner`).toHaveText(BURST_REQUESTS);
   for (const id of [0, 1, 3, 4, 6, 7, 9, 10]) await expect(view(page, id), `node ${id} across the cut from the joiner`).toHaveText('0');
   // Nor do node 0's hits reach the joiner's zone: the run ends with them
   // spread on node 0's side only.
   await send(page, 0);
-  for (const id of [0, 1, 3, 4, 6, 7, 9, 10]) await expect(view(page, id), `node ${id} heard node 0`).toHaveText(BURST_HITS);
-  for (const id of [2, 5, 8, 11, 12]) await expect(view(page, id), `node ${id} in the cut zone`).toHaveText(BURST_HITS);
+  for (const id of [0, 1, 3, 4, 6, 7, 9, 10]) await expect(view(page, id), `node ${id} heard node 0`).toHaveText(BURST_REQUESTS);
+  for (const id of [2, 5, 8, 11, 12]) await expect(view(page, id), `node ${id} in the cut zone`).toHaveText(BURST_REQUESTS);
   await expect(lede(page)).toContainText('zone c cut off');
 });
 

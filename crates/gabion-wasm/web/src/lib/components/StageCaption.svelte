@@ -1,6 +1,6 @@
 <script lang="ts">
   import { fmtCount, type Blurb } from '../format';
-  import { BURST_HITS_MAX } from '../presets';
+  import { BURST_REQUESTS_MAX } from '../presets';
   import { GOES_TO, WATCHES, waitClause, type NextAction } from '../next';
   import type { Preset } from '../presets';
   import Icon from './Icon.svelte';
@@ -9,39 +9,41 @@
   // The caption above the stage: the act's goal, which explains and never
   // commands, and the action line, which names the one next action by the
   // exact label of its control (or carries the control itself), or says what
-  // to wait for and shows its progress, or what to watch.
+  // to wait for and shows its progress, or what to watch. The control's label
+  // comes from `actionLabel`, the one source the narration quotes too.
   let {
     goal,
     action,
-    pressLabel,
+    label,
     pressClause,
     phone,
     subject,
-    useHitsReason,
+    requestsReason,
     zoneName,
     meter,
     presetLabel,
     onSelect,
-    onUseHits,
+    onUseRequests,
     onGo,
     onPreview,
   }: {
     goal: Blurb;
     action: NextAction;
-    /** The label of the transport control a press names, as it renders. */
-    pressLabel: Blurb;
+    /** The label of the control the action names, as it renders, or null
+     *  when it names none. */
+    label: Blurb | null;
     pressClause: Blurb;
     /** Below 640 px the transport is the sticky bar below. */
     phone: boolean;
     subject: number;
-    /** Why Hits per Send needs fixing. */
-    useHitsReason: Blurb;
+    /** Why Requests per Send needs fixing. */
+    requestsReason: Blurb;
     zoneName: (zone: number) => string;
     /** A wait's progress in [0, 1] and in words, or null while it has no end. */
     meter: { value: number; text: string } | null;
     presetLabel: (id: Preset['id']) => string;
     onSelect: (node: number) => void;
-    onUseHits: (hits: number) => void;
+    onUseRequests: (requests: number) => void;
     onGo: (to: Preset['id']) => void;
     onPreview: (node: number | null) => void;
   } = $props();
@@ -56,7 +58,7 @@
     {#if action.kind === 'press'}
       <span
         >press <strong
-          ><Icon name={action.control === 'send' ? 'next' : action.control} /><Sentence parts={pressLabel} field="next" /></strong
+          ><Icon name={action.control === 'send' ? 'next' : action.control} /><Sentence parts={label ?? []} field="next" /></strong
         >
         {phone ? 'in the bar below' : 'below'}<Sentence parts={pressClause} field="next" /></span
       >
@@ -69,29 +71,29 @@
         onpointerenter={() => onPreview(node)}
         onpointerleave={() => onPreview(null)}
         onfocus={() => onPreview(node)}
-        onblur={() => onPreview(null)}>Select node <span data-field="next">{node}</span></button
+        onblur={() => onPreview(null)}><Sentence parts={label ?? []} field="next" /></button
       >
       <span>in {zoneName(action.action.zone)}, or click its disc</span>
-    {:else if action.kind === 'inline'}
-      {@const hits = action.action.kind === 'use-hits' ? action.action.hits : 0}
-      <button data-primary="" aria-describedby="next-action" onclick={() => onUseHits(hits)}
-        >Use <span data-field="next">{hits}</span> hits</button
+    {:else if action.kind === 'inline' && action.action.kind === 'use-requests'}
+      {@const requests = action.action.requests}
+      <button data-primary="" aria-describedby="next-action" onclick={() => onUseRequests(requests)}
+        ><Sentence parts={label ?? []} field="next" /></button
       >
-      <span>· <Sentence parts={useHitsReason} field="next" /></span>
+      <span>· <Sentence parts={requestsReason} field="next" /></span>
     {:else if action.kind === 'repair'}
       <span
-        >press <strong><Icon name="reconnect" /><Sentence parts={action.label} field="next" /></strong> in the heading</span
+        >press <strong><Icon name="reconnect" /><Sentence parts={label ?? []} field="next" /></strong> in the heading</span
       >
     {:else if action.kind === 'go'}
       {@const to = action.to}
       <button data-primary="" aria-describedby="next-action" onclick={() => onGo(to)}
-        >Go to {presetLabel(to)}<Icon name="go" /></button
+        ><Sentence parts={label ?? []} field="next" /><Icon name="go" /></button
       >
       <span>· {GOES_TO[to]}</span>
     {:else if action.kind === 'edit'}
       <span
-        >type a whole number from <span data-field="next">{1}</span> to&nbsp;<span data-field="next">{fmtCount(BURST_HITS_MAX)}</span> in
-        <strong>Hits per Send</strong>, then press Enter</span
+        >type a whole number from <span data-field="next">{1}</span> to&nbsp;<span data-field="next">{fmtCount(BURST_REQUESTS_MAX)}</span> in
+        <strong>Requests per Send</strong>, then press Enter</span
       >
     {:else if action.kind === 'wait'}
       <span><Sentence parts={waitClause(action.reason, subject)} field="next" /></span>

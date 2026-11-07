@@ -1,12 +1,12 @@
 <script lang="ts">
-  import { BURST_HITS_MAX, RULE_LIMIT_MAX, type Knobs, type Preset } from '../presets';
+  import { BURST_REQUESTS_MAX, RULE_LIMIT_MAX, type Knobs, type Preset } from '../presets';
   import { nominalBuckets } from '../buckets';
   import { fmtCount, zoneLabel } from '../format';
   import type { Roles } from '../stage/renderer';
   import type { SimConfig, ZoneView } from '../sim/types';
   import Icon from './Icon.svelte';
 
-  // The left control rail: the scenarios in four groups with Hits per Send and
+  // The left control rail: the scenarios in four groups with Requests per Send and
   // Restart, the rebuild knobs (a collapsed disclosure), the network actions
   // that cut a zone or one of the selected node's gateways and heal them, and
   // live membership. Every field is checked when committed (Enter or leaving
@@ -14,8 +14,8 @@
   let {
     presets,
     activeId,
-    hitsText = $bindable(),
-    hitsValid,
+    requestsText = $bindable(),
+    requestsValid,
     editing,
     zones,
     selected,
@@ -29,9 +29,9 @@
     bucketMs,
     onSelectPreset,
     onRestart,
-    onCommitHits,
-    onEditHits,
-    onRevertHits,
+    onCommitRequests,
+    onEditRequests,
+    onRevertRequests,
     onApplyKnobs,
     onBackToScenario,
     onCutZone,
@@ -43,10 +43,10 @@
   }: {
     presets: readonly Preset[];
     activeId: string;
-    /** What the Hits per Send field holds, typed or committed. */
-    hitsText: string;
-    /** Whether its last committed value is a valid Hits per Send. */
-    hitsValid: boolean;
+    /** What the Requests per Send field holds, typed or committed. */
+    requestsText: string;
+    /** Whether its last committed value is a valid Requests per Send. */
+    requestsValid: boolean;
     /** Whether it is being typed: then it is the next action's target. */
     editing: boolean;
     /** Every zone with its live members, in zone order. */
@@ -69,10 +69,10 @@
     bucketMs: number;
     onSelectPreset: (preset: Preset) => void;
     onRestart: () => void;
-    onCommitHits: () => void;
-    onEditHits: (editing: boolean) => void;
+    onCommitRequests: () => void;
+    onEditRequests: (editing: boolean) => void;
     /** Escape: back to the last committed value. */
-    onRevertHits: () => void;
+    onRevertRequests: () => void;
     onApplyKnobs: () => void;
     onBackToScenario: () => void;
     onCutZone: (zone: number) => void;
@@ -136,12 +136,12 @@
     addPick = null;
   }
 
-  function onHitsKey(event: KeyboardEvent): void {
+  function onRequestsKey(event: KeyboardEvent): void {
     if (event.key === 'Escape') {
       // Back to the last committed value before leaving the field, so leaving
       // it commits nothing.
-      onRevertHits();
-      (event.currentTarget as HTMLInputElement).value = hitsText;
+      onRevertRequests();
+      (event.currentTarget as HTMLInputElement).value = requestsText;
       (event.currentTarget as HTMLInputElement).blur();
       event.stopPropagation();
     }
@@ -175,26 +175,26 @@
         </div>
       {/each}
     </div>
-    <div class="hits">
-      <label for="burst-hits">Hits per Send</label>
+    <div class="requests">
+      <label for="burst-requests">Requests per Send</label>
       <input
-        id="burst-hits"
+        id="burst-requests"
         type="text"
         inputmode="numeric"
         autocomplete="off"
-        bind:value={hitsText}
+        bind:value={requestsText}
         data-primary={editing ? '' : undefined}
-        aria-invalid={!hitsValid}
-        aria-describedby={editing ? 'next-action burst-hits-hint' : 'burst-hits-hint'}
-        onfocus={() => onEditHits(true)}
-        onblur={() => onEditHits(false)}
-        onchange={onCommitHits}
-        onkeydown={onHitsKey}
+        aria-invalid={!requestsValid}
+        aria-describedby={editing ? 'next-action burst-requests-hint' : 'burst-requests-hint'}
+        onfocus={() => onEditRequests(true)}
+        onblur={() => onEditRequests(false)}
+        onchange={onCommitRequests}
+        onkeydown={onRequestsKey}
       />
     </div>
-    <p class="hint" id="burst-hits-hint" class:bad={!hitsValid}>
-      a whole number from <span data-field="hits-min">{1}</span> to&nbsp;<span data-field="hits-max"
-        >{fmtCount(BURST_HITS_MAX)}</span
+    <p class="hint" id="burst-requests-hint" class:bad={!requestsValid}>
+      a whole number from <span data-field="requests-min">{1}</span> to&nbsp;<span data-field="requests-max"
+        >{fmtCount(BURST_REQUESTS_MAX)}</span
       >
     </p>
     <button class="btn-secondary restart" title="keeps your settings" onclick={onRestart}>Restart {active?.label ?? ''}</button>
@@ -428,7 +428,7 @@
     cursor: default;
   }
 
-  .hits {
+  .requests {
     display: grid;
     grid-template-columns: 1fr 4.5rem;
     align-items: center;
@@ -437,7 +437,7 @@
     font-size: var(--font-size-caption);
   }
 
-  .hits input {
+  .requests input {
     text-align: right;
   }
 

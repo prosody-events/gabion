@@ -9,8 +9,7 @@ const caught: Lag = { kind: 'CaughtUp' };
 const behind: Lag = { kind: 'Behind', missing_for_ms: 5 };
 const stranded: Lag = { kind: 'Stranded', missing_for_ms: 600 };
 const admits: Admission = { kind: 'Admitted', total_before: 0 };
-const refuses: Admission = { kind: 'Rejected', total: 100, reopens: { kind: 'In', ms: 9900 } };
-const never: Admission = { kind: 'Rejected', total: 0, reopens: { kind: 'Never' } };
+const refuses: Admission = { kind: 'Rejected', total: 100, reopens_ms: 9900 };
 
 /** Twelve nodes in three zones, node `i` in zone `i mod 3`, each `lag`. */
 const nodes = (lag: (id: number) => Lag = () => caught) =>
@@ -28,18 +27,15 @@ export const BASE: RunView = {
   selected: 0,
   selectedZone: 0,
   nodes: nodes(),
-  nextSend: admits,
+  brim: admits,
   subjectCount: 0,
   subjectStrata: 0,
-  subjectAtLimit: false,
   cutZone: null,
   repair: null,
   clock: 'paused',
   busy: false,
-  hits: 'valid',
-  lastDecision: null,
-  burstHits: 25,
-  sendHits: 25,
+  requests: 'valid',
+  defaultRequests: 25,
   oracle: 0,
   virtualMs: 3000,
   bucketNow: 3,
@@ -66,11 +62,10 @@ export interface Row {
 
 export const TABLE: readonly Row[] = [
   // The precedence every story shares.
-  { name: 'typing Hits per Send', view: { hits: 'editing', busy: true }, action: { kind: 'edit' } },
+  { name: 'typing Requests per Send', view: { requests: 'editing', busy: true }, action: { kind: 'edit' } },
   { name: 'the engine starting', view: { busy: true }, action: wait('starting') },
-  { name: 'an invalid Hits per Send', view: { hits: 'invalid' }, action: { kind: 'inline', action: { kind: 'use-hits', hits: 25 } } },
-  { name: 'invalid hits during a run', view: { hits: 'invalid', clock: 'settled' }, action: { kind: 'inline', action: { kind: 'use-hits', hits: 25 } } },
-  { name: 'a request heavier than the limit', view: { lastDecision: never }, action: { kind: 'inline', action: { kind: 'use-hits', hits: 25 } } },
+  { name: 'an invalid Requests per Send', view: { requests: 'invalid' }, action: { kind: 'inline', action: { kind: 'use-requests', requests: 25 } } },
+  { name: 'invalid requests during a run', view: { requests: 'invalid', clock: 'settled' }, action: { kind: 'inline', action: { kind: 'use-requests', requests: 25 } } },
   { name: 'a run stopped at its cap', view: { clock: 'capped' }, action: press('play') },
   { name: 'a wave held for Step', view: { clock: 'before-wave' }, action: press('step') },
   { name: "a Send's run", view: { clock: 'settled' }, action: wait('run') },
@@ -81,14 +76,14 @@ export const TABLE: readonly Row[] = [
   { name: 'RL-4 zone b sent, select zone c', view: { story: rl('filling', { zones: 3 }), selected: 1, selectedZone: 1, oracle: 50 }, action: { kind: 'inline', action: { kind: 'select', node: 2, zone: 2 } } },
   { name: 'RL-4 zone b emptied: zone c is still next', view: { story: rl('filling', { zones: 1 }), nodes: nodes().filter((n) => n.zone !== 1), zoneCount: 2, oracle: 25 }, action: { kind: 'inline', action: { kind: 'select', node: 2, zone: 2 } } },
   { name: 'RL-5 node 2 sends again', view: { story: rl('filling', { zones: 7 }), selected: 2, selectedZone: 2, oracle: 75 }, action: press('send') },
-  { name: 'RL-6 at the limit', view: { story: rl('filling', { zones: 7 }), selected: 2, selectedZone: 2, oracle: 100, subjectAtLimit: true, nextSend: refuses }, action: press('send') },
-  { name: 'RL-7 refused', view: { story: rl('refused', { zones: 7 }), selected: 2, selectedZone: 2, oracle: 100, nextSend: refuses, lastDecision: refuses }, action: press('play') },
-  { name: 'RL-8 the window', view: { story: rl('refused', { zones: 7 }), selected: 2, selectedZone: 2, oracle: 100, nextSend: refuses, clock: 'playing' }, action: wait('window') },
+  { name: 'RL-6 at the limit', view: { story: rl('filling', { zones: 7 }), selected: 2, selectedZone: 2, oracle: 100, brim: refuses }, action: press('send') },
+  { name: 'RL-7 refused', view: { story: rl('refused', { zones: 7 }), selected: 2, selectedZone: 2, oracle: 100, brim: refuses }, action: press('play') },
+  { name: 'RL-8 the window', view: { story: rl('refused', { zones: 7 }), selected: 2, selectedZone: 2, oracle: 100, brim: refuses, clock: 'playing' }, action: wait('window') },
   { name: 'RL-9 reopened', view: { story: rl('reopened', { zones: 7, sendBucket: 2 }), selected: 2, selectedZone: 2, clock: 'playing' }, action: press('send') },
   { name: 'RL-10 the bucket', view: { story: rl('reopened', { zones: 7, sendBucket: 3 }), selected: 2, selectedZone: 2, clock: 'playing', oracle: 25 }, action: wait('bucket') },
   { name: 'RL-10 the bucket, paused', view: { story: rl('reopened', { zones: 7, sendBucket: 3 }), selected: 2, selectedZone: 2, oracle: 25 }, action: press('play') },
-  { name: 'RL-11 the oldest bucket', view: { story: rl('sliding-refused', { zones: 7 }), selected: 2, selectedZone: 2, clock: 'playing', oracle: 100, subjectStrata: 4, nextSend: refuses }, action: wait('oldest-bucket') },
-  { name: 'RL-11 one stratum', view: { story: rl('sliding-refused', { zones: 7 }), selected: 2, selectedZone: 2, clock: 'playing', oracle: 100, subjectStrata: 1, nextSend: refuses }, action: wait('window') },
+  { name: 'RL-11 the oldest bucket', view: { story: rl('sliding-refused', { zones: 7 }), selected: 2, selectedZone: 2, clock: 'playing', oracle: 100, subjectStrata: 4, brim: refuses }, action: wait('oldest-bucket') },
+  { name: 'RL-11 one stratum', view: { story: rl('sliding-refused', { zones: 7 }), selected: 2, selectedZone: 2, clock: 'playing', oracle: 100, subjectStrata: 1, brim: refuses }, action: wait('window') },
   { name: 'RL-12 the partial fall-off', view: { story: rl('drained', { zones: 7 }), selected: 2, selectedZone: 2, clock: 'playing', oracle: 75 }, action: press('send') },
   { name: 'RL-13 the end', view: { story: rl('done', { zones: 7 }), selected: 2, selectedZone: 2, clock: 'playing', oracle: 100 }, action: { kind: 'go', to: 'partition' } },
   // Propagation, Send stopping before each wave.
@@ -105,7 +100,7 @@ export const TABLE: readonly Row[] = [
   { name: 'Partition both refused, relays still landing', view: { story: { ...P, act: 'repair' }, cutZone: 2, clock: 'playing', nodes: nodes((id) => (id % 3 === 2 ? stranded : id === 1 ? behind : caught)) }, action: wait('run') },
   { name: 'Partition both refused, relays still landing, paused', view: { story: { ...P, act: 'repair' }, cutZone: 2, nodes: nodes((id) => (id % 3 === 2 ? stranded : id === 1 ? behind : caught)) }, action: press('play') },
   { name: 'Partition reconnected', view: { story: { ...P, act: 'counted', both: true }, oracle: 200 }, action: press('play') },
-  { name: 'Partition counting down', view: { story: { ...P, act: 'counted', both: true }, oracle: 200, clock: 'playing', nextSend: refuses }, action: wait('window') },
+  { name: 'Partition counting down', view: { story: { ...P, act: 'counted', both: true }, oracle: 200, clock: 'playing', brim: refuses }, action: wait('window') },
   { name: 'Partition at the end', view: { story: { ...P, act: 'done', both: true } }, action: { kind: 'go', to: 'gateway-failure' } },
   // The watched scenarios and Sandbox.
   { name: 'a watched scenario, paused', view: { story: { kind: 'watch', watched: 'loss', next: 'rate-limiting' } }, action: press('play') },

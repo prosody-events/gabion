@@ -90,22 +90,24 @@ export function waves(batch: EventBatch): number {
  *  hits. */
 export type StepUntil = 'Time' | { Event: { key: number } };
 
-/** Mirror of `crate::engine::Watch`: the key a snapshot reads, and the weight
- *  of the request its inspected node's `next_send` decides. Crosses inbound as
- *  two `bigint` arguments, not as a serde shape; `key` stays a safe integer. */
-export interface Watch {
-  key: number;
-  probe_hits: number;
+/** Mirror of `crate::event::Burst`: a node's decisions on a burst of one-hit
+ *  requests, taken in order against its own window. `Rejected` admitted the
+ *  first `admitted` (none if the window was full) and refused the other
+ *  `rejected`; one more request fits in `reopens_ms`. */
+export type Burst =
+  | { kind: 'Admitted'; requests: number; total_before: number }
+  | { kind: 'Rejected'; admitted: number; rejected: number; total: number; reopens_ms: number };
+
+/** The requests `burst` admitted and recorded. */
+export function admittedOf(burst: Burst): number {
+  return burst.kind === 'Admitted' ? burst.requests : burst.admitted;
 }
 
-/** Mirror of `crate::event::Reopens`: when a rejected request would be
- *  admitted if sent again. */
-export type Reopens = { kind: 'In'; ms: number } | { kind: 'Never' };
-
-/** Mirror of `crate::event::Admission`: a node's decision on a whole request. */
+/** Mirror of `crate::event::Admission`: a node's decision on one more
+ *  request, of one hit. */
 export type Admission =
   | { kind: 'Admitted'; total_before: number }
-  | { kind: 'Rejected'; total: number; reopens: Reopens };
+  | { kind: 'Rejected'; total: number; reopens_ms: number };
 
 /** Mirror of `crate::event::Lag`: whether a node holds every in-window change,
  *  and if not, whether waiting can help (`Behind`) or not (`Stranded`). */
@@ -126,7 +128,7 @@ export type Tier = 'InZone' | 'CrossZone';
 
 /** Mirror of `crate::event::EventKind` (serde-tagged by `type`). */
 export type EventKind =
-  | { type: 'Decided'; node: number; hits: number; admission: Admission }
+  | { type: 'Decided'; node: number; burst: Burst }
   | { type: 'Tick'; node: number }
   | { type: 'ThresholdFire'; node: number }
   | { type: 'PacketSent'; src: number; dst: number; bytes: number; kind: PacketKind; tier: Tier }
@@ -228,8 +230,8 @@ export interface NodeState {
   /** gabion's `window_total` of the watched key on this node's own count
    *  table: the number its admission reads. */
   window_total: number;
-  /** The decision a one-hit request would get here now: `Rejected` exactly
-   *  while the node is at its limit. */
+  /** The decision one more request, of one hit, would get here now:
+   *  `Rejected` exactly while the node is at its limit. */
   brim: Admission;
   lag: Lag;
   /** The next instant this node's heartbeat fires, in virtual ms. */
@@ -267,9 +269,6 @@ export interface Inspected {
   id: number;
   cells: CellView[];
   peers: PeerView[];
-  /** The decision this node would make now on a request of the watch's
-   *  `probe_hits`. */
-  next_send: Admission;
 }
 
 /** Mirror of `crate::event::ZoneView`: a zone and its live members. */

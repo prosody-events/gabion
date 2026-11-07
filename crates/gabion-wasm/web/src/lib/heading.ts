@@ -1,6 +1,6 @@
 // The stage heading: the cluster's state in one line, the page's largest
 // type. Every number comes from the engine's snapshot (each node's windowed
-// count and lag, the true total, the selected node's next decision) and the
+// count and lag, the true total, the selected node's one-hit decision) and the
 // page's own record of the run (its cuts, the waves since the last Send). Each
 // form has a template id, published for the audit.
 
@@ -35,8 +35,8 @@ export interface HeadingView {
   readonly cuts: readonly Cut[];
   readonly zones: readonly { name: string }[];
   readonly selected: number;
-  readonly nextSend: Admission | undefined;
-  readonly sendHits: number;
+  /** The selected node's decision on one more request. */
+  readonly brim: Admission | undefined;
   /** Whether the window emptied since the last admitted Send. */
   readonly emptied: boolean;
   readonly badge: Badge | null;
@@ -118,13 +118,9 @@ export function heading(h: HeadingView): Heading {
   }
   if (t === 0) return { id: 'rl-0', parts: blurb`All ${n} nodes see ${claim(0, 'cluster', 'view')} of the ${limit} limit`, repair };
   const all = blurb`All ${n} nodes see ${claim(t, 'cluster', 'view')} of the ${limit} limit`;
-  const next = h.nextSend;
-  if (next?.kind === 'Rejected') {
+  if (h.brim?.kind === 'Rejected') {
     const s = h.selected;
-    const countdown: Blurb =
-      next.reopens.kind === 'In'
-        ? blurb` · node ${s} admits ${h.sendHits} again in ${claim(fmtSeconds(next.reopens.ms), s, 'reopens')}`
-        : blurb` · node ${s} can never admit ${h.sendHits}: the limit is ${h.limit}`;
+    const countdown = blurb` · node ${s} admits again in ${claim(fmtSeconds(h.brim.reopens_ms), s, 'reopens')}`;
     return { id: 'rl-3', parts: [...all, ...countdown, ...over], repair };
   }
   if (h.badge !== null) return { id: 'rl-2', parts: ['✓ ', ...all, ...agreed, ...over], repair };

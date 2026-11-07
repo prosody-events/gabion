@@ -1,11 +1,11 @@
 import { readFileSync } from 'node:fs';
 import { expect, test, type Page } from '@playwright/test';
-import { ORIGIN } from '../src/lib/presets';
+import { ORIGIN, WATCHED_KEY } from '../src/lib/presets';
 import type { ClusterState } from '../src/lib/sim/types';
 import { CONTROL, CROSS, DROPPED, FADE_MS, RELAY } from '../src/lib/stage/layout';
 import { BOUNCE_MS, RING_CAUGHT_UP, type BeamPool, type GlyphTable } from '../src/lib/stage/renderer';
 import { BEAM_ALPHA, FADED_ALPHA } from '../src/lib/theme';
-import { PERIOD_MS, WATCH, recordData, refusal, send, sendButton, setRange, setSpeed, step, still, virtualMs } from './drive';
+import { PERIOD_MS, recordData, refusal, send, sendButton, setRange, setSpeed, step, still, virtualMs } from './drive';
 import { sourceOf } from './sourcemap';
 
 // The packets in motion (README "Tests"), run once at 1440 px in the light
@@ -31,12 +31,12 @@ const FRAME_MS = 16;
 const RUN_MS = 100;
 // The longest one tick of Pixi's ticker advances, ms (its `maxElapsedMS`).
 const MAX_TICK_MS = 100;
-// The Hits per Send every scenario opens with.
+// The Requests per Send every scenario opens with.
 const BURST = 25;
 
 /** The page's engine, snapshotted, with node `inspect`'s rows. */
 const snapshot = (page: Page, inspect: number | null = null): Promise<ClusterState> =>
-  page.evaluate(([id, watch]) => window.sim!.snapshot(id, watch), [inspect, WATCH] as const);
+  page.evaluate(([id, key]) => window.sim!.snapshot(id, key), [inspect, WATCHED_KEY] as const);
 
 /** Load the page, open "Show as table" (the DOM's counts) and wait for the
  *  stage's layout to follow the smaller box, so no line is drawn mid-resize. */
@@ -178,7 +178,7 @@ interface Causality {
  *  stands before a wave, differing from the engine's, which holds the wave
  *  undelivered. */
 async function installCausality(page: Page): Promise<void> {
-  await page.evaluate(({ watch, bits }) => {
+  await page.evaluate(({ key, bits }) => {
     type Log = {
       violations: string[];
       checked: number;
@@ -217,7 +217,7 @@ async function installCausality(page: Page): Promise<void> {
       };
     }
     const sim = window.sim as unknown as {
-      submitRequest: (...args: unknown[]) => Promise<{ events: { kind: { type: string; node?: number; admission?: { kind: string } } }[] }>;
+      submitRequest: (...args: unknown[]) => Promise<{ events: { kind: { type: string; node?: number; burst?: { kind: string; admitted?: number } } }[] }>;
       causal?: boolean;
     };
     if (sim.causal !== true) {
@@ -226,7 +226,8 @@ async function installCausality(page: Page): Promise<void> {
       sim.submitRequest = async (...args) => {
         const batch = await submit(...args);
         for (const { kind } of batch.events) {
-          if (kind.type === 'Decided' && kind.admission?.kind === 'Admitted') w.causality.credit.set(kind.node!, w.causality.frame);
+          const admitted = kind.burst?.kind === 'Admitted' || (kind.burst?.admitted ?? 0) > 0;
+          if (kind.type === 'Decided' && admitted) w.causality.credit.set(kind.node!, w.causality.frame);
         }
         return batch;
       };
@@ -254,7 +255,7 @@ async function installCausality(page: Page): Promise<void> {
       const clock = pane.dataset.clock;
       if (clock === 'before-wave' && last !== 'before-wave') {
         const shown = readCounts();
-        void window.sim!.snapshot(null, watch).then((snap) => {
+        void window.sim!.snapshot(null, key).then((snap) => {
           // Compared only if the run still stands before the wave: the engine
           // then cannot have delivered it before it answered.
           if (pane.dataset.clock !== 'before-wave') return;
@@ -270,7 +271,7 @@ async function installCausality(page: Page): Promise<void> {
       requestAnimationFrame(sample);
     };
     requestAnimationFrame(sample);
-  }, { watch: WATCH, bits: BITS });
+  }, { key: WATCHED_KEY, bits: BITS });
 }
 
 /** What the causality log has found so far. */
@@ -768,11 +769,11 @@ const WARM_STRETCHES = 3;
 // The rule window every preset runs with.
 const WINDOW_MS = 10_000;
 
-const STRETCHES: readonly { name: string; hits?: number; sends: number; warm: number }[] = [
+const STRETCHES: readonly { name: string; requests?: number; sends: number; warm: number }[] = [
   { name: 'Packet loss', sends: 1, warm: WARM_STRETCHES },
   // Each stretch that opens on an empty window admits two Sends and refuses
   // the third, so the tracked one repeats a warm one.
-  { name: 'Rate limiting', hits: 50, sends: 3, warm: 2 * WARM_STRETCHES },
+  { name: 'Rate limiting', requests: 50, sends: 3, warm: 2 * WARM_STRETCHES },
   { name: 'Propagation', sends: 1, warm: WARM_STRETCHES },
 ];
 
@@ -785,9 +786,9 @@ for (const stretchOf of STRETCHES) {
       await openOnFakeClock(page);
       await stopClock(page);
       await loadPreset(page, stretchOf.name);
-      if (stretchOf.hits !== undefined) {
-        await page.locator('#burst-hits').fill(String(stretchOf.hits));
-        await page.locator('#burst-hits').press('Enter');
+      if (stretchOf.requests !== undefined) {
+        await page.locator('#burst-requests').fill(String(stretchOf.requests));
+        await page.locator('#burst-requests').press('Enter');
       }
       const title = page.locator('.pane-title [data-field="node"]');
       await page.locator(`[role="gridcell"][data-node="${ORIGIN}"]`).press('Enter');
@@ -972,8 +973,8 @@ test("a refusal's band drops, rebounds and fades in the headroom", async ({ page
   await page.goto('/');
   await expect(page.locator('.stage canvas')).toBeVisible({ timeout: 30_000 });
   await loadPreset(page, 'Rate limiting');
-  // A request of the whole limit, then one more: refused at node 0.
-  const field = page.locator('#burst-hits');
+  // A Send of the whole limit, then one more: refused at node 0.
+  const field = page.locator('#burst-requests');
   await field.fill('100');
   await field.press('Enter');
   await send(page, 0);

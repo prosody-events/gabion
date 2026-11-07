@@ -74,9 +74,9 @@ the inside is at least `STRATA_MIN_INNER` px and a request's stratum at least
 `STRATUM_MIN`; the part over the brim is `--color-bad`. The brim, 1.5 px of ink
 at 0.8 of the inside, is the limit; it thickens into a red cap while the
 engine's `brim` decision is `Rejected`. A limit more than `LIMIT_ON_SCALE`
-requests away is off the scale: no fill, brim or cap, and the key says so. A
-refused Send drops a red band into the vessel's headroom, the hits that would
-have overflowed, clipped to the disc, rebounding and fading over 600 ms (at
+Sends away is off the scale: no fill, brim or cap, and the key says so. A
+Send's rejected requests drop a red band into the vessel's headroom, the hits
+that would have overflowed, clipped to the disc, rebounding and fading over 600 ms (at
 rest and hatched under reduced motion). The ring is the share of the cluster's
 windowed hits the node has heard: a closed neutral ring while its `lag` is
 `CaughtUp`, an amber arc over a thin amber track while it is behind, held a
@@ -145,21 +145,29 @@ report, retransmission and sweep counters, and the error budget. Every figure
 is the runtime's own admin row; the page chooses nothing.
 
 **Controls** (one model: time, traffic, network, membership, configuration).
-The transport holds Play/Pause, Step, Send and Speed. Send sends a request of
-Hits per Send to the selected node, its label saying so ("Send a request of 25
-hits to node 0", shorter on narrower screens, `lib/controls.ts`). A command
+The transport holds Play/Pause, Step, Send and Speed. Send sends a burst of
+Requests per Send to the selected node: one-hit requests it decides in order,
+admitting each while its window has room and rejecting the rest, its label
+saying so ("Send 25 requests to node 0", "Send 25 requests" below 640 px,
+`lib/controls.ts`). A command
 that creates something to spread (an admitted Send, Heal, Add) pressed while
 paused plays until no node that waiting can reach is behind and one heartbeat
 period has passed since the last wave, so the acknowledgements have been
 sent, or 16 periods, then pauses itself; the readout says "playing until every
 node has it" while it does. In Propagation the Send also stops before each
-wave, which the engine holds until Step draws it with its counts. A
-refused Send runs no time; pressed while playing, a command leaves time alone.
+wave, which the engine holds until Step draws it with its counts. A Send
+rejected whole runs no time; pressed while playing, a command leaves time
+alone. Play never runs silently: when time runs and nothing is coming (no
+feed, no hits held for a heartbeat, no node a wave can still reach), the
+narration says so at once and quotes the next action's control, with the
+window's edge counted down when hits will leave it; a preset whose seed leaves
+the selected node holding hits shows its heartbeat sweep and says when they
+leave.
 Step goes to the next event (the next wave of packets that carry hits, the
 next instant hits leave the window, or one heartbeat period when neither is
 coming) and is never disabled for playing. The rail has the scenarios in four
-groups (the current one marked by a rule, never filled, and inert), Hits per
-Send (checked when committed: Enter or leaving the field), Restart, a "Tune the
+groups (the current one marked by a rule, never filled, and inert), Requests
+per Send (checked when committed: Enter or leaving the field), Restart, a "Tune the
 cluster" disclosure (edits stage, counted on its summary, until Rebuild;
 "Back to the scenario's settings" restages the scenario's own), the network
 actions (cut a zone off; under a heading naming the selected node, silence one
@@ -173,7 +181,7 @@ last heartbeat period took to watch at the chosen speed.
 **Presets** (`presets.ts`): Rate limiting, Propagation and Sustained overload;
 Zone partition, Packet loss, Gateway failure and Gateway cut; Steady state and
 No zone configured; Sandbox. Each declares its config, the node it selects,
-Hits per Send, its charts, its story and the scenario its story hands over to.
+Requests per Send, its charts, its story and the scenario its story hands over to.
 Rate limiting (limit 100, the default) and Zone partition (limit 100, zone c cut
 at load) put the limit on the scale. Every preset opens on a warmed, settled
 cluster: the page steps whole heartbeat periods until every node has a gateway
@@ -185,8 +193,8 @@ sending data its cut gateway must answer with "cannot relay".
 
 **The next action** (`lib/next.ts`). In every state the page decides one next
 action from the run alone: press a transport control, press a button in the
-caption's action line (Select node N, Use 25 hits), press the heading's repair,
-go to the next scenario at a story's end, finish typing Hits per Send, wait, or
+caption's action line (Select node N, Use 25 requests), press the heading's repair,
+go to the next scenario at a story's end, finish typing Requests per Send, wait, or
 watch. Its control is the only filled one on the page (`data-primary`); the
 action line names it by the label the control renders; a wait fills nothing and
 shows a meter of its progress; the goal above the line explains the act and
@@ -273,9 +281,10 @@ text until a face loads; the canvas and the charts wait for the faces
   `BucketStrata`, `ControlRail`, `TransportBar`, `RoleGlyph` and `Icon` (the
   drawn marks), `Sentence` and `InfoTip`.
 - `src/lib/presets.ts` — the scenario presets: a config, the node
-  it selects, Hits per Send, its charts, its story and the scenario it hands
+  it selects, Requests per Send, its charts, its story and the scenario it hands
   over to, an optional feed and an `async seed(sim, config, gateways)` that
-  fires the opening commands against a fresh, warmed cluster (`warm`). A feed
+  fires the opening commands against a fresh, warmed cluster (`warm`) and
+  reports the hits they leave held for the selected node's heartbeat. A feed
   injects ⌊rate·T⌋ hits by virtual time T since the build was handed to the
   reader.
 - `src/wasm/` — generated by `pnpm run build:wasm`; never edited or committed.
@@ -344,7 +353,7 @@ study dashboard. A rule that assumes the study's data model says "N/A" and why.
 27. Accessibility: a focusable roving-tabindex grid, sentence labels, tooltips on hover, focus and tap, targets of at least 24 px, contrast (A3, A6, A7).
 28. Automated checks carried over (CI).
 29. Cause and effect in one frame: every packet is drawn as a line the instant it is sent, the instant the engine delivers it, so each count changes in the frame its line appears, never before; Play never waits for a packet, and overlapping waves draw together; a line fades over one simulated second. A command first runs past gabion's emit floor. In Propagation a Send stops before each wave, which the engine holds until Step draws it with its counts. Step stops at the next wave, which it draws at once, or at the next instant hits leave the window (motion suite).
-30. One next action: in every state exactly one control is filled, the caption's action line quotes its label, a wait fills nothing and shows its progress, and the goal never commands (A49, A54, A56; story suite).
+30. One next action: in every state exactly one control is filled, the caption's action line quotes its label, a wait fills nothing and shows its progress, and the goal never commands (A49, A54, A56; story suite); Play is never silent (A61).
 
 The grep gates, which `make hygiene` runs: no colour literal outside
 `tokens.css`, no pixel `font-size`, no token a component names that
@@ -388,7 +397,9 @@ The story, motion and page checks the test titles name:
 - A55: Propagation's Send stops before each wave, one that flushes at once included, and Step draws wave 1 alone, then the relays, then reaches the window's edge.
 - A56: a goal never begins a clause with a control's verb or quotes a control's label.
 - A57: the sliding-window act paces itself: Send is the next action again only in a new bucket.
-- A59: typing in Hits per Send never moves the next action; a committed invalid value does.
+- A59: typing in Requests per Send never moves the next action; a committed invalid value does.
+- A60: a Send is a burst of one-hit requests: 250 at limit 100 admits 100 and rejects 150, and the verdict states the split.
+- A61: Play is never silent: in every preset at load and after each story's settled state, by 300 ms of simulated time a stage mark changes, or the narration says nothing is coming and quotes the next control's label.
 
 `tests/audit.spec.ts` automates them, in ten projects, and checks each preset a second time with `data-theme` forcing the other theme. It saves a full-page PNG per project, preset and theme to `audit-shots/`. `tests/motion.spec.ts` checks rule 29 with motion on and saves Propagation's two waves, just drawn by Step, as `propagation-wave1.png` and `propagation-wave2.png`, and a paused fade as `lines-paused.png`.
 
@@ -414,8 +425,8 @@ control, and checks in each state that one control is filled and the line
 quotes it, that a wait shows a meter that never falls, that the goal never
 commands and that one live region speaks, with the heading's templates and the
 refusal's sentence; Propagation's Send stopping before each wave that Step
-draws; Zone partition's 200 admitted against 100; Hits per Send checked on
-commit; the skip link and keys; buttons and boundaries and the dashed preview
+draws; Zone partition's 200 admitted against 100; Requests per Send checked on
+commit; a Send of 250 at limit 100; Play never silent; the skip link and keys; buttons and boundaries and the dashed preview
 of every control that names a node; the title; the one-column pane; and a
 story's hand-over and Undo. The design audit is ten projects (widths
 1440, 1280, 1100, 768 and 400, each in light and dark, with motion reduced).

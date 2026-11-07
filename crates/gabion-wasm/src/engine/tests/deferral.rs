@@ -39,7 +39,13 @@ fn a_sends_eager_flush_lands_before_the_submit_returns() {
         let submitted = send(&mut state, 0, 25).await;
         assert!(matches!(
             decisions(&submitted.events)[..],
-            [(0, Admission::Admitted { total_before: 0 })]
+            [(
+                0,
+                Burst::Admitted {
+                    requests,
+                    total_before: 0
+                }
+            )] if requests == super::requests(25)
         ));
         assert!(submitted.events.iter().any(|e| matches!(
             e.kind,
@@ -59,7 +65,7 @@ fn a_sends_eager_flush_lands_before_the_submit_returns() {
         assert_eq!(cell_nodes(&submitted.events), counted);
         assert!(submitted.events.iter().all(|e| e.virtual_ms == at));
 
-        let snap = state.snapshot(None, WATCH).await;
+        let snap = state.snapshot(None, WATCHED).await;
         for node in &snap.nodes {
             let want = if counted.contains(&node.id) { 25 } else { 0 };
             assert_eq!(node.window_total, want, "node {}", node.id);
@@ -87,14 +93,14 @@ fn a_send_by_event_holds_its_eager_flush_until_the_next_command() {
         ready(&mut state).await;
         let at = state.virtual_ms;
         let submitted = state
-            .submit_request(0, KeyHash(WATCHED_KEY), hits(25), EVENT)
+            .submit_request(0, KeyHash(WATCHED_KEY), requests(25), EVENT)
             .await
             .expect("a live node");
         let own = packets(&submitted.events, PacketKind::Own);
         assert_eq!(own.len(), 5, "{own:?}");
         assert!(matches!(state.sub_step, SubStep::Open(_)));
         assert_eq!(cell_nodes(&submitted.events), BTreeSet::from([0]));
-        let snap = state.snapshot(None, WATCH).await;
+        let snap = state.snapshot(None, WATCHED).await;
         for node in &snap.nodes {
             let want = if node.id == 0 { 25 } else { 0 };
             assert_eq!(node.window_total, want, "held: node {}", node.id);
@@ -104,7 +110,7 @@ fn a_send_by_event_holds_its_eager_flush_until_the_next_command() {
         assert_eq!(delivered.virtual_ms, at);
         assert!(matches!(state.sub_step, SubStep::Closed));
         assert_eq!(cell_nodes(&delivered.events), destinations(&own));
-        let snap = state.snapshot(None, WATCH).await;
+        let snap = state.snapshot(None, WATCHED).await;
         for node in &snap.nodes {
             let want = if node.id == 0 || destinations(&own).contains(&node.id) {
                 25
@@ -169,7 +175,7 @@ fn every_command_closes_an_open_sub_step_first() {
                 events.extend(state.step(0, StepUntil::Time).await.events);
             }
             events.extend(command.run(&mut state).await);
-            let snap = state.snapshot(Some(0), WATCH).await;
+            let snap = state.snapshot(Some(0), WATCHED).await;
             events.extend(state.step(0, StepUntil::Time).await.events);
             let run = (events, serde_json::to_value(&snap).unwrap());
             (state, run)
@@ -209,7 +215,7 @@ fn stepped(until: StepUntil) -> (Run, usize) {
             // A wave at `to` itself is still held: deliver it.
             events.extend(state.step(0, StepUntil::Time).await.events);
         }
-        let snap = state.snapshot(Some(1), WATCH).await;
+        let snap = state.snapshot(Some(1), WATCHED).await;
         let run = (events, serde_json::to_value(&snap).unwrap());
         (state, (run, holds))
     })
@@ -294,7 +300,7 @@ fn event_stops_at_each_wave_and_at_the_window_edge() {
         for kind in [PacketKind::Own, PacketKind::Relay, PacketKind::Sweep] {
             assert!(packets(&edge.events, kind).is_empty(), "no data moves");
         }
-        let snap = state.snapshot(None, WATCH).await;
+        let snap = state.snapshot(None, WATCHED).await;
         assert_eq!(snap.next_expiry_ms, None);
         assert!(snap.nodes.iter().all(|n| n.window_total == 0));
         state

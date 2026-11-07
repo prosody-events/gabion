@@ -2,7 +2,7 @@
   import { onMount, untrack } from 'svelte';
   import { blurb, fmtCount, type Blurb } from '../format';
   import { capHeight, textWidth } from '../measure';
-  import type { ClusterState, EventBatch } from '../sim/types';
+  import type { Burst, ClusterState, EventBatch } from '../sim/types';
   import {
     MARK,
     StageRenderer,
@@ -14,7 +14,7 @@
   import { R_MAX, countFits, nodeAt, stageLayout, stageMargin, type Point, type StageLayout } from '../stage/layout';
   import { fontsReady, type Theme } from '../theme';
   import InfoTip from './InfoTip.svelte';
-  import NodeGrid, { type Decision } from './NodeGrid.svelte';
+  import NodeGrid from './NodeGrid.svelte';
   import RoleGlyph, { type Glyph } from './RoleGlyph.svelte';
   import Sentence from './Sentence.svelte';
 
@@ -61,7 +61,7 @@
     awaiting: number | null;
     /** The node a hovered or focused control names, previewed dashed. */
     previewId: number | null;
-    decisions: ReadonlyMap<number, Decision>;
+    decisions: ReadonlyMap<number, Burst>;
     phone: boolean;
     /** The presentation clock's speed against wall time: the rings' sweeps
      *  and a refusal play at it. */
@@ -160,7 +160,7 @@
     renderer?.reset();
   }
 
-  /** Play node `node`'s refusal of `hits`. */
+  /** Play node `node`'s refusal of `hits`, one per request it rejected. */
   export function reject(node: number, hits: number): void {
     renderer?.reject(node, hits);
   }

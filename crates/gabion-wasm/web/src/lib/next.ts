@@ -8,7 +8,7 @@
 // an act cannot go without an action, a goal or a move.
 
 import { blurb, type Blurb } from './format';
-import type { Admission, Lag } from './sim/types';
+import type { Admission, Burst, Lag } from './sim/types';
 
 /** How a command's bounded run plays on its own: `'settled'` until every
  *  node that waiting can reach has the hits and their acknowledgements have
@@ -29,7 +29,7 @@ export type WaitReason = 'starting' | 'run' | 'window' | 'bucket' | 'oldest-buck
 /** A story-only action: a button in the action line. */
 type InlineAction =
   | { readonly kind: 'select'; readonly node: number; readonly zone: number }
-  | { readonly kind: 'use-hits'; readonly hits: number };
+  | { readonly kind: 'use-requests'; readonly requests: number };
 
 /** The scenarios a story hands over to, by preset id. */
 export type PresetId =
@@ -58,7 +58,8 @@ export type NextAction =
   | { readonly kind: 'wait'; readonly reason: WaitReason }
   | { readonly kind: 'watch'; readonly what: WatchedPreset; readonly next: PresetId };
 
-/** Rate limiting: `open`, `filling` (an admitted Send), `refused`,
+/** Rate limiting: `open`, `filling` (a Send admitted whole), `refused` (a
+ *  Send the limit split or rejected whole),
  *  `reopened`, `sliding-refused`, `drained`, `done`. `zones` is a bitmask of
  *  the zones with an admitted Send; `sendBucket` the bucket of the last
  *  admitted Send. */
@@ -100,27 +101,26 @@ interface Watched {
 /** Each scenario's story, as it stands: a preset declares its opening. */
 export type Story = RateLimiting | Propagation | Partition | Watched | { readonly kind: 'sandbox' };
 
-/** A decided Send as a story reads it: admitted, or refused by the window,
- *  in the zone of the node that decided it. */
+/** A decided Send as a story reads it: admitted whole, split by the limit
+ *  (some admitted, the rest refused), or refused whole, in the zone of the
+ *  node that decided it. */
 export interface Verdict {
-  readonly kind: 'admitted' | 'refused';
+  readonly kind: 'admitted' | 'split' | 'refused';
   readonly zone: number;
 }
 
-/** What Send `admission`, decided in `zone`, means to a story; null for a
- *  request heavier than the limit, which is refused for its weight and moves
- *  no story. */
-export function verdictOf(admission: Admission, zone: number): Verdict | null {
-  if (admission.kind === 'Admitted') return { kind: 'admitted', zone };
-  return admission.reopens.kind === 'In' ? { kind: 'refused', zone } : null;
+/** What Send `burst`, decided in `zone`, means to a story. */
+export function verdictOf(burst: Burst, zone: number): Verdict {
+  if (burst.kind === 'Admitted') return { kind: 'admitted', zone };
+  return { kind: burst.admitted > 0 ? 'split' : 'refused', zone };
 }
 
 /** What one applied snapshot tells a story. */
 export interface Observation {
   /** The verdict on the Send this command decided, if any. */
   readonly decided: Verdict | null;
-  /** The selected node's decision on its next Send, after. */
-  readonly nextSend: Admission | undefined;
+  /** The selected node's decision on one more request, after. */
+  readonly brim: Admission | undefined;
   readonly oracle: number;
   readonly bucket: number;
   readonly cuts: number;
@@ -146,21 +146,27 @@ export function observe(s: Story, o: Observation): Story {
 function observeRate(s: RateLimiting, o: Observation): RateLimiting {
   const d = o.decided;
   const verdict = d?.kind;
-  const opens = o.nextSend?.kind === 'Admitted';
+  const opens = o.brim?.kind === 'Admitted';
   switch (s.act) {
     case 'open':
     case 'filling':
-      if (d?.kind === 'admitted') return { ...s, act: 'filling', zones: s.zones | (1 << d.zone), sendBucket: o.bucket };
-      return verdict === 'refused' ? { ...s, act: 'refused' } : s;
+      if (d === null) return s;
+      if (d.kind === 'refused') return { ...s, act: 'refused' };
+      return {
+        ...s,
+        act: d.kind === 'admitted' ? 'filling' : 'refused',
+        zones: s.zones | (1 << d.zone),
+        sendBucket: o.bucket,
+      };
     case 'refused':
       return opens ? { ...s, act: 'reopened' } : s;
     case 'reopened':
       if (verdict === 'admitted') return { ...s, sendBucket: o.bucket };
-      return verdict === 'refused' ? { ...s, act: 'sliding-refused' } : s;
+      return verdict === undefined ? s : { ...s, act: 'sliding-refused' };
     case 'sliding-refused':
       return opens ? { ...s, act: 'drained' } : s;
     case 'drained':
-      return verdict === 'admitted' ? { ...s, act: 'done' } : s;
+      return verdict === 'admitted' || verdict === 'split' ? { ...s, act: 'done' } : s;
     case 'done':
       return s;
   }
@@ -169,7 +175,7 @@ function observeRate(s: RateLimiting, o: Observation): RateLimiting {
 function observePropagation(s: Propagation, o: Observation): Propagation {
   switch (s.act) {
     case 'open':
-      return o.decided?.kind === 'admitted' ? { ...s, act: 'sent' } : s;
+      return o.decided === null || o.decided.kind === 'refused' ? s : { ...s, act: 'sent' };
     case 'sent':
       return o.oracle === 0 ? { ...s, act: 'done' } : s;
     case 'done':
@@ -189,7 +195,7 @@ function observePartition(s: Partition, o: Observation): Partition {
     case 'repair': {
       if (o.cuts === 0) return { kind: 'partition', next, act: 'counted', both: s.act === 'repair' };
       const d = o.decided;
-      if (d?.kind !== 'refused') return s;
+      if (d === null || d.kind === 'admitted') return s;
       const side: Side = d.zone === o.cutZone ? 'cut' : 'near';
       if (s.act === 'open') return { kind: 'partition', next, act: 'far-side', refused: side };
       return s.act === 'far-side' && s.refused !== side ? { kind: 'partition', next, act: 'repair' } : s;
@@ -204,26 +210,21 @@ export interface RunView {
   readonly selected: number;
   readonly selectedZone: number;
   readonly nodes: readonly { readonly id: number; readonly zone: number; readonly lag: Lag }[];
-  /** The selected node's decision on its next Send, its count and its
+  /** The selected node's decision on one more request, its count and its
    *  non-empty buckets. */
-  readonly nextSend: Admission | undefined;
+  readonly brim: Admission;
   readonly subjectCount: number;
   readonly subjectStrata: number;
-  /** Whether the selected node is at its limit. */
-  readonly subjectAtLimit: boolean;
   readonly cutZone: number | null;
   /** The repair the heading offers, by its label, or null. */
   readonly repair: Blurb | null;
   readonly clock: Clock;
   readonly busy: boolean;
-  /** Hits per Send: committed and valid, committed and invalid, or being
+  /** Requests per Send: committed and valid, committed and invalid, or being
    *  typed. */
-  readonly hits: 'valid' | 'invalid' | 'editing';
-  /** The last Send's decision, until the next command. */
-  readonly lastDecision: Admission | null;
-  /** The scenario's own Hits per Send, and the one a Send carries now. */
-  readonly burstHits: number;
-  readonly sendHits: number;
+  readonly requests: 'valid' | 'invalid' | 'editing';
+  /** The scenario's own Requests per Send. */
+  readonly defaultRequests: number;
   readonly oracle: number;
   /** Simulated time, the window bucket it falls in and the bucket's width. */
   readonly virtualMs: number;
@@ -237,10 +238,9 @@ export interface RunView {
 
 /** The one next action in the state `v` describes. */
 export function nextAction(v: RunView): NextAction {
-  if (v.hits === 'editing') return { kind: 'edit' };
+  if (v.requests === 'editing') return { kind: 'edit' };
   if (v.busy) return wait('starting');
-  const never = v.lastDecision?.kind === 'Rejected' && v.lastDecision.reopens.kind === 'Never';
-  if (v.hits === 'invalid' || never) return { kind: 'inline', action: { kind: 'use-hits', hits: v.burstHits } };
+  if (v.requests === 'invalid') return { kind: 'inline', action: { kind: 'use-requests', requests: v.defaultRequests } };
   if (v.clock === 'capped') return press('play');
   if (v.clock === 'before-wave') return press('step');
   if (v.clock === 'settled' || v.clock === 'per-wave') return wait('run');
@@ -371,7 +371,7 @@ export function progress(v: RunView, reason: WaitReason, from: WaitStart): numbe
     }
     case 'window':
     case 'oldest-bucket': {
-      const left = v.nextSend?.kind === 'Rejected' && v.nextSend.reopens.kind === 'In' ? v.nextSend.reopens.ms : 0;
+      const left = v.brim.kind === 'Rejected' ? v.brim.reopens_ms : 0;
       return from.reopensMs <= 0 ? 1 : clamp01(1 - left / from.reopensMs);
     }
     case 'bucket': {
@@ -407,9 +407,9 @@ function rateGoal(v: RunView, s: RateLimiting): Blurb {
   switch (s.act) {
     case 'open':
     case 'filling':
-      return v.subjectAtLimit
+      return v.brim.kind === 'Rejected'
         ? blurb`Every node now sees the limit, so node ${v.selected} decides on its own whether the next request fits.`
-        : blurb`The limit of ${v.limit} hits per ${seconds} s is shared by every node in all ${v.zoneCount} zones, and each request carries ${v.sendHits} hits.`;
+        : blurb`The limit of ${v.limit} hits per ${seconds} s is shared by every node in all ${v.zoneCount} zones, and each request is one hit.`;
     case 'refused':
       return blurb`A hit counts for ${seconds} s. When the oldest hits leave the window, node ${v.selected} admits again.`;
     case 'reopened':
@@ -501,7 +501,7 @@ export function waitClause(reason: WaitReason, subject: number): Blurb {
     case 'window':
       return blurb`the heading counts down to node ${subject}'s reopening`;
     case 'bucket':
-      return ["the next one-second bucket opens, so the next request's hits form their own layer"];
+      return ["the next one-second bucket opens, so the next Send's hits form their own layer"];
     case 'oldest-bucket':
       return blurb`the bottom layer leaves the window first, and node ${subject} admits again`;
   }

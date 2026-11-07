@@ -6,24 +6,24 @@
   import {
     ANSWER,
     CARRIES_CELLS,
+    admittedOf,
     waves,
-    type Admission,
+    type Burst,
     type ClusterState,
     type EventBatch,
     type Inspected,
     type PeerView,
     type SimConfig,
     type StepUntil,
-    type Watch,
   } from './lib/sim/types';
   import type { Fault, Roles, Scale } from './lib/stage/renderer';
   import {
     DEFAULT_PRESET,
     PRESETS,
     WATCHED_KEY,
-    BURST_HITS,
-    BURST_HITS_MAX,
-    BURST_HITS_MIN,
+    BURST_REQUESTS,
+    BURST_REQUESTS_MAX,
+    BURST_REQUESTS_MIN,
     ORIGIN,
     knobsFromPreset,
     presetById,
@@ -34,7 +34,7 @@
   } from './lib/presets';
   import { nominalBuckets } from './lib/buckets';
   import { cutName, cutState } from './lib/cuts';
-  import { sendLabel, watchWidth, widthNow, type Width } from './lib/controls';
+  import { actionLabel, sendLabel, watchWidth, widthNow, type Width } from './lib/controls';
   import { heading as headingOf, type Badge } from './lib/heading';
   import { onScale } from './lib/limit';
   import {
@@ -55,7 +55,6 @@
   import * as say from './lib/narration';
   import { Run, UNDO_MS } from './lib/run.svelte';
   import Stage from './lib/components/Stage.svelte';
-  import type { Decision } from './lib/components/NodeGrid.svelte';
   import Dashboard from './lib/components/Dashboard.svelte';
   import NodeInspector from './lib/components/NodeInspector.svelte';
   import BucketStrata from './lib/components/BucketStrata.svelte';
@@ -69,7 +68,7 @@
   // The session runs one scenario at a time (`lib/presets.ts`), as a `Run`: a
   // warmed cluster, its seed, and everything the page keeps about it. Play
   // advances simulated time, Step runs it to the next event, and Send submits
-  // a request of Hits per Send at the selected node. A scenario button, Restart
+  // a burst of Requests per Send at the selected node. A scenario button, Restart
   // and Rebuild each build a fresh run first, then swap it in; Undo swaps the
   // previous run back.
   //
@@ -128,10 +127,6 @@
   let controlsOpen = $state(widthNow() !== 'narrow');
   let helpOpen = $state(false);
 
-  // What every snapshot reads: the watched key, and the weight of the next Send
-  // its selected node decides.
-  const watchOf = (r: Run): Watch => ({ key: WATCHED_KEY, probe_hits: r.hits });
-
   // The run's clocks and bounds, from the knobs it was built with.
   const tickMs = $derived(run?.applied.tick_interval_ms ?? 0);
   const floorMs = $derived(run?.config.min_emit_interval_ms ?? 0);
@@ -167,16 +162,12 @@
   // reading of `time`.
   const playing = $derived(loops(time));
 
-  // The last Send: each node's decision text, the decision itself, and the
-  // narration sentence it was told in. Cleared at the next command; an
-  // admitted decision's text also when its run ends.
-  let decisions = $state.raw<ReadonlyMap<number, Decision>>(new Map());
-  let lastDecision = $state.raw<Admission | null>(null);
+  // The last Send: its node's decisions, as the story reads them, and the
+  // narration sentence it was told in. Cleared at the next command; a
+  // decision that admitted any also when its run ends.
+  let decisions = $state.raw<ReadonlyMap<number, Burst>>(new Map());
   let decided: Verdict | null = null;
   let told: Blurb = [];
-  // The node holding admitted hits it has not yet sent, whose heartbeat the
-  // selection outline sweeps toward.
-  let awaitingNode = $state<number | null>(null);
   // The badge's count: data waves delivered since the last admitted Send, the
   // Send's instant, whether it waited for a heartbeat, and the packets sent.
   let hops = 0;
@@ -188,18 +179,21 @@
   let badge = $state.raw<Badge | null>(null);
   let emptied = $state(false);
 
-  // The narration: the page's one live region.
-  let narration = $state.raw<Blurb>([]);
+  // The narration: the page's one live region. `IDLE`, compared by identity,
+  // stands for the sentence derived from the run as it is now (`idleText`), so
+  // an idle narration can never go stale.
+  const IDLE: Blurb = [];
+  let narration = $state.raw<Blurb>(IDLE);
   // The rebuilt run's sentence, which says it stands at its start: the first
   // snapshot that moves time replaces it while it is still told.
   let atStart: Blurb | null = null;
 
-  // Hits per Send as typed, as last committed, whether that is valid, and
+  // Requests per Send as typed, as last committed, whether that is valid, and
   // whether it is being typed.
-  let hitsText = $state('25');
-  let hitsCommitted = '25';
-  let hitsValid = $state(true);
-  let editingHits = $state(false);
+  let requestsText = $state('25');
+  let requestsCommitted = '25';
+  let requestsValid = $state(true);
+  let editingRequests = $state(false);
 
   // The node under the pointer, the node with keyboard focus, and the node a
   // hovered or focused control names.
@@ -263,9 +257,9 @@
 
   const selectedNode = $derived(cluster?.nodes.find((n) => n.id === run?.selected) ?? null);
   const limit = $derived(run?.applied.rule_limit ?? 1);
-  const scaled = $derived(run !== null && onScale(limit, run.hits));
+  const scaled = $derived(run !== null && onScale(limit, run.requests));
   const buckets = $derived(run === null ? 1 : nominalBuckets(run.applied.rule_window_ms, bucketMs));
-  const scale = $derived<Scale>({ limit, onScale: scaled, hits: run?.hits ?? 1, buckets });
+  const scale = $derived<Scale>({ limit, onScale: scaled, requests: run?.requests ?? 1, buckets });
   const faults = $derived.by((): ReadonlyMap<number, Fault> => {
     const out = new Map<number, Fault>();
     for (const c of run?.cuts ?? []) {
@@ -276,14 +270,11 @@
   });
   const cutZone = $derived(run?.cuts.find((c) => c.kind === 'zone')?.zone ?? null);
 
+  // The selected node's held hits, if it holds any for its heartbeat.
+  const held = $derived(run !== null && run.held?.node === run.selected ? run.held : null);
   // The sweep toward the selected node's heartbeat, while it holds hits unsent.
-  const awaiting = $derived.by((): number | null => {
-    if (awaitingNode === null || selectedNode === null || awaitingNode !== selectedNode.id || tickMs === 0) return null;
-    return 1 - (selectedNode.next_heartbeat_ms - virtualMs) / tickMs;
-  });
-  // Its countdown, beside the narration, in 100 ms slots.
-  const heartbeatIn = $derived(
-    awaitingNode === null ? null : (cluster?.nodes.find((n) => n.id === awaitingNode)?.next_heartbeat_ms ?? virtualMs) - virtualMs,
+  const awaiting = $derived(
+    held === null || selectedNode === null || tickMs === 0 ? null : 1 - (selectedNode.next_heartbeat_ms - virtualMs) / tickMs,
   );
 
   /** The origin if live, else the lowest live node in its zone, else the
@@ -318,30 +309,30 @@
 
   /** Build, warm and seed a fresh run of `preset` with knobs `k`, without
    *  touching the running one: a build that fails leaves it running. */
-  async function build(preset: Preset, k: Knobs, hits: number): Promise<Run> {
+  async function build(preset: Preset, k: Knobs, requests: number): Promise<Run> {
     const d = defaults ?? (defaults = await Sim.defaultConfig());
     if (maxZones === 0) maxZones = await Sim.maxZones();
     const config = effectiveConfig(preset, k, d);
     const fresh = await Sim.create(config);
     try {
-      await preset.seed(fresh, config, await warm(fresh, config));
-      const snap = await fresh.snapshot(ORIGIN, { key: WATCHED_KEY, probe_hits: hits });
-      return new Run(fresh, preset, config, { ...k }, snap, hits);
+      const held = await preset.seed(fresh, config, await warm(fresh, config));
+      const snap = await fresh.snapshot(ORIGIN, WATCHED_KEY);
+      return new Run(fresh, preset, config, { ...k }, snap, requests, held);
     } catch (e) {
       await fresh.shutdown();
       throw e;
     }
   }
 
-  /** Start `preset` fresh with knobs `k` and Hits per Send `hits`: build it
-   *  first, then pause, keep the run it replaces for Undo, and swap. */
-  function start(preset: Preset, k: Knobs, hits: number, staged?: Knobs): Promise<void> {
+  /** Start `preset` fresh with knobs `k` and Requests per Send `requests`:
+   *  build it first, then pause, keep the run it replaces for Undo, and swap. */
+  function start(preset: Preset, k: Knobs, requests: number, staged?: Knobs): Promise<void> {
     return serial(async () => {
       pause();
       busy = true;
       commandError = null;
       try {
-        const next = await build(preset, k, hits);
+        const next = await build(preset, k, requests);
         const old = run;
         if (staged !== undefined) next.knobs = { ...staged };
         if (old !== null) {
@@ -349,7 +340,7 @@
           narration = atStart = say.rebuilt(preset.label, discarded(old));
         }
         adopt(next);
-        if (old === null) narration = idleOf(next);
+        if (old === null) narration = IDLE;
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
         if (run === null) firstError = message;
@@ -377,7 +368,7 @@
    *  snapshot is the engine's own. */
   async function keep(old: Run): Promise<void> {
     await old.sim.step(0);
-    old.cluster = await old.sim.snapshot(old.selected, watchOf(old));
+    old.cluster = await old.sim.snapshot(old.selected, WATCHED_KEY);
     dropPrevious();
     previous = old;
     undoTimer = window.setTimeout(dropPrevious, UNDO_MS);
@@ -396,9 +387,7 @@
     floorUntil = 0;
     setTime(PAUSED);
     decisions = new Map();
-    lastDecision = null;
     decided = null;
-    awaitingNode = null;
     badge = null;
     armed = false;
     emptied = false;
@@ -410,9 +399,9 @@
     run = r;
     window.sim = r.sim;
     inspected = r.cluster.inspected ?? null;
-    hitsText = String(r.hits);
-    hitsCommitted = hitsText;
-    hitsValid = true;
+    requestsText = String(r.requests);
+    requestsCommitted = requestsText;
+    requestsValid = true;
     r.history.push(r.cluster);
     r.chartVersion += 1;
   }
@@ -440,7 +429,7 @@
         ? [{ node: p.id, zone: zoneAt(r.cluster.zones, p.zone) }]
         : [],
     );
-    return say.idle(r.selected, gateways, onScale(r.applied.rule_limit, r.hits));
+    return say.idle(r.selected, gateways, onScale(r.applied.rule_limit, r.requests));
   }
 
   /** Adopt a fresh snapshot of `r` and append it to the chart history: the one
@@ -452,17 +441,17 @@
     if (snap.inspected !== undefined && snap.inspected.id === r.selected) inspected = snap.inspected;
     r.history.push(snap);
     r.chartVersion += 1;
-    const nextSend = snap.inspected?.next_send;
+    const brim = snap.nodes.find((n) => n.id === r.selected)?.brim;
     r.story = observe(r.story, {
       decided,
-      nextSend,
+      brim,
       oracle: snap.oracle_total,
       bucket: snap.bucket_epoch_now,
       cuts: r.cuts.length,
       cutZone,
     });
     decided = null;
-    if (narration === atStart && snap.virtual_ms !== before.virtual_ms) narration = idleOf(r);
+    if (narration === atStart && snap.virtual_ms !== before.virtual_ms) narration = IDLE;
     const agreed = snap.nodes.every((n) => n.lag.kind === 'CaughtUp');
     if (!agreed) badge = null;
     else if (armed && snap.oracle_total > 0) {
@@ -474,8 +463,8 @@
       const left = before.oracle_total - snap.oracle_total;
       emptied = snap.oracle_total === 0;
       badge = null;
-      const reopened = before.inspected?.next_send.kind === 'Rejected' && nextSend?.kind === 'Admitted';
-      narration = say.expiry(left, emptied, r.applied.rule_window_ms / 1000, r.selected, reopened ? r.hits : null);
+      const reopened = before.nodes.find((n) => n.id === r.selected)?.brim.kind === 'Rejected' && brim?.kind === 'Admitted';
+      narration = say.expiry(left, emptied, r.applied.rule_window_ms / 1000, r.selected, reopened);
     }
   }
 
@@ -524,7 +513,7 @@
 
   /** Apply the engine's current state. */
   async function refresh(r: Run): Promise<void> {
-    applySnapshot(r, await r.sim.snapshot(r.selected, watchOf(r)));
+    applySnapshot(r, await r.sim.snapshot(r.selected, WATCHED_KEY));
   }
 
   /** What one batch tells the page beyond its snapshot: a held Send's hits
@@ -535,7 +524,7 @@
     let wave = Number.NaN;
     for (const { kind, virtual_ms } of batch.events) {
       if ((kind.type === 'PacketSent' || kind.type === 'PacketDropped') && CARRIES_CELLS[kind.kind]) {
-        if (kind.src === awaitingNode) awaitingNode = null;
+        if (kind.src === r.held?.node) r.held = null;
         dataSent += 1;
         if (kind.tier === 'CrossZone') dataCrossed += 1;
         wave = virtual_ms;
@@ -552,7 +541,7 @@
    *  snapshot, in one task, so every count changes in the frame its line
    *  appears. */
   async function meet(r: Run, batch: EventBatch): Promise<void> {
-    const snap = await r.sim.snapshot(r.selected, watchOf(r));
+    const snap = await r.sim.snapshot(r.selected, WATCHED_KEY);
     note(r, batch);
     hops += waves(batch);
     stage?.show(batch);
@@ -564,7 +553,7 @@
    *  receivers' counts show in one frame. */
   async function deliverWave(r: Run, held: EventBatch): Promise<void> {
     const delivered = await r.sim.step(0);
-    const snap = await r.sim.snapshot(r.selected, watchOf(r));
+    const snap = await r.sim.snapshot(r.selected, WATCHED_KEY);
     note(r, delivered);
     hops += 1;
     stage?.show(held);
@@ -648,7 +637,7 @@
     const ends = late === undefined && now >= b.lastWave + tickMs;
     if (!ends && now < b.start + UNTIL_SETTLED_MAX_PERIODS * tickMs) return;
     setTime(ends ? PAUSED : CAPPED);
-    for (const d of decisions.values()) if (d.admitted) decisions = new Map();
+    for (const d of decisions.values()) if (admittedOf(d) > 0) decisions = new Map();
     if (ends) {
       const stranded = r.cluster.nodes.some((n) => n.lag.kind === 'Stranded');
       narration = stranded ? say.strandedStop(r.cuts.map((c) => cutState(c, r.cluster.zones))) : [...told, ...say.EVERY_NODE];
@@ -682,7 +671,6 @@
       const delivered = await sendHeld(r);
       await pastFloor(r);
       decisions = new Map();
-      lastDecision = null;
       if (time.kind === 'capped') setTime(PAUSED);
       await task(r, delivered);
     });
@@ -697,35 +685,34 @@
     setTime({ kind: mode, start, lastWave: start });
   }
 
-  /** Send a request of Hits per Send at the selected node, at the current
-   *  virtual time. The node decides it in the frame of the press: a refusal
-   *  plays in its vessel and runs no time; an admitted request's eager flush
-   *  is drawn with its receivers' counts in the frame of the press, except
-   *  that Propagation's paused run stops before it, as before every wave. */
+  /** Send a burst of Requests per Send at the selected node, at the current
+   *  virtual time. The node decides it in the frame of the press: the
+   *  requests it rejects play in its vessel; a burst rejected whole runs no
+   *  time; the admitted requests' eager flush is drawn with its receivers'
+   *  counts in the frame of the press, except that Propagation's paused run
+   *  stops before it, as before every wave. */
   const sendBurst = (): Promise<void> =>
     command(async (r) => {
       const node = r.selected;
-      const hits = r.hits;
       const before = r.cluster.nodes.find((n) => n.id === node);
       const mode: UntilSettled = r.story.kind === 'propagation' ? 'per-wave' : 'settled';
       const perWave = mode === 'per-wave' && time.kind !== 'playing';
-      const batch = await r.sim.submitRequest(node, WATCHED_KEY, hits, perWave ? EVENT : 'Time');
+      const batch = await r.sim.submitRequest(node, WATCHED_KEY, r.requests, perWave ? EVENT : 'Time');
       const event = batch.events.find((e) => e.kind.type === 'Decided');
       if (event === undefined || event.kind.type !== 'Decided') return;
-      const admission = event.kind.admission;
-      decisions = new Map([[node, { hits, admitted: admission.kind === 'Admitted' }]]);
-      lastDecision = admission;
-      decided = verdictOf(admission, before?.zone ?? 0);
-      if (admission.kind === 'Rejected') {
-        stage?.reject(node, hits);
-        narration =
-          admission.reopens.kind === 'Never'
-            ? say.never(node, hits, limit)
-            : say.rejected(node, hits, admission.total, limit, senders(r, admission.total));
-        await refresh(r);
-        return;
+      const burst = event.kind.burst;
+      decisions = new Map([[node, burst]]);
+      decided = verdictOf(burst, before?.zone ?? 0);
+      if (burst.kind === 'Rejected') {
+        stage?.reject(node, burst.rejected);
+        if (burst.admitted === 0) {
+          narration = say.rejected(node, burst.rejected, burst.total, limit, senders(r, burst.total));
+          await refresh(r);
+          return;
+        }
       }
-      r.requests.push(node, r.cluster.bucket_epoch_now);
+      const admitted = admittedOf(burst);
+      r.admissions.push(node, r.cluster.bucket_epoch_now);
       const eager = waves(batch) > 0;
       hops = 0;
       dataSent = 0;
@@ -734,8 +721,15 @@
       waited = !eager;
       armed = true;
       emptied = false;
-      awaitingNode = eager ? null : node;
-      told = eager ? say.admittedEager(node, hits, admission.total_before, limit) : say.admittedWaiting(node, hits, limit, r.config.target_err_bps);
+      // Hits that wait for the node's heartbeat join any it holds; an eager
+      // flush's packets clear them (`note`).
+      if (!eager) r.held = { node, hits: (r.held?.node === node ? r.held.hits : 0) + admitted };
+      told =
+        burst.kind === 'Rejected'
+          ? say.split(node, burst.admitted, burst.rejected, burst.total, limit)
+          : eager
+            ? say.admittedEager(node, burst.requests, burst.total_before, limit)
+            : say.admittedWaiting(node, burst.requests, limit, r.config.target_err_bps);
       narration = told;
       runOn(r, mode);
       // Only a wave the engine was asked to hold: a Pause pressed while the
@@ -749,7 +743,7 @@
    *  the refusing node sees them all and more than one sent them. */
   function senders(r: Run, view: number): readonly number[] | null {
     if (view !== r.cluster.oracle_total) return null;
-    const nodes = r.requests.nodesInWindow(r.cluster.bucket_epoch_now, buckets);
+    const nodes = r.admissions.nodesInWindow(r.cluster.bucket_epoch_now, buckets);
     return nodes.length > 1 ? nodes : null;
   }
 
@@ -757,11 +751,11 @@
    *  count, so it delivers nothing. */
   const select = (id: number): Promise<void> =>
     exec(async (r) => {
-      const snap = await r.sim.snapshot(id, watchOf(r));
+      const snap = await r.sim.snapshot(id, WATCHED_KEY);
       r.selected = id;
       inspected = snap.inspected ?? null;
       r.cluster = snap;
-      if (time.kind === 'paused' || time.kind === 'playing' || time.kind === 'capped') narration = idleOf(r);
+      if (time.kind === 'paused' || time.kind === 'playing' || time.kind === 'capped') narration = IDLE;
     });
 
   /** Make fault `c` over the live nodes; made while Propagation's run stood
@@ -800,12 +794,14 @@
     });
 
   /** Remove the selected node. Survivors keep their ids and re-converge; the
-   *  selection moves to the scenario's fallback. */
+   *  selection moves to the scenario's fallback, and hits the node held for
+   *  its heartbeat go with it. */
   const removeNode = (id: number): Promise<void> =>
     command(async (r) => {
       await r.sim.removeNode(id);
+      if (r.held?.node === id) r.held = null;
       r.cuts = r.sim.cuts();
-      const snap = await r.sim.snapshot(null, watchOf(r));
+      const snap = await r.sim.snapshot(null, WATCHED_KEY);
       r.cluster = snap;
       r.selected = subjectOf(r);
       await refresh(r);
@@ -836,13 +832,20 @@
   function play(): void {
     if (run === null || busy) return;
     if (time.kind !== 'before-wave') {
-      setTime(PLAYING);
+      runFreely();
       return;
     }
     void exec(async (r) => {
       await sendHeld(r);
-      setTime(PLAYING);
+      runFreely();
     });
+  }
+
+  /** Time runs freely; when nothing is coming, the narration says so at once,
+   *  replacing what a settled run left. */
+  function runFreely(): void {
+    setTime(PLAYING);
+    if (quiet && label !== null) narration = IDLE;
   }
 
   /** The reader's Pause: time stops, and a bounded run ends. A run stopped
@@ -918,36 +921,36 @@
     }
   }
 
-  /** Commit what Hits per Send holds: a whole number in range becomes the
-   *  Send's weight; anything else disables Send until it is fixed. */
-  function commitHits(): void {
+  /** Commit what Requests per Send holds: a whole number in range becomes
+   *  the Send's size; anything else disables Send until it is fixed. */
+  function commitRequests(): void {
     const r = run;
-    const n = /^\d+$/.test(hitsText.trim()) ? Number(hitsText.trim()) : Number.NaN;
-    hitsCommitted = hitsText;
-    hitsValid = Number.isSafeInteger(n) && n >= BURST_HITS_MIN && n <= BURST_HITS_MAX;
-    if (hitsValid && r !== null) r.hits = n;
+    const n = /^\d+$/.test(requestsText.trim()) ? Number(requestsText.trim()) : Number.NaN;
+    requestsCommitted = requestsText;
+    requestsValid = Number.isSafeInteger(n) && n >= BURST_REQUESTS_MIN && n <= BURST_REQUESTS_MAX;
+    if (requestsValid && r !== null) r.requests = n;
   }
 
-  /** The caption's fix: back to the scenario's own Hits per Send. */
-  function useHits(hits: number): void {
-    hitsText = String(hits);
-    commitHits();
-    lastDecision = null;
+  /** The caption's fix: back to the scenario's own Requests per Send. */
+  function useRequests(requests: number): void {
+    requestsText = String(requests);
+    commitRequests();
   }
 
   function selectPreset(preset: Preset): void {
     if (defaults === null || preset.id === run?.preset.id) return;
-    void start(preset, knobsFromPreset(preset, defaults), BURST_HITS);
+    void start(preset, knobsFromPreset(preset, defaults), BURST_REQUESTS);
   }
 
   const go = (to: PresetId): void => selectPreset(presetById(to));
+  const presetLabel = (id: PresetId): string => presetById(id).label;
 
   function restart(): void {
-    if (run !== null) void start(run.preset, run.applied, run.hits, run.knobs);
+    if (run !== null) void start(run.preset, run.applied, run.requests, run.knobs);
   }
 
   function rebuild(): void {
-    if (run !== null) void start(run.preset, run.knobs, run.hits);
+    if (run !== null) void start(run.preset, run.knobs, run.requests);
   }
 
   function backToScenario(): void {
@@ -990,18 +993,15 @@
       selected: r.selected,
       selectedZone: selectedNode.zone,
       nodes: r.cluster.nodes,
-      nextSend: r.cluster.inspected?.next_send,
+      brim: selectedNode.brim,
       subjectCount: selectedNode.window_total,
       subjectStrata: strata,
-      subjectAtLimit: selectedNode.brim.kind === 'Rejected',
       cutZone,
       repair: heading?.repair ?? null,
       clock: time.kind,
       busy,
-      hits: editingHits ? 'editing' : hitsValid ? 'valid' : 'invalid',
-      lastDecision,
-      burstHits: BURST_HITS,
-      sendHits: r.hits,
+      requests: editingRequests ? 'editing' : requestsValid ? 'valid' : 'invalid',
+      defaultRequests: BURST_REQUESTS,
       oracle: r.cluster.oracle_total,
       virtualMs: r.cluster.virtual_ms,
       bucketNow: r.cluster.bucket_epoch_now,
@@ -1015,19 +1015,47 @@
   const action = $derived<NextAction>(view === null ? { kind: 'wait', reason: 'starting' } : nextAction(view));
   const primary = $derived(action.kind === 'press' ? action.control : null);
   const goal = $derived(view === null ? [] : goalOf(view));
-  const send = $derived(sendLabel(width, hitsValid && run !== null ? run.hits : null, run?.selected ?? 0));
-  const pressLabel = $derived(
-    action.kind !== 'press' ? [] : action.control === 'send' ? send : action.control === 'play' ? ['Play'] : ['Step'],
-  );
+  const send = $derived(sendLabel(width, requestsValid && run !== null ? run.requests : null, run?.selected ?? 0));
+  // The next action's control label, as the control renders it: the action
+  // line and the narration quote it.
+  const label = $derived(actionLabel(action, send, presetLabel));
   const lineClause = $derived(
     view === null || action.kind !== 'press' ? [] : pressClause(view, action.control, hops + 1),
   );
-  const useHitsReason = $derived<Blurb>(
-    lastDecision?.kind === 'Rejected' && lastDecision.reopens.kind === 'Never'
-      ? blurb`a request of ${run?.hits ?? 0} can never fit the limit of ${limit}`
-      : hitsCommitted.trim() === ''
-        ? ['Hits per Send is empty']
-        : blurb`Hits per Send must be a whole number from ${BURST_HITS_MIN} to\u00a0${BURST_HITS_MAX}`,
+  const requestsReason = $derived<Blurb>(
+    requestsCommitted.trim() === ''
+      ? ['Requests per Send is empty']
+      : blurb`Requests per Send must be a whole number from ${BURST_REQUESTS_MIN} to\u00a0${BURST_REQUESTS_MAX}`,
+  );
+
+  // Nothing is coming: no feed, no hits held for a heartbeat, and no node a
+  // wave can still reach. The hits that leave the window first, if any.
+  const quiet = $derived(
+    run !== null && run.preset.traffic === undefined && run.held === null && !run.cluster.nodes.some((n) => n.lag.kind === 'Behind'),
+  );
+  const leaving = $derived(cluster?.oracle_buckets.find((n) => n > 0) ?? null);
+  // Time runs, nothing is coming, and the next action names a control.
+  const nothingComing = $derived(time.kind === 'playing' && quiet && label !== null);
+  // The idle narration, derived from the run as it is now: while time runs
+  // with nothing coming, that, with the control to press; while the selected
+  // node holds hits, when they leave; else what the selection means.
+  const idleText = $derived.by((): Blurb => {
+    const r = run;
+    if (r === null) return [];
+    if (nothingComing && label !== null) return say.nothingComing(label, leaving);
+    if (held !== null) return say.holding(held.node, held.hits);
+    return idleOf(r);
+  });
+  const said = $derived(narration === IDLE ? idleText : narration);
+  // The countdown beside the narration, in 100 ms slots: to the selected
+  // node's heartbeat while it holds hits (not beside the start sentence), or
+  // to the window's edge while nothing else is coming.
+  const countdown = $derived(
+    held !== null && selectedNode !== null && narration !== atStart
+      ? selectedNode.next_heartbeat_ms - virtualMs
+      : narration === IDLE && nothingComing && leaving !== null
+        ? (cluster?.next_expiry_ms ?? virtualMs) - virtualMs
+        : null,
   );
   const heading = $derived(
     run === null
@@ -1041,8 +1069,7 @@
           cuts: run.cuts,
           zones: run.cluster.zones,
           selected: run.selected,
-          nextSend: run.cluster.inspected?.next_send,
-          sendHits: run.hits,
+          brim: selectedNode?.brim,
           emptied,
           badge,
           tickMs,
@@ -1062,11 +1089,10 @@
     if (action.kind !== 'wait' || view === null) return null;
     const reason = action.reason;
     if (waitStart?.reason !== reason) {
-      const next = view.nextSend;
       waitStart = {
         reason,
         virtualMs: view.virtualMs,
-        reopensMs: next?.kind === 'Rejected' && next.reopens.kind === 'In' ? next.reopens.ms : 0,
+        reopensMs: view.brim.kind === 'Rejected' ? view.brim.reopens_ms : 0,
       };
     }
     const value = progress(view, reason, waitStart);
@@ -1091,7 +1117,7 @@
         busy = false;
         return;
       }
-      await start(DEFAULT_PRESET, knobsFromPreset(DEFAULT_PRESET, defaults), BURST_HITS);
+      await start(DEFAULT_PRESET, knobsFromPreset(DEFAULT_PRESET, defaults), BURST_REQUESTS);
     })();
     const unwatch = watchTheme(() => (theme = readTheme()));
     const unwidth = watchWidth((w) => {
@@ -1179,6 +1205,8 @@
         <dd>A one-off copy of a node's whole live store, sent to a zone member that just joined.</dd>
         <dt>How the controls work</dt>
         <dd>
+          A Send is a burst of one-hit requests, as many as Requests per Send says: the node admits them in order while its
+          window has room and rejects the rest.
           The one dark button is what to press next, and the line under the goal names it; when nothing is dark, watch the
           meter. A Send pressed while paused plays until every node has the hits, then pauses again; Space plays or pauses, →
           steps to the next event, and Escape returns the selection to the scenario's node. Restart keeps your settings, a
@@ -1208,9 +1236,9 @@
           <ControlRail
             presets={PRESETS}
             activeId={r.preset.id}
-            bind:hitsText
-            {hitsValid}
-            editing={editingHits}
+            bind:requestsText
+            {requestsValid}
+            editing={editingRequests}
             zones={cluster.zones}
             selected={r.selected}
             {roles}
@@ -1223,9 +1251,9 @@
             bucketMs={defaults.rule_bucket_ms}
             onSelectPreset={selectPreset}
             onRestart={restart}
-            onCommitHits={commitHits}
-            onEditHits={(on) => (editingHits = on)}
-            onRevertHits={() => (hitsText = hitsCommitted)}
+            onCommitRequests={commitRequests}
+            onEditRequests={(on) => (editingRequests = on)}
+            onRevertRequests={() => (requestsText = requestsCommitted)}
             onApplyKnobs={rebuild}
             onBackToScenario={backToScenario}
             onCutZone={(zone) => void cut({ kind: 'zone', zone })}
@@ -1246,16 +1274,16 @@
           <StageCaption
             {goal}
             {action}
-            {pressLabel}
+            {label}
             pressClause={lineClause}
             phone={width === 'narrow'}
             subject={r.selected}
-            {useHitsReason}
+            {requestsReason}
             zoneName={(z) => zoneAt(cluster.zones, z)}
             {meter}
-            presetLabel={(id) => presetById(id).label}
+            {presetLabel}
             onSelect={(node) => void select(node)}
-            onUseHits={useHits}
+            onUseRequests={useRequests}
             onGo={go}
             onPreview={(node) => (namedId = node)}
           />
@@ -1268,9 +1296,9 @@
           {/if}
           <div class="narration-row">
             <p class="narration">
-              <span aria-live="polite" aria-atomic="true"><Sentence parts={narration} field="narration" /></span
-              >{#if heartbeatIn !== null && heartbeatIn >= 0}<span class="countdown">, in <span data-field="countdown"
-                    >{fmtSeconds(heartbeatIn)}</span
+              <span aria-live="polite" aria-atomic="true"><Sentence parts={said} field="narration" /></span
+              >{#if countdown !== null && countdown >= 0}<span class="countdown">, in <span data-field="countdown"
+                    >{fmtSeconds(countdown)}</span
                   ></span
                 >{/if}
             </p>
@@ -1366,7 +1394,7 @@
       {virtualMs}
       {heartbeatWallMs}
       sendLabel={send}
-      sendValid={hitsValid}
+      sendValid={requestsValid}
       {primary}
       bounded={playing && (time.kind === 'settled' || time.kind === 'per-wave')}
       onToggle={toggle}
