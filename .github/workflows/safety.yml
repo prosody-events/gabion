@@ -63,7 +63,7 @@ jobs:
           cache-directories: ~/.cache/miri
       # Prebuilt nextest — cargo-install compiles it from source on a
       # cache miss; install-action fetches the release binary.
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
           tool: nextest
       - run: make miri-safety miri-ffi-alignment
@@ -86,7 +86,7 @@ jobs:
           # See miri-safety: shared entry, and the sysroot in ~/.cache/miri
           # isn't captured by default.
           cache-directories: ~/.cache/miri
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
           tool: nextest
       - run: make miri-safety-tb miri-ffi-alignment-tb
@@ -109,7 +109,7 @@ jobs:
           # See miri-safety: shared entry, and the sysroot in ~/.cache/miri
           # isn't captured by default.
           cache-directories: ~/.cache/miri
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
           tool: nextest
       - run: make miri-lib
@@ -140,7 +140,7 @@ jobs:
           # See miri-safety: shared entry, and the sysroot in ~/.cache/miri
           # isn't captured by default.
           cache-directories: ~/.cache/miri
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
           tool: nextest
       - run: rustup run nightly cargo miri nextest run --no-fail-fast -p gabion-nginx --lib
