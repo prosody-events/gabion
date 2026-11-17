@@ -82,7 +82,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Prebuilt nextest binary — `cargo-install` compiles it from source
       # on a cache miss (minutes); `install-action` fetches the release.
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: nextest
       # `make unit` covers the full workspace; the `gabion-nginx` `safety`
