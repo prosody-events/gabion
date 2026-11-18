@@ -26,7 +26,7 @@ on:
     # patch without anyone bumping anything by hand. Upstream security
     # releases land without warning, so the rebuild runs daily: a weekly
     # one left published images on a vulnerable nginx for up to six
-    # days. A day with no upstream change is all cache hits.
+    # days. A day with no upstream change skips the build (see `plan`).
     - cron: '0 6 * * *'
   # Dispatching on a branch also runs the floating-release-tag refresh
   # below, so an upstream security fix can reach `:latest` at once
@@ -53,12 +53,14 @@ permissions:
 jobs:
   # PRs reach this workflow only through the `paths:` filter above, so it
   # has no need for cargo-rail's PR-skip gate.
-  # The plan job here exists solely to resolve the gabion version once
-  # and hand it to every build / combine job below — release tag wins,
-  # otherwise we read `.release-please-manifest.json`.
+  # The plan job resolves the gabion version once and hands it to every
+  # build / combine job below — release tag wins, otherwise we read
+  # `.release-please-manifest.json`. On the cron it also decides whether
+  # any upstream base image moved since the last publish.
   plan:
     runs-on: ubuntu-latest
     outputs:
+      rebuild: ${{ steps.upstream.outputs.rebuild || 'true' }}
       version: ${{ steps.version.outputs.version }}
       ref-tag: ${{ steps.version.outputs.ref-tag }}
       is-release: ${{ steps.version.outputs.is-release }}
@@ -78,6 +80,63 @@ jobs:
             echo "ref-tag=main" >> "$GITHUB_OUTPUT"
             echo "is-release=false" >> "$GITHUB_OUTPUT"
           fi
+        shell: bash
+      # The cron exists to pick up upstream base-image updates, so it
+      # skips the rebuild when nothing upstream moved. Every published
+      # image starts with its base image's layer blobs, so a base has
+      # moved exactly when its layers are no longer a prefix of ours. Each
+      # `:main*` and `:latest*` tag is checked against its base, per
+      # arch. A tag that doesn't exist yet counts as moved.
+      - id: upstream
+        if: github.event_name == 'schedule'
+        env:
+          REPO: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}
+        run: |
+          set -euo pipefail
+          # Raw manifests only, one read per index plus one per arch:
+          # Docker Hub rate-limits manifest reads.
+          layers() {
+            local index digest
+            index="$(docker buildx imagetools inspect --raw "$1")" || return 0
+            digest="$(jq -r --arg a "$2" \
+              '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $a) | .digest' \
+              <<<"$index" | head -n1)"
+            [[ -n "$digest" ]] || return 0
+            docker buildx imagetools inspect --raw "${1%:*}@$digest" | jq -r '.layers[].digest'
+          }
+          gabiond_base="$(sed -n 's/^FROM \([^ ]*\)$/\1/p' deploy/gabiond/Dockerfile | tail -n1)"
+          rebuild=false
+          while read -r image suffix base; do
+            [[ "$suffix" == - ]] && suffix=''
+            for arch in amd64 arm64; do
+              base_layers="$(layers "$base" "$arch")"
+              if [[ -z "$base_layers" ]]; then
+                echo "::error::Could not read the $arch layers of $base. Check that the tag still exists and that Docker Hub isn't rate-limiting this runner, then re-run." >&2
+                exit 1
+              fi
+              for channel in main latest; do
+                tag="$channel${suffix:+-$suffix}"
+                ours="$(layers "$REPO/$image:$tag" "$arch" 2>/dev/null)"
+                if [[ "$(head -n "$(wc -l <<<"$base_layers")" <<<"$ours")" != "$base_layers" ]]; then
+                  echo "$image:$tag ($arch) is not on the current $base; rebuilding."
+                  rebuild=true
+                fi
+              done
+            done
+          done <<EOF
+          gabiond - $gabiond_base
+          nginx - nginx:stable-alpine
+          nginx mainline-alpine nginx:mainline-alpine
+          nginx alpine nginx:alpine
+          nginx stable nginx:stable
+          nginx mainline nginx:mainline
+          nginx debian nginx:latest
+          openresty - openresty/openresty:alpine
+          openresty jammy openresty/openresty:jammy
+          openresty bookworm openresty/openresty:bookworm
+          EOF
+          [[ "$rebuild" == false ]] && echo "Every image is on its current upstream base; skipping the rebuild."
+          echo "rebuild=$rebuild" >> "$GITHUB_OUTPUT"
         shell: bash
 
   # PR builds: amd64-only, default flavors only. Pushed with two tags:
@@ -217,7 +276,7 @@ jobs:
   # single-platform image, pushes it to GHCR by digest, and uploads the
   # digest as an artifact for the manifest-combine job.
   build:
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && needs.plan.outputs.rebuild == 'true'
     needs: plan
     strategy:
       fail-fast: false
@@ -686,11 +745,16 @@ jobs:
   #
   # Refresh runs on the schedule and on a branch dispatch (a dispatch
   # on a `v*` tag is a release build, which publishes these tags
-  # itself). It emits the floating subset of the release tag set —
-  # never the immutable `:vX.Y.Z` or `:vX.Y.Z-<upstream>(-<sfx>)?` pins. Those keep their original
-  # release digest.
+  # itself), and on the cron only when `plan` saw an upstream move. It
+  # emits the floating subset of the release tag set — never the
+  # immutable `:vX.Y.Z` or `:vX.Y.Z-<upstream>(-<sfx>)?` pins. Those
+  # keep their original release digest.
   refresh-plan:
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/'))
+    if: >-
+      needs.plan.outputs.rebuild == 'true'
+        && (github.event_name == 'schedule'
+          || (github.event_name == 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/')))
+    needs: plan
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.tag.outputs.version }}
