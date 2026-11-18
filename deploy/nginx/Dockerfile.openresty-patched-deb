@@ -41,7 +41,7 @@ RUN version="$(openresty -v 2>&1 | sed -n 's|.*openresty/||p')" \
 WORKDIR /build/openresty
 
 RUN test -n "${NGINX_FIX_COMMITS}" \
-    && nginx_dir="$(ls -d bundle/nginx-*)" \
+    && nginx_dir="$(ls -d bundle/nginx-[0-9]*/)" \
     && for c in ${NGINX_FIX_COMMITS}; do \
         curl -fsSL "https://github.com/nginx/nginx/commit/${c}.patch" \
             | patch -d "${nginx_dir}" -p1 --forward --batch; \
@@ -87,7 +87,7 @@ RUN eval "$(dpkg-buildflags --export=sh)" \
 
 # The new binary must be configured exactly like the deb's, or it is not
 # a drop-in replacement. dh_strip's flags, as the deb's binary has.
-RUN built="$(ls build/nginx-*/objs/nginx)" \
+RUN built="$(ls build/nginx-[0-9]*/objs/nginx)" \
     && diff <("${built}" -V 2>&1 | grep -E '^(configure arguments|built with)') \
             <(/usr/local/openresty/nginx/sbin/nginx -V 2>&1 | grep -E '^(configure arguments|built with)') \
     && strip --remove-section=.comment --remove-section=.note --strip-unneeded "${built}" \
