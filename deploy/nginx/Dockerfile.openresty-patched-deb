@@ -1,0 +1,98 @@
+# syntax=docker/dockerfile:1.7
+
+# One-off: an apt-based OpenResty image (bookworm) whose nginx binary
+# carries nginx's 1.31.9 security fixes. OpenResty has not released them.
+# The `openresty` deb stays installed and recorded by dpkg, so images built
+# on this one can keep pinning it and installing openresty-opm,
+# openresty-resty and other packages that depend on it. Only the binary
+# changes. See deploy/nginx/README.md, "Patched OpenResty for
+# CVE-2026-123007". Used by .github/workflows/openresty-cve-2026-123007.yml;
+# delete both once OpenResty ships nginx >= 1.31.9.
+
+ARG OPENRESTY_BASE_IMAGE=openresty/openresty:bookworm
+
+FROM ${OPENRESTY_BASE_IMAGE} AS builder
+
+# Space-separated nginx commit hashes, applied in order.
+ARG NGINX_FIX_COMMITS
+
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
+# Headers for the exact openssl3 / pcre2 / zlib builds the deb links.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        dpkg-dev \
+        patch \
+        perl \
+        "openresty-openssl3-dev=$(dpkg-query -W -f '${Version}' openresty-openssl3)" \
+        "openresty-pcre2-dev=$(dpkg-query -W -f '${Version}' openresty-pcre2)" \
+        "openresty-zlib-dev=$(dpkg-query -W -f '${Version}' openresty-zlib)" \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+RUN version="$(openresty -v 2>&1 | sed -n 's|.*openresty/||p')" \
+    && curl -fsSL "https://openresty.org/download/openresty-${version}.tar.gz" | tar -xz \
+    && mv "openresty-${version}" openresty
+
+WORKDIR /build/openresty
+
+RUN test -n "${NGINX_FIX_COMMITS}" \
+    && nginx_dir="$(ls -d bundle/nginx-*)" \
+    && for c in ${NGINX_FIX_COMMITS}; do \
+        curl -fsSL "https://github.com/nginx/nginx/commit/${c}.patch" \
+            | patch -d "${nginx_dir}" -p1 --forward --batch; \
+    done
+
+# The configure line from openresty-packaging's deb/openresty/debian/rules,
+# with the dpkg build flags (hardening, -O2) that its
+# DPKG_EXPORT_BUILDFLAGS exports. The check below proves it matches.
+RUN eval "$(dpkg-buildflags --export=sh)" \
+    && ./configure \
+        --with-cc-opt="-DNGX_LUA_ABORT_AT_PANIC -I/usr/local/openresty/zlib/include -I/usr/local/openresty/pcre2/include -I/usr/local/openresty/openssl3/include" \
+        --with-ld-opt="-L/usr/local/openresty/zlib/lib -L/usr/local/openresty/pcre2/lib -L/usr/local/openresty/openssl3/lib -Wl,-rpath,/usr/local/openresty/zlib/lib:/usr/local/openresty/pcre2/lib:/usr/local/openresty/openssl3/lib" \
+        --with-pcre-jit \
+        --without-http_rds_json_module \
+        --without-http_rds_csv_module \
+        --without-lua_rds_parser \
+        --with-stream \
+        --with-stream_ssl_module \
+        --with-stream_ssl_preread_module \
+        --with-http_v2_module \
+        --with-http_v3_module \
+        --without-mail_pop3_module \
+        --without-mail_imap_module \
+        --without-mail_smtp_module \
+        --with-http_stub_status_module \
+        --with-http_realip_module \
+        --with-http_addition_module \
+        --with-http_auth_request_module \
+        --with-http_secure_link_module \
+        --with-http_random_index_module \
+        --with-http_gzip_static_module \
+        --with-http_sub_module \
+        --with-http_dav_module \
+        --with-http_flv_module \
+        --with-http_mp4_module \
+        --with-http_slice_module \
+        --with-http_gunzip_module \
+        --with-threads \
+        --with-compat \
+        --with-luajit-xcflags='-DLUAJIT_NUMMODE=2 -DLUAJIT_ENABLE_LUA52COMPAT' \
+        -j"$(nproc)" \
+    && make -j"$(nproc)"
+
+# The new binary must be configured exactly like the deb's, or it is not
+# a drop-in replacement. dh_strip's flags, as the deb's binary has.
+RUN built="$(ls build/nginx-*/objs/nginx)" \
+    && diff <("${built}" -V 2>&1 | grep -E '^(configure arguments|built with)') \
+            <(/usr/local/openresty/nginx/sbin/nginx -V 2>&1 | grep -E '^(configure arguments|built with)') \
+    && strip --remove-section=.comment --remove-section=.note --strip-unneeded "${built}" \
+    && install -m 0755 "${built}" /nginx
+
+FROM ${OPENRESTY_BASE_IMAGE}
+
+COPY --from=builder /nginx /usr/local/openresty/nginx/sbin/nginx
