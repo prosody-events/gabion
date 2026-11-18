@@ -141,12 +141,13 @@ docker build -f deploy/nginx/Dockerfile.openresty \
 
 ## Patched OpenResty for CVE-2026-123007
 
-nginx 1.31.9 and 1.30.7 fix CVE-2026-123007 and CVE-2026-123633 (HTTP/2),
-CVE-2026-121810 (HTTP/3), CVE-2026-123634 (resolver) and CVE-2026-113425
-(mail). OpenResty 1.31.8.1 still bundles the vulnerable nginx 1.31.8.
-Until OpenResty releases a fixed version,
-`.github/workflows/openresty-cve-2026-123007.yml` publishes a separate
-OpenResty image with those fixes applied:
+nginx 1.31.9 and 1.30.7 fix ten CVEs, including two HTTP/2 remote code
+execution bugs (CVE-2026-123007, CVE-2026-123633) and a buffer overflow
+with `try_files` + `alias` (CVE-2026-125283). OpenResty 1.31.8.1 still
+bundles the vulnerable nginx 1.31.8. Until OpenResty releases a fixed
+version, `.github/workflows/openresty-cve-2026-123007.yml` publishes a
+separate OpenResty image with all ten fixes applied. The workflow lists
+each CVE next to its fix commits. The images:
 
 ```sh
 docker pull ghcr.io/<repo>/openresty:v0.3.2-openresty1.31.8.1-cve-2026-123007
