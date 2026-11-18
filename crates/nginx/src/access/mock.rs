@@ -45,46 +45,11 @@ impl VariableLookup for MockVars {
             BindingLookup::RequestUri => Some(self.request_uri.as_slice()),
             BindingLookup::Args => Some(self.args.as_slice()),
             BindingLookup::RemoteAddr => Some(self.remote_addr.as_slice()),
-            BindingLookup::Arg(name) => find_query_arg_mock(self.args.as_slice(), name.as_bytes()),
+            BindingLookup::Arg(name) => find_query_arg(self.args.as_slice(), name.as_bytes()),
             BindingLookup::IndexedVariable { name, .. } => {
                 self.vars.get(name.as_ref()).map(Vec::as_slice)
             }
             BindingLookup::ComplexValue { .. } => None,
         }
-    }
-}
-
-fn find_query_arg_mock<'a>(args: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
-    let mut rest = args;
-    while !rest.is_empty() {
-        let next = rest
-            .iter()
-            .position(|byte| *byte == b'&')
-            .unwrap_or(rest.len());
-        let pair = &rest[..next];
-        if let Some(eq) = pair.iter().position(|byte| *byte == b'=')
-            && &pair[..eq] == name
-        {
-            return Some(&pair[eq + 1..]);
-        }
-        if next == rest.len() {
-            break;
-        }
-        rest = &rest[next + 1..];
-    }
-    None
-}
-
-use crate::shm::ShmRegion;
-
-#[allow(dead_code)]
-pub(crate) fn ctx<'a>(rules: &'a CompiledRules, region: &'a ShmRegion) -> AccessCtx<'a> {
-    AccessCtx {
-        rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
     }
 }

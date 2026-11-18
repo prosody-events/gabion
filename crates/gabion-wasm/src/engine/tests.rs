@@ -3,29 +3,70 @@
 //! These exercise the exact `run_engine` the wasm `Sim` spawns: the engine is
 //! spawned as a `spawn_local` task on a paused current-thread runtime and
 //! driven over the command channel, validating "spawn once, drive forever"
-//! (Phase 0.5) and the `CellDump` + logging shims (Phase 1).
+//! and the `CellDump` + logging shims.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::num::{NonZeroU16, NonZeroU64};
 
+use gabion::crdt::KeyHash;
+use gabion::defaults;
+use gabion::gossip::{AnswerState, Role};
+use gabion::settings::SettingError;
 use tokio::runtime::Builder;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::LocalSet;
 
-use super::{Command, LinkPolicyKind, run_engine};
-use crate::config::{MAX_NODES, SimConfig};
-use crate::event::{ClusterState, EventBatch, EventKind};
+use super::{Command, EngineError, EngineState, LinkPolicyKind, StepUntil, Watch, run_engine};
+use crate::config::{MAX_NODES, SimConfig, ZoneMode};
+use crate::event::{
+    Admission, CellView, ClusterState, Event, EventBatch, EventKind, Inspected, Lag, PacketKind,
+    PeerView, Reopens, Tier,
+};
+
+mod admission;
+mod deferral;
+mod phases;
+mod window;
 
 const WATCHED_KEY: u128 = 0x1;
+/// The snapshot's watch: the watched key, decided for one hit.
+const WATCH: Watch = watch(1);
+/// Step to the next event of the watched key.
+const EVENT: StepUntil = StepUntil::Event {
+    key: KeyHash(WATCHED_KEY),
+};
+
+/// `n` hits, which must be at least one.
+const fn hits(n: u64) -> NonZeroU64 {
+    match NonZeroU64::new(n) {
+        Some(hits) => hits,
+        None => panic!("a request carries at least one hit"),
+    }
+}
+
+/// The heartbeat interval of [`test_config`].
+const T: u64 = 100;
+/// The relay floor: how long after a packet is owed its prompt round runs.
+const F_R: u64 = defaults::GOSSIP_MIN_EMIT_INTERVAL_MS;
+/// `gossip.suspect_after`'s default: `max(GOSSIP_SUSPECT_AFTER_TICKS × T,
+/// GOSSIP_SUSPECT_AFTER_FLOOR_MS)`.
+const T_U: u64 = {
+    let ticks = defaults::GOSSIP_SUSPECT_AFTER_TICKS * T;
+    if ticks > defaults::GOSSIP_SUSPECT_AFTER_FLOOR_MS {
+        ticks
+    } else {
+        defaults::GOSSIP_SUSPECT_AFTER_FLOOR_MS
+    }
+};
 
 fn test_config(nodes: usize) -> SimConfig {
     SimConfig {
         nodes,
-        fanout: 3,
-        tick_interval_ms: 100,
+        tick_interval_ms: T,
         rule_window_ms: 60_000,
         rule_bucket_ms: 1_000,
         rule_limit: 1_000_000,
-        rng_seed: 42,
         uniform_loss: 0.0,
         ..SimConfig::default()
     }
@@ -46,7 +87,8 @@ where
     let local = LocalSet::new();
     local.block_on(&rt, async move {
         let (tx, rx) = mpsc::channel(16);
-        let engine = tokio::task::spawn_local(run_engine(config, rx));
+        let valid = config.validate().expect("test config validates");
+        let engine = tokio::task::spawn_local(run_engine(valid, rx));
         driver(tx.clone()).await;
         drop(tx);
         engine
@@ -58,16 +100,23 @@ where
 
 async fn step(tx: &mpsc::Sender<Command>, delta_ms: u64) -> EventBatch {
     let (reply, rx) = oneshot::channel();
-    tx.send(Command::Step { delta_ms, reply }).await.unwrap();
+    tx.send(Command::Step {
+        delta_ms,
+        until: StepUntil::Time,
+        reply,
+    })
+    .await
+    .unwrap();
     rx.await.unwrap()
 }
 
-async fn submit(tx: &mpsc::Sender<Command>, node: u32, key: u128, hits: u64) -> EventBatch {
+async fn submit(tx: &mpsc::Sender<Command>, node: u32, key: u128, n: u64) -> EventBatch {
     let (reply, rx) = oneshot::channel();
     tx.send(Command::SubmitRequest {
         node,
-        key,
-        hits,
+        key: KeyHash(key),
+        hits: hits(n),
+        until: StepUntil::Time,
         reply,
     })
     .await
@@ -76,9 +125,27 @@ async fn submit(tx: &mpsc::Sender<Command>, node: u32, key: u128, hits: u64) -> 
 }
 
 async fn snapshot(tx: &mpsc::Sender<Command>) -> ClusterState {
+    snapshot_inspecting(tx, None).await
+}
+
+async fn snapshot_inspecting(tx: &mpsc::Sender<Command>, inspect: Option<u32>) -> ClusterState {
     let (reply, rx) = oneshot::channel();
-    tx.send(Command::Snapshot { reply }).await.unwrap();
+    tx.send(Command::Snapshot {
+        inspect,
+        watch: WATCH,
+        reply,
+    })
+    .await
+    .unwrap();
     rx.await.unwrap()
+}
+
+/// Node `id`'s cells and peer rows, as the snapshot inspecting it reports them.
+async fn inspect(tx: &mpsc::Sender<Command>, id: u32) -> Inspected {
+    snapshot_inspecting(tx, Some(id))
+        .await
+        .inspected
+        .expect("a live node")
 }
 
 async fn set_link(tx: &mpsc::Sender<Command>, src: u32, dst: u32, policy: LinkPolicyKind) {
@@ -96,8 +163,10 @@ async fn set_link(tx: &mpsc::Sender<Command>, src: u32, dst: u32, policy: LinkPo
 
 async fn add_node(tx: &mpsc::Sender<Command>) -> EventBatch {
     let (reply, rx) = oneshot::channel();
-    tx.send(Command::AddNode { reply }).await.unwrap();
-    rx.await.unwrap()
+    tx.send(Command::AddNode { zone: None, reply })
+        .await
+        .unwrap();
+    rx.await.unwrap().expect("the node joins")
 }
 
 async fn remove_node(tx: &mpsc::Sender<Command>, id: u32) -> EventBatch {
@@ -110,30 +179,43 @@ fn node_ids(state: &ClusterState) -> Vec<u32> {
     state.nodes.iter().map(|n| n.id).collect()
 }
 
-/// Phase 0.5: a spawned engine survives many `step` commands, with the gossip
-/// tick index and per-node `ticks_total` accumulating monotonically.
+/// A spawned engine survives many `step` commands, and every node runs one
+/// heartbeat per period at its own phase: every phase is under `T`, so each
+/// node has exactly 25 due instants in `(0, 2500]`, and the stream carries a
+/// `Tick` for each, at the instant it ran.
 #[test]
-fn engine_accumulates_ticks_across_many_steps() {
+fn every_node_runs_one_heartbeat_per_period() {
     with_engine(test_config(2), |tx| async move {
-        let mut last_tick = 0;
+        let mut ticks: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
         for _ in 0..5 {
-            let batch = step(&tx, 500).await; // 5 ticks at 100 ms each
-            assert!(batch.tick >= last_tick, "tick index must not go backward");
-            last_tick = batch.tick;
+            for event in step(&tx, 500).await.events {
+                if let EventKind::Tick { node } = event.kind {
+                    ticks.entry(node).or_default().push(event.virtual_ms);
+                }
+            }
         }
-        assert_eq!(last_tick, 25, "2500 ms at 100 ms/tick is 25 ticks");
-
+        for (node, at) in &ticks {
+            let first = super::first_heartbeat(*node, T, 0);
+            let due: Vec<u64> = (0..25).map(|k| first + k * T).collect();
+            assert_eq!(*at, due, "node {node}'s ticks");
+        }
+        assert_eq!(ticks.len(), 2, "both nodes tick");
         let state = snapshot(&tx).await;
         assert_eq!(state.nodes.len(), 2);
         assert_eq!(state.virtual_ms, 2_500);
         assert!(
-            state.nodes.iter().all(|n| n.ticks_total > 0),
-            "every runtime should have fired heartbeat ticks"
+            state.nodes.iter().all(|n| n.rounds_heartbeat == 25),
+            "25 heartbeats each: {:?}",
+            state
+                .nodes
+                .iter()
+                .map(|n| n.rounds_heartbeat)
+                .collect::<Vec<_>>()
         );
     });
 }
 
-/// Phase 1: submitting a request creates a cell on the local node (visible
+/// Submitting a request creates a cell on the local node (visible
 /// both as a `CellCreated` event and via the `CellDump` snapshot) and the hit
 /// gossips to the other node, where the aggregate converges to the oracle.
 #[test]
@@ -152,9 +234,10 @@ fn submit_creates_and_gossips_a_cell() {
         // The submitting node sees the cell immediately as a local origin.
         let before = snapshot(&tx).await;
         assert_eq!(before.oracle_total, 5);
-        assert_eq!(before.nodes[0].aggregate_total, 5);
+        assert_eq!(before.nodes[0].window_total, 5);
         assert!(
-            before.nodes[0]
+            inspect(&tx, 0)
+                .await
                 .cells
                 .iter()
                 .any(|c| c.key == WATCHED_KEY && c.count == 5 && c.is_local),
@@ -162,9 +245,7 @@ fn submit_creates_and_gossips_a_cell() {
         );
 
         // Drive gossip forward and gather every event across the whole stream
-        // (the submit batch plus every step). The runtime's first interval
-        // tick fires at t=0, so propagation can begin during the submit call
-        // itself — we assert on the cumulative stream, not on one batch.
+        // (the submit batch plus every step).
         let mut all_events = submit_batch.events;
         for _ in 0..10 {
             all_events.extend(step(&tx, 100).await.events);
@@ -187,12 +268,13 @@ fn submit_creates_and_gossips_a_cell() {
         let after = snapshot(&tx).await;
         assert_eq!(after.oracle_total, 5);
         assert!(
-            after.nodes.iter().all(|n| n.aggregate_total == 5),
+            after.nodes.iter().all(|n| n.window_total == 5),
             "both nodes converge on the oracle total"
         );
         // Node 1's copy is a remote (non-local) cell.
         assert!(
-            after.nodes[1]
+            inspect(&tx, 1)
+                .await
                 .cells
                 .iter()
                 .any(|c| c.key == WATCHED_KEY && c.count == 5 && !c.is_local),
@@ -201,89 +283,160 @@ fn submit_creates_and_gossips_a_cell() {
     });
 }
 
-/// The adaptive-decision outputs reach the snapshot. The runtime sizes its
-/// per-tick fanout by the coverage threshold `⌈ln(peers) + c⌉` — driven by
-/// cluster size, not the dirty set — so a node in a 12-member cluster (11
-/// peers) fans out above the configured floor of 2, and the effective/peak
-/// fanout and the error budget all surface on the node: the metrics whose
-/// absence made the adaptation invisible in the inspector.
+/// The error budget the most recent request computed reaches the snapshot,
+/// so the inspector shows the threshold a burst must cross, and each peer row
+/// and gateway counter reaches it as the runtime reports it.
 #[test]
-fn coverage_fanout_and_budget_surface_in_snapshot() {
+fn error_budget_and_gateway_counters_surface_in_snapshot() {
     let config = SimConfig {
-        fanout: 2,
         rule_limit: 1_000,
         target_err_bps: 100,
-        ..test_config(12)
+        ..zoned(12, 3)
     };
-    // 12 members → 11 peers per node → coverage `⌈ln(11) + c⌉`, well above
-    // the configured floor of 2. The dirty set does not move it.
-    let expected = (11.0_f64.ln() + gabion::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as u32;
-    with_engine(config, |tx| async move {
-        // A 16-key burst makes the dirty set large; the coverage fanout
-        // ignores it — the burst rides one fat frame, not a wider peer pick.
-        for key in 0..16u128 {
-            submit(&tx, 0, key, 7).await;
-        }
-        for _ in 0..3 {
-            step(&tx, 100).await;
-        }
-        let origin = snapshot(&tx)
+    with_state(config, |mut state| async move {
+        state
+            .submit_request(0, KeyHash(0), hits(7), StepUntil::Time)
             .await
-            .nodes
-            .into_iter()
-            .find(|n| n.id == 0)
-            .expect("node 0 present");
-        assert_eq!(
-            origin.effective_fanout, expected,
-            "a 12-member cluster fans out to the coverage threshold ⌈ln(11)+c⌉={expected}, \
-             independent of the dirty set; got {}",
-            origin.effective_fanout,
-        );
-        assert!(
-            origin.peak_fanout >= origin.effective_fanout,
-            "peak fanout must be a high-water mark; peak {} < last {}",
-            origin.peak_fanout,
-            origin.effective_fanout,
-        );
+            .unwrap();
+        let origin = state.snapshot(None, WATCH).await.nodes.swap_remove(0);
+        assert_eq!(origin.id, 0);
         assert!(
             origin.error_budget > 0,
             "the error budget must be recorded once a request is seen",
         );
+
+        warm(&mut state).await;
+        let g = gateway_of(&state, 0, 1).await;
+        silence(&mut state, g).await;
+        state
+            .submit_request(0, KeyHash(0), hits(1), StepUntil::Time)
+            .await
+            .unwrap();
+        state.step(T_U / 2 + T, StepUntil::Time).await;
+
+        // Checkpoint A, the peer mirror: the rows the page shows are the rows
+        // the runtime reports, read at the same virtual instant.
+        let snap = state.snapshot(Some(0), WATCH).await;
+        let direct = super::admin_snapshot(&state.nodes[0].admin_tx)
+            .await
+            .expect("node 0 runs");
+        let rows = &snap.inspected.expect("node 0 is live").peers;
+        assert_eq!(rows.len(), direct.peers.len());
+        for (row, entry) in rows.iter().zip(&direct.peers) {
+            assert_eq!(row.role, entry.role);
+            assert_eq!(row.answer, entry.answer);
+            assert_eq!(row.unanswered_ms, entry.unanswered_ms);
+            assert_eq!(row.own_unacked, entry.own_unacked);
+            assert_eq!(row.relay_unacked, entry.relay_unacked);
+        }
+        let silent = rows
+            .iter()
+            .find(|row| row.id == Some(g))
+            .expect("row for g");
+        assert_eq!(silent.answer, AnswerState::Owed);
+        assert!(silent.own_unacked >= 1);
+        let held = |cells: Vec<CellView>| -> u64 {
+            cells
+                .iter()
+                .filter(|c| c.key == 0 && c.origin == Some(0))
+                .map(|c| c.count)
+                .sum()
+        };
+        assert_eq!(held(cells_of(&state, 0).await), 8);
+        assert_eq!(
+            held(cells_of(&state, g).await),
+            7,
+            "g heard nothing after the silence"
+        );
+
+        // Checkpoint B, the counter mirror: each node's counters are the
+        // library's own fields.
+        state.step(T_U + 3 * T, StepUntil::Time).await;
+        let snap = state.snapshot(None, WATCH).await;
+        for (node, handle) in snap.nodes.iter().zip(&state.nodes) {
+            let c = super::counters(&handle.admin_tx).await.expect("runs");
+            assert_eq!(node.gateway_failovers, c.gateway_failovers);
+            assert_eq!(node.gap_reports_sent, c.gap_reports_sent);
+            assert_eq!(node.rto_rewinds_own, c.rto_rewinds_own);
+            assert_eq!(node.rto_rewinds_relay, c.rto_rewinds_relay);
+            assert_eq!(node.sweeps_served, c.sweeps_served);
+        }
+        assert!(snap.nodes[0].gateway_failovers >= 1);
+        assert!(snap.nodes[0].rto_rewinds_own >= 1);
+        state
     });
 }
 
-/// The windowed oracle is the sum of every node's locally-originated *live*
-/// cells: a gossiped replica never inflates it (one origin → counted once), and
-/// it decays to zero as the window slides past the only bucket — the behaviour
-/// a monotonic accumulator could not show.
+/// The windowed oracle sums each origin's fullest in-window copy: a gossiped
+/// replica never inflates it (one origin, counted once), a stale replica on a
+/// node read first never stands in for its origin's fuller cell, and it decays
+/// to zero as the window slides past the only bucket — the behaviour a
+/// monotonic accumulator could not show. A node cut off from the cell dates
+/// its lag from the origin's update, which every replica carries.
 #[test]
 fn oracle_total_is_windowed_and_counts_each_origin_once() {
     let config = SimConfig {
         rule_window_ms: 2_000,
         rule_bucket_ms: 1_000,
-        ..test_config(2)
+        ..test_config(3)
     };
     with_engine(config, |tx| async move {
-        submit(&tx, 0, WATCHED_KEY, 9).await;
+        for peer in [0, 1] {
+            set_link(&tx, peer, 2, LinkPolicyKind::Block).await;
+            set_link(&tx, 2, peer, LinkPolicyKind::Block).await;
+        }
+        submit(&tx, 1, WATCHED_KEY, 9).await;
         assert_eq!(
             snapshot(&tx).await.oracle_total,
             9,
             "the windowed oracle counts the fresh burst at its origin"
         );
 
-        // Spread it so node 1 holds a remote replica of node 0's cell.
+        // Spread it so node 0 holds a remote replica of node 1's cell.
         for _ in 0..5 {
             step(&tx, 100).await;
         }
         let converged = snapshot(&tx).await;
-        assert!(
-            converged.nodes.iter().all(|n| n.aggregate_total == 9),
-            "both nodes hold the cell"
+        let views = |snap: &ClusterState| -> Vec<(u64, Lag)> {
+            snap.nodes.iter().map(|n| (n.window_total, n.lag)).collect()
+        };
+        assert_eq!(
+            views(&converged),
+            [
+                (9, Lag::CaughtUp),
+                (9, Lag::CaughtUp),
+                (
+                    0,
+                    Lag::Stranded {
+                        missing_for_ms: 500
+                    }
+                )
+            ],
+            "nodes 0 and 1 hold the cell; node 2 has lacked it since node 1 recorded it at 0 ms, \
+             the date node 0's replica carries too"
         );
         assert_eq!(
             converged.oracle_total, 9,
-            "the replica on node 1 is not local, so the oracle still counts the hit once at its \
+            "the replica on node 0 is not local, so the oracle still counts the hit once at its \
              single origin"
+        );
+
+        // More hits at the origin, before its next heartbeat: node 0, read
+        // first, holds a stale replica of the cell node 1 holds in full.
+        submit(&tx, 1, WATCHED_KEY, 4).await;
+        let stale = snapshot(&tx).await;
+        assert_eq!(
+            views(&stale),
+            [
+                (9, Lag::Behind { missing_for_ms: 0 }),
+                (13, Lag::CaughtUp),
+                (0, Lag::Stranded { missing_for_ms: 0 })
+            ],
+            "{stale:?}"
+        );
+        assert_eq!(
+            stale.oracle_total, 13,
+            "the origin's fuller cell, not the stale replica read before it"
         );
 
         // Step well past the 2 s window so the only bucket ages out everywhere.
@@ -296,13 +449,13 @@ fn oracle_total_is_windowed_and_counts_each_origin_once() {
             "the windowed oracle decays to zero as the bucket expires"
         );
         assert!(
-            aged.nodes.iter().all(|n| n.aggregate_total == 0),
+            aged.nodes.iter().all(|n| n.window_total == 0),
             "node views age out in lockstep with the oracle"
         );
     });
 }
 
-/// Phase 1: a blocked link stops propagation (the logging transport records
+/// A blocked link stops propagation (the logging transport records
 /// drops), and healing the link lets the cluster converge.
 #[test]
 fn partition_blocks_then_heal_converges() {
@@ -327,9 +480,9 @@ fn partition_blocks_then_heal_converges() {
         assert!(saw_drop, "blocked link must produce dropped-packet events");
 
         let partitioned = snapshot(&tx).await;
-        assert_eq!(partitioned.nodes[0].aggregate_total, 7);
+        assert_eq!(partitioned.nodes[0].window_total, 7);
         assert_eq!(
-            partitioned.nodes[1].aggregate_total, 0,
+            partitioned.nodes[1].window_total, 0,
             "node 1 is isolated and learns nothing"
         );
 
@@ -342,22 +495,127 @@ fn partition_blocks_then_heal_converges() {
 
         let healed = snapshot(&tx).await;
         assert!(
-            healed.nodes.iter().all(|n| n.aggregate_total == 7),
+            healed.nodes.iter().all(|n| n.window_total == 7),
             "convergence after heal"
         );
     });
 }
 
-/// Determinism: the same `(seed, config, command-script)` produces an
-/// identical event log — the invariant the shareable-URL replay relies on.
+/// `lag` dates the oldest change a node lacks from its origin cell's last
+/// update: a lower count in a cell it holds counts as missing, a cell it
+/// never received counts too, and the older of the two wins. Both directions
+/// are blocked, so the lagging node is stranded.
 #[test]
-fn same_seed_and_script_produce_identical_events() {
+fn lag_dates_the_oldest_change_a_node_lacks() {
+    use Lag::{CaughtUp, Stranded};
+    with_engine(test_config(2), |tx| async move {
+        let missing =
+            |state: &ClusterState| -> Vec<Lag> { state.nodes.iter().map(|n| n.lag).collect() };
+        submit(&tx, 0, WATCHED_KEY, 7).await;
+        for _ in 0..5 {
+            step(&tx, T).await;
+        }
+        let caught_up = snapshot(&tx).await;
+        assert!(caught_up.nodes.iter().all(|n| n.window_total == 7));
+        assert_eq!(
+            missing(&caught_up),
+            [CaughtUp, CaughtUp],
+            "both nodes hold the 7 hits"
+        );
+
+        set_link(&tx, 0, 1, LinkPolicyKind::Block).await;
+        set_link(&tx, 1, 0, LinkPolicyKind::Block).await;
+        // At 500 ms, into the bucket node 1 already holds at a count of 7.
+        submit(&tx, 0, WATCHED_KEY, 3).await;
+        for _ in 0..4 {
+            step(&tx, T).await;
+        }
+        let lower = snapshot(&tx).await;
+        assert_eq!(lower.virtual_ms, 900);
+        assert_eq!(
+            lower.nodes[1].window_total, 7,
+            "node 1 holds the cell at 7 of 10"
+        );
+        assert_eq!(
+            missing(&lower),
+            [
+                CaughtUp,
+                Stranded {
+                    missing_for_ms: 400
+                }
+            ],
+            "the cell was last updated at 500 ms"
+        );
+
+        // At 1200 ms, into a bucket node 1 has never received.
+        for _ in 0..3 {
+            step(&tx, T).await;
+        }
+        submit(&tx, 0, WATCHED_KEY, 2).await;
+        for _ in 0..3 {
+            step(&tx, T).await;
+        }
+        let absent = snapshot(&tx).await;
+        assert_eq!(absent.virtual_ms, 1_500);
+        assert_eq!(
+            missing(&absent),
+            [
+                CaughtUp,
+                Stranded {
+                    missing_for_ms: 1_000
+                }
+            ],
+            "the change at 500 ms is the oldest"
+        );
+
+        set_link(&tx, 0, 1, LinkPolicyKind::Pass).await;
+        set_link(&tx, 1, 0, LinkPolicyKind::Pass).await;
+        for _ in 0..10 {
+            step(&tx, T).await;
+        }
+        let healed = snapshot(&tx).await;
+        assert!(healed.nodes.iter().all(|n| n.window_total == 12));
+        assert_eq!(
+            missing(&healed),
+            [CaughtUp, CaughtUp],
+            "node 1 caught up after the heal"
+        );
+
+        // At 2500 ms, into a new bucket, with node 1 holding every older one:
+        // a cell it lacks outright is its only missing change, read after
+        // node 0, which holds that cell.
+        set_link(&tx, 0, 1, LinkPolicyKind::Block).await;
+        set_link(&tx, 1, 0, LinkPolicyKind::Block).await;
+        submit(&tx, 0, WATCHED_KEY, 4).await;
+        for _ in 0..3 {
+            step(&tx, T).await;
+        }
+        let only_absent = snapshot(&tx).await;
+        assert_eq!(only_absent.virtual_ms, 2_800);
+        assert_eq!(
+            missing(&only_absent),
+            [
+                CaughtUp,
+                Stranded {
+                    missing_for_ms: 300
+                }
+            ],
+            "node 1 lacks only the cell made at 2500 ms"
+        );
+    });
+}
+
+/// Determinism: the same `(config, command-script)` produces an identical
+/// event log, tier tags and gateway events included — the invariant the
+/// replay tests rely on.
+#[test]
+fn same_script_produces_identical_events() {
     fn run() -> Vec<EventBatch> {
         let mut batches = Vec::new();
         // N=16 so the determinism check exercises ticks arriving *while*
         // packets are in flight across a sizeable fan — the combined load
         // under which a coalescing (watch) tick source diverged.
-        with_engine(test_config(16), |tx| {
+        with_engine(zoned(16, 3), |tx| {
             let batches = &mut batches;
             async move {
                 batches.push(submit(&tx, 0, WATCHED_KEY, 3).await);
@@ -374,18 +632,26 @@ fn same_seed_and_script_produce_identical_events() {
     let second = run();
     assert_eq!(
         first, second,
-        "identical seed + script must yield identical event batches"
+        "identical script must yield identical event batches"
     );
     assert!(
         first.iter().any(|b| !b.events.is_empty()),
         "the script should produce some events"
     );
+    assert!(
+        first
+            .iter()
+            .flat_map(|b| &b.events)
+            .any(|e| matches!(e.kind, EventKind::GatewayChanged { .. })),
+        "the zones should elect gateways, and the script should report them"
+    );
 }
 
 /// At a larger cluster the per-node tick channel must deliver *every* fired
-/// tick — no coalescing — so each runtime's `ticks_total` equals the number of
-/// whole ticks stepped, identically across nodes and across runs. (A `watch`
-/// tick source failed exactly here: a busy runtime silently dropped ticks.)
+/// tick — no coalescing — so each runtime's `rounds_heartbeat` equals the
+/// number of whole ticks stepped, identically across nodes and across runs. (A
+/// `watch` tick source failed exactly here: a busy runtime silently dropped
+/// ticks.)
 #[test]
 fn many_nodes_receive_every_tick_deterministically() {
     fn run() -> Vec<u64> {
@@ -394,10 +660,11 @@ fn many_nodes_receive_every_tick_deterministically() {
             let totals = &mut totals;
             async move {
                 // 1000 ms at 100 ms/tick = 10 whole ticks, and no requests (so
-                // no threshold fires): every node's ticks_total must be 10.
+                // no threshold rounds): every node's rounds_heartbeat must be
+                // 10.
                 step(&tx, 1_000).await;
                 let state = snapshot(&tx).await;
-                *totals = state.nodes.iter().map(|n| n.ticks_total).collect();
+                *totals = state.nodes.iter().map(|n| n.rounds_heartbeat).collect();
             }
         });
         totals
@@ -427,7 +694,7 @@ fn added_node_catches_up_by_gossip() {
         let before = snapshot(&tx).await;
         assert_eq!(node_ids(&before), vec![0, 1, 2]);
         assert!(
-            before.nodes.iter().all(|n| n.aggregate_total == 50),
+            before.nodes.iter().all(|n| n.window_total == 50),
             "cluster converged before the add"
         );
 
@@ -440,7 +707,7 @@ fn added_node_catches_up_by_gossip() {
             "ids are stable; the newcomer is 3, not a renumber"
         );
         let newcomer = joined.nodes.iter().find(|n| n.id == 3).unwrap();
-        assert_eq!(newcomer.aggregate_total, 0, "the newcomer starts cold");
+        assert_eq!(newcomer.window_total, 0, "the newcomer starts cold");
 
         // Drive gossip; the newcomer catches up to the settled total.
         for _ in 0..15 {
@@ -448,12 +715,12 @@ fn added_node_catches_up_by_gossip() {
         }
         let after = snapshot(&tx).await;
         assert!(
-            after.nodes.iter().all(|n| n.aggregate_total == 50),
+            after.nodes.iter().all(|n| n.window_total == 50),
             "every node, the newcomer included, converges on 50: {:?}",
             after
                 .nodes
                 .iter()
-                .map(|n| (n.id, n.aggregate_total))
+                .map(|n| (n.id, n.window_total))
                 .collect::<Vec<_>>(),
         );
     });
@@ -479,7 +746,7 @@ fn removed_node_leaves_and_survivors_keep_converging() {
             "node 1 left; 0 and 2 keep their ids (a gap, not a renumber)"
         );
         assert!(
-            removed.nodes.iter().all(|n| n.aggregate_total == 50),
+            removed.nodes.iter().all(|n| n.window_total == 50),
             "survivors still hold the converged total"
         );
 
@@ -493,20 +760,61 @@ fn removed_node_leaves_and_survivors_keep_converging() {
         assert_eq!(after.oracle_total, 60);
         assert_eq!(node_ids(&after), vec![0, 2]);
         assert!(
-            after.nodes.iter().all(|n| n.aggregate_total == 60),
+            after.nodes.iter().all(|n| n.window_total == 60),
             "the two survivors converge on 60: {:?}",
             after
                 .nodes
                 .iter()
-                .map(|n| (n.id, n.aggregate_total))
+                .map(|n| (n.id, n.window_total))
                 .collect::<Vec<_>>(),
         );
     });
 }
 
+/// A join reaches every survivor before its next round: the first survivor
+/// to beat after it sends the newcomer a packet in that round.
+#[test]
+fn the_first_round_after_a_join_reaches_the_newcomer() {
+    with_state(test_config(12), |mut state| async move {
+        ready(&mut state).await;
+        let joined_at = state.virtual_ms;
+        let mut events = state.add_node(None).await.unwrap().events;
+        let newcomer = state.nodes.last().expect("the joiner").id;
+        events.extend(state.step(T, StepUntil::Time).await.events);
+        let (beat, first) = state
+            .nodes
+            .iter()
+            .filter(|n| n.id != newcomer)
+            .map(|n| (super::first_heartbeat(n.id, T, joined_at), n.id))
+            .min()
+            .expect("survivors");
+        assert!(
+            events.iter().any(|e| e.virtual_ms == beat
+                && matches!(e.kind, EventKind::PacketSent { src, dst, .. }
+                    if src == first && dst == newcomer)),
+            "node {first}, the first to beat after the join, skipped the newcomer at {beat}"
+        );
+        state
+    });
+}
+
+/// A removal shifts the touched marks with the nodes, so a mark left above
+/// the departed node reads the node it named.
+#[test]
+fn a_removal_keeps_each_touched_mark_on_its_node() {
+    with_state(test_config(4), |mut state| async move {
+        state.touched.insert(3);
+        let reads = state.counter_reads;
+        state.remove_node(0).await.unwrap();
+        assert_eq!(state.counter_reads - reads, 1, "node 3, now at position 2");
+        assert!(state.touched.is_empty());
+        state
+    });
+}
+
 /// Determinism across churn: the same command script — including a join and a
 /// leave — yields an identical event log *and* identical stable ids on every
-/// run. This is the invariant the shareable-URL replay relies on once churn is
+/// run. This is the invariant the replay tests rely on once churn is
 /// part of the command stream.
 #[test]
 fn churn_script_is_deterministic() {
@@ -549,75 +857,905 @@ fn churn_script_is_deterministic() {
     );
 }
 
-/// A single `step` is a single gossip round: a brand-new count must not reach
-/// more than `fanout` other nodes in one step. Before the delivery-barrier fix
-/// the step driver interleaved tick-consumption with packet delivery, so a peer
-/// that received the burst could re-gossip it within the *same* step — a
-/// hop-by-hop cascade that lit up far more than `fanout + 1` nodes per click.
-///
-/// `nodes = 12`, `fanout = 6`: 11 peers ⇒ coverage `⌈ln(11) + c⌉ = 6`, so the
-/// effective fanout is 6 and at most `6 + 1 = 7` nodes may know after one step.
-/// `hits` stays well under the eager-flush budget
+/// One heartbeat sends a new count to the origin's zone and one gateway in
+/// each remote zone, and the submit alone sends nothing; the gateways relay it
+/// into their zones one relay floor after they hear it, which the next
+/// heartbeat's step covers. `hits` stays well under the eager-flush budget
 /// (`epsilon = rule_limit × bps / (10_000 × peers) = 1_000_000 / 1_100 ≈ 909`)
-/// so the submit itself does not gossip — the baseline below proves it.
+/// so no threshold round runs. The relay floor is far below a heartbeat, so a
+/// step that ends at the heartbeat itself ends before the relay leaves.
 #[test]
-fn one_step_propagates_a_new_count_to_at_most_fanout_peers() {
-    let config = SimConfig {
-        fanout: 6,
-        rule_limit: 1_000_000,
-        ..test_config(12)
-    };
-    let effective_fanout = (11.0_f64.ln() + gabion::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as u32;
-    assert_eq!(effective_fanout, 6, "11 peers ⇒ coverage ⌈ln(11)+3⌉ = 6");
-
+fn one_heartbeat_reaches_the_zone_and_one_gateway_per_remote_zone() {
     // A node "knows" the count if it holds the cell (a nonzero aggregate, since
     // the single key is the only traffic).
-    fn known(state: &ClusterState) -> usize {
-        state.nodes.iter().filter(|n| n.aggregate_total > 0).count()
+    fn known(state: &ClusterState) -> Vec<u8> {
+        let mut zones: Vec<u8> = state
+            .nodes
+            .iter()
+            .filter(|n| n.window_total > 0)
+            .map(|n| n.zone)
+            .collect();
+        zones.sort_unstable();
+        zones
     }
 
-    with_engine(config, |tx| async move {
-        submit(&tx, 0, WATCHED_KEY, 5).await;
-        let baseline = snapshot(&tx).await;
+    with_state(zoned(12, 3), |mut state| async move {
+        warm(&mut state).await;
+        send(&mut state, 0, 5).await;
         assert_eq!(
-            known(&baseline),
-            1,
-            "submit alone must not gossip; only the origin knows (if this is 7 the eager-flush \
-             threshold assumption broke — tune hits/rule_limit)"
+            known(&state.snapshot(None, WATCH).await),
+            [0],
+            "the submit alone gossips nothing"
         );
-
-        // One gossip round (one tick at the configured 100 ms interval). The
-        // origin fans out to `effective_fanout` peers and nobody re-forwards
-        // within the same step.
-        step(&tx, 100).await;
-        let after_one = snapshot(&tx).await;
-        assert!(
-            known(&after_one) <= effective_fanout as usize + 1,
-            "one step is one round: at most fanout+1 = {} nodes may know, got {}",
-            effective_fanout + 1,
-            known(&after_one),
-        );
-        assert!(
-            known(&after_one) > 1,
-            "one step must still propagate to at least one peer"
-        );
-
-        // Further steps must eventually inform every node — the fix one-hops
-        // propagation, it does not freeze it.
-        for _ in 0..20 {
-            step(&tx, 100).await;
-        }
-        let converged = snapshot(&tx).await;
+        state.step(T, StepUntil::Time).await;
         assert_eq!(
-            known(&converged),
+            known(&state.snapshot(None, WATCH).await),
+            [0, 0, 0, 0, 1, 2],
+            "the zone's four nodes and one gateway in each other zone"
+        );
+        state.step(T, StepUntil::Time).await;
+        assert_eq!(
+            known(&state.snapshot(None, WATCH).await).len(),
             12,
-            "enough rounds inform all 12 nodes: {:?}",
-            converged
-                .nodes
-                .iter()
-                .map(|n| (n.id, n.aggregate_total))
-                .collect::<Vec<_>>(),
+            "the relays"
         );
+        state
+    });
+}
+
+/// Run `body` on an engine state built from `config` on a paused runtime, so
+/// a test reads the state's own fields.
+fn with_state<F, Fut>(config: SimConfig, body: F)
+where
+    F: FnOnce(super::EngineState) -> Fut,
+    Fut: Future<Output = super::EngineState>,
+{
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("build paused current-thread runtime");
+    LocalSet::new().block_on(&rt, async move {
+        let state = super::EngineState::build(config.validate().expect("config validates"))
+            .expect("every node's settings validate");
+        let mut state = body(state).await;
+        state.shutdown().await;
+    });
+}
+
+/// [`with_state`] for a `body` that also returns a value, and that value.
+fn run_with_state<T, F, Fut>(config: SimConfig, body: F) -> T
+where
+    F: FnOnce(EngineState) -> Fut,
+    Fut: Future<Output = (EngineState, T)>,
+{
+    let mut out = None;
+    with_state(config, |state| {
+        let out = &mut out;
+        async move {
+            let (state, value) = body(state).await;
+            *out = Some(value);
+            state
+        }
+    });
+    out.expect("the run finished")
+}
+
+/// `test_config` with its nodes placed in `zones` zones.
+fn zoned(nodes: usize, zones: usize) -> SimConfig {
+    SimConfig {
+        zones,
+        ..test_config(nodes)
+    }
+}
+
+/// One second of heartbeats, enough for every peer to be heard and every role
+/// to settle.
+async fn warm(state: &mut EngineState) -> Vec<Event> {
+    state.step(1_000, StepUntil::Time).await.events
+}
+
+/// The heartbeat period of the scenarios the page tells: 500 ms.
+const P: u64 = 500;
+
+/// The default scenario's cluster: twelve nodes in three zones, a 500 ms
+/// heartbeat, and a limit of 100 hits per 10 s window of 1 s buckets.
+fn rate_limiting() -> SimConfig {
+    SimConfig {
+        tick_interval_ms: P,
+        rule_window_ms: 10_000,
+        rule_limit: 100,
+        ..zoned(12, 3)
+    }
+}
+
+/// [`rate_limiting`] with the limit far away (1,000,000), so a send of tens
+/// of hits waits for its node's heartbeat instead of flushing at once.
+fn propagation() -> SimConfig {
+    SimConfig {
+        rule_limit: 1_000_000,
+        ..rate_limiting()
+    }
+}
+
+/// A snapshot watch of the watched key, deciding `probe_hits` for the
+/// inspected node.
+const fn watch(probe_hits: u64) -> Watch {
+    Watch {
+        key: KeyHash(WATCHED_KEY),
+        probe_hits: hits(probe_hits),
+    }
+}
+
+/// Step one period at a time until a period passes with no packet sent or
+/// lost, and return every event. Panics after 40 periods with the count.
+async fn settle(state: &mut EngineState) -> Vec<Event> {
+    let period = state.config.tick_interval_ms;
+    let mut events = Vec::new();
+    for _ in 0..40 {
+        let batch = state.step(period, StepUntil::Time).await.events;
+        let quiet = !batch.iter().any(|e| {
+            matches!(
+                e.kind,
+                EventKind::PacketSent { .. } | EventKind::PacketDropped { .. }
+            )
+        });
+        events.extend(batch);
+        if quiet {
+            return events;
+        }
+    }
+    panic!("the cluster did not go quiet within 40 periods");
+}
+
+/// Warm and settle `state`.
+async fn ready(state: &mut EngineState) {
+    warm(state).await;
+    settle(state).await;
+}
+
+/// The nodes whose count of a cell was created or raised in `events`.
+fn cell_nodes(events: &[Event]) -> BTreeSet<u32> {
+    events
+        .iter()
+        .filter_map(|e| match e.kind {
+            EventKind::CellCreated { node, .. } | EventKind::CellUpdated { node, .. } => Some(node),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every node's decision on its requests in `events`, in order.
+fn decisions(events: &[Event]) -> Vec<(u32, Admission)> {
+    events
+        .iter()
+        .filter_map(|e| match e.kind {
+            EventKind::Decided {
+                node, admission, ..
+            } => Some((node, admission)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Submit `n` hits of the watched key at `node`, which must be a live node,
+/// and return the batch.
+async fn send(state: &mut EngineState, node: u32, n: u64) -> EventBatch {
+    state
+        .submit_request(node, KeyHash(WATCHED_KEY), hits(n), StepUntil::Time)
+        .await
+        .expect("a live node")
+}
+
+/// The ids of the live nodes placed in `zone`.
+fn members(state: &EngineState, zone: u8) -> Vec<u32> {
+    state
+        .nodes
+        .iter()
+        .filter(|n| n.zone == zone)
+        .map(|n| n.id)
+        .collect()
+}
+
+/// Block the links between live nodes `a` and `b`, both ways.
+async fn block_both(state: &mut EngineState, a: u32, b: u32) {
+    for (src, dst) in [(a, b), (b, a)] {
+        state
+            .set_link_policy(src, dst, LinkPolicyKind::Block)
+            .await
+            .unwrap();
+    }
+}
+
+/// Block every link between zone `zone` and the rest, both ways.
+async fn cut_zone(state: &mut EngineState, zone: u8) {
+    let inside = members(state, zone);
+    let outside: Vec<u32> = state
+        .nodes
+        .iter()
+        .filter(|n| n.zone != zone)
+        .map(|n| n.id)
+        .collect();
+    for &a in &inside {
+        for &b in &outside {
+            block_both(state, a, b).await;
+        }
+    }
+}
+
+/// The zone node `id` is placed in, as the snapshot reports it.
+fn zone_of(state: &ClusterState, id: u32) -> u8 {
+    state
+        .nodes
+        .iter()
+        .find(|n| n.id == id)
+        .expect("a live node")
+        .zone
+}
+
+/// `origin`'s gateway into `zone`, as its runtime reports it.
+async fn gateway_of(state: &EngineState, origin: u32, zone: u8) -> u32 {
+    peers_of(state, origin)
+        .await
+        .iter()
+        .find(|p| p.role == Role::Gateway && p.zone == Some(zone))
+        .and_then(|p| p.id)
+        .expect("a gateway")
+}
+
+/// Node `id`'s cells, as the snapshot inspecting it reports them.
+async fn cells_of(state: &EngineState, id: u32) -> Vec<CellView> {
+    inspected(state, id).await.cells
+}
+
+/// Node `id`'s peer rows, as the snapshot inspecting it reports them.
+async fn peers_of(state: &EngineState, id: u32) -> Vec<PeerView> {
+    inspected(state, id).await.peers
+}
+
+async fn inspected(state: &EngineState, id: u32) -> Inspected {
+    state
+        .snapshot(Some(id), WATCH)
+        .await
+        .inspected
+        .expect("a live node")
+}
+
+/// Cut `g` off from every other live node, in both directions.
+async fn silence(state: &mut EngineState, g: u32) {
+    let ids: Vec<u32> = state.nodes.iter().map(|n| n.id).collect();
+    for x in ids.into_iter().filter(|&x| x != g) {
+        block_both(state, g, x).await;
+    }
+}
+
+/// The `(dst, tier, virtual_ms)` of every `kind` packet `src` sent.
+fn sent(events: &[Event], src: u32, kind: PacketKind) -> Vec<(u32, Tier, u64)> {
+    events
+        .iter()
+        .filter_map(|e| match e.kind {
+            EventKind::PacketSent {
+                src: s,
+                dst,
+                kind: k,
+                tier,
+                ..
+            } if s == src && k == kind => Some((dst, tier, e.virtual_ms)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The first `GatewayChanged` of `origin`'s gateway into `zone` away from
+/// `from`, with its time and new gateway.
+fn failover(events: &[Event], origin: u32, zone: u8, from: u32) -> Option<(u64, Option<u32>)> {
+    events.iter().find_map(|e| match e.kind {
+        EventKind::GatewayChanged {
+            origin: o,
+            zone: z,
+            from: Some(f),
+            to,
+        } if (o, z, f) == (origin, zone, from) => Some((e.virtual_ms, to)),
+        _ => None,
+    })
+}
+
+/// The summed count of `rule`'s cells at `bucket`.
+fn bucket_count<'a>(cells: impl Iterator<Item = &'a CellView>, rule: u128, bucket: u32) -> u64 {
+    cells
+        .filter(|c| c.rule == rule && c.bucket == bucket)
+        .map(|c| c.count)
+        .sum()
+}
+
+/// Every sent or dropped packet's bytes, summed by tier and class here, equal
+/// the snapshot's `bytes_by_tier`, and each live node's `own_data_bytes` equal
+/// the `Own` bytes it sent. The classification is this test's own, so it
+/// checks the engine's rather than reusing it.
+fn assert_bytes_by_tier_and_sender(events: &[Event], state: &ClusterState) {
+    let mut sums = BTreeMap::new();
+    let mut own_by_sender = BTreeMap::new();
+    for event in events {
+        if let EventKind::PacketSent {
+            src,
+            bytes,
+            kind,
+            tier,
+            ..
+        }
+        | EventKind::PacketDropped {
+            src,
+            bytes,
+            kind,
+            tier,
+            ..
+        } = event.kind
+        {
+            let data = matches!(
+                kind,
+                PacketKind::Own | PacketKind::Relay | PacketKind::Sweep
+            );
+            *sums.entry((tier == Tier::InZone, data)).or_insert(0u64) += u64::from(bytes);
+            if kind == PacketKind::Own {
+                *own_by_sender.entry(src).or_insert(0u64) += u64::from(bytes);
+            }
+        }
+    }
+    for node in &state.nodes {
+        assert_eq!(
+            node.own_data_bytes,
+            own_by_sender.get(&node.id).copied().unwrap_or(0),
+            "node {} own data bytes",
+            node.id
+        );
+    }
+    let sum = |in_zone, data| sums.get(&(in_zone, data)).copied().unwrap_or(0);
+    let by = &state.bytes_by_tier;
+    assert_eq!(by.in_zone.data, sum(true, true), "in-zone data");
+    assert_eq!(by.in_zone.control, sum(true, false), "in-zone control");
+    assert_eq!(by.cross_zone.data, sum(false, true), "cross-zone data");
+    assert_eq!(
+        by.cross_zone.control,
+        sum(false, false),
+        "cross-zone control"
+    );
+    assert!(
+        sums.values().any(|&bytes| bytes > 0),
+        "the run sent something"
+    );
+}
+
+/// Each node's `gateway_for` counts the origins whose runtime reports it as
+/// their gateway into its zone, read here from the runtimes' own peer rows.
+#[test]
+fn gateway_for_counts_the_origins_routing_through_each_node() {
+    with_state(zoned(12, 3), |mut state| async move {
+        warm(&mut state).await;
+        // Remove a node that is some origin's gateway, so the count follows the
+        // failover, not a cached row.
+        let g = gateway_of(&state, 0, 1).await;
+        state.remove_node(g).await.unwrap();
+        state.step(3 * T, StepUntil::Time).await;
+        let snap = state.snapshot(None, WATCH).await;
+        let mut want = BTreeMap::new();
+        for node in &snap.nodes {
+            for peer in peers_of(&state, node.id).await {
+                if peer.role == Role::Gateway {
+                    *want
+                        .entry(peer.id.expect("a resolved gateway"))
+                        .or_insert(0u32) += 1;
+                }
+            }
+        }
+        for node in &snap.nodes {
+            assert_eq!(
+                node.gateway_for,
+                want.get(&node.id).copied().unwrap_or(0),
+                "node {}",
+                node.id
+            );
+        }
+        assert_eq!(
+            snap.nodes.iter().map(|n| n.gateway_for).sum::<u32>(),
+            11 * 2,
+            "each of the eleven origins has a gateway into both other zones"
+        );
+        state
+    });
+}
+
+/// Zones come from configuration, not from the address: all twelve nodes bind
+/// 127.0.0.1 (`addr_of_id`), yet the origin's own packets split three in its
+/// zone, two to one node in each other.
+#[test]
+fn zones_come_from_config_not_address() {
+    with_state(zoned(12, 3), |mut state| async move {
+        warm(&mut state).await;
+        send(&mut state, 0, 5).await;
+        let events = state.step(T, StepUntil::Time).await.events;
+        let snap = state.snapshot(None, WATCH).await;
+
+        let own = sent(&events, 0, PacketKind::Own);
+        assert_eq!(
+            own.len(),
+            5,
+            "one own packet to each of 3 zone peers and 2 gateways: {own:?}"
+        );
+        let in_zone: BTreeSet<u32> = own
+            .iter()
+            .filter(|p| p.1 == Tier::InZone)
+            .map(|p| p.0)
+            .collect();
+        assert_eq!(in_zone, BTreeSet::from([3, 6, 9]));
+        let cross: BTreeSet<u32> = own
+            .iter()
+            .filter(|p| p.1 == Tier::CrossZone)
+            .map(|p| p.0)
+            .collect();
+        let cross_zones: Vec<u8> = cross.iter().map(|&id| zone_of(&snap, id)).collect();
+        assert_eq!(cross.len(), 2, "one gateway in each other zone: {cross:?}");
+        assert_eq!(
+            cross_zones.iter().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([1, 2])
+        );
+        state
+    });
+}
+
+/// A gateway relays into its zone one relay floor after it hears the origin:
+/// the prompt round, not the next heartbeat.
+#[test]
+fn relay_follows_one_prompt_interval_after_the_gateway_hears() {
+    with_state(zoned(12, 3), |mut state| async move {
+        warm(&mut state).await;
+        let g = gateway_of(&state, 0, 1).await;
+        send(&mut state, 0, 1).await;
+        let events = state.step(2 * T, StepUntil::Time).await.events;
+
+        let t_send = sent(&events, 0, PacketKind::Own)
+            .iter()
+            .find_map(|&(dst, _, at)| (dst == g).then_some(at))
+            .expect("the origin sends its gateway");
+        let t_recv = events
+            .iter()
+            .find_map(|e| match e.kind {
+                EventKind::PacketDelivered { src: 0, dst, .. }
+                    if dst == g && e.virtual_ms >= t_send =>
+                {
+                    Some(e.virtual_ms)
+                }
+                _ => None,
+            })
+            .expect("the gateway receives it");
+        let snap = state.snapshot(None, WATCH).await;
+        let relays = sent(&events, g, PacketKind::Relay);
+        assert_eq!(relays.len(), 3, "to the gateway's three zone peers");
+        for (dst, _, at) in relays {
+            assert_eq!(at, t_recv + F_R, "one relay floor after it hears");
+            assert_eq!(zone_of(&snap, dst), 1);
+        }
+        state
+    });
+}
+
+/// A gateway that answers nothing is replaced once a packet to it has gone
+/// unanswered for `suspect_after`, and the replacement relays what it missed.
+#[test]
+fn silent_gateway_fails_over_within_suspect_after() {
+    with_state(zoned(12, 3), |mut state| async move {
+        warm(&mut state).await;
+        let g = gateway_of(&state, 0, 1).await;
+        let t_s = state.virtual_ms;
+        silence(&mut state, g).await;
+        send(&mut state, 0, 1).await;
+        let mut events = Vec::new();
+        while state.virtual_ms < t_s + T_U + 3 * T + 2 * F_R + T {
+            events.extend(state.step(T, StepUntil::Time).await.events);
+        }
+        let (at, to) = failover(&events, 0, 1, g).expect("a failover");
+        assert!(
+            (t_s + T_U..=t_s + T_U + 3 * T + 2 * F_R).contains(&at),
+            "failed over at {at}, silenced at {t_s}"
+        );
+        let to = to.expect("a replacement gateway");
+        assert_ne!(to, g);
+
+        state.step(3 * T, StepUntil::Time).await;
+        let snap = state.snapshot(None, WATCH).await;
+        for node in snap.nodes.iter().filter(|n| n.zone == 1 && n.id != g) {
+            assert_eq!(node.window_total, snap.oracle_total, "node {}", node.id);
+        }
+        assert_eq!(snap.nodes[0].gateway_failovers, 1);
+        assert_eq!(zone_of(&snap, to), 1);
+        state
+    });
+}
+
+/// A gateway cut off from its zone in one direction still answers the origin,
+/// so it is never suspected; the zone is repaired by the gateway telling the
+/// origin it cannot relay. `CANNOT_RELAY` rides only on packets the gateway
+/// sends the origin, which are its answers to the origin's data, so the origin
+/// keeps sending until the repair.
+#[test]
+fn one_way_cut_is_repaired_by_the_backstop() {
+    with_state(zoned(12, 3), |mut state| async move {
+        warm(&mut state).await;
+        let g = gateway_of(&state, 0, 1).await;
+        for m in members(&state, 1).into_iter().filter(|&m| m != g) {
+            state
+                .set_link_policy(g, m, LinkPolicyKind::Block)
+                .await
+                .unwrap();
+        }
+        let t_cut = state.virtual_ms;
+        let mut deadline = t_cut + T_U + 10 * T;
+        let mut t1 = None;
+        let mut failed_over = false;
+        while state.virtual_ms < deadline {
+            if !failed_over {
+                send(&mut state, 0, 1).await;
+            }
+            let events = state
+                .step(T.min(deadline - state.virtual_ms), StepUntil::Time)
+                .await
+                .events;
+            failed_over |= failover(&events, 0, 1, g).is_some();
+            if t1.is_none() {
+                t1 = events.iter().find_map(|e| match e.kind {
+                    EventKind::PacketDropped {
+                        src,
+                        kind: PacketKind::Relay,
+                        ..
+                    } if src == g => Some(e.virtual_ms),
+                    _ => None,
+                });
+                if let Some(t1) = t1 {
+                    deadline = t1 + T_U + 3 * T + 2 * F_R;
+                }
+            }
+        }
+        assert!(failed_over, "the origin left the gateway that cannot relay");
+        let t1 = t1.expect("the cut swallowed a relay, but none was dropped");
+        assert_eq!(state.virtual_ms, t1 + T_U + 3 * T + 2 * F_R);
+        let snap = state.snapshot(None, WATCH).await;
+        for node in snap.nodes.iter().filter(|n| n.zone == 1) {
+            assert_eq!(node.window_total, snap.oracle_total, "node {}", node.id);
+        }
+        state
+    });
+}
+
+/// A zone cut off from the rest for longer than `suspect_after` turns every
+/// row across the cut that is owed data suspect; after the heal, every node
+/// holds every bucket's exact count, and every byte sent or dropped is
+/// accounted by tier. Zone c has one member, so the gateway into it cannot
+/// fail over: a replaced gateway that wins the role back at the heal gets its
+/// stream from 0, but this one keeps its role, so only the rewind its probe
+/// answer brings resends what the cut swallowed.
+#[test]
+fn zone_partition_heals_to_exact_counts() {
+    with_state(zoned(5, 3), |mut state| async move {
+        let mut all = warm(&mut state).await;
+        let lone = state.snapshot(None, WATCH).await.zones[2].live;
+        assert_eq!(lone, 1, "zone c's gateway has no replacement");
+        cut_zone(&mut state, 2).await;
+        all.extend(send(&mut state, 0, 3).await.events);
+        all.extend(send(&mut state, 2, 4).await.events);
+        all.extend(state.step(3_000, StepUntil::Time).await.events);
+        for node in &state.snapshot(None, WATCH).await.nodes {
+            let side = if node.zone == 2 { 4 } else { 3 };
+            assert_eq!(
+                node.window_total, side,
+                "node {} sees only its side of the cut",
+                node.id
+            );
+        }
+        state.heal().await;
+        all.extend(state.step(3 * T, StepUntil::Time).await.events);
+        let snap = state.snapshot(None, WATCH).await;
+        // Pinned to the 3 + 4 hits submitted, not to counts the cells derive,
+        // so a hit lost at its origin or an oracle that sums replicas fails.
+        assert_eq!(snap.oracle_total, 7, "the oracle counts both sides once");
+        for node in &snap.nodes {
+            assert_eq!(node.window_total, 7, "node {} sees both sides", node.id);
+        }
+        let mut cells = Vec::new();
+        for node in &snap.nodes {
+            cells.push((node.id, cells_of(&state, node.id).await));
+        }
+
+        let rule = state.spec.fingerprint;
+        let buckets: BTreeSet<u32> = cells
+            .iter()
+            .flat_map(|(_, cells)| cells)
+            .filter(|c| c.rule == rule)
+            .map(|c| c.bucket)
+            .collect();
+        assert!(!buckets.is_empty(), "the hits left cells");
+        let mut origin_total = 0;
+        for bucket in buckets {
+            let oracle = bucket_count(
+                cells
+                    .iter()
+                    .flat_map(|(_, cells)| cells)
+                    .filter(|c| c.is_local),
+                rule,
+                bucket,
+            );
+            origin_total += oracle;
+            for (id, cells) in &cells {
+                assert_eq!(
+                    bucket_count(cells.iter(), rule, bucket),
+                    oracle,
+                    "node {id} bucket {bucket}"
+                );
+            }
+        }
+        assert_eq!(origin_total, 7, "the origins' own cells hold every hit");
+        assert_bytes_by_tier_and_sender(&all, &snap);
+        state
+    });
+}
+
+/// With no zone configured the nodes send to every peer directly, as one zone
+/// would, while each packet's tier still follows placement.
+#[test]
+fn unset_zone_mode_runs_as_one_zone() {
+    let config = SimConfig {
+        zone_mode: ZoneMode::Unset,
+        ..zoned(12, 3)
+    };
+    with_state(config, |mut state| async move {
+        let mut all = warm(&mut state).await;
+        for node in 0..12 {
+            all.extend(send(&mut state, node, 1).await.events);
+        }
+        let events = state.step(T, StepUntil::Time).await.events;
+        all.extend(events.iter().cloned());
+        for node in 0..12 {
+            let own = sent(&events, node, PacketKind::Own);
+            let dsts: BTreeSet<u32> = own.iter().map(|p| p.0).collect();
+            assert_eq!(
+                (own.len(), dsts.len()),
+                (11, 11),
+                "node {node} sends every peer"
+            );
+            let cross = own.iter().filter(|p| p.1 == Tier::CrossZone).count();
+            assert_eq!(cross, 8, "node {node}: eight peers are in other zones");
+        }
+        let snap = state.snapshot(None, WATCH).await;
+        for node in 0..12 {
+            assert!(
+                peers_of(&state, node)
+                    .await
+                    .iter()
+                    .all(|p| p.zone.is_none()),
+                "node {node}, told no zone, reports none"
+            );
+        }
+        assert_bytes_by_tier_and_sender(&all, &snap);
+        state
+    });
+}
+
+/// A quiet cluster fetches no snapshot for gateway events; a gateway going
+/// silent moves a role count, and only then is one fetched.
+#[test]
+fn gateway_events_fetch_snapshots_only_on_role_change() {
+    with_state(zoned(12, 3), |mut state| async move {
+        warm(&mut state).await;
+        state.gateway_fetches = 0;
+        let substeps = state.substeps;
+        for _ in 0..10 {
+            send(&mut state, 0, 1).await;
+            state.step(T, StepUntil::Time).await;
+        }
+        assert_eq!(
+            state.gateway_fetches, 0,
+            "no role moved in a healthy cluster"
+        );
+        let quiet_substeps = state.substeps - substeps;
+
+        let g = gateway_of(&state, 0, 1).await;
+        silence(&mut state, g).await;
+        send(&mut state, 0, 1).await;
+        let t_s = state.virtual_ms;
+        let mut events = Vec::new();
+        while failover(&events, 0, 1, g).is_none() {
+            assert!(
+                state.virtual_ms <= t_s + T_U + 5 * T,
+                "no failover reported"
+            );
+            events.extend(state.step(T, StepUntil::Time).await.events);
+        }
+        assert!(state.gateway_fetches >= 1);
+        eprintln!(
+            "{} snapshot fetches; {quiet_substeps} sub-steps over the ten quiet heartbeats, {} in \
+             all",
+            state.gateway_fetches, state.substeps
+        );
+        state
+    });
+}
+
+/// Joiners go to the zone they ask for, or the smallest; an unknown zone is
+/// refused without spending an id.
+#[test]
+fn joiner_goes_to_the_zone_it_asks_or_the_smallest() {
+    with_state(zoned(5, 3), |mut state| async move {
+        let live = |snap: &ClusterState| snap.zones.iter().map(|z| z.live).collect::<Vec<_>>();
+        let snap = state.snapshot(None, WATCH).await;
+        assert_eq!(live(&snap), [2, 2, 1], "placement is node i mod 3");
+        let names: Vec<_> = snap.zones.iter().map(|z| z.name).collect();
+        assert_eq!(names, ["zone-a", "zone-b", "zone-c"]);
+
+        // The last ask is for the largest zone, so only honouring it lands
+        // there.
+        for (ask, lands) in [(None, 2), (None, 0), (Some(0), 0)] {
+            state.add_node(ask).await.expect("the node joins");
+            let snap = state.snapshot(None, WATCH).await;
+            let joiner = snap.nodes.last().expect("a joiner");
+            assert_eq!(joiner.zone, lands, "asked for {ask:?}");
+        }
+        let refused = state.add_node(Some(3)).await;
+        assert!(
+            matches!(refused, Err(EngineError::UnknownZone { zone: 3, zones: 3 })),
+            "{:?}",
+            refused.err()
+        );
+        let refused = state.add_node(Some(256)).await;
+        assert!(
+            matches!(
+                refused,
+                Err(EngineError::UnknownZone {
+                    zone: 256,
+                    zones: 3
+                })
+            ),
+            "{:?}",
+            refused.err()
+        );
+        state.add_node(None).await.expect("the node joins");
+        let snap = state.snapshot(None, WATCH).await;
+        assert_eq!(
+            snap.nodes.last().map(|n| n.id),
+            Some(8),
+            "the refusal spent no id"
+        );
+        state
+    });
+}
+
+/// The `(origin, from, to)` of every `GatewayChanged` into `zone`.
+fn gateway_moves(events: &[Event], zone: u8) -> Vec<(u32, Option<u32>, Option<u32>)> {
+    events
+        .iter()
+        .filter_map(|e| match e.kind {
+            EventKind::GatewayChanged {
+                origin,
+                zone: z,
+                from,
+                to,
+            } if z == zone => Some((origin, from, to)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A zone's last member leaving moves no role, yet every origin hears its
+/// gateway into that zone go, once, at the removal: a later role change
+/// diffs those origins again and reports nothing more for that zone.
+#[test]
+fn last_member_leaving_a_zone_reports_its_gateway_gone() {
+    with_state(zoned(5, 3), |mut state| async move {
+        warm(&mut state).await;
+        // Node i sits in zone i mod 3, so node 2 is zone c's only member.
+        for origin in [0, 1, 3, 4] {
+            assert_eq!(gateway_of(&state, origin, 2).await, 2, "origin {origin}");
+        }
+        let removal = state.remove_node(2).await.unwrap().events;
+        assert_eq!(
+            gateway_moves(&removal, 2),
+            [0, 1, 3, 4].map(|o| (o, Some(2), None)),
+            "one report per origin"
+        );
+
+        // Silencing origin 0's gateway into zone b fails it over, which moves
+        // its roles and diffs it again.
+        let g = gateway_of(&state, 0, 1).await;
+        silence(&mut state, g).await;
+        send(&mut state, 0, 1).await;
+        let later = state
+            .step(T_U + 3 * T + 2 * F_R + T, StepUntil::Time)
+            .await
+            .events;
+        assert!(failover(&later, 0, 1, g).is_some(), "origin 0 fails over");
+        assert_eq!(
+            gateway_moves(&later, 2),
+            [],
+            "reported once, not again at the next role change"
+        );
+        state
+    });
+}
+
+/// A quiet cluster costs one sub-step per distinct heartbeat phase: once the
+/// acks and join sweeps a count set off are done, no prompt ticker stays
+/// armed. Ids 0 to 11 have twelve distinct phases at `T` = 100 (0, 61, 23,
+/// 85, 47, 9, 70, 32, 94, 56, 18 and 79 ms), so each period takes twelve.
+#[test]
+fn quiet_cluster_takes_one_substep_per_phase() {
+    with_state(test_config(12), |mut state| async move {
+        send(&mut state, 0, 1).await;
+        state.step(500, StepUntil::Time).await;
+        assert!(
+            state.substeps > 5,
+            "the count armed prompt rounds: {}",
+            state.substeps
+        );
+        // One period per step: a ticker left armed adds a sub-step per floor
+        // and fails the count before its full inbox can block `step`.
+        state.substeps = 0;
+        for periods in 1..=10 {
+            state.step(100, StepUntil::Time).await;
+            assert_eq!(state.substeps, 12 * periods);
+        }
+        state
+    });
+}
+
+/// A full period at `MAX_NODES`, every node sending every peer its own frame
+/// (34 cells, two packets at 33 a packet) while first contact adds each
+/// peer's greeting and sweep request, fits every node's inbound queue: no
+/// packet is dropped, and every node sent every peer both packets.
+#[test]
+fn full_round_at_max_nodes_drops_nothing_under_pass() {
+    let config = SimConfig {
+        rule_limit: 1_000_000_000_000,
+        ..test_config(MAX_NODES)
+    };
+    with_state(config, |mut state| async move {
+        let started = std::time::Instant::now();
+        let ids: Vec<u32> = state.nodes.iter().map(|n| n.id).collect();
+        for &node in &ids {
+            for key in 0..34 {
+                state
+                    .submit_request(
+                        node,
+                        KeyHash(u128::from(node) << 8 | key),
+                        hits(1),
+                        StepUntil::Time,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let batch = state.step(T, StepUntil::Time).await;
+        let mut own: BTreeMap<(u32, u32), usize> = BTreeMap::new();
+        let mut dropped = 0;
+        for event in &batch.events {
+            match event.kind {
+                EventKind::PacketSent {
+                    src,
+                    dst,
+                    kind: PacketKind::Own,
+                    ..
+                } => *own.entry((src, dst)).or_default() += 1,
+                EventKind::PacketDropped { .. } => dropped += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(dropped, 0, "an inbound queue overflowed");
+        assert_eq!(own.len(), MAX_NODES * (MAX_NODES - 1), "every ordered pair");
+        assert!(
+            own.values().all(|&packets| packets >= 2),
+            "every node sent every peer its whole frame"
+        );
+        eprintln!(
+            "a full period at {MAX_NODES} nodes took {:?} of wall time",
+            started.elapsed()
+        );
+        state
     });
 }
 
@@ -626,7 +1764,6 @@ fn one_step_propagates_a_new_count_to_at_most_fanout_peers() {
 #[test]
 fn events_serialize_with_hex_identifiers() {
     let event = crate::event::Event {
-        tick: 3,
         virtual_ms: 300,
         kind: EventKind::CellCreated {
             node: 1,
@@ -640,83 +1777,73 @@ fn events_serialize_with_hex_identifiers() {
     assert_eq!(json["kind"]["type"], "CellCreated");
     assert_eq!(json["kind"]["rule"], "000000000000c0fedeadbeefbabef00d");
     assert_eq!(json["kind"]["key"], "00000000000000000000000000000001");
-    // Round-trips back to the same u128.
-    let back: crate::event::Event = serde_json::from_value(json).unwrap();
-    assert_eq!(back, event);
+
+    let decided = crate::event::Event {
+        virtual_ms: 300,
+        kind: EventKind::Decided {
+            node: 2,
+            hits: hits(150),
+            admission: Admission::Rejected {
+                total: 0,
+                reopens: Reopens::Never,
+            },
+        },
+    };
+    let json = serde_json::to_value(&decided).unwrap();
+    assert_eq!(json["kind"]["type"], "Decided");
+    assert_eq!(json["kind"]["admission"]["kind"], "Rejected");
+    assert_eq!(json["kind"]["admission"]["reopens"]["kind"], "Never");
 }
 
-/// The derived per-node sizing (`SimConfig::cell_store_config`) is anchored on
+/// The derived per-node sizing (`SimConfig::settings`) is anchored on
 /// the `MAX_NODES` *growth ceiling*, not the initial cluster size — so every
 /// node, however small the cluster starts, holds the full cross-node replica
 /// working set it could ever grow into (the `CellStore` never resizes, and
 /// `add_node` grows the live set with no rebuild). It must cover that ceiling
-/// without overflow while staying far below the production floors it replaces.
-/// This is a pure check of the sizing math; the runtime path is exercised by
+/// without overflow while staying far below the production defaults, and the
+/// ceiling-sized settings must validate. The runtime path is exercised by
 /// [`moderate_cluster_runtime_honors_the_shrunk_sizing`] and the growth path by
-/// [`grown_cluster_holds_every_origin_without_overflow`]. (A `MAX_NODES`
-/// *functional* run is intentionally not attempted — 256 nodes gossiping at
-/// once saturates the deterministic `SimRouter`'s inbound queues and trips a
-/// debug-only wire backpressure assert unrelated to cell-store sizing.)
+/// [`grown_cluster_holds_every_origin_without_overflow`].
 #[test]
-fn cell_store_config_is_ceiling_sized_and_holds_the_working_set() {
-    // The viz-default window: a 10 s / 1 s rule has 10 live buckets.
-    const LIVE_BUCKETS: u32 = 10;
+fn settings_are_ceiling_sized_and_hold_the_working_set() {
+    let defaults = SimConfig::default();
+    let live_buckets = (defaults.rule_window_ms / defaults.rule_bucket_ms) as usize;
 
     // Ceiling-anchored: a 12-node cluster and a `MAX_NODES` cluster get
-    // byte-for- byte identical caps. This is the property that makes live
+    // byte-for-byte identical caps. This is the property that makes live
     // growth safe — size is a function of the ceiling and the rule, never
     // of `config.nodes`.
-    let small = SimConfig::default().cell_store_config(LIVE_BUCKETS);
-    let full = SimConfig {
+    let small = SimConfig::default().settings().expect("default settings");
+    let ceiling = SimConfig {
         nodes: MAX_NODES,
         ..SimConfig::default()
-    }
-    .cell_store_config(LIVE_BUCKETS);
-    assert_eq!(small.cell_capacity, full.cell_capacity);
-    assert_eq!(
-        small.forwarded_dirty_capacity,
-        full.forwarded_dirty_capacity
-    );
-    assert_eq!(
-        small.node_dictionary_capacity,
-        full.node_dictionary_capacity
-    );
+    };
+    let full = ceiling.settings().expect("full settings");
+    let node_dictionary_capacity = ceiling
+        .validate()
+        .expect("ceiling-sized config validates")
+        .storage
+        .node_dictionary_capacity();
+    assert_eq!(small.max_cells, full.max_cells);
     assert_eq!(small.peer_capacity, full.peer_capacity);
 
-    let caps = full;
     // Each origin holds its live buckets plus the one emerging, and every node
     // holds a replica of every origin's set — so the cell store must cover
     // `MAX_NODES × (live_buckets + 1)`.
     assert!(
-        caps.cell_capacity as usize >= MAX_NODES * (LIVE_BUCKETS as usize + 1),
-        "cell_capacity {} under the cross-node working set",
-        caps.cell_capacity,
+        full.max_cells.get() as usize >= MAX_NODES * (live_buckets + 1),
+        "max_cells {} under the cross-node working set",
+        full.max_cells,
     );
-    // The forwarded-dirty ring carries replicas of every *other* origin's live
-    // buckets — the cap the design analysis pins.
+    // The node dictionary must intern every origin.
     assert!(
-        caps.forwarded_dirty_capacity >= (MAX_NODES - 1) * LIVE_BUCKETS as usize,
-        "forwarded_dirty_capacity {} under the replica working set",
-        caps.forwarded_dirty_capacity,
+        usize::from(node_dictionary_capacity.get()) >= MAX_NODES,
+        "node_dictionary_capacity {node_dictionary_capacity} cannot hold {MAX_NODES} origins",
     );
-    // The node dictionary must intern every origin (this is the tightest cap —
-    // the slack is only a couple of slots) without truncating to a u16 below
-    // it.
-    assert!(
-        usize::from(caps.node_dictionary_capacity) >= MAX_NODES,
-        "node_dictionary_capacity {} cannot hold {MAX_NODES} origins",
-        caps.node_dictionary_capacity,
-    );
-    assert!(usize::from(caps.peer_capacity) >= MAX_NODES);
 
-    // …and the shrink is real: even at the ceiling every cap is a few thousand
-    // entries, well under the production floors (`gabion::defaults::STORAGE_*`)
-    // it replaces — `STORAGE_FORWARDED_DIRTY_CAPACITY` alone is 524 288.
-    assert!(
-        caps.forwarded_dirty_capacity < gabion::defaults::STORAGE_FORWARDED_DIRTY_CAPACITY / 50
-    );
-    assert!((caps.cell_capacity as usize) < gabion::defaults::STORAGE_MAX_CELLS / 20);
-    assert!(caps.local_dirty_capacity < gabion::defaults::STORAGE_LOCAL_DIRTY_CAPACITY / 1_000);
+    // …and the shrink is real: even at the ceiling the store is a few
+    // thousand cells, well under the production default.
+    assert!((full.max_cells.get() as usize) < gabion::defaults::STORAGE_MAX_CELLS / 20);
 }
 
 /// The live runtime honors the shrunk, derived sizing: a cluster the size of
@@ -732,7 +1859,7 @@ fn moderate_cluster_runtime_honors_the_shrunk_sizing() {
         rule_bucket_ms: 1_000,
         ..test_config(NODES)
     };
-    let caps = config.cell_store_config(10);
+    let caps = config.settings().expect("settings");
 
     with_engine(config, |tx| async move {
         // Eight origins across two buckets: enough cross-node replication to
@@ -766,18 +1893,18 @@ fn moderate_cluster_runtime_honors_the_shrunk_sizing() {
             assert_eq!(s.node_dictionary_full_rejects, 0, "node {}", node.id);
             // The runtime was built with the derived (small) capacity, not a
             // production floor — proof the shrink is in effect end-to-end.
-            assert_eq!(s.cell_capacity, caps.cell_capacity);
+            assert_eq!(s.cell_capacity, caps.max_cells.get());
         }
         // The 40 hits (8 origins × 5) propagate to every node within the
         // window.
         assert_eq!(state.oracle_total, 40);
         assert!(
-            state.nodes.iter().all(|n| n.aggregate_total == 40),
+            state.nodes.iter().all(|n| n.window_total == 40),
             "every node converges on 40: {:?}",
             state
                 .nodes
                 .iter()
-                .map(|n| (n.id, n.aggregate_total))
+                .map(|n| (n.id, n.window_total))
                 .collect::<Vec<_>>(),
         );
     });
@@ -857,12 +1984,12 @@ fn second_burst_after_expiry_still_ages_out() {
         }
         let after_first = snapshot(&tx).await;
         assert!(
-            after_first.nodes.iter().all(|n| n.aggregate_total == 0),
+            after_first.nodes.iter().all(|n| n.window_total == 0),
             "first burst must age out everywhere: {:?}",
             after_first
                 .nodes
                 .iter()
-                .map(|n| n.aggregate_total)
+                .map(|n| n.window_total)
                 .collect::<Vec<_>>(),
         );
 
@@ -873,7 +2000,7 @@ fn second_burst_after_expiry_still_ages_out() {
             after_second_submit
                 .nodes
                 .iter()
-                .any(|n| n.aggregate_total == 25),
+                .any(|n| n.window_total == 25),
             "second burst must register on its origin"
         );
 
@@ -883,13 +2010,128 @@ fn second_burst_after_expiry_still_ages_out() {
         }
         let aged = snapshot(&tx).await;
         assert!(
-            aged.nodes.iter().all(|n| n.aggregate_total == 0),
+            aged.nodes.iter().all(|n| n.window_total == 0),
             "second burst must age out in the 10 s window like the first — a non-zero total here \
              means it was stored under the default 60 s descriptor: {:?}",
             aged.nodes
                 .iter()
-                .map(|n| n.aggregate_total)
+                .map(|n| n.window_total)
                 .collect::<Vec<_>>(),
         );
+    });
+}
+
+/// A departed gateway whose zone still has members is reported gone too,
+/// though no row left in that zone can replace it: node 0 has never heard
+/// node 3, so node 1 was its only gateway into zone b. Only the origins that
+/// used node 1 report it.
+#[test]
+fn a_departed_gateway_is_reported_gone_while_its_zone_lives_on() {
+    with_state(zoned(4, 2), |mut state| async move {
+        block_both(&mut state, 0, 3).await;
+        warm(&mut state).await;
+        assert_eq!(gateway_of(&state, 0, 1).await, 1);
+        let mut users = Vec::new();
+        for origin in [0, 2] {
+            if gateway_of(&state, origin, 1).await == 1 {
+                users.push((origin, Some(1), None));
+            }
+        }
+        let removal = state.remove_node(1).await.unwrap().events;
+        assert_eq!(gateway_moves(&removal, 1), users);
+        assert!(
+            gateway_moves(&removal, 0).is_empty(),
+            "no gateway into zone a moved"
+        );
+        state
+    });
+}
+
+/// The snapshot carries the inspected node's rows alone, read from that
+/// node's runtime, and none when no live node is inspected.
+#[test]
+fn snapshot_carries_only_the_inspected_nodes_rows() {
+    with_state(zoned(6, 3), |mut state| async move {
+        send(&mut state, 4, 3).await;
+        warm(&mut state).await;
+        let snap = state.snapshot(Some(4), WATCH).await;
+        let rows = snap.inspected.expect("node 4 is live");
+        assert_eq!(rows.id, 4);
+        let peers: BTreeSet<_> = rows.peers.iter().filter_map(|p| p.id).collect();
+        assert_eq!(peers, BTreeSet::from([0, 1, 2, 3, 5]), "node 4's peers");
+        assert!(
+            rows.cells.iter().any(|c| c.is_local && c.count == 3),
+            "node 4's own cell"
+        );
+        let replica = cells_of(&state, 0).await;
+        assert!(
+            !replica.is_empty() && replica.iter().all(|c| !c.is_local && c.origin == Some(4)),
+            "node 0 holds node 4's cell as a replica: {replica:?}"
+        );
+        assert!(state.snapshot(None, WATCH).await.inspected.is_none());
+        state.remove_node(4).await.unwrap();
+        assert!(
+            state.snapshot(Some(4), WATCH).await.inspected.is_none(),
+            "a departed node has no rows"
+        );
+        state
+    });
+}
+
+/// A join past `MAX_NODES` live nodes, or past the last id with a port, is
+/// refused before it spends an id.
+#[test]
+fn a_join_past_the_node_or_id_ceiling_is_refused() {
+    with_state(test_config(MAX_NODES), |mut state| async move {
+        let refused = state.add_node(None).await;
+        assert!(
+            matches!(refused, Err(EngineError::ClusterFull)),
+            "{:?}",
+            refused.err()
+        );
+        assert_eq!(state.next_id, MAX_NODES as u32, "the refusal spent no id");
+        state.remove_node(0).await.unwrap();
+        state.next_id = super::MAX_ID + 1;
+        let refused = state.add_node(None).await;
+        assert!(
+            matches!(refused, Err(EngineError::IdsExhausted)),
+            "{:?}",
+            refused.err()
+        );
+        state.next_id = super::MAX_ID;
+        state.add_node(None).await.expect("the last id joins");
+        state
+    });
+}
+
+/// A join its settings refuse (here, more bootstrap peers than
+/// `gossip.peer_capacity` holds) leaves no trace: no id spent, no member added.
+#[test]
+fn a_join_its_settings_refuse_spends_no_id() {
+    with_state(test_config(3), |mut state| async move {
+        let capacity = state.settings.peer_capacity;
+        state.settings.peer_capacity = NonZeroU16::new(2).unwrap();
+        let refused = state.add_node(None).await;
+        assert!(
+            matches!(
+                refused,
+                Err(EngineError::Setting(SettingError::TooManyBootstrapPeers {
+                    listed: 3,
+                    ..
+                }))
+            ),
+            "{:?}",
+            refused.err()
+        );
+        assert_eq!(state.next_id, 3, "the refusal spent no id");
+        assert_eq!(state.nodes.len(), 3, "the refusal added no member");
+        state.settings.peer_capacity = capacity;
+        state.add_node(None).await.expect("the join succeeds");
+        assert_eq!(
+            state.nodes.last().map(|n| n.id),
+            Some(3),
+            "the joiner takes id 3"
+        );
+        state
     });
 }

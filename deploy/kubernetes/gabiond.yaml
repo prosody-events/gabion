@@ -1,0 +1,113 @@
+# gabiond, Envoy's rate-limit service, as a Deployment of three replicas that
+# share counts through gossip. Apply it with gabion-discovery-rbac.yaml (the
+# ServiceAccount and Role discovery needs) and gabion-networkpolicy.yaml.
+# Every object lives in `default`; change every `namespace:` together, in the
+# RBAC file too. deploy/kubernetes/README.md says what to edit.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gabiond
+  namespace: default
+  labels:
+    app: gabiond
+    app.kubernetes.io/part-of: gabion
+data:
+  config.yaml: |
+    # Every key is in crates/server/README.md, "Configuration reference".
+    envoy_bind: 0.0.0.0:8081
+    # /readyz for the readiness probe, /snapshot to inspect a node.
+    admin_bind: 0.0.0.0:9090
+    gossip:
+      bind: 0.0.0.0:9000
+      # Any non-zero id, shared by every node of one cluster: a label, not a
+      # secret. gabion-nginx.yaml uses the same one, so the two applied
+      # together form one mixed cluster.
+      cluster_id_hash: 0x6761626e
+    limits:
+      - name: per_ip
+        domain: envoy
+        descriptors:
+          - key: remote_address
+        rate: 100r/s
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gabiond
+  namespace: default
+  labels:
+    app: gabiond
+    app.kubernetes.io/part-of: gabion
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: gabiond
+  # Every pod of a cluster runs one release: two releases may not share
+  # counts, so roll a new one through quickly (crates/gabion/README.md,
+  # "Upgrading").
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 100%
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: gabiond
+        app.kubernetes.io/part-of: gabion
+    spec:
+      serviceAccountName: gabion
+      containers:
+        - name: gabiond
+          # Pin a release tag (for example :0.4) rather than :latest.
+          image: ghcr.io/prosody-events/gabion/gabiond:latest
+          args: ["/etc/gabion/config.yaml"]
+          ports:
+            - name: envoy
+              containerPort: 8081
+              protocol: TCP
+            - name: admin
+              containerPort: 9090
+              protocol: TCP
+            - name: gabion
+              containerPort: 9000
+              protocol: UDP
+          # /readyz answers while the process runs; gabiond exits when gossip
+          # or a listener fails, so the restart is what a failure looks like.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/gabion
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: gabiond
+---
+# Envoy reaches gabiond on `envoy`; discovery finds the peers through the UDP
+# port named `gabion`, which must keep that name and protocol.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gabiond
+  namespace: default
+  labels:
+    app: gabiond
+    app.kubernetes.io/part-of: gabion
+spec:
+  selector:
+    app: gabiond
+  ports:
+    - name: envoy
+      port: 8081
+      targetPort: envoy
+      protocol: TCP
+    - name: gabion
+      port: 9000
+      targetPort: gabion
+      protocol: UDP

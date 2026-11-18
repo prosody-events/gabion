@@ -1,0 +1,291 @@
+use super::*;
+
+#[test]
+fn identical_inputs_give_bit_identical_results() {
+    let regime = fixtures::tiny();
+    let first = serde_json::to_string(&run(&regime, 11).expect("first run")).expect("json");
+    let second = serde_json::to_string(&run(&regime, 11).expect("second run")).expect("json");
+    assert_eq!(first, second);
+    let other = serde_json::to_string(&run(&regime, 12).expect("other seed")).expect("json");
+    assert_ne!(first, other);
+}
+
+#[test]
+fn tiny_cluster_run_is_healthy_and_internally_consistent() {
+    let regime = fixtures::tiny();
+    let result = run(&regime, 3).expect("run");
+    assert!(result.valid, "{:?}", result.invalid_reasons);
+    assert_eq!(result.sizing.total_nodes, 7);
+    assert_eq!(result.churn.joiners.len(), 2);
+
+    let traffic = result.traffic.run;
+    assert_eq!(
+        traffic.offered,
+        traffic.admitted + traffic.rejected + traffic.unrouted
+    );
+    assert!(traffic.rejected > 0, "the hot key must hit its limit");
+    // A node's view never exceeds truth, so no reject can be false.
+    assert_eq!(traffic.false_rejects, 0);
+    assert!(result.staleness.limited.min.is_some_and(|m| m >= 0.0));
+    assert!(result.staleness.sampled.min.is_some_and(|m| m >= 0.0));
+    assert!(result.convergence.converged > 0);
+    assert_eq!(result.staleness.limited.over_max, Some(0.0));
+    assert_eq!(result.staleness.sampled.over_time_fraction, Some(0.0));
+    assert_eq!(result.health.snapshot_failures, 0);
+    assert_eq!(result.health.nodes_never_snapshotted, 0);
+    assert!(result.flags.is_empty(), "{:?}", result.flags);
+    let kinds: Vec<node::KeyKind> = result.accuracy.iter().map(|a| a.kind).collect();
+    assert_eq!(kinds, [node::KeyKind::Hot, node::KeyKind::Burst]);
+
+    let net = result.network.run;
+    assert!(net.packets_sent > 0);
+    let dropped = net.dropped_loss_packets
+        + net.dropped_partition_packets
+        + net.dropped_rcvbuf_packets
+        + net.dropped_no_receiver_packets;
+    // Every datagram is delivered or dropped exactly once, except the few
+    // still in flight at the end.
+    assert!(net.packets_delivered + dropped <= net.packets_sent);
+    assert!(net.packets_sent - net.packets_delivered - dropped < 100);
+    let loss = net.dropped_loss_packets as f64 / net.packets_sent as f64;
+    assert!((0.02..0.08).contains(&loss), "loss {loss}");
+}
+
+#[test]
+fn offered_load_does_not_depend_on_the_network() {
+    let lossless = {
+        let mut regime = fixtures::tiny();
+        regime.network.loss = 0.0;
+        run(&regime, 5).expect("lossless")
+    };
+    let lossy = {
+        let mut regime = fixtures::tiny();
+        regime.network.loss = 0.3;
+        run(&regime, 5).expect("lossy")
+    };
+    assert_eq!(lossless.traffic.run.offered, lossy.traffic.run.offered);
+    assert_eq!(
+        lossless.traffic.measure.offered,
+        lossy.traffic.measure.offered
+    );
+    let per_key =
+        |r: &StudyResult| -> Vec<u64> { r.accuracy.iter().map(|a| a.measure.offered).collect() };
+    assert_eq!(per_key(&lossless), per_key(&lossy));
+    assert_ne!(
+        lossless.network.run.packets_sent,
+        lossy.network.run.packets_sent
+    );
+}
+
+#[test]
+fn every_regime_file_parses() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("regimes");
+    let mut count = 0;
+    for entry in std::fs::read_dir(&dir).expect("regimes directory") {
+        let path = entry.expect("entry").path();
+        let regime = Regime::load(&path).expect("regime loads");
+        assert_eq!(
+            path.file_stem().and_then(|s| s.to_str()),
+            Some(&*regime.id),
+            "file name matches id"
+        );
+        count += 1;
+    }
+    assert_eq!(count, 13);
+}
+
+/// `Regime::validate` refuses each value a regime author can get wrong.
+#[test]
+fn validate_refuses_each_invalid_field() {
+    fn cut(at_s: u64, heal_s: u64, az: u8) -> regime::Partition {
+        regime::Partition { at_s, heal_s, az }
+    }
+    let cases: [fn(&mut Regime); 11] = [
+        |r| r.nodes = 0,
+        |r| r.warmup_s = r.duration_s,
+        |r| r.rule.bucket_ms = 0,
+        |r| r.rule.window_ms = r.rule.bucket_ms - 1,
+        |r| r.rule.limit = 0,
+        |r| r.traffic.site_jitter = 1.0,
+        |r| r.traffic.site_period_ms = 0,
+        |r| r.network.loss = 1.5,
+        |r| r.churn.partitions = vec![cut(20, 20, 0)],
+        |r| r.churn.partitions = vec![cut(10, 20, 0); 2],
+        |r| r.churn.partitions = vec![cut(10, 20, plan::AVAILABILITY_ZONES)],
+    ];
+    for (i, mutate) in cases.iter().enumerate() {
+        let mut regime = fixtures::tiny();
+        mutate(&mut regime);
+        assert!(regime.validate().is_err(), "case {i} was accepted");
+    }
+}
+
+/// Rollout replacements must not share a tick phase: with starts on exact
+/// multiples of a 500 ms interval, every joiner of a 500 ms-tick solution
+/// would burst at the same instant.
+#[test]
+fn rollout_joiners_start_out_of_phase() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("regimes");
+    let regime = Regime::load(&dir.join("churn-rollout.json")).expect("regime loads");
+    let plan = plan::Plan::build(&regime, 1);
+    let phases: std::collections::BTreeSet<u64> = plan
+        .nodes
+        .iter()
+        .filter(|n| !n.initial)
+        .map(|n| n.start_ns % (500 * plan::NS_PER_MS))
+        .collect();
+    assert_eq!(
+        phases.len(),
+        regime.churn.rollouts[0].count as usize,
+        "every joiner has its own tick phase"
+    );
+}
+
+/// Replaying the plan's discovery leaves every surviving pod listing exactly
+/// the other survivors: each departure is announced as a removal.
+#[test]
+fn discovery_ends_listing_exactly_the_surviving_pods() {
+    let plan = plan::Plan::build(&fixtures::tiny(), 3);
+    let mut views = vec![std::collections::BTreeSet::new(); plan.nodes.len()];
+    for &(_, event) in &plan.events {
+        if let plan::PlanEvent::Discover { to, about, added } = event {
+            if added {
+                views[to].insert(about);
+            } else {
+                views[to].remove(&about);
+            }
+        }
+    }
+    let survivors = (0..plan.nodes.len()).filter(|&i| plan.nodes[i].stop.is_none());
+    for i in survivors.clone() {
+        let others: std::collections::BTreeSet<usize> =
+            survivors.clone().filter(|&j| j != i).collect();
+        assert_eq!(views[i], others, "pod {i}");
+    }
+}
+
+/// A tiny regime on cell stores far smaller than its keys need: every node
+/// rejects cells, so the run is invalid.
+fn starved_run() -> StudyResult {
+    let regime = fixtures::tiny();
+    let seed = 3;
+    let plan = plan::Plan::build(&regime, seed);
+    let keys = Rc::new(node::KeySpace::build(&regime, seed));
+    let mut sizing = node::Sizing::new(&regime, &plan, &keys);
+    sizing.cell_capacity = 64;
+    let world = Rc::new(driver::world_for(&regime, seed, &plan));
+    let launcher = adapter::Launcher::new(&regime, &sizing, &world, &keys, seed).expect("launcher");
+    driver::Driver::new(&regime, seed, plan, sizing, keys, world, move |idx| {
+        launcher.launch(idx)
+    })
+    .run()
+    .expect("run")
+}
+
+/// Library warnings are captured during the run and attributed to the
+/// nodes that logged them.
+#[test]
+fn library_warnings_are_tallied_per_node() {
+    let result = starved_run();
+    let warnings = &result.health.gabion_warnings;
+    assert_eq!(warnings.unparsed_lines, 0);
+    let kinds = &warnings.kinds;
+    assert!(!kinds.is_empty(), "no warning captured");
+    for kind in kinds {
+        assert!(kind.target.starts_with("gabion"), "{kind:?}");
+        assert!(kind.nodes > 0, "{kind:?}");
+        assert!(kind.max_total.is_some(), "{kind:?}");
+    }
+}
+
+/// `make sim-smoke` fails on a run that broke a health invariant.
+#[test]
+fn sim_smoke_fails_on_an_invalid_run() {
+    let result = starved_run();
+    assert!(!result.valid);
+    assert!(result.require_valid().is_err());
+    assert!(
+        run(&fixtures::tiny(), 3)
+            .expect("run")
+            .require_valid()
+            .is_ok()
+    );
+}
+
+/// A run with a partition reports the cut's phases; the cut shows up as
+/// cross-side hits that never converge and a repair that is owed.
+#[test]
+fn partition_run_reports_phases_and_heals() {
+    let regime = fixtures::partitioned();
+    let result = run(&regime, 4).expect("run");
+    assert!(result.valid, "{:?}", result.invalid_reasons);
+    let report = result.partition.expect("partition report");
+    assert_eq!((report.zone_az, report.at_s, report.heal_s), (0, 14, 30));
+    let never = |p: &report::PhaseReport| p.convergence.cross_side.never_fraction;
+    assert!(
+        never(&report.during) > Some(0.25),
+        "{:?}",
+        never(&report.during)
+    );
+    assert!(
+        never(&report.before) < Some(0.1),
+        "{:?}",
+        never(&report.before)
+    );
+    assert!(
+        never(&report.after) < Some(0.1),
+        "{:?}",
+        never(&report.after)
+    );
+    let during = &report.during.staleness;
+    assert!(during.in_zone.limited.mean > report.before.staleness.in_zone.limited.mean);
+    assert!(report.deficit_at_heal_hits > Some(0.0));
+    // The cut outlasts the window, but the buckets still in it at the heal
+    // are repaired before they expire, so the heal can be timed.
+    assert_eq!(report.unrepaired_at_expiry_hits, Some(0.0));
+    assert!(report.time_to_heal_ms.is_some());
+    // The three phases cover every measured hit, once per side.
+    let phases = [&report.before, &report.during, &report.after];
+    let sides: u64 = phases
+        .iter()
+        .map(|p| p.convergence.same_side.converged + p.convergence.cross_side.converged)
+        .sum();
+    assert!(sides >= 2 * result.convergence.converged);
+    assert!(run(&fixtures::tiny(), 4).expect("run").partition.is_none());
+}
+
+/// Healed well inside the window: the repair completes before any cut-era
+/// bucket expires, so nothing is lost and the heal takes a moment.
+#[test]
+fn a_cut_shorter_than_the_window_heals_fully() {
+    let mut regime = fixtures::partitioned();
+    regime.churn.partitions[0].heal_s = 20;
+    let report = run(&regime, 4).expect("run").partition.expect("partition");
+    assert!(report.deficit_at_heal_hits > Some(0.0));
+    assert_eq!(report.unrepaired_at_expiry_hits, Some(0.0));
+    let heal_ms = report.time_to_heal_ms.expect("healed before the run ended");
+    assert!((0.0..4_000.0).contains(&heal_ms), "{heal_ms}");
+}
+
+/// With every datagram lost nothing is ever repaired: the cut-era hits age
+/// out of the window, and expiry must not be scored as a heal.
+#[test]
+fn a_run_that_never_repairs_does_not_heal() {
+    let mut regime = fixtures::partitioned();
+    regime.network.loss = 1.0;
+    let result = run(&regime, 4).expect("run");
+    let report = result.partition.expect("partition report");
+    assert!(report.deficit_at_heal_hits > Some(0.0));
+    assert!(report.unrepaired_at_expiry_hits > Some(0.0));
+    assert_eq!(report.time_to_heal_ms, None);
+}
+
+#[test]
+fn a_regime_may_cut_the_network_once_and_heal_after_it_starts() {
+    let mut regime = fixtures::partitioned();
+    regime.churn.partitions.push(regime.churn.partitions[0]);
+    assert!(regime.validate().is_err());
+    regime.churn.partitions.truncate(1);
+    regime.churn.partitions[0].heal_s = 10;
+    assert!(regime.validate().is_err());
+}

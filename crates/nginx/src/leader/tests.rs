@@ -1,71 +1,17 @@
 use super::*;
 
-#[test]
-fn defaults_match_shared_production_defaults() {
-    let gossip = GossipSettings::default();
-    assert_eq!(
-        gossip.tick_interval,
-        Duration::from_millis(defaults::GOSSIP_TICK_INTERVAL_MILLIS)
-    );
-    assert_eq!(gossip.fanout, defaults::GOSSIP_FANOUT);
-    assert_eq!(gossip.max_payload_bytes, defaults::GOSSIP_MAX_PAYLOAD_BYTES);
-    assert_eq!(
-        gossip.max_cells_per_frame,
-        defaults::GOSSIP_MAX_CELLS_PER_FRAME
-    );
-    assert_eq!(
-        gossip.max_cells_per_tick,
-        defaults::GOSSIP_MAX_CELLS_PER_TICK
-    );
-    assert_eq!(
-        gossip.send_queue_capacity,
-        defaults::GOSSIP_SEND_QUEUE_CAPACITY
-    );
-    assert_eq!(gossip.cluster_id_hash, defaults::GOSSIP_CLUSTER_ID_HASH);
-    assert_eq!(gossip.target_err_bps, defaults::GOSSIP_TARGET_ERR_BPS);
-    assert_eq!(
-        gossip.min_emit_interval,
-        Duration::from_millis(defaults::GOSSIP_MIN_EMIT_INTERVAL_MS)
-    );
-
-    let cell_store = production_cell_store_config();
-    assert_eq!(cell_store.cell_capacity, defaults::STORAGE_MAX_CELLS as u32);
-    assert_eq!(
-        cell_store.rule_dictionary_capacity,
-        defaults::STORAGE_RULE_DICTIONARY_CAPACITY
-    );
-    assert_eq!(
-        cell_store.node_dictionary_capacity,
-        defaults::STORAGE_NODE_DICTIONARY_CAPACITY
-    );
-    assert_eq!(
-        cell_store.local_dirty_capacity,
-        defaults::STORAGE_LOCAL_DIRTY_CAPACITY
-    );
-    assert_eq!(
-        cell_store.forwarded_dirty_capacity,
-        defaults::STORAGE_FORWARDED_DIRTY_CAPACITY
-    );
-    assert_eq!(cell_store.peer_capacity, defaults::STORAGE_PEER_CAPACITY);
-
-    let leader = LeaderConfig::default();
-    assert_eq!(
-        leader.cell_store.cell_capacity,
-        defaults::STORAGE_MAX_CELLS as u32
-    );
-}
-
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::sync::mpsc as std_mpsc;
 use std::time::Instant;
 
-use gabion::crdt::{DeltaSink, ExpirationSink};
+use gabion::crdt::{BucketEpoch, CellIdentity, DeltaSink, ExpirationSink, KeyHash};
 use gabion::gossip::AggregateStore;
-use gabion::rules::EnforcementMode;
+use gabion::settings::Settings;
 use tokio::time::timeout;
 
-use crate::rules::{DEFAULT_DOMAIN, DescriptorBinding, RuleConfig};
-use crate::shm::Layout;
+use crate::mock::with_logs;
+use crate::rules::mock::rules;
+use crate::shm::mock::TestZone;
 use crate::shm::queue::QueueEvent;
 
 const LEASE_TICK: Duration = Duration::from_millis(10);
@@ -74,36 +20,23 @@ const DEADLINE: Duration = Duration::from_secs(5);
 /// A region over a leaked allocation, so a leader thread that outlives a
 /// failed assertion never reads freed memory.
 fn leaked_region() -> ShmRegion {
-    let layout = Layout::new(64, 64).expect("layout");
-    let words: &'static mut [u64] =
-        Box::leak(vec![0_u64; layout.total_bytes.div_ceil(8)].into_boxed_slice());
-    // SAFETY: `ShmRegion::initialize`'s preconditions hold: `words` is a
-    // fresh, writable, 8-byte-aligned allocation of at least
-    // `layout.total_bytes`, `initialize` is its first user, and the leak
-    // keeps it alive for every thread that reads the region.
-    unsafe { ShmRegion::initialize(words.as_mut_ptr().cast(), layout) }
+    let (zone, region) = TestZone::new(128, 64);
+    std::mem::forget(zone);
+    region
 }
 
-fn spawn_worker(region: ShmRegion, worker_id: u32) -> LeaderHandle {
-    let rules = CompiledRules::compile(&[RuleConfig {
-        name: "per_tenant".into(),
-        domain: DEFAULT_DOMAIN.into(),
-        bindings: vec![DescriptorBinding {
-            key: "tenant".into(),
-            source: "$http_x_tenant".into(),
-        }],
-        limit: 2,
-        window: Duration::from_secs(1),
-        bucket: Duration::from_secs(1),
-        mode: EnforcementMode::Enforce,
-        except_if: None,
-    }])
-    .expect("rules");
+fn spawn_worker(
+    region: ShmRegion,
+    worker_id: u32,
+    tune: impl FnOnce(&mut Settings),
+) -> LeaderHandle {
+    let rules = rules(&["per_tenant tenant:$http_x_tenant rate=2r/s"]);
+    let (gossip, cell_store) = crate::mock::validated(tune);
     let config = LeaderConfig {
         worker_id,
-        gossip_bind: Some("127.0.0.1:0".parse().expect("addr")),
+        gossip,
+        cell_store,
         lease_tick: LEASE_TICK,
-        ..LeaderConfig::default()
     };
     spawn(region, Arc::new(rules), config).expect("spawn leader thread")
 }
@@ -136,9 +69,9 @@ fn stop_within_deadline(handle: LeaderHandle) {
 #[cfg_attr(miri, ignore = "binds a UDP socket")]
 fn stopping_a_follower_leaves_the_leader_in_place() {
     let region = leaked_region();
-    let leader = spawn_worker(region, 1);
+    let leader = spawn_worker(region, 1, |_| {});
     wait_for_owner(region, 1);
-    let follower = spawn_worker(region, 2);
+    let follower = spawn_worker(region, 2, |_| {});
     std::thread::sleep(LEASE_TICK * 10);
 
     stop_within_deadline(follower);
@@ -150,9 +83,9 @@ fn stopping_a_follower_leaves_the_leader_in_place() {
 #[cfg_attr(miri, ignore = "binds a UDP socket")]
 fn stopping_the_leader_releases_the_lease_to_a_follower() {
     let region = leaked_region();
-    let leader = spawn_worker(region, 1);
+    let leader = spawn_worker(region, 1, |_| {});
     wait_for_owner(region, 1);
-    let follower = spawn_worker(region, 2);
+    let follower = spawn_worker(region, 2, |_| {});
     std::thread::sleep(LEASE_TICK * 10);
     assert_eq!(region.lease().snapshot().owner_worker, 1);
     let leader_incarnation = region.header().identity.load_incarnation();
@@ -168,22 +101,37 @@ fn stopping_the_leader_releases_the_lease_to_a_follower() {
     assert!(region.header().identity.load_incarnation() > leader_incarnation);
 }
 
-/// Counts the hits the gossip runtime applies, one delta row each.
+/// The cell and the hits of each delta row the gossip runtime applies.
 #[derive(Default)]
-struct AppliedHits(Cell<usize>);
+struct AppliedRows(RefCell<Vec<(CellIdentity, u32)>>);
 
-impl AggregateStore<u32> for AppliedHits {
-    fn apply(&self, deltas: &DeltaSink<u32>, _: &ExpirationSink<u32>) {
-        self.0.set(self.0.get() + deltas.len());
+impl AggregateStore for AppliedRows {
+    fn apply(&self, deltas: &DeltaSink, _: &ExpirationSink) {
+        let rows = deltas
+            .keys
+            .iter()
+            .copied()
+            .zip(deltas.deltas.iter().copied());
+        self.0.borrow_mut().extend(rows);
     }
 }
 
 #[tokio::test(start_paused = true)]
 #[cfg_attr(miri, ignore = "binds a UDP socket")]
 async fn drain_hands_each_event_to_the_runtime_once_it_has_room() {
-    const EVENTS: usize = DRAIN_BATCH + 8;
+    const EVENTS: usize = DRAIN_BATCH.get() + 8;
     let region = leaked_region();
+    // Both halves of each 128-bit field set, so the drain must carry every
+    // field through whole.
+    let cell = CellIdentity {
+        rule_fingerprint: 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210,
+        key_hash: KeyHash(0x1111_2222_3333_4444_5555_6666_7777_8888),
+        bucket: BucketEpoch(7),
+    };
     let event = QueueEvent {
+        rule_fingerprint: cell.rule_fingerprint,
+        key_hash: cell.key_hash,
+        bucket: cell.bucket,
         hits: 1,
         ..QueueEvent::default()
     };
@@ -191,22 +139,199 @@ async fn drain_hands_each_event_to_the_runtime_once_it_has_room() {
         .try_for_each(|_| region.queue().push(event))
         .expect("queue has room");
     let identity = NodeIdentity::new(gabion::crdt::NodeId(1), 1);
-    let applied = Rc::new(AppliedHits::default());
-    let (runtime, client) = GossipRuntime::bind(
-        LONE_NODE_BIND,
-        GossipSettings::default().into_runtime_config(identity, 0),
-        CellStore::new(production_cell_store_config(), identity),
+    let applied = Rc::new(AppliedRows::default());
+    let (gossip, cell_store) = crate::mock::validated(|_| {});
+    let gossip = gossip.with_shallow_limit_queue();
+    let transport = UdpTransport::bind(LONE_NODE_BIND, &gossip)
+        .await
+        .expect("bind the gossip socket");
+    let (runtime, client) = GossipRuntime::from_parts(
+        transport,
+        TokioClock::new(),
+        gossip,
+        CellStore::new(cell_store, identity, rules(&[]).table()),
         applied.clone(),
-    )
-    .await
-    .expect("bind gossip runtime");
+    );
     let drained = || region.stats().snapshot().queue_drained as usize;
     let mut drain = std::pin::pin!(drain_loop(client, region, 1));
     assert!(timeout(DEADLINE, drain.as_mut()).await.is_err());
-    assert_eq!(drained(), DRAIN_BATCH);
+    assert_eq!(drained(), DRAIN_BATCH.get());
     let both = async { tokio::join!(drain.as_mut(), runtime.run(futures::stream::empty())) };
     assert!(timeout(DEADLINE, both).await.is_err());
-    assert_eq!((applied.0.get(), drained()), (EVENTS, EVENTS));
+    let rows = applied.0.take();
+    assert_eq!((rows.len(), drained()), (EVENTS, EVENTS));
+    assert_eq!(rows.iter().find(|row| **row != (cell, 1)), None);
     // `both` dropped the runtime, closing its queue.
     assert_eq!(drain.await.to_string(), "gossip runtime shut down");
+}
+
+/// Whether `line` carries the structured field `field`, as `name=value`.
+fn has_field(line: &str, field: &str) -> bool {
+    line.split(' ').any(|token| token == field)
+}
+
+/// `logs`' lines whose `code` field is `code`.
+fn coded<'a>(logs: &'a str, code: &str) -> impl Iterator<Item = &'a str> {
+    let field = format!("code=\"{code}\"");
+    logs.lines().filter(move |line| has_field(line, &field))
+}
+
+/// The value of `field` on each of `logs`' lines whose `code` is `code`.
+fn logged_totals(logs: &str, code: &str, field: &str) -> Vec<u64> {
+    coded(logs, code)
+        .map(|line| {
+            line.split(' ')
+                .find_map(|token| token.strip_prefix(field)?.strip_prefix('=')?.parse().ok())
+                .unwrap_or_else(|| panic!("{field} missing from {line}"))
+        })
+        .collect()
+}
+
+/// Workers bump the four counters at different rates between ticks; each
+/// tick a leader thread logs a counter only when its total passed a power of
+/// two since one last logged it: a steady one at 1, 2, 4 and 8, a faster one
+/// once per tick that passes one or more, and nothing on a tick without a
+/// rise.
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "tracing-subscriber's registry is outside the unsafe boundary Miri checks here"
+)]
+fn leader_logs_shm_counters_at_powers_of_two() {
+    let (_zone, region) = TestZone::new(8, 16);
+    let (_, storage) = crate::mock::validated(|_| {});
+    let stats = region.stats();
+    let handover = LEASE_TTL + DEFAULT_LEASE_TICK;
+    let ((), logs) = with_logs(|| {
+        for _ in 0..9 {
+            stats.record_matched_rule_overflow();
+            stats.record_queue_drop(2);
+            stats
+                .workers
+                .declines_invalid_descriptor
+                .fetch_add(3, Ordering::Relaxed);
+            stats
+                .workers
+                .rejected_cardinality
+                .fetch_add(5, Ordering::Relaxed);
+            log_bypasses(region, &storage, handover);
+        }
+        log_bypasses(region, &storage, handover);
+    });
+    let totals = |code, field| logged_totals(&logs, code, field);
+    assert_eq!(
+        totals("matched_rule_overflow", "overflowed_total"),
+        [1, 2, 4, 8],
+        "{logs}"
+    );
+    assert_eq!(
+        totals("queue_dropped", "dropped_total"),
+        [2, 4, 8, 16],
+        "{logs}"
+    );
+    assert_eq!(
+        totals("invalid_descriptor_declined", "declined_total"),
+        [3, 6, 9, 18],
+        "{logs}"
+    );
+    assert_eq!(
+        totals("cardinality_rejected", "rejected_total"),
+        [5, 10, 20, 35],
+        "{logs}"
+    );
+    for (code, fields, texts) in [
+        (
+            "matched_rule_overflow",
+            &["cap=16", "config_key=\"storage.max_matched_rules\""][..],
+            &["`gabion_storage_max_matched_rules`", "64 bytes per worker"][..],
+        ),
+        (
+            "queue_dropped",
+            &["capacity=8", "config_key=\"gossip.limit_queue_capacity\""][..],
+            &[
+                "`gabion_gossip_limit_queue_capacity`",
+                "72 bytes",
+                "about 1.3s",
+            ][..],
+        ),
+        (
+            "invalid_descriptor_declined",
+            &[][..],
+            &["not valid UTF-8", "`map`"][..],
+        ),
+        (
+            "cardinality_rejected",
+            &[
+                "max=512",
+                "limit=\"bytes\"",
+                "config_key=\"storage.max_descriptor_bytes\"",
+            ][..],
+            &["`gabion_storage_max_descriptor_bytes`"][..],
+        ),
+    ] {
+        let line = coded(&logs, code)
+            .next()
+            .unwrap_or_else(|| panic!("no {code} line in {logs}"));
+        assert!(line.contains(" WARN "), "{line}");
+        for field in fields {
+            assert!(has_field(line, field), "{field} missing from {line}");
+        }
+        for text in texts {
+            assert!(line.contains(text), "{text} missing from {line}");
+        }
+    }
+}
+
+/// Count one dropped hit, then wait for a leader thread to log it.
+fn drop_one_and_wait_for_its_log(region: ShmRegion) {
+    region.stats().record_queue_drop(1);
+    let deadline = Instant::now() + DEADLINE;
+    while region
+        .stats()
+        .leader
+        .logged
+        .queue_dropped
+        .load(Ordering::Relaxed)
+        != 1
+    {
+        assert!(
+            Instant::now() < deadline,
+            "no leader thread read the bypass counters"
+        );
+        std::thread::sleep(LEASE_TICK);
+    }
+}
+
+/// The leader thread reads the bypass counters every lease tick while its
+/// term runs: a drop a worker counted moves the zone's mark within a few
+/// ticks.
+#[test]
+#[cfg_attr(miri, ignore = "binds a UDP socket")]
+fn the_leader_logs_the_bypass_counters_every_lease_tick() {
+    let region = leaked_region();
+    let leader = spawn_worker(region, 1, |_| {});
+    wait_for_owner(region, 1);
+    drop_one_and_wait_for_its_log(region);
+    stop_within_deadline(leader);
+}
+
+/// A worker whose every term fails to bind the gossip socket still reads the
+/// bypass counters: the full queue such a node fills is the drop the
+/// `queue_dropped` line diagnoses.
+#[test]
+#[cfg_attr(miri, ignore = "binds a UDP socket")]
+fn a_worker_that_cannot_bind_gossip_still_logs_the_bypass_counters() {
+    let taken = std::net::UdpSocket::bind(LONE_NODE_BIND).expect("bind a socket to take its port");
+    let bind = taken.local_addr().expect("the taken socket's address");
+    assert!(
+        std::net::UdpSocket::bind(bind).is_err(),
+        "{bind} can be bound twice, so the worker's term would start"
+    );
+    let region = leaked_region();
+    let worker = spawn_worker(region, 1, |settings| {
+        settings.gossip_bind = Some(bind);
+        settings.bootstrap_peers = [SocketAddr::from((Ipv4Addr::LOCALHOST, 1))].into();
+    });
+    drop_one_and_wait_for_its_log(region);
+    stop_within_deadline(worker);
 }

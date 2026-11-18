@@ -18,5 +18,11 @@ export default defineConfig({
   plugins: [svelte()],
   build: {
     target: 'esnext',
+    // Source maps are written beside the bundle but not referenced from it, so
+    // the page loads none; the design audit maps heap-allocation samples back
+    // to `src/lib/stage/` through them (README "Tests"). The Pages build ships
+    // the `.map` files unreferenced: the code is open source, and nothing
+    // fetches them.
+    sourcemap: 'hidden',
   },
 });

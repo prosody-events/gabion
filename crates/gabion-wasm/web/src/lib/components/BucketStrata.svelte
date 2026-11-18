@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { fmtCount, fmtDuration } from '../format';
   import type { CellView } from '../sim/types';
 
   // The sliding window made literal: one strip per active key, a conveyor belt of
@@ -31,16 +32,17 @@
     windowMs,
     bucketMs,
     limit,
+    atLimit,
   }: {
     cells: CellView[];
-    /** The bucket epoch "now" sits in (`RuleDescriptor::current_epoch`). */
+    /** The bucket epoch "now" sits in (`RuleSpec::bucket_at`). */
     currentEpoch: number;
     /** Fraction of the current bucket already elapsed, `[0, 1)` — the sub-bucket
      *  scroll offset. `(virtual_ms mod bucket_ms) / bucket_ms`, computed by the
      *  caller so this component needn't know the bucket size. */
     epochFraction: number;
-    /** `RuleDescriptor::live_buckets()` (nominal `ceil(window / bucket)`). The
-     *  window holds `liveBuckets + 1` buckets; one more emerging bucket is
+    /** `RuleSpec::live_buckets` (nominal `ceil(window / bucket)`): the window
+     *  admission counts holds these buckets; one more emerging bucket is
      *  rendered so a fresh empty bucket can scroll in under "now". */
     liveBuckets: number;
     /** The rule window in ms — labels the trailing edge of the axis ("Ns ago"). */
@@ -50,6 +52,9 @@
      *  time-to-expiry — a number that honestly ticks toward 0 each step. */
     bucketMs: number;
     limit: number;
+    /** The node's decision on one more hit is a rejection: its window holds
+     *  the limit. */
+    atLimit: boolean;
   } = $props();
 
   // The trailing edge of the visible window, in whole seconds, for the axis
@@ -65,10 +70,10 @@
   // the track sits un-translated until the real width arrives.
   let viewportWidth = $state(0);
 
-  // The window shows `liveBuckets + 1` buckets [oldest, currentEpoch]; the track
+  // The window shows `liveBuckets` buckets [oldest, currentEpoch]; the track
   // carries one more (`currentEpoch + 1`, the bucket forming just off the right
   // edge) so it has something to scroll in.
-  const visibleCols = $derived(Math.max(liveBuckets + 1, 1));
+  const visibleCols = $derived(Math.max(liveBuckets, 1));
   const colCount = $derived(visibleCols + 1);
   const colW = $derived(viewportWidth > 0 ? viewportWidth / visibleCols : 0);
   const oldest = $derived(currentEpoch - (visibleCols - 1));
@@ -94,7 +99,7 @@
   // Bin the live cells by key into the rendered epoch range [oldest, oldest +
   // colCount). Cells outside the range are dropped (not clipped to the edge), so
   // Σ — summed over the in-window buckets [oldest, currentEpoch] — equals this
-  // node's windowed aggregate for the key. The emerging `currentEpoch + 1` column
+  // node's `window_total` for the key. The emerging `currentEpoch + 1` column
   // is excluded from Σ (it is always empty in any case — no cell is dated to the
   // future).
   const strips = $derived.by((): Strip[] => {
@@ -141,14 +146,14 @@
     return (count / max) * 100;
   }
 
-  /** Seconds until `epoch` ages off the trailing edge. The engine keeps a bucket
-   *  while `bucket + liveBuckets >= currentEpoch`, so it leaves the window the
-   *  instant the continuous current (`currentEpoch + epochFraction`) reaches
-   *  `epoch + liveBuckets + 1`. Uses the raw, unclamped `epochFraction` (not the
+  /** Seconds until `epoch` ages off the trailing edge. Admission counts a
+   *  bucket while `bucket + liveBuckets > currentEpoch`, so it leaves the window
+   *  the instant the continuous current (`currentEpoch + epochFraction`) reaches
+   *  `epoch + liveBuckets`. Uses the raw, unclamped `epochFraction` (not the
    *  reduced-motion `fraction`) so the readout is an honest sub-second countdown
    *  rather than a per-bucket snap. */
   function tteSeconds(epoch: number): number {
-    const epochsLeft = epoch + liveBuckets + 1 - currentEpoch - epochFraction;
+    const epochsLeft = epoch + liveBuckets - currentEpoch - epochFraction;
     return Math.max(0, (epochsLeft * bucketMs) / 1000);
   }
 
@@ -173,8 +178,8 @@
     const aging =
       strip.oldestActiveEpoch === null
         ? ''
-        : `; oldest bucket ages out in ${tteSeconds(strip.oldestActiveEpoch).toFixed(1)} seconds`;
-    return `Sliding window, key ${shortKey(strip.key)}: total ${strip.sigma} of ${limit}; ${tally}${aging}`;
+        : `; oldest bucket ages out in ${fmtDuration(tteSeconds(strip.oldestActiveEpoch) * 1000)}`;
+    return `Sliding window, key ${shortKey(strip.key)}: total ${fmtCount(strip.sigma)} of ${fmtCount(limit)}; ${tally}${aging}`;
   }
 </script>
 
@@ -186,15 +191,15 @@
       <section class="strip" role="group" aria-label={stripSummary(strip)}>
         <div class="strip-head">
           <span class="head-left">
-            <span class="key numeric">key {shortKey(strip.key)}</span>
+            <span class="key" data-field="key">key {shortKey(strip.key)}</span>
             {#if strip.oldestActiveEpoch !== null}
-              <span class="tte numeric">ages out in {tteSeconds(strip.oldestActiveEpoch).toFixed(1)}s</span>
+              <span class="tte" data-field="tte">ages out in {fmtDuration(tteSeconds(strip.oldestActiveEpoch) * 1000)}</span>
             {/if}
           </span>
-          <span class="sigma" class:over={strip.sigma >= limit}>
-            Σ <span class="sigma-value numeric">{strip.sigma}</span>
+          <span class="sigma" class:over={atLimit}>
+            Σ <span class="sigma-value" data-field="sigma">{fmtCount(strip.sigma)}</span>
             <span class="sigma-sep">/</span>
-            <span class="numeric">{limit.toLocaleString()}</span>
+            <span data-field="limit">{fmtCount(limit)}</span>
           </span>
         </div>
         <div class="viewport" aria-hidden="true">
@@ -224,7 +229,7 @@
          buckets enter under "now" on the right and age out toward the trailing
          edge on the left. -->
     <div class="axis" aria-hidden="true">
-      <span class="numeric">{windowSeconds}s ago</span>
+      <span data-field="window-ago">{windowSeconds}s ago</span>
       <span>now</span>
     </div>
   {/if}
@@ -234,59 +239,70 @@
   .strata {
     display: flex;
     flex-direction: column;
-    gap: var(--space-3);
+    gap: var(--gap-md);
   }
 
   .no-traffic {
-    margin: var(--space-2) 0 0;
-    font-size: var(--text-sm);
-    color: var(--ink-faint);
+    margin: var(--gap-sm) 0 0;
+    font-size: var(--font-size-caption);
+    color: var(--color-fg-muted);
     font-style: italic;
   }
 
   .strip {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
+    gap: var(--gap-xs);
   }
 
+  /* The header's readouts wrap whole, onto a line of their own when the rail
+     is narrow, with a gap between them however they fall; none breaks inside. */
   .strip-head {
     display: flex;
+    flex-wrap: wrap;
     align-items: baseline;
     justify-content: space-between;
-    font-size: var(--text-sm);
+    gap: 0 var(--gap-sm);
+    font-size: var(--font-size-caption);
   }
 
   .head-left {
     display: flex;
+    flex-wrap: wrap;
     align-items: baseline;
-    gap: var(--space-2);
+    gap: 0 var(--gap-sm);
     min-width: 0;
   }
 
+  .key,
+  .tte,
+  .sigma {
+    white-space: nowrap;
+  }
+
   .key {
-    color: var(--ink-faint);
+    color: var(--color-fg-muted);
   }
 
   /* The time-to-expiry countdown for the oldest live bucket: amber (the
      "transient / on the clock" hue, matching the `.expiring` bar it points at),
      tabular figures so the ticking number doesn't jitter its width. */
   .tte {
-    color: var(--signal-dirty);
+    color: var(--color-warn);
     font-variant-numeric: tabular-nums;
   }
 
   .sigma {
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
   }
 
   .sigma-value {
     font-weight: 650;
-    color: var(--ink);
+    color: var(--color-fg);
   }
 
   .sigma-sep {
-    color: var(--ink-faint);
+    color: var(--color-fg-muted);
   }
 
   /* Over the cap: the Σ readout turns red — the honest "this window is rejecting"
@@ -294,7 +310,7 @@
      range, but the readout always tells the truth). Paired with the word "Σ" and
      position, never color alone. */
   .sigma.over .sigma-value {
-    color: var(--signal-reject);
+    color: var(--color-bad);
   }
 
   /* The scroll window: a fixed-height viewport that clips the track's emerging
@@ -304,7 +320,7 @@
     position: relative;
     height: 96px;
     overflow: hidden;
-    border-bottom: 1.5px solid var(--chrome-border);
+    border-bottom: 1.5px solid var(--color-border-line);
   }
 
   /* The conveyor belt: a row of fixed-width columns, one wider than the viewport,
@@ -329,13 +345,13 @@
     justify-content: center;
   }
 
-  /* Slate data-ink bars (the disc colour) — clears 3:1 on the white panel as a
-     graphical mark. Height encodes count; the auto-scale keeps them legible at
+  /* Muted data-ink bars (`--chart-muted`) — 3:1 or more on the panel in both
+     themes, as a graphical mark. Height encodes count; the auto-scale keeps them legible at
      any limit. */
   .bar {
     width: 70%;
     min-height: 0;
-    background: var(--node-fill);
+    background: var(--chart-muted);
     border-radius: 3px 3px 0 0;
   }
 
@@ -358,7 +374,7 @@
      of equal-height bars has a clear anchor for "this is what ages out in
      N.Ns". */
   .bar.expiring {
-    background: var(--signal-dirty);
+    background: var(--color-warn);
   }
 
   /* The shared time axis: quiet end-labels orienting the scroll. "now" on the
@@ -367,10 +383,10 @@
   .axis {
     display: flex;
     justify-content: space-between;
-    margin-top: calc(-1 * var(--space-2));
-    font-size: var(--text-xs);
+    margin-top: calc(-1 * var(--gap-sm));
+    font-size: var(--font-size-caption-sm);
     letter-spacing: 0.04em;
-    color: var(--ink-faint);
+    color: var(--color-fg-muted);
   }
 
   /* The rule limit as a dashed threshold across the viewport — fixed (it does not
@@ -379,7 +395,7 @@
     position: absolute;
     left: 0;
     right: 0;
-    border-top: 1.5px dashed var(--signal-reject);
+    border-top: 1.5px dashed var(--color-bad);
     pointer-events: none;
     z-index: 1;
   }

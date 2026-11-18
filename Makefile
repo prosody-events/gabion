@@ -123,8 +123,14 @@ help:
 	@printf '%s\n' '  make miri-ffi-alignment-tb Run FFI alignment tests under miri (Tree Borrows)'
 	@printf '%s\n' '  make miri-lib        Run all gabion-nginx lib tests under miri'
 	@printf '%s\n' '  make miri-all        Run miri (Stacked + Tree Borrows) on every gabion-nginx test'
-	@printf '%s\n' '  make bench-check     Compile the crdt and SHM aggregate benchmarks'
+	@printf '%s\n' '  make bench-check     Compile the crdt, gossip, aggregate and admission benchmarks'
+	@printf '%s\n' '  make sim-smoke       Run the study harness judge tests and one small regime; fails on an unhealthy run'
+	@printf '%s\n' '  make sim-baselines   Run the main and imp-az-hier-nopk baseline arms of the regression gate (H1=<sha>)'
+	@printf '%s\n' '  make sim-gate        Run this checkout as the zone arm and apply the regression gate pass rules'
+	@printf '%s\n' '  make study-data      Download the study data release asset, check its sha256 and unpack it into docs/study/data'
+	@printf '%s\n' '  make study-test      Check the study data compaction and run the study dashboard browser audit (Playwright)'
 	@printf '%s\n' '  make wasm-check      Cross-compile gabion-wasm, run its native tests, and build the web frontend'
+	@printf '%s\n' '  make fonts           Rebuild the visualizer and study dashboard font subsets from google/fonts (needs the network and fonttools)'
 	@printf '%s\n' '  make nginx-config    Validate the base nginx:stable-alpine config'
 	@printf '%s\n' '  make nginx-module    Build and load-test the Gabion NGINX module config'
 	@printf '%s\n' '  make nginx-test      Build the module for NGINX and OpenResty and assert 200, 200, 429 responses'
@@ -134,10 +140,10 @@ help:
 	@printf '%s\n' '  make kubernetes-test Run guarded local kind EndpointSlice convergence tests'
 	@printf '%s\n' '  make kubernetes-nginx-test Run guarded local kind NGINX scale rate-limit tests'
 	@printf '%s\n' '  make kubernetes-mixed-test Run guarded local kind NGINX plus Gabion server gossip test'
-	@printf '%s\n' '  make kubernetes-gossip-bench Run guarded local kind gossip propagation benchmark'
+	@printf '%s\n' '  make kubernetes-zones-test Run guarded three-zone gabiond gossip test (needs a cluster from deploy/kubernetes/kind-zones.yaml)'
 	@printf '%s\n' '  make kubernetes-clean Delete local Kubernetes test namespaces'
 	@printf '%s\n' '  make ci              Fast contributor pre-merge: test, loom, miri-safety, bench-check, wasm-check, nginx-config, nginx-module, nginx-test'
-	@printf '%s\n' '  make ci-full         Mirror GitHub Actions end-to-end: ci + nginx-asan + miri-all + every kubernetes-* target'
+	@printf '%s\n' '  make ci-full         Mirror GitHub Actions end-to-end: ci + nginx-asan + miri-all + study-test + every kubernetes-* target'
 
 .PHONY: fmt
 fmt: fmt-check
@@ -168,7 +174,7 @@ safety: require-nextest
 	$(CARGO_ENV) $(NEXTEST) -p gabion-nginx --test safety
 
 # Loom model checks for the SHM queue, leader lease and aggregate seqlock, in
-# crates/nginx/tests/loom.rs. The `loom` feature rebuilds only gabion-nginx.
+# crates/nginx/tests/loom.rs. The `loom` feature rebuilds gabion and gabion-nginx.
 .PHONY: loom
 loom: require-nextest
 	$(CARGO_ENV) $(NEXTEST) -p gabion-nginx --features loom --test loom
@@ -212,18 +218,128 @@ miri-lib:
 miri-all: miri-lib miri-safety miri-safety-tb miri-ffi-alignment miri-ffi-alignment-tb
 	MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-disable-isolation" $(CARGO_ENV) $(MIRI) -p gabion-nginx --lib
 
+# Operator-message catalogue: every `code` field has an entry, and every entry
+# for a log line (a code heading over a **Level** line) names a code its
+# crate's sources still emit; each catalogue is paired with those sources. The
+# visualizer's design rules (web/README.md "Design rules"): no colour literal
+# outside tokens.css, no pixel font-size, and every token named is defined.
+CATALOGUE_SOURCES := crates/gabion/TROUBLESHOOTING.md=crates/gabion/src crates/server/README.md=crates/server/src crates/nginx/README.md=crates/nginx/src
+CATALOGUES := $(foreach pair,$(CATALOGUE_SOURCES),$(firstword $(subst =, ,$(pair))))
+# The study harness's adapter boundary (crates/gossip-bench/README.md, "The
+# adapter contract"): outside adapter.rs, every line that names the gabion
+# crate is one `use` of the stable trait surface. Aliases, `extern crate`,
+# brace lists with any other name and inline paths all fail.
+SIM_TRAITS := Clock|GossipTransport|Ticker
+SIM_DISCOVERY := Peer|PeerEvent
+SIM_BOUNDARY := ^[^:]+:[0-9]+:use gabion::(gossip::($(SIM_TRAITS)|\{($(SIM_TRAITS))(, ($(SIM_TRAITS)))*\})|discovery::($(SIM_DISCOVERY)|\{($(SIM_DISCOVERY))(, ($(SIM_DISCOVERY)))*\}));$$
+
 .PHONY: hygiene
 hygiene:
-	! rg -n 'Box\s*<\s*dyn|dyn\s+' --glob '!crates/nginx/src/log.rs' Cargo.toml crates deploy
-	! rg -n 'version\s*=\s*"|=\s*\{\s*version' crates/*/Cargo.toml
+	rg -n 'Box\s*<\s*dyn|dyn\s+' --glob '!crates/nginx/src/log.rs' Cargo.toml crates deploy; test $$? -eq 1
+	rg -n 'version\s*=\s*"|=\s*\{\s*version' crates/*/Cargo.toml; test $$? -eq 1
+	@for code in $$(rg -oNI 'code = "([^"]+)"' -r '$$1' crates/*/src -g '!**/tests.rs' -g '!**/tests/**' | sort -u); do \
+		rg -qFx "### \`$$code\`" $(CATALOGUES) || { echo "operator message code \`$$code\` has no entry in $(CATALOGUES)"; exit 1; }; \
+	done
+	@for pair in $(CATALOGUE_SOURCES); do \
+		doc=$${pair%%=*}; src=$${pair#*=}; \
+		for code in $$(rg -oNIU '^### `([^`]+)`\n\n\*\*Level\*\* (.*)' -r '$$1 $$2' $$doc | awk '!/not a log line/ { print $$1 }'); do \
+			rg -qF "code = \"$$code\"" $$src -g '!**/tests.rs' -g '!**/tests/**' || { echo "$$doc documents \`$$code\`, which no message in $$src emits; delete the entry, or rename it to the code that replaced it"; exit 1; }; \
+		done; \
+	done
+	@test "$$(rg --count-matches 'ngx_conf_log_error!' crates/nginx/src/module.rs)" = 1 || { echo "crates/nginx/src/module.rs calls ngx_conf_log_error! outside conf_error!; report every nginx -t error through conf_error!(cf, code = \"...\", ...) and give the code an entry in the README's configuration errors"; exit 1; }
+	rg -n '#[0-9a-fA-F]{3,8}\b|0x[0-9a-fA-F]{6}|rgba?\(|hsla?\(' $(WEB_DIR)/src --glob '!tokens.css'; test $$? -eq 1
+	rg -n 'font-size:\s*[0-9.]+px' $(WEB_DIR)/src; test $$? -eq 1
+	@for token in $$(rg -oNI "(var\(|')(--[a-z][a-z0-9-]*)" -r '$$2' $(WEB_DIR)/src | sort -u); do \
+		rg -q -- "^\s*$$token:" $(WEB_DIR)/src/tokens.css || { echo "design token \`$$token\` is not defined in $(WEB_DIR)/src/tokens.css, so it resolves to nothing; use a token defined there (web/README.md \"Design rules\") or define it:"; rg -nF -- "$$token" $(WEB_DIR)/src; exit 1; }; \
+	done
+	cmp $(WEB_DIR)/src/tokens.css docs/study/dashboard/tokens.css
+	diff -r $(WEB_DIR)/src/fonts docs/study/dashboard/fonts
+	rg -n 'font-family' $(WEB_DIR)/src --glob '!tokens.css' --glob '!app.css'; test $$? -eq 1
+	@awk '/^  ([a-z]+ )*(#?[A-Za-z]+|constructor)\(/ { fn = $$0 } /^(export )?(async )?function / { fn = $$0 } /new Graphics/ && fn !~ /constructor\(|#createNode\(/ { print FILENAME ":" FNR ": " $$0; bad = 1 } END { exit bad }' $(WEB_DIR)/src/lib/stage/renderer.ts || { echo "renderer.ts builds a Graphics outside its constructor and #createNode, so a frame or an event can allocate GPU objects; draw into the pre-built Graphics instead ($(WEB_DIR)/README.md, \"Beams\")"; exit 1; }
+	@bad=$$(rg -n '\bgabion(_server)?\s*(::|as\b|;)|\bcrate\s+gabion' $(SIM)/src --glob '!**/harness/adapter.rs' | rg -v '$(SIM_BOUNDARY)'); \
+	test -z "$$bad" || { printf '%s\n' "$$bad" "these lines in $(SIM) name gabion outside src/harness/adapter.rs, so the regression gate's arms would no longer share one core; outside it import only gabion::gossip::{Clock, GossipTransport, Ticker} and gabion::discovery::{Peer, PeerEvent}, one use line each, and reach anything else through a re-export from adapter.rs (crates/gossip-bench/README.md, \"The adapter contract\")"; exit 1; }
 
 .PHONY: test
 test: fmt clippy unit safety hygiene
 
+# The study harness (crates/gossip-bench). `sim-smoke` runs the judge's tests
+# and one small regime, failing on a run that broke a health invariant;
+# `sim-baselines` and `sim-gate` are the regression gate (see its README).
+SIM := crates/gossip-bench
+SIM_OUT ?= target/sim
+SIM_JOBS ?= 2
+# The commit that landed the harness: its adapter and manifest build every baseline.
+H1 ?= $(shell git log --diff-filter=A --format=%H -- $(SIM)/src/harness/adapter.rs | tail -n 1)
+# The measured branch, sim/imp-az-hier-nopk.
+SIM_NOPK := 328f7cf214b95a505c528dcaa8e1f26498157968
+
+.PHONY: sim-smoke
+sim-smoke:
+	python3 -m unittest discover -s $(SIM)/judge
+	mkdir -p $(SIM_OUT)
+	$(CARGO_ENV) $(STABLE_CARGO) run -q -p gossip-bench -- --regime $(SIM)/regimes/low-3.json --seed 1 --require-valid --out $(SIM_OUT)/smoke.json
+
+.PHONY: sim-baselines
+sim-baselines:
+	@test -n "$(H1)" || { echo 'sim-baselines: no commit added $(SIM)/src/harness/adapter.rs; pass H1=<sha>' >&2; exit 1; }
+	set -e; date=$$(git log -1 --format=%cI $(H1)); \
+	for arm in main=$(H1) imp-az-hier-nopk=$(SIM_NOPK); do \
+		label=$${arm%%=*}; wt=$(SIM_OUT)/worktrees/$$label; \
+		git worktree remove --force $$wt 2>/dev/null || true; \
+		git worktree add -q --detach $$wt $${arm#*=}; \
+		rm -rf $$wt/$(SIM); git archive HEAD $(SIM) | tar -x -C $$wt; \
+		git show $(H1):$(SIM)/src/harness/adapter.rs > $$wt/$(SIM)/src/harness/adapter.rs; \
+		git show $(H1):$(SIM)/Cargo.toml > $$wt/$(SIM)/Cargo.toml; \
+		$(CARGO_ENV) $(STABLE_CARGO) metadata -q --format-version 1 --manifest-path $$wt/Cargo.toml > /dev/null; \
+		git -C $$wt add -A $(SIM) Cargo.lock; \
+		git -C $$wt diff --cached --quiet || GIT_AUTHOR_DATE=$$date GIT_COMMITTER_DATE=$$date \
+			git -C $$wt -c user.name=sim-baselines -c user.email=sim-baselines@localhost \
+			commit -q -m "sim: $$label with the current harness core"; \
+		CARGO_TARGET_DIR=$(abspath $(SIM_OUT))/target/$$label python3 $(SIM)/judge/matrix.py \
+			--repo $$wt --solution $$label --seeds 3 --jobs $(SIM_JOBS) --out $(SIM_OUT)/results; \
+	done
+
+.PHONY: sim-gate
+sim-gate:
+	python3 $(SIM)/judge/matrix.py --solution zone --seeds 3 --jobs $(SIM_JOBS) --out $(SIM_OUT)/results
+	python3 $(SIM)/judge/gate.py $(SIM_OUT)/results --out $(SIM_OUT)/gate
+
+# The study's generated data is a release asset, not part of the tree
+# (docs/study/README.md, "Data"). New data is a new release: bump both.
+STUDY_DATA_TAG := study-data-2026-10-24
+STUDY_DATA_SHA256 := 5716a0315101cc2ddf69d1cff4b7c551792cd76a67df65a9ce1b3a2c82558117
+STUDY_DATA_STAMP := docs/study/.data-$(STUDY_DATA_SHA256)
+
+.PHONY: study-data
+study-data: $(STUDY_DATA_STAMP)
+
+$(STUDY_DATA_STAMP):
+	mkdir -p target
+	curl -fsSL --retry 3 -o target/study-data.tar.gz \
+		https://github.com/prosody-events/gabion/releases/download/$(STUDY_DATA_TAG)/study-data.tar.gz
+	echo '$(STUDY_DATA_SHA256)  target/study-data.tar.gz' | shasum -a 256 -c -
+	tar -xzf target/study-data.tar.gz -C docs/study/data
+	rm -f docs/study/.data-* && touch $@
+
+# The tarball a new study-data release uploads: every file under
+# docs/study/data that docs/study/.gitignore keeps out of the tree.
+.PHONY: study-data-pack
+study-data-pack:
+	mkdir -p target
+	cd docs/study/data && tar -czf ../../../target/study-data.tar.gz \
+		$$(git ls-files --others --ignored --exclude-standard --directory .)
+
+.PHONY: study-test
+study-test: study-data
+	python3 docs/study/tests/test_compact.py
+	python3 docs/study/tests/test_ui.py
+
 .PHONY: bench-check
 bench-check:
 	$(CARGO_ENV) $(STABLE_CARGO) bench -p gabion --bench crdt --no-run
-	$(CARGO_ENV) $(STABLE_CARGO) bench -p gabion-nginx --bench aggregate --no-run
+	$(CARGO_ENV) $(STABLE_CARGO) bench -p gabion --bench gossip --no-run
+	$(CARGO_ENV) $(STABLE_CARGO) bench -p gabion-server --bench admission --no-run
+	$(CARGO_ENV) $(STABLE_CARGO) bench -p gabion-nginx --bench access --no-run
 
 # Gate the visualizer's wasm bridge and frontend: (1) type-check gabion-wasm
 # for wasm32 with the browser getrandom backend (the make-or-break
@@ -233,6 +349,37 @@ bench-check:
 # the production Vite build. The Playwright screenshot/in-browser smoke
 # (`pnpm run screenshot`) downloads a browser, so it stays a documented
 # on-demand run rather than part of this gate — same treatment as smoke.cjs.
+# The three faces the visualizer and the study dashboard set (web/README.md,
+# "Fonts"): Source Sans 3, Source Serif 4 and Source Code Pro from the
+# google/fonts registry at one pinned commit, instanced to the weights the
+# design uses (400 and 600) and subset to the characters the pages print.
+# Needs the network and fonttools (`pip install fonttools brotli`), so it is
+# not part of `make test`; its outputs are committed, byte-identical in both
+# folders (hygiene checks it).
+FONTS_COMMIT := 24ddc1f324cac5d9f5aedca126d298f56e3f1640
+FONTS_RAW := https://raw.githubusercontent.com/google/fonts/$(FONTS_COMMIT)/ofl
+FONTS_TMP := target/fonts
+FONTS_UNICODES := U+0020-007E,U+00A0-00FF,U+2009,U+202F,U+2013-2014,U+2018-201E,U+2026,U+2190-2193,U+2212,U+2264-2265,U+03A3,U+03B5,U+03C3,U+2713
+
+.PHONY: fonts
+fonts:
+	mkdir -p $(FONTS_TMP) $(WEB_DIR)/src/fonts docs/study/dashboard/fonts
+	curl -fsSL --retry 3 -o $(FONTS_TMP)/SourceSans3.ttf '$(FONTS_RAW)/sourcesans3/SourceSans3%5Bwght%5D.ttf'
+	curl -fsSL --retry 3 -o $(FONTS_TMP)/SourceSerif4.ttf '$(FONTS_RAW)/sourceserif4/SourceSerif4%5Bopsz,wght%5D.ttf'
+	curl -fsSL --retry 3 -o $(FONTS_TMP)/SourceCodePro.ttf '$(FONTS_RAW)/sourcecodepro/SourceCodePro%5Bwght%5D.ttf'
+	curl -fsSL --retry 3 -o $(WEB_DIR)/src/fonts/OFL-SourceSans3.txt '$(FONTS_RAW)/sourcesans3/OFL.txt'
+	curl -fsSL --retry 3 -o $(WEB_DIR)/src/fonts/OFL-SourceSerif4.txt '$(FONTS_RAW)/sourceserif4/OFL.txt'
+	curl -fsSL --retry 3 -o $(WEB_DIR)/src/fonts/OFL-SourceCodePro.txt '$(FONTS_RAW)/sourcecodepro/OFL.txt'
+	fonttools varLib.instancer -q -o $(FONTS_TMP)/SourceSans3-i.ttf $(FONTS_TMP)/SourceSans3.ttf wght=400:600
+	fonttools varLib.instancer -q -o $(FONTS_TMP)/SourceSerif4-i.ttf $(FONTS_TMP)/SourceSerif4.ttf wght=400:600 opsz=8:20
+	fonttools varLib.instancer -q -o $(FONTS_TMP)/SourceCodePro-i.ttf $(FONTS_TMP)/SourceCodePro.ttf wght=400
+	for face in SourceSans3 SourceSerif4 SourceCodePro; do \
+		pyftsubset $(FONTS_TMP)/$$face-i.ttf --layout-features='*' --flavor=woff2 \
+			--unicodes='$(FONTS_UNICODES)' --output-file=$(WEB_DIR)/src/fonts/$$face.woff2 || exit 1; \
+	done
+	rm -f docs/study/dashboard/fonts/*
+	cp $(WEB_DIR)/src/fonts/* docs/study/dashboard/fonts/
+
 .PHONY: wasm-check
 wasm-check: require-nextest require-wasm-target require-wasm-pack require-pnpm require-wasm-nightly
 	$(CARGO_ENV) $(STABLE_CARGO) check --target $(WASM_TARGET) -p gabion-wasm
@@ -276,9 +423,9 @@ kubernetes-nginx-test:
 kubernetes-mixed-test:
 	sh deploy/kubernetes/mixed-nginx-gabion-gossip.sh
 
-.PHONY: kubernetes-gossip-bench
-kubernetes-gossip-bench:
-	python3 deploy/kubernetes/gossip-propagation-bench.py
+.PHONY: kubernetes-zones-test
+kubernetes-zones-test:
+	sh deploy/kubernetes/zones-gossip.sh
 
 .PHONY: kubernetes-clean
 kubernetes-clean:
@@ -294,4 +441,4 @@ kubernetes-clean:
 ci: test loom miri-safety bench-check wasm-check nginx-config nginx-module nginx-test
 
 .PHONY: ci-full
-ci-full: ci nginx-asan miri-all kubernetes-test kubernetes-nginx-test kubernetes-mixed-test kubernetes-gossip-bench
+ci-full: ci nginx-asan miri-all study-test kubernetes-test kubernetes-nginx-test kubernetes-mixed-test kubernetes-zones-test

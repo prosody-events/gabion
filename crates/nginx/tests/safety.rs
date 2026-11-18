@@ -9,14 +9,13 @@
 //!    queue. Every worker spawns a leader thread; the one holding the lease
 //!    (`LeaderLease::try_acquire`) stamps the incarnation, drains the queue,
 //!    drives the gossip runtime, and writes back into the aggregate via
-//!    `ShmAggregateStore::apply` (which invokes
-//!    `write_delta`/`write_expiration` per row of the `DeltaSink`/
-//!    `ExpirationSink`).
+//!    `ShmAggregateStore::apply` (which folds each row of the `DeltaSink`/
+//!    `ExpirationSink` into the library's table over the zone's slots).
 //!
 //! These tests run under `cargo +nightly miri test --test safety` and exercise
 //! every memory-unsafe entry point on the production hot paths. Networking
-//! and tokio are not invoked — we manufacture `DeltaSink<u32>` /
-//! `ExpirationSink<u32>` rows directly and feed them through
+//! and tokio are not invoked — we manufacture `DeltaSink` /
+//! `ExpirationSink` rows directly and feed them through
 //! `AggregateStore::apply`.
 //!
 //! Exempt: `module.rs`'s nginx FFI, which needs nginx itself and so can't run
@@ -27,56 +26,68 @@
 //! `r->variables` array nginx allocates per request.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread;
+use std::time::Duration;
 
-use gabion::crdt::{CellHandle, CellIdentity, DeltaSink, ExpirationSink, KeyHash};
+use gabion::crdt::ValidStorageConfig;
+use gabion::crdt::{BucketEpoch, CellHandle, CellIdentity, DeltaSink, ExpirationSink, KeyHash};
 use gabion::gossip::AggregateStore;
-use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, hash_key};
+use gabion::rules::{EnforcementMode, Rule, RuleDef, hash_key};
+use gabion::settings::Settings;
 
 use gabion::crdt::{NodeId, NodeIdentity};
 
-use gabion_nginx::access::{AccessCtx, AccessOutcome, CardinalitySettings, VariableLookup, decide};
-use gabion_nginx::rules::{BindingLookup, CompiledRules, DescriptorBinding, RuleConfig};
+use gabion_nginx::access::{AccessCtx, AccessOutcome, VariableLookup, decide_all};
+use gabion_nginx::rules::{
+    BindingLookup, CompiledRules, NopBindingCompiler, RuleConfig, parse_rule_directive,
+};
 use gabion_nginx::shm::aggregate::ShmAggregateStore;
+use gabion_nginx::shm::header::{SHM_MAGIC, SHM_VERSION};
 use gabion_nginx::shm::queue::QueueEvent;
-use gabion_nginx::shm::{Layout, ShmRegion};
+use gabion_nginx::shm::{CACHELINE, CachePadded, Layout, ShmRegion};
 
 const DEFAULT_DOMAIN: &str = "nginx";
 
 /// Aligned heap allocation that mimics the `mmap` mapping nginx hands the
-/// adapter in production. `Box<[u64]>` gives us 8-byte alignment — enough
-/// for every atomic field in the region. `Box::into_raw` puts the pointer
-/// at a stable address so Stacked-/Tree-Borrows reborrow rules aren't
-/// violated when the test moves the wrapper.
+/// adapter in production. A slice of cache lines gives the region the
+/// `CACHELINE` alignment `ShmRegion::initialize` requires, as nginx's
+/// page-aligned slab block does. `Box::into_raw` puts the pointer at a
+/// stable address so Stacked-/Tree-Borrows reborrow rules aren't violated
+/// when the test moves the wrapper.
 pub struct TestZone {
-    ptr: *mut u8,
-    words: usize,
+    ptr: *mut Line,
+    lines: usize,
 }
 
+/// One cache line of a test zone.
+type Line = CachePadded<[u64; CACHELINE / 8]>;
+
 impl TestZone {
-    pub fn allocate(words: usize) -> Self {
-        let buf: Box<[u64]> = vec![0_u64; words].into_boxed_slice();
-        let raw = Box::into_raw(buf);
+    pub fn allocate(bytes: usize) -> Self {
+        let lines = bytes.div_ceil(CACHELINE);
+        let block: Box<[Line]> = (0..lines)
+            .map(|_| CachePadded([0; CACHELINE / 8]))
+            .collect();
         Self {
-            ptr: raw as *mut u8,
-            words,
+            ptr: Box::into_raw(block).cast(),
+            lines,
         }
     }
 
     pub fn as_ptr(&self) -> *mut u8 {
-        self.ptr
+        self.ptr.cast()
     }
 }
 
 impl Drop for TestZone {
     fn drop(&mut self) {
-        // SAFETY: `self.ptr` came from `Box::into_raw` of a `Box<[u64]>`
-        // with length `self.words`. The caller pairs the `TestZone` with
+        // SAFETY: `self.ptr` came from `Box::into_raw` of a `Box<[Line]>`
+        // with length `self.lines`. The caller pairs the `TestZone` with
         // its `ShmRegion` such that the region is dropped first; no live
         // references remain when this Drop runs.
         unsafe {
-            let slice = std::ptr::slice_from_raw_parts_mut(self.ptr as *mut u64, self.words);
+            let slice = std::ptr::slice_from_raw_parts_mut(self.ptr, self.lines);
             let _ = Box::from_raw(slice);
         }
     }
@@ -91,29 +102,62 @@ unsafe impl Sync for TestZone {}
 
 fn build_zone(queue_cap: usize, agg_cap: usize) -> (TestZone, ShmRegion) {
     let layout = Layout::new(queue_cap, agg_cap).expect("layout");
-    let words = layout.total_bytes.div_ceil(8);
-    let zone = TestZone::allocate(words);
-    // SAFETY: zone.as_ptr() is 8-byte aligned, fresh, exclusive, and lives
-    // until TestZone drops. layout matches the allocation size.
+    let zone = TestZone::allocate(layout.total_bytes);
+    // SAFETY: zone.as_ptr() is cache-line aligned, fresh, exclusive, and
+    // lives until TestZone drops. layout matches the allocation size.
     let region = unsafe { ShmRegion::initialize(zone.as_ptr(), layout) };
     (zone, region)
 }
 
-fn build_rules() -> CompiledRules {
-    CompiledRules::compile(&[RuleConfig {
-        name: "per_tenant".into(),
-        domain: DEFAULT_DOMAIN.into(),
-        bindings: vec![DescriptorBinding {
-            key: "tenant".into(),
-            source: "$http_x_tenant".into(),
-        }],
-        limit: 2,
-        window: std::time::Duration::from_secs(1),
-        bucket: std::time::Duration::from_millis(250),
+fn storage() -> ValidStorageConfig {
+    Settings::default().validate().expect("defaults validate").1
+}
+
+/// A rule of `rate` on `key`, in 250 ms buckets, built as both adapters
+/// build theirs.
+fn rule(key: &str, rate: &str) -> Rule {
+    RuleDef {
+        name: key,
+        domain: DEFAULT_DOMAIN,
+        patterns: &[(key, "*")],
+        rate,
+        window: None,
+        bucket: Some(Duration::from_millis(250)),
         mode: EnforcementMode::Enforce,
-        except_if: None,
-    }])
-    .expect("compile rules")
+    }
+    .build(&storage().cardinality)
+    .expect("rule")
+}
+
+/// One rule per `gabion_limit_rule` directive, compiled as nginx compiles
+/// them.
+fn compile(directives: &[&str]) -> CompiledRules {
+    let configs: Vec<RuleConfig> = directives
+        .iter()
+        .map(|text| {
+            let args: Vec<&str> = text.split_whitespace().collect();
+            parse_rule_directive(&args).expect("directive")
+        })
+        .collect();
+    CompiledRules::compile_with(&configs, &storage(), &mut NopBindingCompiler)
+        .expect("compile rules")
+}
+
+fn build_rules() -> CompiledRules {
+    compile(&["per_tenant tenant:$http_x_tenant rate=2r/s bucket=250ms"])
+}
+
+/// The access context over `region` for `rules`, with the default settings.
+fn ctx<'a>(rules: &'a CompiledRules, region: &'a ShmRegion) -> AccessCtx<'a> {
+    let storage = storage();
+    AccessCtx {
+        rules,
+        aggregate: region.aggregate(),
+        queue: region.queue(),
+        stats: region.stats(),
+        cardinality: storage.cardinality,
+        max_matched_rules: storage.max_matched_rules(),
+    }
 }
 
 struct MockVars {
@@ -138,14 +182,14 @@ fn deltas_and_expirations(
     rule: &Rule,
     deltas: &[(KeyHash, u32, u32)],
     expirations: &[(KeyHash, u32, u32)],
-) -> (DeltaSink<u32>, ExpirationSink<u32>) {
-    let mut d: DeltaSink<u32> = DeltaSink::with_capacity(deltas.len());
-    let mut e: ExpirationSink<u32> = ExpirationSink::with_capacity(expirations.len());
+) -> (DeltaSink, ExpirationSink) {
+    let mut d = DeltaSink::with_capacity(deltas.len());
+    let mut e = ExpirationSink::with_capacity(expirations.len());
     for &(kh, bucket, delta) in deltas {
         let key = CellIdentity {
-            rule_fingerprint: rule.fingerprint,
+            rule_fingerprint: rule.fingerprint(),
             key_hash: kh,
-            bucket,
+            bucket: BucketEpoch(bucket),
         };
         d.handles.push(CellHandle::default());
         d.keys.push(key);
@@ -156,9 +200,9 @@ fn deltas_and_expirations(
     }
     for &(kh, bucket, last_count) in expirations {
         let key = CellIdentity {
-            rule_fingerprint: rule.fingerprint,
+            rule_fingerprint: rule.fingerprint(),
             key_hash: kh,
-            bucket,
+            bucket: BucketEpoch(bucket),
         };
         e.handles.push(CellHandle::default());
         e.keys.push(key);
@@ -170,7 +214,7 @@ fn deltas_and_expirations(
 }
 
 /// Deterministic identity for miri-compatible tests. The production
-/// `derive_identity` calls `whoami::hostname()` and
+/// `gabion::identity::node_id` calls `whoami::hostname()` and
 /// `UdpSocket::bind` (network I/O), which miri rejects without
 /// `-Zmiri-disable-isolation`.
 fn test_identity(node_id_lo: u64, incarnation: u32) -> NodeIdentity {
@@ -185,7 +229,8 @@ fn master_stamps_node_id_and_initializes_region() {
     let identity = test_identity(0xdead_beef_cafe, 1);
     region.header().identity.store_node_id(identity.node_id.0);
     assert_eq!(region.header().identity.load_node_id(), identity.node_id.0);
-    assert!(region.header().is_initialized());
+    assert_eq!(region.header().magic.load(Ordering::Acquire), SHM_MAGIC);
+    assert_eq!(region.header().version.load(Ordering::Acquire), SHM_VERSION);
     // Geometry is reachable through the region.
     assert_eq!(region.queue().capacity(), 8);
     assert_eq!(region.aggregate().capacity(), 16);
@@ -209,25 +254,16 @@ fn leader_stamps_incarnation_and_applies_deltas() {
     // Build the store and feed it a synthetic delta batch.
     let store = ShmAggregateStore::new(region);
 
-    let rule = Rule::new(
-        1,
-        DEFAULT_DOMAIN.to_string(),
-        vec![DescriptorPattern {
-            key: "tenant".into(),
-            value: "*".into(),
-        }],
-        2,
-        1_000,
-        250,
-        EnforcementMode::Enforce,
-    );
+    let rule = rule("tenant", "2r/s");
     let key_hash = KeyHash(0xABCD);
     let (deltas, expirations) = deltas_and_expirations(&rule, &[(key_hash, 3, 5)], &[]);
     store.apply(&deltas, &expirations);
 
     // Workers should read the new value through the seqlock-protected view.
     let view = region.aggregate();
-    let cell = view.get(rule.fingerprint, key_hash.0, 3).expect("found");
+    let cell = view
+        .get(rule.fingerprint(), key_hash, BucketEpoch(3))
+        .expect("found");
     assert_eq!(cell.count, 5);
 }
 
@@ -235,18 +271,7 @@ fn leader_stamps_incarnation_and_applies_deltas() {
 fn expiration_subtracts_then_empties_when_zero() {
     let (_zone, region) = build_zone(8, 16);
     let store = ShmAggregateStore::new(region);
-    let rule = Rule::new(
-        1,
-        DEFAULT_DOMAIN.to_string(),
-        vec![DescriptorPattern {
-            key: "k".into(),
-            value: "*".into(),
-        }],
-        100,
-        1_000,
-        250,
-        EnforcementMode::Enforce,
-    );
+    let rule = rule("k", "100r/s");
     let kh = KeyHash(0x42);
 
     let (d1, e_empty) = deltas_and_expirations(&rule, &[(kh, 1, 7)], &[]);
@@ -254,7 +279,7 @@ fn expiration_subtracts_then_empties_when_zero() {
     assert_eq!(
         region
             .aggregate()
-            .get(rule.fingerprint, kh.0, 1)
+            .get(rule.fingerprint(), kh, BucketEpoch(1))
             .unwrap()
             .count,
         7
@@ -266,7 +291,7 @@ fn expiration_subtracts_then_empties_when_zero() {
     assert_eq!(
         region
             .aggregate()
-            .get(rule.fingerprint, kh.0, 1)
+            .get(rule.fingerprint(), kh, BucketEpoch(1))
             .unwrap()
             .count,
         4
@@ -275,7 +300,12 @@ fn expiration_subtracts_then_empties_when_zero() {
     // Subtract the rest — should empty the slot.
     let (d_empty, e_full) = deltas_and_expirations(&rule, &[], &[(kh, 1, 4)]);
     store.apply(&d_empty, &e_full);
-    assert!(region.aggregate().get(rule.fingerprint, kh.0, 1).is_none());
+    assert!(
+        region
+            .aggregate()
+            .get(rule.fingerprint(), kh, BucketEpoch(1))
+            .is_none()
+    );
 }
 
 // -- 3. Access path: full decision logic via SHM views ---------------------
@@ -284,20 +314,17 @@ fn expiration_subtracts_then_empties_when_zero() {
 fn access_path_allows_then_rejects_via_aggregate_seqlock() {
     let (_zone, region) = build_zone(8, 16);
     let rules = build_rules();
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
-    };
+    let ctx = ctx(&rules, &region);
     let vars = MockVars {
         tenant: b"alice".to_vec(),
     };
+    let mut events = Vec::new();
 
-    // First two requests — limit is 2 — should be allowed.
-    assert!(matches!(decide(ctx, 0, &vars, 0), AccessOutcome::Allow(_)));
+    // The first request is under the limit of 2, so it is allowed.
+    assert!(matches!(
+        decide_all(ctx, &[0], &vars, 0, &mut events),
+        AccessOutcome::Allow(_)
+    ));
 
     // Simulate leader applying the recorded hits before the third arrives.
     let store = ShmAggregateStore::new(region);
@@ -305,15 +332,15 @@ fn access_path_allows_then_rejects_via_aggregate_seqlock() {
         key: "tenant",
         value: "alice",
     }];
-    let spec = rules.rules()[0].rule.spec();
-    let key_hash = hash_key(spec.id, DEFAULT_DOMAIN, &descriptors);
+    let spec = rules.table().rules()[0].spec();
+    let key_hash = hash_key(DEFAULT_DOMAIN, descriptors);
     let bucket = 0_u32;
     let (deltas, expirations) =
-        deltas_and_expirations(&rules.rules()[0].rule, &[(key_hash, bucket, 3)], &[]);
+        deltas_and_expirations(&rules.table().rules()[0], &[(key_hash, bucket, 3)], &[]);
     store.apply(&deltas, &expirations);
 
     // Third request must now be rejected — total (3) + 1 > limit (2).
-    let outcome = decide(ctx, 0, &vars, 0);
+    let outcome = decide_all(ctx, &[0], &vars, 0, &mut events);
     match outcome {
         AccessOutcome::Reject(info) => {
             assert_eq!(info.spec.id, spec.id);
@@ -322,10 +349,9 @@ fn access_path_allows_then_rejects_via_aggregate_seqlock() {
         other => panic!("expected Reject after apply, got {other:?}"),
     }
 
-    // The queue should hold the original two hits plus this one.
+    // The allowed request queued one event; the rejected one queued none.
     let mut drained = [QueueEvent::default(); 4];
-    let n = region.queue().drain(&mut drained);
-    assert!(n >= 1, "queue should retain pushed events");
+    assert_eq!(region.queue().drain(&mut drained), 1);
 }
 
 // -- 4. Concurrent leader writer + worker readers --------------------------
@@ -343,19 +369,8 @@ fn readers_see_exact_counts_while_the_leader_moves_cells() {
     const STEADY: u32 = 1_000_000;
 
     let (_zone, region) = build_zone(8, 16);
-    let rule = Rule::new(
-        1,
-        DEFAULT_DOMAIN.to_string(),
-        vec![DescriptorPattern {
-            key: "k".into(),
-            value: "*".into(),
-        }],
-        u64::MAX,
-        1_000,
-        250,
-        EnforcementMode::Enforce,
-    );
-    let fp = rule.fingerprint;
+    let rule = rule("k", &format!("{}r/s", u64::MAX / 1_000));
+    let fp = rule.fingerprint();
     let steady = KeyHash(0x777);
     let store = ShmAggregateStore::new(region);
     let (d, e) = deltas_and_expirations(&rule, &[(steady, 0, STEADY)], &[]);
@@ -368,11 +383,11 @@ fn readers_see_exact_counts_while_the_leader_moves_cells() {
             thread::spawn(move || {
                 while !stop.load(Ordering::Acquire) {
                     let view = region.aggregate();
-                    if let Some(cell) = view.get(fp, steady.0, 0) {
+                    if let Some(cell) = view.get(fp, steady, BucketEpoch(0)) {
                         assert_eq!(cell.count, u64::from(STEADY));
                     }
                     for bucket in 1..=8 {
-                        if let Some(cell) = view.get(fp, steady.0, bucket) {
+                        if let Some(cell) = view.get(fp, steady, BucketEpoch(bucket)) {
                             assert_eq!(cell.count, u64::from(bucket));
                         }
                     }
@@ -395,10 +410,10 @@ fn readers_see_exact_counts_while_the_leader_moves_cells() {
 
     let view = region.aggregate();
     assert_eq!(
-        view.get(fp, steady.0, 0).expect("steady").count,
+        view.get(fp, steady, BucketEpoch(0)).expect("steady").count,
         u64::from(STEADY)
     );
-    assert!((1..=8).all(|bucket| view.get(fp, steady.0, bucket).is_none()));
+    assert!((1..=8).all(|bucket| view.get(fp, steady, BucketEpoch(bucket)).is_none()));
 }
 
 // -- 5. Lease takeover under contention ------------------------------------
@@ -406,31 +421,21 @@ fn readers_see_exact_counts_while_the_leader_moves_cells() {
 #[test]
 fn lease_takeover_under_contention() {
     let (_zone, region) = build_zone(8, 16);
-    let lease = std::sync::Arc::new(LeaseFacade { region });
+    let lease = region.lease();
 
     // Millisecond precision now that the lease packs `(owner: u24,
     // expires_millis: u40)` into a single atomic.
-    assert!(lease.region.lease().try_acquire(1, 0, 100));
+    assert!(lease.try_acquire(1, 0, 100));
     // Worker 2 cannot steal a live lease.
-    assert!(!lease.region.lease().try_acquire(2, 50, 100));
+    assert!(!lease.try_acquire(2, 50, 100));
     // After the lease expires (now=200ms > expires=100ms), worker 2 takes over.
-    assert!(lease.region.lease().try_acquire(2, 200, 100));
+    assert!(lease.try_acquire(2, 200, 100));
     // Worker 1's renewal must now fail.
-    assert!(!lease.region.lease().try_acquire(1, 210, 100));
+    assert!(!lease.try_acquire(1, 210, 100));
     // Release lets the next worker grab it immediately.
-    assert!(lease.region.lease().release(2));
-    assert!(lease.region.lease().try_acquire(3, 300, 100));
+    assert!(lease.release(2));
+    assert!(lease.try_acquire(3, 300, 100));
 }
-
-// We need a wrapper to bypass the lack of `Send` impl for `*mut u8` inside
-// `ShmRegion` if we want it shared between threads. `ShmRegion` is `Send`
-// + `Sync` by `unsafe impl`. Use it directly.
-struct LeaseFacade {
-    region: ShmRegion,
-}
-
-unsafe impl Send for LeaseFacade {}
-unsafe impl Sync for LeaseFacade {}
 
 // -- 6. End-to-end nginx flow: workers push, leader drains+applies, workers
 // reread
@@ -455,30 +460,18 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
     const TOTAL: u64 = (PER_WORKER * WORKER_COUNT) as u64;
 
     let layout = Layout::new(32, 32).expect("layout");
-    let words = layout.total_bytes.div_ceil(8);
-    let zone = Arc::new(TestZone::allocate(words));
+    let zone = Arc::new(TestZone::allocate(layout.total_bytes));
     // SAFETY: see build_zone.
     let region = unsafe { ShmRegion::initialize(zone.as_ptr(), layout) };
 
     // Build a rule and its fingerprint+key the same way nginx would.
-    let rule = Rule::new(
-        1,
-        DEFAULT_DOMAIN.to_string(),
-        vec![DescriptorPattern {
-            key: "tenant".into(),
-            value: "*".into(),
-        }],
-        TOTAL * 2,
-        1_000,
-        250,
-        EnforcementMode::Enforce,
-    );
-    let fingerprint = rule.fingerprint;
+    let rule = rule("tenant", &format!("{}r/s", TOTAL * 2));
+    let fingerprint = rule.fingerprint();
     let descriptors = [gabion::rules::Descriptor {
         key: "tenant",
         value: "alice",
     }];
-    let key_hash = hash_key(rule.id, DEFAULT_DOMAIN, &descriptors);
+    let key_hash = hash_key(DEFAULT_DOMAIN, descriptors);
     let bucket = 1_u32;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -493,8 +486,8 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
                 loop {
                     match queue.push(QueueEvent {
                         rule_fingerprint: fingerprint,
-                        key_hash: key_hash.0,
-                        bucket,
+                        key_hash,
+                        bucket: BucketEpoch(bucket),
                         hits: 1,
                         rule_limit: 1_000,
                         now_millis: 0,
@@ -524,11 +517,8 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
                 }
             }
             if batched > 0 {
-                let (d, e) = deltas_and_expirations(
-                    &rule,
-                    &[(KeyHash(key_hash.0), bucket, batched as u32)],
-                    &[],
-                );
+                let (d, e) =
+                    deltas_and_expirations(&rule, &[(key_hash, bucket, batched as u32)], &[]);
                 store.apply(&d, &e);
                 total = total.saturating_add(batched);
             }
@@ -548,7 +538,7 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
             let r = region;
             let view = r.aggregate();
             while !reader_stop.load(Ordering::Acquire) {
-                let _ = view.get(fingerprint, key_hash.0, bucket);
+                let _ = view.get(fingerprint, key_hash, BucketEpoch(bucket));
             }
         }));
     }
@@ -566,15 +556,15 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
 
     let final_view = region.aggregate();
     let cell = final_view
-        .get(fingerprint, key_hash.0, bucket)
+        .get(fingerprint, key_hash, BucketEpoch(bucket))
         .expect("aggregate cell present");
     assert_eq!(cell.count, TOTAL);
 }
 
-// -- 7. Decide() + leader apply running concurrently -----------------------
+// -- 7. decide_all + leader apply running concurrently ----------------------
 
 #[test]
-fn decide_and_leader_apply_concurrent() {
+fn decide_all_and_leader_apply_concurrent() {
     // Smaller iteration counts under miri to keep runtime reasonable.
     #[cfg(not(miri))]
     const ITERATIONS: usize = 64;
@@ -582,15 +572,14 @@ fn decide_and_leader_apply_concurrent() {
     const ITERATIONS: usize = 8;
 
     let layout = Layout::new(32, 32).expect("layout");
-    let words = layout.total_bytes.div_ceil(8);
-    let zone = Arc::new(TestZone::allocate(words));
-    // SAFETY: zone is fresh, 8-byte aligned, exclusive during init.
+    let zone = Arc::new(TestZone::allocate(layout.total_bytes));
+    // SAFETY: zone is fresh, cache-line aligned, exclusive during init.
     let region = unsafe { ShmRegion::initialize(zone.as_ptr(), layout) };
 
     let rules = Arc::new(build_rules());
     let stop = Arc::new(AtomicBool::new(false));
 
-    // Worker thread runs the access path (decide()) repeatedly. This
+    // Worker thread runs the access path (decide_all()) repeatedly. This
     // exercises every read-side unsafe accessor as well as queue push and
     // aggregate seqlock retries when the writer races us.
     let worker_rules = rules.clone();
@@ -600,21 +589,21 @@ fn decide_and_leader_apply_concurrent() {
         let vars = MockVars {
             tenant: b"alice".to_vec(),
         };
+        let mut events = Vec::new();
         for _ in 0..ITERATIONS {
-            let ctx = AccessCtx {
-                rules: &worker_rules,
-                aggregate: r.aggregate(),
-                queue: r.queue(),
-                stats: r.stats(),
-                domain: DEFAULT_DOMAIN,
-                cardinality: CardinalitySettings::default(),
-            };
-            let _ = decide(ctx, 0, &vars, 0);
+            let ctx = ctx(&worker_rules, &r);
+            assert!(matches!(
+                decide_all(ctx, &[0], &vars, 0, &mut events),
+                AccessOutcome::Allow(_)
+            ));
         }
         worker_stop.store(true, Ordering::Release);
     });
 
-    // Leader thread continuously applies deltas until the worker stops.
+    // Leader thread applies a hit and its expiry until the worker stops, so
+    // the cell keeps appearing and vanishing but never reaches the limit. It
+    // applies at least once, so the final check sees an expiry, not a table
+    // the leader never touched.
     let leader_stop = stop.clone();
     let leader_rules = rules.clone();
     let leader = thread::spawn(move || {
@@ -624,38 +613,41 @@ fn decide_and_leader_apply_concurrent() {
             key: "tenant",
             value: "alice",
         }];
-        let spec = leader_rules.rules()[0].rule.spec();
-        let key_hash = hash_key(spec.id, DEFAULT_DOMAIN, &descriptors);
-        let mut applied = 0_u32;
-        while !leader_stop.load(Ordering::Acquire) {
-            let (d, e) =
-                deltas_and_expirations(&leader_rules.rules()[0].rule, &[(key_hash, 0, 1)], &[]);
+        let key_hash = hash_key(DEFAULT_DOMAIN, descriptors);
+        let hit = [(key_hash, 0, 1)];
+        let (d, e) = deltas_and_expirations(&leader_rules.table().rules()[0], &hit, &hit);
+        for _ in 0..=1_000 {
             store.apply(&d, &e);
-            applied += 1;
-            if applied > 1_000 {
+            if leader_stop.load(Ordering::Acquire) {
                 break;
             }
         }
-        applied
     });
 
     worker.join().expect("worker joined");
-    let _ = leader.join().expect("leader joined");
+    leader.join().expect("leader joined");
 
-    // Final read through the seqlock; must not panic.
-    let view = region.aggregate();
+    // Every allowed request queued one event, up to the queue's capacity.
+    let mut drained = [QueueEvent::default(); 32];
+    assert_eq!(region.queue().drain(&mut drained), ITERATIONS.min(32));
+    // Every hit the leader applied was expired again.
     let descriptors = [gabion::rules::Descriptor {
         key: "tenant",
         value: "alice",
     }];
-    let spec = rules.rules()[0].rule.spec();
-    let key_hash = hash_key(spec.id, DEFAULT_DOMAIN, &descriptors);
-    let _ = view.get(spec.fingerprint, key_hash.0, 0);
+    let spec = rules.table().rules()[0].spec();
+    let key_hash = hash_key(DEFAULT_DOMAIN, descriptors);
+    assert!(
+        region
+            .aggregate()
+            .get(spec.fingerprint, key_hash, BucketEpoch(0))
+            .is_none()
+    );
 }
 
 // -- 8b. Multi-rule decide_all + leader apply running concurrently --------
 
-/// Same shape as `decide_and_leader_apply_concurrent`, but with two stacked
+/// Same shape as `decide_all_and_leader_apply_concurrent`, but with two stacked
 /// rules so the multi-rule queue-flush path is exercised under the
 /// writer/reader race. Catches regressions in the queue-batching logic
 /// that single-rule tests can't surface.
@@ -667,40 +659,14 @@ fn decide_all_multi_rule_concurrent() {
     const ITERATIONS: usize = 8;
 
     let layout = Layout::new(32, 32).expect("layout");
-    let words = layout.total_bytes.div_ceil(8);
-    let zone = Arc::new(TestZone::allocate(words));
-    // SAFETY: zone is fresh, 8-byte aligned, exclusive during init.
+    let zone = Arc::new(TestZone::allocate(layout.total_bytes));
+    // SAFETY: zone is fresh, cache-line aligned, exclusive during init.
     let region = unsafe { ShmRegion::initialize(zone.as_ptr(), layout) };
 
-    let rule_configs = vec![
-        RuleConfig {
-            name: "rule_a".into(),
-            domain: DEFAULT_DOMAIN.into(),
-            bindings: vec![DescriptorBinding {
-                key: "tenant_a".into(),
-                source: "$http_x_tenant".into(),
-            }],
-            limit: u64::MAX / 2,
-            window: std::time::Duration::from_secs(1),
-            bucket: std::time::Duration::from_millis(250),
-            mode: EnforcementMode::Enforce,
-            except_if: None,
-        },
-        RuleConfig {
-            name: "rule_b".into(),
-            domain: DEFAULT_DOMAIN.into(),
-            bindings: vec![DescriptorBinding {
-                key: "tenant_b".into(),
-                source: "$http_x_tenant".into(),
-            }],
-            limit: u64::MAX / 2,
-            window: std::time::Duration::from_secs(1),
-            bucket: std::time::Duration::from_millis(250),
-            mode: EnforcementMode::Enforce,
-            except_if: None,
-        },
-    ];
-    let rules = Arc::new(CompiledRules::compile(&rule_configs).expect("compile two rules"));
+    let rules = Arc::new(compile(&[
+        "rule_a tenant_a:$http_x_tenant rate=9223372036854775r/s bucket=250ms",
+        "rule_b tenant_b:$http_x_tenant rate=9223372036854775r/s bucket=250ms",
+    ]));
     let stop = Arc::new(AtomicBool::new(false));
     let worker_rules = rules.clone();
     let worker_stop = stop.clone();
@@ -709,16 +675,13 @@ fn decide_all_multi_rule_concurrent() {
         let vars = MockVars {
             tenant: b"alice".to_vec(),
         };
+        let mut events = Vec::new();
         for _ in 0..ITERATIONS {
-            let ctx = AccessCtx {
-                rules: &worker_rules,
-                aggregate: r.aggregate(),
-                queue: r.queue(),
-                stats: r.stats(),
-                domain: DEFAULT_DOMAIN,
-                cardinality: CardinalitySettings::default(),
-            };
-            let _ = gabion_nginx::access::decide_all(ctx, &[0, 1], &vars, 0);
+            let ctx = ctx(&worker_rules, &r);
+            assert!(matches!(
+                decide_all(ctx, &[0, 1], &vars, 0, &mut events),
+                AccessOutcome::Allow(_)
+            ));
         }
         worker_stop.store(true, Ordering::Release);
     });
@@ -727,65 +690,167 @@ fn decide_all_multi_rule_concurrent() {
     let leader = thread::spawn(move || {
         let r = region;
         let store = ShmAggregateStore::new(r);
-        let mut applied = 0_u32;
-        while !leader_stop.load(Ordering::Acquire) {
-            for compiled in leader_rules.rules() {
-                let rule = &compiled.rule;
+        for _ in 0..=1_000 {
+            for rule in leader_rules.table().rules() {
                 let descriptors = [gabion::rules::Descriptor {
-                    key: &compiled.bindings[0].key,
+                    key: &rule.descriptors()[0].key,
                     value: "alice",
                 }];
-                let key_hash = hash_key(rule.id, DEFAULT_DOMAIN, &descriptors);
+                let key_hash = hash_key(DEFAULT_DOMAIN, descriptors);
                 let (d, e) = deltas_and_expirations(rule, &[(key_hash, 0, 1)], &[]);
                 store.apply(&d, &e);
             }
-            applied += 1;
-            if applied > 1_000 {
+            if leader_stop.load(Ordering::Acquire) {
                 break;
             }
         }
-        applied
     });
 
     worker.join().expect("worker joined");
-    let _ = leader.join().expect("leader joined");
+    leader.join().expect("leader joined");
 
-    let view = region.aggregate();
-    for compiled in rules.rules() {
-        let rule = &compiled.rule;
-        let descriptors = [gabion::rules::Descriptor {
-            key: &compiled.bindings[0].key,
-            value: "alice",
-        }];
-        let key_hash = hash_key(rule.id, DEFAULT_DOMAIN, &descriptors);
-        let _ = view.get(rule.fingerprint, key_hash.0, 0);
-    }
+    // The leader wrote each rule's cell, so the reads raced real writes.
+    assert_eq!(region.aggregate().occupied(), 2);
+    // Every allowed request queued one event per rule, up to the capacity.
+    let mut drained = [QueueEvent::default(); 32];
+    assert_eq!(region.queue().drain(&mut drained), (2 * ITERATIONS).min(32));
 }
 
 // -- 8. Concurrent lease contention: only one winner among many threads ---
 
 #[test]
 fn lease_concurrent_acquire_distinct_winners() {
-    use std::sync::Barrier;
+    // A lost-update race shows in well under 1% of rounds, so run many.
+    #[cfg(not(miri))]
+    const ROUNDS: u64 = 4096;
+    #[cfg(miri)]
+    const ROUNDS: u64 = 4;
+
     let (_zone, region) = build_zone(8, 16);
-    let region = std::sync::Arc::new(LeaseFacade { region });
-    let barrier = std::sync::Arc::new(Barrier::new(4));
-    let mut handles = Vec::new();
-    let winners = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    for worker in 1..=4_u32 {
-        let region = region.clone();
-        let barrier = barrier.clone();
-        let winners = winners.clone();
-        handles.push(thread::spawn(move || {
-            barrier.wait();
-            if region.region.lease().try_acquire(worker, 0, 1_000) {
-                winners.lock().unwrap().push(worker);
-            }
-        }));
-    }
+    let barrier = Arc::new(std::sync::Barrier::new(4));
+    let winners: Arc<[AtomicU32]> = (0..ROUNDS).map(|_| AtomicU32::new(0)).collect();
+    let handles: Vec<_> = (1..=4_u32)
+        .map(|worker| {
+            let (barrier, winners) = (barrier.clone(), winners.clone());
+            thread::spawn(move || {
+                for round in 0..ROUNDS {
+                    barrier.wait();
+                    // Each round starts after the previous round's lease
+                    // expired.
+                    if region.lease().try_acquire(worker, round * 2_000, 1_000) {
+                        winners[round as usize].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
     for h in handles {
         h.join().unwrap();
     }
-    let winners = winners.lock().unwrap();
-    assert_eq!(winners.len(), 1, "expected exactly one lease winner");
+    for (round, won) in winners.iter().enumerate() {
+        let won = won.load(Ordering::Relaxed);
+        assert_eq!(won, 1, "round {round}: expected exactly one lease winner");
+    }
+}
+
+// -- 9. A configured queue capacity bounds the ring ------------------------
+
+/// `gabion_gossip_limit_queue_capacity` of 100 lays the zone out with a
+/// 128-slot ring: producers fill exactly those slots, the rest drop, and the
+/// leader pops every accepted event intact. Under Miri, every slot write
+/// stays inside the region `Layout::for_zone` sized.
+#[test]
+fn custom_queue_capacity_bounds_the_ring() {
+    const PER_PRODUCER: u64 = 100;
+    let layout = Layout::for_zone(256 * 1024, 4096, 100).expect("layout");
+    assert_eq!(layout.queue_capacity, 128);
+    let zone = Arc::new(TestZone::allocate(layout.total_bytes));
+    // SAFETY: see build_zone.
+    let region = unsafe { ShmRegion::initialize(zone.as_ptr(), layout) };
+    let event = |producer: u64, i: u64| QueueEvent {
+        rule_fingerprint: u128::from(producer) << 64 | u128::from(i),
+        key_hash: KeyHash(u128::from(i) << 64 | u128::from(producer)),
+        bucket: BucketEpoch::wrap(i),
+        hits: producer + 1,
+        rule_limit: i + 1,
+        now_millis: producer * 1_000 + i,
+    };
+    let producers: Vec<_> = (0..2_u64)
+        .map(|producer| {
+            thread::spawn(move || {
+                let queue = region.queue();
+                (0..PER_PRODUCER)
+                    .map(|i| event(producer, i))
+                    .filter(|event| queue.push(*event).is_ok())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    let mut accepted: Vec<QueueEvent> = producers
+        .into_iter()
+        .flat_map(|producer| producer.join().expect("producer joined"))
+        .collect();
+    let queue = region.queue();
+    assert_eq!(accepted.len(), 128);
+    let mut popped: Vec<QueueEvent> = std::iter::from_fn(|| queue.pop()).collect();
+    let key = |event: &QueueEvent| (event.rule_fingerprint, event.key_hash);
+    accepted.sort_by_key(key);
+    popped.sort_by_key(key);
+    assert_eq!(popped, accepted);
+    drop(zone);
+}
+
+// -- 10. Statistics layout: the workers' line and the leader's -------------
+
+/// Every worker bumps the per-request counters on every request, so they
+/// share one cache line of the zone; what the leader writes each pass or
+/// tick, and the counter only a full queue bumps, sit on the next line. The
+/// region hands the statistics out through a reference Miri checks for
+/// cache-line alignment.
+#[test]
+fn stats_keep_the_leaders_writes_off_the_workers_line() {
+    let (zone, region) = build_zone(8, 16);
+    let stats = region.stats();
+    let line = |counter: &AtomicU64| std::ptr::from_ref(counter).addr() / CACHELINE;
+    assert_eq!(
+        std::ptr::from_ref(stats).addr() % CACHELINE,
+        0,
+        "the statistics start mid-line"
+    );
+    let workers = line(&stats.workers.requests);
+    for counter in [
+        &stats.workers.allowed,
+        &stats.workers.rejected,
+        &stats.workers.rejected_cardinality,
+        &stats.workers.declines_invalid_descriptor,
+        &stats.workers.matched_rule_overflows,
+        &stats.workers.exempted,
+        &stats.workers.queue_pushed,
+    ] {
+        assert_eq!(
+            line(counter),
+            workers,
+            "a per-request counter left the workers' line"
+        );
+    }
+    for counter in [
+        &stats.leader.queue_drained,
+        &stats.leader.queue_dropped,
+        &stats.leader.aggregate_dropped,
+        &stats.leader.logged.matched_rule_overflows,
+        &stats.leader.logged.queue_dropped,
+        &stats.leader.logged.declines_invalid_descriptor,
+        &stats.leader.logged.rejected_cardinality,
+    ] {
+        assert_eq!(
+            line(counter),
+            workers + 1,
+            "the leader writes on the workers' line"
+        );
+    }
+    stats.record_request();
+    stats.record_queue_drain(3);
+    let snapshot = stats.snapshot();
+    assert_eq!((snapshot.requests, snapshot.queue_drained), (1, 3));
+    drop(zone);
 }

@@ -1,41 +1,59 @@
 use super::*;
-use crate::rules::{DescriptorBinding, RuleConfig};
-use crate::shm::ShmAggregateStore;
-use crate::shm::mock::TestZone;
-use gabion::rules::EnforcementMode;
-use std::time::Duration;
+use crate::rules::mock::{compile, directive, rules};
+use crate::rules::{CompiledRules, DEFAULT_DOMAIN};
+use crate::shm::mock::{TestZone, seed};
+use crate::shm::{ShmAggregateStore, ShmRegion};
+use gabion::crdt::BucketEpoch;
+use gabion::defaults;
+use gabion::rules::{Descriptor, KeyHash, hash_key};
+use gabion::settings::Settings;
 
-fn build_rules() -> CompiledRules {
-    CompiledRules::compile(&[RuleConfig {
-        name: "per_tenant".into(),
-        domain: crate::rules::DEFAULT_DOMAIN.into(),
-        bindings: vec![DescriptorBinding {
-            key: "tenant".into(),
-            source: "$http_x_tenant".into(),
-        }],
-        limit: 2,
-        window: Duration::from_secs(1),
-        bucket: Duration::from_millis(250),
-        mode: EnforcementMode::Enforce,
-        except_if: None,
-    }])
-    .expect("compile rules")
+/// `per_tenant`: 2 hits a second on `tenant`, in 250 ms buckets.
+const PER_TENANT: &str = "per_tenant tenant:$http_x_tenant rate=2r/s bucket=250ms";
+
+/// The access context over `region` for `rules`, with the test settings
+/// then `tune`.
+fn ctx<'a>(
+    rules: &'a CompiledRules,
+    region: &'a ShmRegion,
+    tune: impl FnOnce(&mut Settings),
+) -> AccessCtx<'a> {
+    let (_, storage) = crate::mock::validated(tune);
+    AccessCtx {
+        rules,
+        aggregate: region.aggregate(),
+        queue: region.queue(),
+        stats: region.stats(),
+        cardinality: storage.cardinality,
+        max_matched_rules: storage.max_matched_rules(),
+    }
+}
+
+/// [`decide_all`] with a fresh scratch.
+fn decide(
+    ctx: AccessCtx<'_>,
+    indices: &[usize],
+    vars: &MockVars,
+    now_millis: u64,
+) -> AccessOutcome {
+    decide_all(ctx, indices, vars, now_millis, &mut Vec::new())
+}
+
+/// How `key=value` hashes in the default domain.
+fn key_hash(key: &str, value: &str) -> KeyHash {
+    hash_key(DEFAULT_DOMAIN, [Descriptor { key, value }])
+}
+
+fn queued(region: &ShmRegion) -> usize {
+    region.queue().drain(&mut [QueueEvent::default(); 64])
 }
 
 #[test]
 fn allow_on_empty_aggregate() {
     let (_buf, region) = TestZone::new(8, 16);
-    let rules = build_rules();
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
-    };
+    let rules = rules(&[PER_TENANT]);
     let vars = MockVars::new().set("http_x_tenant", "alice");
-    let outcome = decide(ctx, 0, &vars, 1_000);
+    let outcome = decide(ctx(&rules, &region, |_| {}), &[0], &vars, 1_000);
     // Single matched rule, aggregate empty: limit=2, hits=1 -> remaining=1.
     match outcome {
         AccessOutcome::Allow(Some(info)) => {
@@ -45,37 +63,40 @@ fn allow_on_empty_aggregate() {
         }
         other => panic!("expected Allow(Some), got {other:?}"),
     }
-    // One queue event pushed.
-    let mut out = [QueueEvent::default(); 1];
-    assert_eq!(region.queue().drain(&mut out), 1);
+    // The queued hit lands in the 250 ms bucket holding now=1000ms: bucket 4.
+    let mut events = [QueueEvent::default(); 2];
+    assert_eq!(region.queue().drain(&mut events), 1);
+    assert_eq!(
+        events[0],
+        QueueEvent {
+            rule_fingerprint: rules.table().rules()[0].spec().fingerprint,
+            key_hash: key_hash("tenant", "alice"),
+            bucket: BucketEpoch(4),
+            hits: 1,
+            rule_limit: 2,
+            now_millis: 1_000,
+        }
+    );
 }
 
 #[test]
 fn reject_when_window_total_exceeds_limit() {
     let (_buf, region) = TestZone::new(8, 16);
-    let rules = build_rules();
-    let domain = crate::rules::DEFAULT_DOMAIN;
-    let spec = rules.rules()[0].rule.spec();
-    let descriptors = [Descriptor {
-        key: "tenant",
-        value: "alice",
-    }];
-    let key_hash = hash_key(spec.id, domain, &descriptors);
-    let bucket = (1_000_u64 / spec.bucket_millis) as u32;
+    let rules = rules(&[PER_TENANT]);
+    let spec = rules.table().rules()[0].spec();
+    let bucket = BucketEpoch((1_000_u64 / spec.bucket_millis) as u32);
     // Pre-populate aggregate so total >= limit (limit is 2).
     let store = ShmAggregateStore::new(region);
-    store.write_delta(spec.fingerprint, key_hash.0, bucket, 5, 1_000);
+    seed(
+        &store,
+        spec.fingerprint,
+        key_hash("tenant", "alice"),
+        bucket,
+        5,
+    );
 
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain,
-        cardinality: CardinalitySettings::default(),
-    };
     let vars = MockVars::new().set("http_x_tenant", "alice");
-    let outcome = decide(ctx, 0, &vars, 1_000);
+    let outcome = decide(ctx(&rules, &region, |_| {}), &[0], &vars, 1_000);
     match outcome {
         AccessOutcome::Reject(info) => {
             assert_eq!(info.spec.id, spec.id);
@@ -89,8 +110,7 @@ fn reject_when_window_total_exceeds_limit() {
         }
         other => panic!("expected Reject, got {other:?}"),
     }
-    let mut out = [QueueEvent::default(); 1];
-    assert_eq!(region.queue().drain(&mut out), 0);
+    assert_eq!(queued(&region), 0);
 }
 
 #[test]
@@ -102,27 +122,19 @@ fn reject_delta_reflects_oldest_non_empty_bucket() {
     // = 5+1-2 = 4, satisfied at bucket 2; fall_off = (2+4)*250 = 1500ms;
     // delta from now=1_000 is 500ms.
     let (_buf, region) = TestZone::new(8, 16);
-    let rules = build_rules();
-    let domain = crate::rules::DEFAULT_DOMAIN;
-    let spec = rules.rules()[0].rule.spec();
-    let descriptors = [Descriptor {
-        key: "tenant",
-        value: "alice",
-    }];
-    let key_hash = hash_key(spec.id, domain, &descriptors);
+    let rules = rules(&[PER_TENANT]);
+    let spec = rules.table().rules()[0].spec();
     let store = ShmAggregateStore::new(region);
-    store.write_delta(spec.fingerprint, key_hash.0, 2, 5, 0);
+    seed(
+        &store,
+        spec.fingerprint,
+        key_hash("tenant", "alice"),
+        BucketEpoch(2),
+        5,
+    );
 
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain,
-        cardinality: CardinalitySettings::default(),
-    };
     let vars = MockVars::new().set("http_x_tenant", "alice");
-    let outcome = decide(ctx, 0, &vars, 1_000);
+    let outcome = decide(ctx(&rules, &region, |_| {}), &[0], &vars, 1_000);
     match outcome {
         AccessOutcome::Reject(info) => {
             assert_eq!(info.total, 5);
@@ -135,74 +147,56 @@ fn reject_delta_reflects_oldest_non_empty_bucket() {
 #[test]
 fn decline_when_variable_missing() {
     let (_buf, region) = TestZone::new(8, 16);
-    let rules = build_rules();
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
-    };
+    let rules = rules(&[PER_TENANT]);
     let vars = MockVars::new(); // no http_x_tenant set
-    let outcome = decide(ctx, 0, &vars, 1_000);
+    let outcome = decide(ctx(&rules, &region, |_| {}), &[0], &vars, 1_000);
     assert!(matches!(outcome, AccessOutcome::Decline));
 }
 
+/// NGINX rejects exactly the requests the library's one cardinality check
+/// flags, on both sides of the byte budget.
 #[test]
-fn cardinality_settings_reject_oversized_descriptors() {
-    let (_buf, region) = TestZone::new(8, 16);
-    let rules = build_rules();
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings {
-            max_descriptor_count: defaults::STORAGE_MAX_DESCRIPTOR_COUNT,
-            max_descriptor_bytes: crate::rules::DEFAULT_DOMAIN.len() + "tenant".len(),
-            max_key_bytes: defaults::STORAGE_MAX_KEY_BYTES,
-        },
-    };
-    let vars = MockVars::new().set("http_x_tenant", "alice");
-
-    let outcome = decide(ctx, 0, &vars, 1_000);
-
-    assert!(matches!(outcome, AccessOutcome::Cardinality));
-}
-
-#[test]
-fn default_cardinality_settings_match_shared_defaults() {
-    let settings = CardinalitySettings::default();
-    assert_eq!(
-        settings.max_descriptor_count,
-        defaults::STORAGE_MAX_DESCRIPTOR_COUNT
-    );
-    assert_eq!(
-        settings.max_descriptor_bytes,
-        defaults::STORAGE_MAX_DESCRIPTOR_BYTES
-    );
-    assert_eq!(settings.max_key_bytes, defaults::STORAGE_MAX_KEY_BYTES);
-    assert_eq!(MAX_DESCRIPTOR_BYTES, defaults::STORAGE_MAX_DESCRIPTOR_BYTES);
-    assert_eq!(MAX_KEY_BYTES, defaults::STORAGE_MAX_KEY_BYTES);
+fn one_cardinality_check_for_both_adapters() {
+    const BUDGET: usize = 32;
+    let budget = |s: &mut Settings| s.max_descriptor_bytes = BUDGET.try_into().unwrap();
+    let limits = crate::mock::validated(budget).1.cardinality;
+    let rules = rules(&[PER_TENANT]);
+    let flagged: Vec<bool> = [BUDGET - 1, BUDGET, BUDGET + 1]
+        .into_iter()
+        .map(|bytes| {
+            let (_buf, region) = TestZone::new(8, 16);
+            let value = "v".repeat(bytes - DEFAULT_DOMAIN.len() - "tenant".len());
+            let entry = Descriptor {
+                key: "tenant",
+                value: &value,
+            };
+            let flagged = limits
+                .exceeded(DEFAULT_DOMAIN, [entry].into_iter())
+                .is_some();
+            let vars = MockVars::new().set("http_x_tenant", &value);
+            let outcome = decide(ctx(&rules, &region, budget), &[0], &vars, 1_000);
+            assert_eq!(
+                outcome == AccessOutcome::Cardinality,
+                flagged,
+                "{bytes} bytes"
+            );
+            flagged
+        })
+        .collect();
+    assert_eq!(flagged, [false, false, true]);
 }
 
 #[test]
 fn invalid_utf8_descriptor_declines_and_bumps_counter() {
     let (_buf, region) = TestZone::new(8, 16);
-    let rules = build_rules();
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
-    };
+    let rules = rules(&[PER_TENANT]);
+    // Over budget too, so a budget check moved before UTF-8 rejects.
+    let ctx = ctx(&rules, &region, |s| {
+        s.max_descriptor_bytes = DEFAULT_DOMAIN.len().try_into().unwrap();
+    });
     // `0xFF` is never a valid UTF-8 lead byte — guaranteed decline.
     let vars = MockVars::new().set_bytes("http_x_tenant", &[0xFFu8, 0xFE, 0xFD]);
-    let outcome = decide(ctx, 0, &vars, 1_000);
+    let outcome = decide(ctx, &[0], &vars, 1_000);
     assert!(matches!(outcome, AccessOutcome::Decline));
     let snap = region.stats().snapshot();
     assert_eq!(snap.declines_invalid_descriptor, 1);
@@ -210,6 +204,30 @@ fn invalid_utf8_descriptor_declines_and_bumps_counter() {
     // user-facing reject counter.
     assert_eq!(snap.rejected, 0);
     assert_eq!(snap.rejected_cardinality, 0);
+}
+
+/// A `mode=disabled` rule declines before its predicate, UTF-8 and byte
+/// budget checks, so none of them answers or moves a counter.
+#[test]
+fn disabled_rule_declines_before_any_check() {
+    let (_buf, region) = TestZone::new(8, 16);
+    let rules = rules(&[&format!("{PER_TENANT} except_if=$trusted mode=disabled")]);
+    let ctx = ctx(&rules, &region, |_| {});
+    let over_budget = "a".repeat(defaults::STORAGE_MAX_DESCRIPTOR_BYTES);
+    // In the order the checks run last to first, so a disabled check moved
+    // past any one of them fails on that check's own case.
+    for vars in [
+        MockVars::new().set("http_x_tenant", &over_budget),
+        MockVars::new().set_bytes("http_x_tenant", &[0xFF]),
+        MockVars::new().set("trusted", "1"),
+    ] {
+        let outcome = decide(ctx, &[0], &vars, 1_000);
+        assert!(matches!(outcome, AccessOutcome::Decline), "{outcome:?}");
+        let snap = region.stats().snapshot();
+        assert_eq!(snap.exempted, 0);
+        assert_eq!(snap.rejected_cardinality, 0);
+        assert_eq!(snap.declines_invalid_descriptor, 0);
+    }
 }
 
 #[test]
@@ -226,6 +244,9 @@ fn is_truthy_matches_documented_falsy_set() {
         b"no",
         b"No",
         b"NO",
+        b"fAlSe",
+        b"oFf",
+        b"nO",
     ] {
         assert!(!is_truthy(falsy), "{:?} should be falsy", falsy);
     }
@@ -234,39 +255,33 @@ fn is_truthy_matches_documented_falsy_set() {
     }
 }
 
-fn rule_with_predicate(predicate: Option<&str>) -> CompiledRules {
-    CompiledRules::compile(&[RuleConfig {
-        name: "per_tenant".into(),
-        domain: crate::rules::DEFAULT_DOMAIN.into(),
-        bindings: vec![DescriptorBinding {
-            key: "tenant".into(),
-            source: "$http_x_tenant".into(),
-        }],
-        limit: 2,
-        window: Duration::from_secs(1),
-        bucket: Duration::from_millis(250),
-        mode: EnforcementMode::Enforce,
-        except_if: predicate.map(Into::into),
-    }])
-    .expect("compile rules")
+/// `$arg_name` reads the first pair whose name matches `name` in any ASCII
+/// case, as nginx's does.
+#[test]
+fn find_query_arg_matches_the_first_pair_in_any_case() {
+    let args = b"tt=1&t&t=x=y&t=z&u=";
+    assert_eq!(find_query_arg(args, b"t"), Some(&b"x=y"[..]));
+    assert_eq!(find_query_arg(args, b"tt"), Some(&b"1"[..]));
+    assert_eq!(find_query_arg(args, b"u"), Some(&b""[..]));
+    assert_eq!(find_query_arg(args, b"v"), None);
+    assert_eq!(find_query_arg(b"", b"t"), None);
+    assert_eq!(find_query_arg(b"T=1", b"t"), Some(&b"1"[..]));
+    assert_eq!(find_query_arg(b"t=1", b"T"), Some(&b"1"[..]));
+    assert_eq!(find_query_arg(b"&&xt=1&t=2&", b"t"), Some(&b"2"[..]));
+}
+
+fn rule_with_predicate() -> CompiledRules {
+    rules(&[&format!("{PER_TENANT} except_if=$trusted")])
 }
 
 #[test]
 fn except_truthy_skips_rule() {
     let (_buf, region) = TestZone::new(8, 16);
-    let rules = rule_with_predicate(Some("trusted"));
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
-    };
+    let rules = rule_with_predicate();
     let vars = MockVars::new()
         .set("http_x_tenant", "alice")
         .set("trusted", "1");
-    let outcome = decide(ctx, 0, &vars, 0);
+    let outcome = decide(ctx(&rules, &region, |_| {}), &[0], &vars, 0);
     // Exempt-only outcome: no rule produced a quota view, so no
     // `X-RateLimit-*` headers should be emitted on the response.
     assert!(matches!(outcome, AccessOutcome::Allow(None)));
@@ -275,125 +290,56 @@ fn except_truthy_skips_rule() {
     assert_eq!(snap.allowed, 0, "exempt is not a normal allow");
     // No queue event from an exempted request — under-count rather
     // than over-count when the predicate fires.
-    let mut out = [QueueEvent::default(); 1];
-    assert_eq!(region.queue().drain(&mut out), 0);
+    assert_eq!(queued(&region), 0);
 }
 
+/// A falsy, missing or empty predicate leaves the rule applying: the
+/// operator's intent for `except_if=` is opt-in exemption, not opt-in
+/// enforcement.
 #[test]
-fn except_falsy_applies_rule() {
-    let (_buf, region) = TestZone::new(8, 16);
-    let rules = rule_with_predicate(Some("trusted"));
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
-    };
-    let vars = MockVars::new()
-        .set("http_x_tenant", "alice")
-        .set("trusted", "off");
-    let outcome = decide(ctx, 0, &vars, 0);
-    assert!(matches!(outcome, AccessOutcome::Allow(_)));
-    let snap = region.stats().snapshot();
-    assert_eq!(snap.exempted, 0);
-    assert_eq!(snap.allowed, 1);
+fn except_falsy_missing_or_empty_applies_rule() {
+    let rules = rule_with_predicate();
+    for predicate in [Some("off"), None, Some("")] {
+        let (_buf, region) = TestZone::new(8, 16);
+        let mut vars = MockVars::new().set("http_x_tenant", "alice");
+        if let Some(value) = predicate {
+            vars = vars.set("trusted", value);
+        }
+        let outcome = decide(ctx(&rules, &region, |_| {}), &[0], &vars, 0);
+        assert!(matches!(outcome, AccessOutcome::Allow(_)), "{predicate:?}");
+        let snap = region.stats().snapshot();
+        assert_eq!((snap.exempted, snap.allowed), (0, 1), "{predicate:?}");
+    }
 }
 
-#[test]
-fn except_missing_applies_rule() {
-    let (_buf, region) = TestZone::new(8, 16);
-    let rules = rule_with_predicate(Some("trusted"));
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
-    };
-    // `trusted` is not set — the predicate variable resolves to None;
-    // per allow-by-default and the documented semantic, the rule still
-    // applies (the operator's intent for predicate=set is opt-in
-    // exemption, not opt-in enforcement).
-    let vars = MockVars::new().set("http_x_tenant", "alice");
-    let outcome = decide(ctx, 0, &vars, 0);
-    assert!(matches!(outcome, AccessOutcome::Allow(_)));
-    let snap = region.stats().snapshot();
-    assert_eq!(snap.exempted, 0);
-    assert_eq!(snap.allowed, 1);
-}
-
-#[test]
-fn except_empty_applies_rule() {
-    let (_buf, region) = TestZone::new(8, 16);
-    let rules = rule_with_predicate(Some("trusted"));
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
-    };
-    let vars = MockVars::new()
-        .set("http_x_tenant", "alice")
-        .set("trusted", "");
-    let outcome = decide(ctx, 0, &vars, 0);
-    assert!(matches!(outcome, AccessOutcome::Allow(_)));
-    let snap = region.stats().snapshot();
-    assert_eq!(snap.exempted, 0);
-    assert_eq!(snap.allowed, 1);
-}
-
-/// Build a `CompiledRules` with two rules sharing one descriptor key
-/// so a single `Descriptor { key: "tenant", ... }` matches both — the
-/// stacked-rule shape `decide_all` exists for.
+/// Two rules on `tenant`, `first_limit` hits over `first_window_secs` and
+/// `second_limit` over `second_window_secs`, so a single request matches
+/// both — the stacked-rule shape `decide_all` exists for.
 fn build_two_rules(
     first_limit: u64,
     first_window_secs: u64,
     second_limit: u64,
     second_window_secs: u64,
 ) -> CompiledRules {
-    let mk = |name: &str, limit: u64, window_secs: u64| RuleConfig {
-        name: name.into(),
-        domain: crate::rules::DEFAULT_DOMAIN.into(),
-        bindings: vec![DescriptorBinding {
-            key: "tenant".into(),
-            source: "$http_x_tenant".into(),
-        }],
-        limit,
-        window: Duration::from_secs(window_secs),
-        bucket: Duration::from_millis(250),
-        mode: EnforcementMode::Enforce,
-        except_if: None,
-    };
-    CompiledRules::compile(&[
-        mk("first", first_limit, first_window_secs),
-        mk("second", second_limit, second_window_secs),
+    rules(&[
+        &format!(
+            "first tenant:$http_x_tenant rate={first_limit}r/{first_window_secs}s bucket=250ms"
+        ),
+        &format!(
+            "second tenant:$http_x_tenant rate={second_limit}r/{second_window_secs}s bucket=250ms"
+        ),
     ])
-    .expect("compile two rules")
 }
 
 #[test]
 fn decide_all_allow_when_all_pass() {
     let (_buf, region) = TestZone::new(8, 16);
     let rules = build_two_rules(10, 1, 10, 60);
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
-    };
     let vars = MockVars::new().set("http_x_tenant", "alice");
-    let outcome = decide_all(ctx, &[0, 1], &vars, 0);
+    let outcome = decide(ctx(&rules, &region, |_| {}), &[0, 1], &vars, 0);
     assert!(matches!(outcome, AccessOutcome::Allow(_)));
     // Both rules push a QueueEvent because both matched.
-    let mut out = [QueueEvent::default(); 4];
-    assert_eq!(region.queue().drain(&mut out), 2);
+    assert_eq!(queued(&region), 2);
     let snap = region.stats().snapshot();
     assert_eq!(snap.allowed, 1);
     assert_eq!(snap.rejected, 0);
@@ -403,17 +349,8 @@ fn decide_all_allow_when_all_pass() {
 fn decide_all_decline_when_all_decline() {
     let (_buf, region) = TestZone::new(8, 16);
     let rules = build_two_rules(10, 1, 10, 60);
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
-    };
     // No variable set — every rule declines.
-    let vars = MockVars::new();
-    let outcome = decide_all(ctx, &[0, 1], &vars, 0);
+    let outcome = decide(ctx(&rules, &region, |_| {}), &[0, 1], &MockVars::new(), 0);
     assert!(matches!(outcome, AccessOutcome::Decline));
     let snap = region.stats().snapshot();
     assert_eq!(snap.allowed, 0);
@@ -425,28 +362,19 @@ fn decide_all_picks_longest_window() {
     let (_buf, region) = TestZone::new(8, 16);
     // First rule: 1s window, limit 1; second: 60s window, limit 1.
     let rules = build_two_rules(1, 1, 1, 60);
-    let domain = crate::rules::DEFAULT_DOMAIN;
-    let descriptors = [Descriptor {
-        key: "tenant",
-        value: "alice",
-    }];
     // Pre-populate aggregate so BOTH rules are over their budget.
     let store = ShmAggregateStore::new(region);
-    for rule in rules.rules() {
-        let spec = rule.rule.spec();
-        let key_hash = hash_key(spec.id, domain, &descriptors);
-        store.write_delta(spec.fingerprint, key_hash.0, 0, 5, 0);
+    for rule in rules.table().rules() {
+        seed(
+            &store,
+            rule.fingerprint(),
+            key_hash("tenant", "alice"),
+            BucketEpoch(0),
+            5,
+        );
     }
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain,
-        cardinality: CardinalitySettings::default(),
-    };
     let vars = MockVars::new().set("http_x_tenant", "alice");
-    let outcome = decide_all(ctx, &[0, 1], &vars, 0);
+    let outcome = decide(ctx(&rules, &region, |_| {}), &[0, 1], &vars, 0);
     match outcome {
         AccessOutcome::Reject(info) => {
             assert_eq!(
@@ -463,89 +391,35 @@ fn decide_all_one_declines_one_allows() {
     let (_buf, region) = TestZone::new(8, 16);
     // First rule keyed on a missing variable so it declines; second
     // rule has the variable set so it allows.
-    let rule_a = RuleConfig {
-        name: "missing".into(),
-        domain: crate::rules::DEFAULT_DOMAIN.into(),
-        bindings: vec![DescriptorBinding {
-            key: "nonexistent".into(),
-            source: "$does_not_exist".into(),
-        }],
-        limit: 10,
-        window: Duration::from_secs(1),
-        bucket: Duration::from_millis(250),
-        mode: EnforcementMode::Enforce,
-        except_if: None,
-    };
-    let rule_b = RuleConfig {
-        name: "tenant".into(),
-        domain: crate::rules::DEFAULT_DOMAIN.into(),
-        bindings: vec![DescriptorBinding {
-            key: "tenant".into(),
-            source: "$http_x_tenant".into(),
-        }],
-        limit: 10,
-        window: Duration::from_secs(1),
-        bucket: Duration::from_millis(250),
-        mode: EnforcementMode::Enforce,
-        except_if: None,
-    };
-    let rules = CompiledRules::compile(&[rule_a, rule_b]).expect("compile");
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
-    };
+    let rules = rules(&[
+        "missing nonexistent:$does_not_exist rate=10r/s bucket=250ms",
+        "tenant tenant:$http_x_tenant rate=10r/s bucket=250ms",
+    ]);
     let vars = MockVars::new().set("http_x_tenant", "alice");
-    let outcome = decide_all(ctx, &[0, 1], &vars, 0);
+    let outcome = decide(ctx(&rules, &region, |_| {}), &[0, 1], &vars, 0);
     assert!(matches!(outcome, AccessOutcome::Allow(_)));
     // Only one rule (the second) produced an event.
-    let mut out = [QueueEvent::default(); 4];
-    assert_eq!(region.queue().drain(&mut out), 1);
+    assert_eq!(queued(&region), 1);
 }
 
 #[test]
 fn dry_run_records_but_never_rejects() {
     let (_buf, region) = TestZone::new(8, 16);
-    let cfg = RuleConfig {
-        name: "shadow".into(),
-        domain: crate::rules::DEFAULT_DOMAIN.into(),
-        bindings: vec![DescriptorBinding {
-            key: "tenant".into(),
-            source: "$http_x_tenant".into(),
-        }],
-        limit: 1,
-        window: Duration::from_secs(1),
-        bucket: Duration::from_millis(250),
-        mode: EnforcementMode::DryRun,
-        except_if: None,
-    };
-    let rules = CompiledRules::compile(&[cfg]).expect("compile");
-    let domain = crate::rules::DEFAULT_DOMAIN;
-
+    let rules = rules(&["shadow tenant:$http_x_tenant rate=1r/s bucket=250ms dry_run"]);
     // Pre-populate so the aggregate is way over the limit.
     let store = ShmAggregateStore::new(region);
-    let spec = rules.rules()[0].rule.spec();
-    let descriptors = [Descriptor {
-        key: "tenant",
-        value: "alice",
-    }];
-    let key_hash = hash_key(spec.id, domain, &descriptors);
-    store.write_delta(spec.fingerprint, key_hash.0, 0, 99, 0);
+    let spec = rules.table().rules()[0].spec();
+    seed(
+        &store,
+        spec.fingerprint,
+        key_hash("tenant", "alice"),
+        BucketEpoch(0),
+        99,
+    );
 
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain,
-        cardinality: CardinalitySettings::default(),
-    };
     let vars = MockVars::new().set("http_x_tenant", "alice");
     // DryRun: over the limit but never rejects.
-    let outcome = decide_all(ctx, &[0], &vars, 0);
+    let outcome = decide(ctx(&rules, &region, |_| {}), &[0], &vars, 0);
     match outcome {
         // Over-limit DryRun: saturating subtraction collapses remaining
         // to 0 so the response still gets `Remaining: 0` headers,
@@ -560,8 +434,7 @@ fn dry_run_records_but_never_rejects() {
         other => panic!("expected Allow(Some), got {other:?}"),
     }
     // Still records the hit for the gossip aggregate.
-    let mut out = [QueueEvent::default(); 4];
-    assert_eq!(region.queue().drain(&mut out), 1);
+    assert_eq!(queued(&region), 1);
     let snap = region.stats().snapshot();
     assert_eq!(snap.rejected, 0);
     assert_eq!(snap.allowed, 1);
@@ -569,73 +442,39 @@ fn dry_run_records_but_never_rejects() {
 
 /// Build two rules with different descriptor keys so the per-request
 /// cardinality budget can trip one without affecting the other.
-fn build_two_rules_varied(name_a: &str, key_a: &str, name_b: &str, key_b: &str) -> CompiledRules {
-    let mk = |name: &str, key: &str| RuleConfig {
-        name: name.into(),
-        domain: crate::rules::DEFAULT_DOMAIN.into(),
-        bindings: vec![DescriptorBinding {
-            key: key.into(),
-            source: "$http_x_tenant".into(),
-        }],
-        limit: 10,
-        window: Duration::from_secs(1),
-        bucket: Duration::from_millis(250),
-        mode: EnforcementMode::Enforce,
-        except_if: None,
-    };
-    CompiledRules::compile(&[mk(name_a, key_a), mk(name_b, key_b)]).expect("compile two rules")
+fn build_two_rules_varied(key_a: &str, key_b: &str) -> CompiledRules {
+    rules(&[
+        &format!("a {key_a}:$http_x_tenant rate=10r/s bucket=250ms"),
+        &format!("b {key_b}:$http_x_tenant rate=10r/s bucket=250ms"),
+    ])
 }
 
 #[test]
 fn decide_all_one_rule_cardinality_others_still_evaluate() {
     let (_buf, region) = TestZone::new(8, 16);
-    let rules = build_two_rules_varied("a", "long_descriptor_key_name", "b", "k");
-    let domain = crate::rules::DEFAULT_DOMAIN;
-    let budget = domain.len() + 1 + "alice".len();
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain,
-        cardinality: CardinalitySettings {
-            max_descriptor_bytes: budget,
-            ..CardinalitySettings::default()
-        },
-    };
+    let rules = build_two_rules_varied("long_descriptor_key_name", "k");
+    let budget = DEFAULT_DOMAIN.len() + 1 + "alice".len();
+    let ctx = ctx(&rules, &region, |s| {
+        s.max_descriptor_bytes = budget.try_into().unwrap();
+    });
     let vars = MockVars::new().set("http_x_tenant", "alice");
-    let outcome = decide_all(ctx, &[0, 1], &vars, 0);
+    let outcome = decide(ctx, &[0, 1], &vars, 0);
     assert!(matches!(outcome, AccessOutcome::Allow(_)));
     let snap = region.stats().snapshot();
     assert_eq!(snap.allowed, 1);
     assert_eq!(snap.rejected_cardinality, 1, "one rule tripped cardinality");
-    let mut out = [QueueEvent::default(); 4];
-    assert_eq!(region.queue().drain(&mut out), 1);
+    assert_eq!(queued(&region), 1);
 }
 
 #[test]
 fn decide_all_all_rules_cardinality_returns_cardinality() {
     let (_buf, region) = TestZone::new(8, 16);
-    let rules = build_two_rules_varied(
-        "a",
-        "long_descriptor_key_name_a",
-        "b",
-        "long_descriptor_key_name_b",
-    );
-    let domain = crate::rules::DEFAULT_DOMAIN;
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain,
-        cardinality: CardinalitySettings {
-            max_descriptor_bytes: domain.len() + 1,
-            ..CardinalitySettings::default()
-        },
-    };
+    let rules = build_two_rules_varied("long_descriptor_key_name_a", "long_descriptor_key_name_b");
+    let ctx = ctx(&rules, &region, |s| {
+        s.max_descriptor_bytes = (DEFAULT_DOMAIN.len() + 1).try_into().unwrap();
+    });
     let vars = MockVars::new().set("http_x_tenant", "alice");
-    let outcome = decide_all(ctx, &[0, 1], &vars, 0);
+    let outcome = decide(ctx, &[0, 1], &vars, 0);
     assert!(matches!(outcome, AccessOutcome::Cardinality));
     let snap = region.stats().snapshot();
     assert_eq!(snap.rejected_cardinality, 2);
@@ -645,103 +484,39 @@ fn decide_all_all_rules_cardinality_returns_cardinality() {
 #[test]
 fn decide_all_mixed_decline_and_cardinality_returns_cardinality() {
     let (_buf, region) = TestZone::new(8, 16);
-    let cfg_a = RuleConfig {
-        name: "a".into(),
-        domain: crate::rules::DEFAULT_DOMAIN.into(),
-        bindings: vec![DescriptorBinding {
-            key: "k".into(),
-            source: "$does_not_exist".into(),
-        }],
-        limit: 10,
-        window: Duration::from_secs(1),
-        bucket: Duration::from_millis(250),
-        mode: EnforcementMode::Enforce,
-        except_if: None,
-    };
-    let cfg_b = RuleConfig {
-        name: "b".into(),
-        domain: crate::rules::DEFAULT_DOMAIN.into(),
-        bindings: vec![DescriptorBinding {
-            key: "long_descriptor_key".into(),
-            source: "$http_x_tenant".into(),
-        }],
-        limit: 10,
-        window: Duration::from_secs(1),
-        bucket: Duration::from_millis(250),
-        mode: EnforcementMode::Enforce,
-        except_if: None,
-    };
-    let rules = CompiledRules::compile(&[cfg_a, cfg_b]).expect("compile");
-    let domain = crate::rules::DEFAULT_DOMAIN;
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain,
-        cardinality: CardinalitySettings {
-            max_descriptor_bytes: domain.len() + 1,
-            ..CardinalitySettings::default()
-        },
-    };
+    let rules = rules(&[
+        "a k:$does_not_exist rate=10r/s bucket=250ms",
+        "b long_descriptor_key:$http_x_tenant rate=10r/s bucket=250ms",
+    ]);
+    let ctx = ctx(&rules, &region, |s| {
+        s.max_descriptor_bytes = (DEFAULT_DOMAIN.len() + 1).try_into().unwrap();
+    });
     let vars = MockVars::new().set("http_x_tenant", "alice");
-    let outcome = decide_all(ctx, &[0, 1], &vars, 0);
+    let outcome = decide(ctx, &[0, 1], &vars, 0);
     assert!(matches!(outcome, AccessOutcome::Cardinality));
 }
 
 #[test]
 fn decide_all_one_rule_exempt_one_rejects() {
     let (_buf, region) = TestZone::new(8, 16);
-    let cfg_a = RuleConfig {
-        name: "a".into(),
-        domain: crate::rules::DEFAULT_DOMAIN.into(),
-        bindings: vec![DescriptorBinding {
-            key: "tenant".into(),
-            source: "$http_x_tenant".into(),
-        }],
-        limit: 10,
-        window: Duration::from_secs(1),
-        bucket: Duration::from_millis(250),
-        mode: EnforcementMode::Enforce,
-        except_if: Some("trusted".into()),
-    };
-    let cfg_b = RuleConfig {
-        name: "b".into(),
-        domain: crate::rules::DEFAULT_DOMAIN.into(),
-        bindings: vec![DescriptorBinding {
-            key: "k".into(),
-            source: "$http_x_tenant".into(),
-        }],
-        limit: 1,
-        window: Duration::from_secs(1),
-        bucket: Duration::from_millis(250),
-        mode: EnforcementMode::Enforce,
-        except_if: None,
-    };
-    let rules = CompiledRules::compile(&[cfg_a, cfg_b]).expect("compile");
-    let domain = crate::rules::DEFAULT_DOMAIN;
-
+    let rules = rules(&[
+        "a tenant:$http_x_tenant rate=10r/s bucket=250ms except_if=$trusted",
+        "b k:$http_x_tenant rate=1r/s bucket=250ms",
+    ]);
     let store = ShmAggregateStore::new(region);
-    let spec_b = rules.rules()[1].rule.spec();
-    let descriptors_b = [Descriptor {
-        key: "k",
-        value: "alice",
-    }];
-    let key_hash_b = hash_key(spec_b.id, domain, &descriptors_b);
-    store.write_delta(spec_b.fingerprint, key_hash_b.0, 0, 5, 0);
+    let spec_b = rules.table().rules()[1].spec();
+    seed(
+        &store,
+        spec_b.fingerprint,
+        key_hash("k", "alice"),
+        BucketEpoch(0),
+        5,
+    );
 
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain,
-        cardinality: CardinalitySettings::default(),
-    };
     let vars = MockVars::new()
         .set("http_x_tenant", "alice")
         .set("trusted", "1");
-    let outcome = decide_all(ctx, &[0, 1], &vars, 0);
+    let outcome = decide(ctx(&rules, &region, |_| {}), &[0, 1], &vars, 0);
     match outcome {
         AccessOutcome::Reject(info) => assert_eq!(info.spec.id, spec_b.id),
         other => panic!("expected Reject, got {other:?}"),
@@ -754,45 +529,28 @@ fn decide_all_one_rule_exempt_one_rejects() {
 #[test]
 fn cardinality_skip_does_not_push_queue_event() {
     let (_buf, region) = TestZone::new(8, 16);
-    let rules = build_rules();
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings {
-            max_descriptor_bytes: crate::rules::DEFAULT_DOMAIN.len() + 1,
-            ..CardinalitySettings::default()
-        },
-    };
+    let rules = rules(&[PER_TENANT]);
+    let ctx = ctx(&rules, &region, |s| {
+        s.max_descriptor_bytes = (DEFAULT_DOMAIN.len() + 1).try_into().unwrap();
+    });
     let vars = MockVars::new().set("http_x_tenant", "alice");
-    let outcome = decide(ctx, 0, &vars, 0);
+    let outcome = decide(ctx, &[0], &vars, 0);
     assert!(matches!(outcome, AccessOutcome::Cardinality));
-    let mut out = [QueueEvent::default(); 4];
-    assert_eq!(region.queue().drain(&mut out), 0);
+    assert_eq!(queued(&region), 0);
 }
 
 #[test]
 fn except_does_not_count_cardinality() {
     let (_buf, region) = TestZone::new(8, 16);
     // Predicate truthy — request is exempted before the byte-budget check.
-    let rules = rule_with_predicate(Some("trusted"));
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings {
-            max_descriptor_bytes: 1,
-            ..CardinalitySettings::default()
-        },
-    };
+    let rules = rule_with_predicate();
+    let ctx = ctx(&rules, &region, |s| {
+        s.max_descriptor_bytes = 1.try_into().unwrap();
+    });
     let vars = MockVars::new()
         .set("http_x_tenant", "alice")
         .set("trusted", "1");
-    let outcome = decide(ctx, 0, &vars, 0);
+    let outcome = decide(ctx, &[0], &vars, 0);
     // Exempt-only outcome — no rule produced a quota view.
     assert!(matches!(outcome, AccessOutcome::Allow(None)));
     let snap = region.stats().snapshot();
@@ -804,79 +562,15 @@ fn except_does_not_count_cardinality() {
 }
 
 #[test]
-fn per_rule_exempt_counter_bumps_only_target_rule() {
-    let (_buf, region) = TestZone::new(8, 16);
-    let cfg_a = RuleConfig {
-        name: "a".into(),
-        domain: crate::rules::DEFAULT_DOMAIN.into(),
-        bindings: vec![DescriptorBinding {
-            key: "tenant_a".into(),
-            source: "$http_x_tenant".into(),
-        }],
-        limit: 10,
-        window: Duration::from_secs(1),
-        bucket: Duration::from_millis(250),
-        mode: EnforcementMode::Enforce,
-        except_if: Some("trusted_a".into()),
-    };
-    let cfg_b = RuleConfig {
-        name: "b".into(),
-        domain: crate::rules::DEFAULT_DOMAIN.into(),
-        bindings: vec![DescriptorBinding {
-            key: "tenant_b".into(),
-            source: "$http_x_tenant".into(),
-        }],
-        limit: 10,
-        window: Duration::from_secs(1),
-        bucket: Duration::from_millis(250),
-        mode: EnforcementMode::Enforce,
-        except_if: Some("trusted_b".into()),
-    };
-    let rules = CompiledRules::compile(&[cfg_a, cfg_b]).expect("compile");
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
-    };
-    // Rule a exempts (truthy); rule b applies (falsy predicate).
-    let vars = MockVars::new()
-        .set("http_x_tenant", "alice")
-        .set("trusted_a", "1")
-        .set("trusted_b", "0");
-    let outcome = decide_all(ctx, &[0, 1], &vars, 0);
-    assert!(matches!(outcome, AccessOutcome::Allow(_)));
-    let snap = region.stats().snapshot();
-    // Rule ids are assigned 1, 2 in declaration order; per-rule slot is
-    // indexed by `rule_id - 1`.
-    assert_eq!(snap.exempted_per_rule[0], 1, "rule a exempted");
-    assert_eq!(snap.exempted_per_rule[1], 0, "rule b not exempted");
-    assert_eq!(snap.exempted, 1);
-}
-
-#[test]
 fn unknown_predicate_variable_fails_at_compile() {
     use crate::rules::RuleConfigError;
     // The NopBindingCompiler rejects anything that isn't a single
     // `$identifier` or one of the inline fast-path arms. A hyphen in the
     // identifier trips the legal-ident check, so the source `$bad-ident`
     // forwarded through `except_if=` fails compilation.
-    let cfg = RuleConfig {
-        name: "bad".into(),
-        domain: crate::rules::DEFAULT_DOMAIN.into(),
-        bindings: vec![DescriptorBinding {
-            key: "tenant".into(),
-            source: "$http_x_tenant".into(),
-        }],
-        limit: 10,
-        window: Duration::from_secs(1),
-        bucket: Duration::from_millis(250),
-        mode: EnforcementMode::Enforce,
-        except_if: Some("bad-ident".into()),
-    };
-    let err = CompiledRules::compile(&[cfg]).expect_err("predicate compile rejected");
+    let mut config = directive(PER_TENANT);
+    config.except_if = Some("bad-ident".into());
+    let err = compile(&[config]).expect_err("predicate compile rejected");
     assert!(
         matches!(err, RuleConfigError::CompileBinding { .. }),
         "expected CompileBinding, got {err:?}"
@@ -891,17 +585,8 @@ fn allow_info_picks_min_remaining_across_rules() {
     let (_buf, region) = TestZone::new(8, 16);
     // Rule 0: limit=2, window=1s. Rule 1: limit=10, window=60s.
     let rules = build_two_rules(2, 1, 10, 60);
-    let domain = crate::rules::DEFAULT_DOMAIN;
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain,
-        cardinality: CardinalitySettings::default(),
-    };
     let vars = MockVars::new().set("http_x_tenant", "alice");
-    let outcome = decide_all(ctx, &[0, 1], &vars, 0);
+    let outcome = decide(ctx(&rules, &region, |_| {}), &[0, 1], &vars, 0);
     match outcome {
         AccessOutcome::Allow(Some(info)) => {
             // Rule 0 reports the smaller remaining (limit=2, hits=1) -> 1.
@@ -920,16 +605,8 @@ fn allow_info_tie_break_prefers_longer_window() {
     // most-constraining-context rationale.
     let (_buf, region) = TestZone::new(8, 16);
     let rules = build_two_rules(5, 1, 5, 60);
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
-    };
     let vars = MockVars::new().set("http_x_tenant", "alice");
-    let outcome = decide_all(ctx, &[0, 1], &vars, 0);
+    let outcome = decide(ctx(&rules, &region, |_| {}), &[0, 1], &vars, 0);
     match outcome {
         AccessOutcome::Allow(Some(info)) => {
             assert_eq!(info.remaining, 4);
@@ -946,33 +623,12 @@ fn allow_info_tie_break_prefers_longer_window() {
 fn allow_info_under_limit_dry_run_emits_positive_remaining() {
     // DryRun rule under its limit should produce an AllowInfo with the
     // real remaining budget — same as Enforce. Mirrors the
-    // over-limit case below, which is exercised by
+    // over-limit case, which is exercised by
     // `dry_run_records_but_never_rejects`.
     let (_buf, region) = TestZone::new(8, 16);
-    let cfg = RuleConfig {
-        name: "shadow".into(),
-        domain: crate::rules::DEFAULT_DOMAIN.into(),
-        bindings: vec![DescriptorBinding {
-            key: "tenant".into(),
-            source: "$http_x_tenant".into(),
-        }],
-        limit: 5,
-        window: Duration::from_secs(1),
-        bucket: Duration::from_millis(250),
-        mode: EnforcementMode::DryRun,
-        except_if: None,
-    };
-    let rules = CompiledRules::compile(&[cfg]).expect("compile");
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
-    };
+    let rules = rules(&["shadow tenant:$http_x_tenant rate=5r/s bucket=250ms dry_run"]);
     let vars = MockVars::new().set("http_x_tenant", "alice");
-    let outcome = decide_all(ctx, &[0], &vars, 0);
+    let outcome = decide(ctx(&rules, &region, |_| {}), &[0], &vars, 0);
     match outcome {
         AccessOutcome::Allow(Some(info)) => {
             assert_eq!(info.spec.limit, 5);
@@ -980,4 +636,121 @@ fn allow_info_under_limit_dry_run_emits_positive_remaining() {
         }
         other => panic!("expected Allow(Some), got {other:?}"),
     }
+}
+
+/// `value=tenant:acme` makes the rule count only `tenant=acme`; any other
+/// tenant declines without touching a counter, and a `value=` naming no
+/// binding fails `nginx -t`.
+#[test]
+fn nginx_value_argument_matches_only_its_literal() {
+    use crate::rules::{RuleArgError, parse_rule_directive};
+    let config = directive("acme tenant:$arg_t rate=10r/s value=tenant:acme");
+    assert_eq!(&*config.bindings[0].value, "acme");
+    let rules = compile(&[config]).expect("compile");
+    let (_buf, region) = TestZone::new(8, 16);
+    let ctx = ctx(&rules, &region, |_| {});
+    let request = |tenant: &str| {
+        let vars = MockVars {
+            args: format!("t={tenant}").into_bytes(),
+            ..MockVars::new()
+        };
+        decide(ctx, &[0], &vars, 0)
+    };
+
+    assert!(matches!(request("acme"), AccessOutcome::Allow(Some(_))));
+    assert_eq!(queued(&region), 1);
+    let before = region.stats().snapshot();
+    assert_eq!(request("other"), AccessOutcome::Decline);
+    assert_eq!(queued(&region), 0);
+    let after = region.stats().snapshot();
+    assert_eq!(
+        (after.allowed, after.rejected),
+        (before.allowed, before.rejected)
+    );
+
+    assert_eq!(
+        parse_rule_directive(&["acme", "tenant:$arg_t", "rate=10r/s", "value=missing:acme"]),
+        Err(RuleArgError::UnknownValueKey {
+            rule: "acme".into(),
+            key: "missing".into(),
+        })
+    );
+}
+
+/// A rule's `domain=` is the domain its keys hash in, as `gabiond` hashes
+/// the same request.
+#[test]
+fn nginx_rule_domain_hashes_its_keys() {
+    let rules = rules(&["api tenant:$arg_t rate=10r/s domain=api"]);
+    let (_buf, region) = TestZone::new(8, 16);
+    let vars = MockVars {
+        args: b"t=x".to_vec(),
+        ..MockVars::new()
+    };
+    let outcome = decide(ctx(&rules, &region, |_| {}), &[0], &vars, 0);
+    assert!(matches!(outcome, AccessOutcome::Allow(Some(_))));
+    let mut events = [QueueEvent::default(); 1];
+    assert_eq!(region.queue().drain(&mut events), 1);
+    let expected = hash_key(
+        "api",
+        [Descriptor {
+            key: "tenant",
+            value: "x",
+        }],
+    );
+    assert_eq!(events[0].key_hash, expected);
+}
+
+/// `storage.max_matched_rules` is how many of a request's allowed rules
+/// count it: at 20, a location with 20 matching rules queues 20 hits and
+/// overflows nothing, and one with 22 queues 20 and counts one overflowing
+/// request, not one per uncounted rule.
+#[test]
+fn matched_rule_bound_is_the_setting() {
+    for (matched, expected_queued, overflows) in [(20, 20, 0), (22, 20, 1)] {
+        let directives: Vec<String> = (1..=matched)
+            .map(|i| format!("r{i} tenant:$http_x_tenant rate=100r/{i}s"))
+            .collect();
+        let directives: Vec<&str> = directives.iter().map(String::as_str).collect();
+        let rules = rules(&directives);
+        let (_buf, region) = TestZone::new(32, 64);
+        let ctx = ctx(&rules, &region, |s| {
+            s.max_matched_rules = 20.try_into().unwrap();
+        });
+        let vars = MockVars::new().set("http_x_tenant", "alice");
+        let indices: Vec<usize> = (0..matched).collect();
+        let outcome = decide(ctx, &indices, &vars, 0);
+        assert!(matches!(outcome, AccessOutcome::Allow(Some(_))));
+        assert_eq!(
+            (
+                queued(&region),
+                region.stats().snapshot().matched_rule_overflows
+            ),
+            (expected_queued, overflows),
+            "{matched} rules"
+        );
+    }
+}
+
+/// A full request queue drops the hits of an allowed request: the request is
+/// still allowed, and `queue_dropped`, a count leader threads log, rises once
+/// per dropped hit. Three requests make the two counts differ, so swapping
+/// them fails.
+#[test]
+fn a_full_queue_allows_the_request_and_counts_each_dropped_hit() {
+    let (_buf, region) = TestZone::new(2, 16);
+    let rules = build_two_rules_varied("a_key", "b_key");
+    let ctx = ctx(&rules, &region, |_| {});
+    let vars = MockVars::new().set("http_x_tenant", "alice");
+    for _ in 0..3 {
+        assert!(matches!(
+            decide(ctx, &[0, 1], &vars, 0),
+            AccessOutcome::Allow(_)
+        ));
+    }
+    let snap = region.stats().snapshot();
+    assert_eq!(
+        (snap.allowed, snap.queue_pushed, snap.queue_dropped),
+        (3, 2, 4)
+    );
 }

@@ -18,21 +18,23 @@
 //! [ node_slot          : u8 ×N  ]    each < D
 //! [ origin_incarnation : u32 ×N ]     4N
 //! [ last_update_millis : u64 ×N ]     8N
-//! [ origin_sequence    : u64 ×N ]     8N
-//! [ count              : C  ×N  ]    count_size · N
+//! [ count              : u32 ×N ]     4N
 //! ```
 //!
 //! When `cell_count == 0` the body is empty (no dict section). All integers
 //! are little-endian; no alignment requirement.
 
-use crate::crdt::{BucketEpoch, CellHandle, CellStore, Count, Incarnation, KeyHash, NodeId};
+use crate::crdt::{BucketEpoch, CellHandle, CellRow, CellStore, KeyHash, NodeId, Observation};
 
-use super::DecodeError;
+use super::{DecodeError, read_u32, read_u64, read_u128};
 
 /// Per-cell identity bytes once the slot indices are encoded.
 /// `1 (rule_slot) + 16 (key_hash) + 4 (bucket) + 1 (node_slot) +
-///  4 (origin_incarnation) + 8 (last_update_millis) + 8 (origin_sequence)`.
-pub(crate) const PER_CELL_IDENT_BYTES: usize = 1 + 16 + 4 + 1 + 4 + 8 + 8;
+///  4 (origin_incarnation) + 8 (last_update_millis)`.
+const PER_CELL_IDENT_BYTES: usize = 1 + 16 + 4 + 1 + 4 + 8;
+
+/// Bytes one cell costs: its identity and its `u32` count.
+pub(crate) const CELL_BYTES: usize = PER_CELL_IDENT_BYTES + 4;
 
 /// Fixed body overhead when at least one cell is present: the two
 /// `dict_len` bytes. Dictionary entries themselves cost `16 * (R + D)`.
@@ -42,19 +44,6 @@ pub(crate) const DICT_LEN_BYTES: usize = 2;
 /// by the `u8` slot type at the call site; this constant is for boundary
 /// arithmetic.
 pub(crate) const MAX_DICT_SLOTS: usize = 255;
-
-/// Decoded cell handed to visitor callbacks.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct WireCell<C: Count> {
-    pub rule_fingerprint: u128,
-    pub key_hash: KeyHash,
-    pub bucket: BucketEpoch,
-    pub origin_node_id: NodeId,
-    pub origin_incarnation: Incarnation,
-    pub count: C,
-    pub last_update_millis: u64,
-    pub origin_sequence: u64,
-}
 
 /// Per-encode scratch. Re-fills `rule_remap` / `node_remap` with `u8::MAX` on
 /// every `reset()`; the dictionary fingerprints are truncated to length zero.
@@ -79,7 +68,7 @@ pub struct WireScratch {
 impl WireScratch {
     /// Allocate scratch sized to a particular store's dictionary capacities.
     /// One allocation at startup; threaded through every packet.
-    pub fn for_store<C: Count>(store: &CellStore<C>) -> Self {
+    pub fn for_store(store: &CellStore) -> Self {
         let rule_cap = store.rule_dictionary().capacity() as usize;
         let node_cap = store.node_dictionary().capacity() as usize;
         Self {
@@ -104,125 +93,75 @@ impl WireScratch {
     }
 }
 
-/// Outcome of encoding one packet's body. The header patcher reads these.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct EncodedBody {
-    /// Bytes written into the body region (exclusive of header / auth tag).
-    pub body_len: usize,
-    /// Cells emitted into this packet.
-    pub cells_emitted: u32,
-    /// Handles inspected for this packet that did not resolve to a stored
-    /// row (stale generation, missing dict descriptor). They never advance
-    /// to the next packet.
-    pub cells_dropped: u32,
-    /// Lowest `origin_sequence` among emitted cells, or `0` when empty.
-    pub min_origin_sequence: u64,
-    /// Highest `origin_sequence` among emitted cells.
-    pub max_origin_sequence: u64,
-    /// Number of handles consumed from `handles[start..]`, i.e.
-    /// `cells_emitted + cells_dropped`.
-    pub handles_consumed: usize,
-}
-
-/// Pre-flight pass: project how many handles fit in this packet without
-/// writing anything. Returns the chosen handle range and the dictionary
-/// sizes used.
-struct Plan {
-    /// Number of handles consumed: `cells_emitted + cells_dropped`.
-    consumed: usize,
-    cells_emitted: u32,
-    cells_dropped: u32,
+/// What one packet's body holds: the handles it consumes, the cells it
+/// emits, and its dictionary sizes and length.
+pub(crate) struct Plan {
+    /// Handles consumed from `handles[start..]`: the cells emitted and the
+    /// stale handles skipped, which never carry over to the next packet.
+    pub(crate) handles_consumed: usize,
+    pub(crate) cells_emitted: u16,
     /// `R` — distinct rule fingerprints required by the emitted cells.
     rule_count: u8,
     /// `D` — distinct origin node ids required by the emitted cells.
     node_count: u8,
-    body_len: usize,
-    min_seq: u64,
-    max_seq: u64,
+    /// Body bytes.
+    len: usize,
 }
 
 /// Encode the next packet's body into `out` starting at `out.len()`. Returns
-/// `EncodedBody` describing what was written; the caller patches the header
-/// using these values.
+/// the [`Plan`] it wrote; the caller patches the header from it.
 ///
-/// `body_budget` is the bytes available for the body (header + auth tag are
-/// the caller's concern). The encoder will not exceed it.
+/// `body_budget` is the bytes available for the body (the header is the
+/// caller's concern). The encoder will not exceed it.
 ///
 /// `start_at` is the index into `handles` of the next handle to consider.
-pub(crate) fn encode_packet_body<C: Count>(
-    store: &CellStore<C>,
+pub(crate) fn encode_packet_body(
+    store: &CellStore,
     handles: &[CellHandle],
     start_at: usize,
     body_budget: usize,
     scratch: &mut WireScratch,
     out: &mut Vec<u8>,
-) -> EncodedBody {
+) -> Plan {
     debug_assert!(start_at <= handles.len());
     scratch.reset();
 
-    let count_size = std::mem::size_of::<C>();
-    let plan = plan_packet(store, handles, start_at, body_budget, count_size, scratch);
-
-    if plan.cells_emitted == 0 {
-        return EncodedBody {
-            body_len: 0,
-            cells_emitted: 0,
-            cells_dropped: plan.cells_dropped,
-            min_origin_sequence: 0,
-            max_origin_sequence: 0,
-            handles_consumed: plan.consumed,
-        };
+    let plan = plan_packet(store, handles, start_at, body_budget, scratch);
+    if plan.cells_emitted > 0 {
+        write_body(store, handles, start_at, &plan, scratch, out);
     }
-
-    write_body::<C>(store, handles, start_at, &plan, count_size, scratch, out);
-
-    EncodedBody {
-        body_len: plan.body_len,
-        cells_emitted: plan.cells_emitted,
-        cells_dropped: plan.cells_dropped,
-        min_origin_sequence: plan.min_seq,
-        max_origin_sequence: plan.max_seq,
-        handles_consumed: plan.consumed,
-    }
+    plan
 }
 
-fn plan_packet<C: Count>(
-    store: &CellStore<C>,
+/// The row behind `handle` with its rule fingerprint and origin node id,
+/// or `None` for a stale handle, which both passes skip alike.
+fn resolve(store: &CellStore, handle: CellHandle) -> Option<(CellRow, u128, u128)> {
+    let row = store.get(handle)?;
+    let rule = store.rule_dictionary().descriptor(row.key.rule)?;
+    let node = store.node_dictionary().descriptor(row.key.origin)?;
+    Some((row, rule.fingerprint, node.node_id.0))
+}
+
+fn plan_packet(
+    store: &CellStore,
     handles: &[CellHandle],
     start_at: usize,
     body_budget: usize,
-    count_size: usize,
     scratch: &mut WireScratch,
 ) -> Plan {
-    let per_cell_bytes = PER_CELL_IDENT_BYTES + count_size;
     let mut cursor = start_at;
-    let mut cells_emitted: u32 = 0;
-    let mut cells_dropped: u32 = 0;
+    let mut cells_emitted: u16 = 0;
     let mut r: u8 = 0;
     let mut d: u8 = 0;
-    let mut min_seq = u64::MAX;
-    let mut max_seq = 0_u64;
 
     while cursor < handles.len() {
-        let handle = handles[cursor];
-        let Some(row) = store.get(handle) else {
+        let Some((row, rule_fp, node_id)) = resolve(store, handles[cursor]) else {
             cursor += 1;
-            cells_dropped = cells_dropped.saturating_add(1);
-            continue;
-        };
-        let Some(rule_desc) = store.rule_dictionary().descriptor(row.key.rule) else {
-            cursor += 1;
-            cells_dropped = cells_dropped.saturating_add(1);
-            continue;
-        };
-        let Some(node_desc) = store.node_dictionary().descriptor(row.key.origin) else {
-            cursor += 1;
-            cells_dropped = cells_dropped.saturating_add(1);
             continue;
         };
 
-        let rule_unseen = scratch.rule_remap[row.key.rule as usize] == u8::MAX;
-        let node_unseen = scratch.node_remap[row.key.origin as usize] == u8::MAX;
+        let rule_unseen = scratch.rule_remap[row.key.rule.index()] == u8::MAX;
+        let node_unseen = scratch.node_remap[row.key.origin.index()] == u8::MAX;
         let new_r = r as usize + if rule_unseen { 1 } else { 0 };
         let new_d = d as usize + if node_unseen { 1 } else { 0 };
 
@@ -234,68 +173,58 @@ fn plan_packet<C: Count>(
         let projected_body = DICT_LEN_BYTES
             + 16 * new_r
             + 16 * new_d
-            + (cells_emitted as usize + 1) * per_cell_bytes;
+            + (usize::from(cells_emitted) + 1) * CELL_BYTES;
         if projected_body > body_budget {
             break;
         }
 
         // Admit: assign per-packet slots if unseen.
         if rule_unseen {
-            scratch.rule_remap[row.key.rule as usize] = r;
-            scratch.rule_fps.push(rule_desc.fingerprint);
+            scratch.rule_remap[row.key.rule.index()] = r;
+            scratch.rule_fps.push(rule_fp);
             r += 1;
         }
         if node_unseen {
-            scratch.node_remap[row.key.origin as usize] = d;
-            scratch.node_ids.push(node_desc.node_id.0);
+            scratch.node_remap[row.key.origin.index()] = d;
+            scratch.node_ids.push(node_id);
             d += 1;
         }
 
-        cells_emitted = cells_emitted.saturating_add(1);
-        if row.origin_sequence < min_seq {
-            min_seq = row.origin_sequence;
-        }
-        if row.origin_sequence > max_seq {
-            max_seq = row.origin_sequence;
-        }
+        cells_emitted += 1;
         cursor += 1;
     }
 
-    let body_len = if cells_emitted == 0 {
+    let len = if cells_emitted == 0 {
         0
     } else {
-        DICT_LEN_BYTES + 16 * (r as usize + d as usize) + cells_emitted as usize * per_cell_bytes
+        DICT_LEN_BYTES + 16 * (r as usize + d as usize) + usize::from(cells_emitted) * CELL_BYTES
     };
 
     Plan {
-        consumed: cursor - start_at,
+        handles_consumed: cursor - start_at,
         cells_emitted,
-        cells_dropped,
         rule_count: r,
         node_count: d,
-        body_len,
-        min_seq: if cells_emitted == 0 { 0 } else { min_seq },
-        max_seq,
+        len,
     }
 }
 
-fn write_body<C: Count>(
-    store: &CellStore<C>,
+fn write_body(
+    store: &CellStore,
     handles: &[CellHandle],
     start_at: usize,
     plan: &Plan,
-    count_size: usize,
     scratch: &WireScratch,
     out: &mut Vec<u8>,
 ) {
-    let n = plan.cells_emitted as usize;
+    let n = usize::from(plan.cells_emitted);
     let r = plan.rule_count as usize;
     let d = plan.node_count as usize;
 
     let base = out.len();
     // Grow once to the planned size; pass 2 writes via slice indexing.
-    out.resize(base + plan.body_len, 0);
-    let body = &mut out[base..base + plan.body_len];
+    out.resize(base + plan.len, 0);
+    let body = &mut out[base..base + plan.len];
 
     // Header: dict lengths + dict fingerprints, in declared layout order.
     body[0] = plan.rule_count;
@@ -311,7 +240,7 @@ fn write_body<C: Count>(
         cursor += 16;
     }
 
-    // Compute the eight column slab offsets. Splitting via slice indexing
+    // Compute the seven column slab offsets. Splitting via slice indexing
     // keeps the borrow checker happy without `split_at_mut` ceremony.
     let rule_slot_off = cursor;
     let key_hash_off = rule_slot_off + n;
@@ -319,115 +248,68 @@ fn write_body<C: Count>(
     let node_slot_off = bucket_off + 4 * n;
     let origin_inc_off = node_slot_off + n;
     let last_update_off = origin_inc_off + 4 * n;
-    let origin_seq_off = last_update_off + 8 * n;
-    let count_off = origin_seq_off + 8 * n;
-    debug_assert_eq!(count_off + count_size * n, plan.body_len);
+    let count_off = last_update_off + 8 * n;
+    debug_assert_eq!(count_off + 4 * n, plan.len);
 
     // Pass 2 — walk the same handle range we planned over and fill slabs.
-    // The staleness checks are identical to plan_packet so the two cell
-    // counts agree.
     let mut i = 0_usize;
     let mut consumed = 0_usize;
-    while consumed < plan.consumed && i < n {
+    while consumed < plan.handles_consumed && i < n {
         let handle = handles[start_at + consumed];
         consumed += 1;
-        let Some(row) = store.get(handle) else {
-            continue;
-        };
-        let Some(_rule_desc) = store.rule_dictionary().descriptor(row.key.rule) else {
-            continue;
-        };
-        let Some(_node_desc) = store.node_dictionary().descriptor(row.key.origin) else {
+        let Some((row, ..)) = resolve(store, handle) else {
             continue;
         };
 
-        body[rule_slot_off + i] = scratch.rule_remap[row.key.rule as usize];
+        body[rule_slot_off + i] = scratch.rule_remap[row.key.rule.index()];
         body[key_hash_off + i * 16..key_hash_off + i * 16 + 16]
             .copy_from_slice(&row.key.key_hash.0.to_le_bytes());
         body[bucket_off + i * 4..bucket_off + i * 4 + 4]
-            .copy_from_slice(&row.key.bucket.to_le_bytes());
-        body[node_slot_off + i] = scratch.node_remap[row.key.origin as usize];
+            .copy_from_slice(&row.key.bucket.0.to_le_bytes());
+        body[node_slot_off + i] = scratch.node_remap[row.key.origin.index()];
         body[origin_inc_off + i * 4..origin_inc_off + i * 4 + 4]
             .copy_from_slice(&row.key.incarnation.to_le_bytes());
         body[last_update_off + i * 8..last_update_off + i * 8 + 8]
             .copy_from_slice(&row.last_update_millis.to_le_bytes());
-        body[origin_seq_off + i * 8..origin_seq_off + i * 8 + 8]
-            .copy_from_slice(&row.origin_sequence.to_le_bytes());
-
-        let count_u64: u64 = row.count.into();
-        body[count_off + i * count_size..count_off + i * count_size + count_size]
-            .copy_from_slice(&count_u64.to_le_bytes()[..count_size]);
+        body[count_off + i * 4..count_off + i * 4 + 4].copy_from_slice(&row.count.to_le_bytes());
 
         i += 1;
     }
     debug_assert_eq!(i, n, "pass 2 emitted a different cell count than pass 1");
 }
 
-fn read_count<C: Count>(src: &[u8]) -> C {
-    let mut buf = [0u8; 8];
-    let n = std::mem::size_of::<C>();
-    buf[..n].copy_from_slice(&src[..n]);
-    C::saturating_from_u64(u64::from_le_bytes(buf))
-}
-
-fn read_u32(src: &[u8]) -> u32 {
-    u32::from_le_bytes(src[..4].try_into().expect("4 bytes"))
-}
-
-fn read_u64(src: &[u8]) -> u64 {
-    u64::from_le_bytes(src[..8].try_into().expect("8 bytes"))
-}
-
-fn read_u128(src: &[u8]) -> u128 {
-    u128::from_le_bytes(src[..16].try_into().expect("16 bytes"))
-}
-
 /// Decode one packet's body. Per-packet; no scratch needed because the
 /// dictionaries are embedded.
-pub(crate) fn decode_body_visit<C: Count>(
+pub(crate) fn decode_body(
     bytes: &[u8],
-    cell_count: u32,
-    mut on_cell: impl FnMut(WireCell<C>),
+    cell_count: u16,
+    mut on_cell: impl FnMut(Observation),
 ) -> Result<(), DecodeError> {
-    let count_size = std::mem::size_of::<C>();
-
     if cell_count == 0 {
         if !bytes.is_empty() {
-            return Err(DecodeError::BodyLenMismatch);
+            return Err(DecodeError::BodyLength);
         }
         return Ok(());
     }
 
     if bytes.is_empty() {
-        return Err(DecodeError::BodyLenMismatch);
+        return Err(DecodeError::BodyLength);
     }
     let rule_dict_len = bytes[0] as usize;
-    if rule_dict_len == 0 {
-        // Cells require at least one rule slot.
-        return Err(DecodeError::BodyLenMismatch);
-    }
     let rule_dict_start = 1;
     let rule_dict_end = rule_dict_start + 16 * rule_dict_len;
     if bytes.len() < rule_dict_end + 1 {
-        return Err(DecodeError::BodyLenMismatch);
+        return Err(DecodeError::BodyLength);
     }
     let node_dict_len = bytes[rule_dict_end] as usize;
-    if node_dict_len == 0 {
-        return Err(DecodeError::BodyLenMismatch);
-    }
     let node_dict_start = rule_dict_end + 1;
     let node_dict_end = node_dict_start + 16 * node_dict_len;
 
-    let n = cell_count as usize;
-    let per_cell = PER_CELL_IDENT_BYTES + count_size;
-    let expected_tail = n
-        .checked_mul(per_cell)
-        .ok_or(DecodeError::BodyLenMismatch)?;
-    let expected_total = node_dict_end
-        .checked_add(expected_tail)
-        .ok_or(DecodeError::BodyLenMismatch)?;
-    if bytes.len() != expected_total {
-        return Err(DecodeError::BodyLenMismatch);
+    // The exact length is checked before any cell is visited, so a cell
+    // count larger than the bytes hold never reaches the loop.
+    let n = usize::from(cell_count);
+    if bytes.len() != node_dict_end + n * CELL_BYTES {
+        return Err(DecodeError::BodyLength);
     }
 
     let rule_dict_bytes = &bytes[rule_dict_start..rule_dict_end];
@@ -447,37 +329,28 @@ pub(crate) fn decode_body_visit<C: Count>(
     cursor += 4 * n;
     let last_update_slab = &bytes[cursor..cursor + 8 * n];
     cursor += 8 * n;
-    let origin_seq_slab = &bytes[cursor..cursor + 8 * n];
-    cursor += 8 * n;
-    let count_slab = &bytes[cursor..cursor + count_size * n];
-    debug_assert_eq!(cursor + count_size * n, bytes.len());
+    let count_slab = &bytes[cursor..cursor + 4 * n];
+    debug_assert_eq!(cursor + 4 * n, bytes.len());
+
+    // Every slot is checked before any cell is handed over, so a dropped
+    // packet hands over none.
+    if rule_slot.iter().any(|&s| usize::from(s) >= rule_dict_len)
+        || node_slot.iter().any(|&s| usize::from(s) >= node_dict_len)
+    {
+        return Err(DecodeError::BadSlot);
+    }
 
     for i in 0..n {
-        let rs = rule_slot[i] as usize;
-        if rs >= rule_dict_len {
-            return Err(DecodeError::BadSlot);
-        }
-        let ns = node_slot[i] as usize;
-        if ns >= node_dict_len {
-            return Err(DecodeError::BadSlot);
-        }
-        let rule_fingerprint = read_u128(&rule_dict_bytes[rs * 16..]);
-        let origin_node_id = read_u128(&node_dict_bytes[ns * 16..]);
-        let key_hash = read_u128(&key_hash_slab[i * 16..]);
-        let bucket = read_u32(&bucket_slab[i * 4..]);
-        let origin_incarnation = read_u32(&origin_inc_slab[i * 4..]);
-        let last_update_millis = read_u64(&last_update_slab[i * 8..]);
-        let origin_sequence = read_u64(&origin_seq_slab[i * 8..]);
-        let count = read_count::<C>(&count_slab[i * count_size..]);
-        on_cell(WireCell {
-            rule_fingerprint,
-            key_hash: KeyHash(key_hash),
-            bucket,
-            origin_node_id: NodeId(origin_node_id),
-            origin_incarnation,
-            count,
-            last_update_millis,
-            origin_sequence,
+        let rs = usize::from(rule_slot[i]);
+        let ns = usize::from(node_slot[i]);
+        on_cell(Observation {
+            rule_fingerprint: read_u128(&rule_dict_bytes[rs * 16..]),
+            key_hash: KeyHash(read_u128(&key_hash_slab[i * 16..])),
+            bucket: BucketEpoch(read_u32(&bucket_slab[i * 4..])),
+            origin: NodeId(read_u128(&node_dict_bytes[ns * 16..])),
+            incarnation: read_u32(&origin_inc_slab[i * 4..]),
+            count: read_u32(&count_slab[i * 4..]),
+            last_update_millis: read_u64(&last_update_slab[i * 8..]),
         });
     }
 

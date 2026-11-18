@@ -1,0 +1,39 @@
+{
+  "id": "loss-burst",
+  "description": "prod-peak with Gilbert-Elliott burst loss per directed link: 5 % mean loss in bursts of ~5 datagrams (p_good_to_bad 0.01, p_bad_to_good 0.19, all lost while bad).",
+  "duration_s": 80,
+  "warmup_s": 20,
+  "nodes": 183,
+  "rule": {
+    "limit": 100,
+    "window_ms": 10000,
+    "bucket_ms": 1000
+  },
+  "traffic": {
+    "site_rate_rps": 1800,
+    "site_period_ms": 3200,
+    "site_jitter": 0.5,
+    "hot_keys": [
+      {
+        "limit_multiple": 1.5
+      },
+      {
+        "limit_multiple": 3.0
+      }
+    ],
+    "bursts": [
+      {
+        "rate_rps": 90,
+        "start_s": 40,
+        "duration_s": 20
+      }
+    ]
+  },
+  "network": {
+    "burst_loss": {
+      "p_good_to_bad": 0.01,
+      "p_bad_to_good": 0.19,
+      "loss_in_bad": 1.0
+    }
+  }
+}

@@ -87,7 +87,6 @@ duration_millis() {
 : "${RATE_LIMIT_BUCKET:=$RATE_LIMIT_WINDOW}"
 : "${WINDOW_MS:=$(duration_millis "$RATE_LIMIT_PERIOD")}"
 : "${GOSSIP_TICK_INTERVAL:=100ms}"
-: "${GOSSIP_FANOUT:=6}"
 : "${GOSSIP_TARGET_ERR_BPS:=100}"
 : "${GOSSIP_MIN_EMIT_INTERVAL:=5ms}"
 : "${KEEP_NAMESPACE:=0}"
@@ -111,14 +110,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-build_images() {
-    if [ "$BACKEND" = "nginx" ]; then
-        docker compose --profile module -f deploy/nginx/docker-compose.yml build nginx-module-request-smoke
-    fi
-    docker build -f deploy/gabiond/Dockerfile -t gabiond:local .
-    docker build -f deploy/kubernetes/loader.Dockerfile -t gabion-loader:local .
-}
-
 create_configmaps() {
     if [ "$BACKEND" = "nginx" ]; then
         awk \
@@ -126,7 +117,6 @@ create_configmaps() {
             -v period="$RATE_LIMIT_PERIOD" \
             -v window="$RATE_LIMIT_WINDOW" \
             -v bucket="$RATE_LIMIT_BUCKET" \
-            -v fanout="$GOSSIP_FANOUT" \
             -v tick="$GOSSIP_TICK_INTERVAL" \
             -v target_err_bps="$GOSSIP_TARGET_ERR_BPS" \
             -v min_emit="$GOSSIP_MIN_EMIT_INTERVAL" '
@@ -134,8 +124,7 @@ create_configmaps() {
                     print "    gabion_limit_rule tenant_dist tenant:$arg_tenant rate=" budget "r/" period " window=" window " bucket=" bucket ";"
                     next
                 }
-                /gabion_gossip_fanout [0-9]+;/ {
-                    sub(/gabion_gossip_fanout [0-9]+;/, "gabion_gossip_fanout " fanout ";")
+                /gabion_gossip_cluster [0-9]+;/ {
                     print
                     print "    gabion_gossip_tick_interval " tick ";"
                     print "    gabion_gossip_target_err_bps " target_err_bps ";"
@@ -152,7 +141,6 @@ envoy_bind: 0.0.0.0:8081
 admin_bind: 0.0.0.0:9090
 gossip:
   bind: 0.0.0.0:9000
-  fanout: ${GOSSIP_FANOUT}
   tick_interval: ${GOSSIP_TICK_INTERVAL}
   target_err_bps: ${GOSSIP_TARGET_ERR_BPS}
   min_emit_interval: ${GOSSIP_MIN_EMIT_INTERVAL}
@@ -168,34 +156,6 @@ limits:
     window: ${RATE_LIMIT_WINDOW}
     bucket: ${RATE_LIMIT_BUCKET}
     mode: enforce
-YAML
-}
-
-apply_common_rbac() {
-    kubectl -n "$namespace" apply -f - <<YAML
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: gabion-endpointslice-reader
-rules:
-  - apiGroups: [""]
-    resources: ["services"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["discovery.k8s.io"]
-    resources: ["endpointslices"]
-    verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: gabion-endpointslice-reader
-subjects:
-  - kind: ServiceAccount
-    name: default
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: gabion-endpointslice-reader
 YAML
 }
 
@@ -215,6 +175,7 @@ spec:
       labels:
         app: gabion-nginx
     spec:
+      serviceAccountName: gabion
       containers:
         - name: nginx
           image: nginx-nginx-module-request-smoke:latest
@@ -299,6 +260,7 @@ spec:
       labels:
         app: gabiond
     spec:
+      serviceAccountName: gabion
       containers:
         - name: gabiond
           image: gabiond:local
@@ -431,30 +393,45 @@ show_loader_log() {
     fi
 }
 
-show_snapshot() {
-    printf '\n=== gabiond /snapshot ===\n'
+# open_admin: forward 127.0.0.1:19090 to the first gabiond pod's admin port,
+# once; cleanup closes it.
+open_admin() {
+    if [ -n "$admin_pf_pid" ]; then
+        return
+    fi
     gabiond_pod="$(kubectl -n "$namespace" get pods -l app=gabiond -o 'jsonpath={.items[0].metadata.name}')"
     kubectl -n "$namespace" port-forward "pod/$gabiond_pod" 19090:9090 >"$admin_pf_log" 2>&1 &
     admin_pf_pid=$!
-
     retry 30 curl -fsS -o /dev/null "http://127.0.0.1:19090/snapshot" 2>/dev/null || true
+}
 
+# peers_listed <count>: gabiond's /snapshot lists at least <count> peers.
+peers_listed() {
+    curl -fsS "http://127.0.0.1:19090/snapshot" 2>/dev/null | python3 -c '
+import json, sys
+sys.exit(len(json.load(sys.stdin).get("peers") or []) < int(sys.argv[1]))
+' "$1"
+}
+
+show_snapshot() {
+    printf '\n=== gabiond /snapshot ===\n'
+    open_admin
     if curl -fsS "http://127.0.0.1:19090/snapshot" >"$snapshot_path" 2>/dev/null; then
         python3 - "$snapshot_path" <<'PY'
 import json
 import sys
 with open(sys.argv[1]) as f:
     snap = json.load(f)
-store = snap.get("store", {})
-cell_store = store.get("cell_store", {})
+cell_store = snap.get("store_stats", {})
 print(f"  known_peers                {len(snap.get('peers') or [])}")
-print(f"  aggregate_rows             {store.get('aggregate_rows', '?')}")
+print(f"  aggregate_rows             {snap.get('aggregate_rows', '?')}")
 print(f"  active_cells               {cell_store.get('active_cells', '?')}")
 print(f"  cell_capacity              {cell_store.get('cell_capacity', '?')}")
 print(f"  cell_store_full_rejects    {cell_store.get('cell_store_full_rejects', '?')}")
 print(f"  rule_dict_full_rejects     {cell_store.get('rule_dictionary_full_rejects', '?')}")
 print(f"  node_dict_full_rejects     {cell_store.get('node_dictionary_full_rejects', '?')}")
-print(f"  decode_reject_count        {snap.get('decode_reject_count', '?')}")
+counters = snap.get("counters", {})
+print(f"  decode_rejects             {sum(v for k, v in counters.items() if k.startswith('decode_rejects_'))}")
 PY
         printf '\n  -- full snapshot --\n'
         sed 's/^/    /' "$snapshot_path" | head -n 60
@@ -462,10 +439,6 @@ PY
         printf '  FAIL: could not reach gabiond admin endpoint\n' >&2
         cat "$admin_pf_log" >&2 || true
     fi
-
-    kill "$admin_pf_pid" 2>/dev/null || true
-    wait "$admin_pf_pid" 2>/dev/null || true
-    admin_pf_pid=""
 }
 
 show_cluster_overview() {
@@ -493,25 +466,41 @@ show_cluster_overview() {
     fi
 }
 
-build_images
+if [ "$BACKEND" = "nginx" ]; then
+    build_and_load_images nginx-nginx-module-request-smoke:latest gabiond:local gabion-loader:local
+else
+    build_and_load_images gabiond:local gabion-loader:local
+fi
 kubectl create namespace "$namespace"
 create_configmaps
-apply_common_rbac
+apply_gabion_rbac
 if [ "$BACKEND" = "nginx" ]; then
     apply_nginx_backend
     printf '\nwaiting for %s nginx pods + gabiond to roll out...\n' "$POD_COUNT"
     kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=300s
     kubectl -n "$namespace" rollout status deployment/gabiond --timeout=180s
+    assert_pods_run_image app=gabion-nginx nginx-nginx-module-request-smoke:latest
+    assert_pods_run_image app=gabiond gabiond:local
     wait_for_endpoint_count gabion-nginx "$POD_COUNT"
 else
     apply_gabiond_backend
     printf '\nwaiting for %s gabiond pods to roll out...\n' "$POD_COUNT"
     kubectl -n "$namespace" rollout status deployment/gabiond --timeout=180s
+    assert_pods_run_image app=gabiond gabiond:local
     wait_for_endpoint_count gabiond "$POD_COUNT"
 fi
 
-printf '\nletting gossip converge for 15s...\n'
-sleep 15
+# The gabiond observer lists every NGINX pod; a gabiond pod, every other one.
+if [ "$BACKEND" = "nginx" ]; then
+    expected_peers="$POD_COUNT"
+else
+    expected_peers=$((POD_COUNT - 1))
+fi
+printf '\nwaiting for gabiond to list %s peers...\n' "$expected_peers"
+open_admin
+converge_start_ms="$(now_ms)"
+retry 60 peers_listed "$expected_peers"
+printf 'gabiond listed %s peers after %s ms\n' "$expected_peers" "$(($(now_ms) - converge_start_ms))"
 
 printf '\nconfigured tenant rule: rate=%sr/%s window=%s bucket=%s\n' \
     "$BUDGET_PER_TENANT" "$RATE_LIMIT_PERIOD" "$RATE_LIMIT_WINDOW" "$RATE_LIMIT_BUCKET"
@@ -523,6 +512,7 @@ loader_timeout=$((WARMUP_S + DURATION_S + 180))
 printf 'waiting up to %ss for the loader Job to complete...\n' "$loader_timeout"
 wait_status=0
 kubectl -n "$namespace" wait --for=condition=complete --timeout="${loader_timeout}s" job/loader 2>/dev/null || wait_status=$?
+assert_pods_run_image job-name=loader gabion-loader:local
 if [ "$wait_status" -ne 0 ]; then
     printf '\nloader Job did not reach Complete; current state:\n'
     kubectl -n "$namespace" get job/loader -o wide || true

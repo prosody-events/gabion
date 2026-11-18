@@ -12,13 +12,18 @@ use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 use tower::ServiceExt;
 
-use gabion::crdt::{CellStore, CellStoreConfig, NodeId, NodeIdentity};
+use gabion::aggregate::Aggregate;
+use gabion::crdt::{
+    BucketEpoch, CellHandle, CellIdentity, CellStore, DeltaSink, ExpirationSink, KeyHash, NodeId,
+    NodeIdentity,
+};
 use gabion::gossip::sim::SimRouter;
-use gabion::gossip::{AdminCommand, GossipConfig, GossipRuntime, TokioClock};
-use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, RuleTable};
+use gabion::gossip::{AdminCommand, AggregateStore, GossipRuntime, TokioClock};
+use gabion::rules::{EnforcementMode, RuleDef, RuleTable};
+use gabion::settings::Settings;
+use gabion::zone::{UnknownZone, ZoneName, ZoneStatus};
 
-use crate::admin::{AdminState, admin_channel, router};
-use crate::store::DashMapStore;
+use crate::admin::{AdminState, UNAVAILABLE, admin_channel, router};
 
 static TEST_PORT: AtomicU16 = AtomicU16::new(41_500);
 
@@ -37,45 +42,73 @@ fn run_local<F: std::future::Future<Output = T>, T>(f: F) -> T {
     local.block_on(&rt, f)
 }
 
-fn sample_rule() -> Rule {
-    Rule::new(
-        1,
-        "api",
-        vec![DescriptorPattern {
-            key: "tenant".into(),
-            value: "*".into(),
-        }],
-        10,
-        1_000,
-        100,
-        EnforcementMode::Enforce,
-    )
+/// A small node's settings.
+fn settings() -> Settings {
+    Settings {
+        max_cells: 256.try_into().unwrap(),
+        ..Settings::default()
+    }
+}
+
+/// One `tenant:*` rule.
+fn sample_rules() -> RuleTable {
+    let rule = RuleDef {
+        name: "tenant",
+        domain: "api",
+        patterns: &[("tenant", "*")],
+        rate: "10r/s",
+        window: None,
+        bucket: Some(std::time::Duration::from_millis(100)),
+        mode: EnforcementMode::Enforce,
+    }
+    .build(&settings().validate().unwrap().1.cardinality)
+    .unwrap();
+    RuleTable::new(Box::new([rule]), None).unwrap()
 }
 
 fn build_router(gossip_admin: mpsc::Sender<AdminCommand>) -> axum::Router {
-    let rule_table = Arc::new(RuleTable::new(vec![sample_rule()]));
-    let counts = Arc::new(DashMapStore::<u32>::with_capacity(64));
-    let state = AdminState::new(rule_table, counts, gossip_admin);
+    let counts = Arc::new(Aggregate::new(&settings().validate().unwrap().1));
+    let state = AdminState::new(Arc::new(sample_rules()), counts, gossip_admin);
     router(state)
 }
 
+/// The `/snapshot` JSON is the library's snapshot flattened, with the rules
+/// and the aggregate row count, so a renamed field or an id written in decimal
+/// changes this shape.
 #[test]
-fn snapshot_returns_full_state_via_axum_route() {
+fn snapshot_json_shape_is_pinned() {
     run_local(async {
         let sim = SimRouter::new();
         let bind_addr = next_addr();
         let transport = sim.bind(bind_addr);
         let identity = NodeIdentity::new(NodeId(0xBEEF_CAFE), 11);
-        let store = CellStore::<u32>::new(CellStoreConfig::default(), identity);
-        let counts = Arc::new(DashMapStore::<u32>::with_capacity(64));
-
         let bootstrap = next_addr();
-        let gossip_config = GossipConfig {
-            local_identity: identity,
-            bootstrap_peers: vec![bootstrap],
-            rng_seed: 7,
-            ..GossipConfig::default()
+        let (gossip_config, storage) = Settings {
+            gossip_bind: Some(bind_addr),
+            bootstrap_peers: [bootstrap].into(),
+            zone: Some(ZoneName::parse("use1-az2").expect("a zone name")),
+            ..settings()
+        }
+        .validate()
+        .expect("settings validate");
+        let rule_table = Arc::new(sample_rules());
+        let store = CellStore::new(storage, identity, &rule_table);
+        let counts = Arc::new(Aggregate::new(&storage));
+        let row = DeltaSink {
+            handles: vec![CellHandle::default()],
+            keys: vec![CellIdentity {
+                rule_fingerprint: rule_table.rules()[0].fingerprint(),
+                key_hash: KeyHash(1),
+                bucket: BucketEpoch(0),
+            }],
+            previous: vec![0],
+            current: vec![1],
+            deltas: vec![1],
+            applies_locally: vec![1],
         };
+        counts.apply(&row, &ExpirationSink::default());
+
+        let tick = settings().tick_interval.duration();
 
         let (admin_tx, admin_rx) = admin_channel();
         let (rt, client) = GossipRuntime::from_parts_with_admin(
@@ -88,62 +121,173 @@ fn snapshot_returns_full_state_via_axum_route() {
         );
         let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
 
-        let rule_table = Arc::new(RuleTable::new(vec![sample_rule()]));
-        let state = AdminState::new(rule_table, counts, admin_tx);
+        let state = AdminState::new(rule_table.clone(), counts, admin_tx);
         let app = router(state);
+        let snapshot = async || {
+            let request = Request::builder().uri("/snapshot").body(Body::empty());
+            let response =
+                (app.clone().oneshot(request.expect("request")).await).expect("router responded");
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("body");
+            serde_json::from_slice::<Value>(&bytes).expect("json")
+        };
+        let body = snapshot().await;
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/snapshot")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("router responded");
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let bytes = to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .expect("body");
-        let body: Value = serde_json::from_slice(&bytes).expect("json");
-
-        let node_id = body["identity"]["node_id"].as_str().expect("node_id");
-        assert!(!node_id.is_empty());
-        assert!(
-            node_id.chars().all(|c| c.is_ascii_hexdigit()),
-            "node_id should be hex: {node_id:?}",
+        let keys = |value: &Value| {
+            let mut keys: Vec<String> =
+                value.as_object().expect("object").keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(
+            keys(&body),
+            [
+                "aggregate_rows",
+                "counters",
+                "last_error_budget",
+                "local_identity",
+                "peers",
+                "peers_by_role",
+                "rules",
+                "store_stats",
+                "zone",
+            ]
         );
-        assert_eq!(body["identity"]["incarnation"], 11);
+        assert_eq!(
+            body["zone"],
+            serde_json::json!({"name": "use1-az2", "source": "config"})
+        );
+        let unknown = ZoneStatus::Unknown(UnknownZone::OwnEntryNotFound);
+        assert_eq!(
+            serde_json::to_value(unknown).expect("serialises"),
+            serde_json::json!({"name": null, "source": "none", "reason": "own_entry_not_found"})
+        );
+        assert_eq!(
+            body["peers_by_role"],
+            serde_json::json!({
+                "unheard": 1,
+                "zone": 0,
+                "gateway": 0,
+                "remote": 0,
+                "incompatible": 0
+            })
+        );
+        assert_eq!(keys(&body["local_identity"]), ["incarnation", "node_id"]);
+        assert_eq!(
+            keys(&body["counters"]),
+            [
+                "bytes_received",
+                "bytes_sent",
+                "bytes_sent_cross_zone",
+                "cells_merged",
+                "decode_rejects_cluster",
+                "decode_rejects_framing",
+                "decode_rejects_peer_limits",
+                "decode_rejects_version",
+                "gap_reports_sent",
+                "gaps_abandoned",
+                "gateway_failovers",
+                "liveness_probes",
+                "packets_received",
+                "packets_sent",
+                "peers_declined",
+                "relay_stalls",
+                "role_changes",
+                "rounds_heartbeat",
+                "rounds_prompt",
+                "rounds_threshold",
+                "rto_rewinds_own",
+                "rto_rewinds_relay",
+                "send_blocked",
+                "send_errors",
+                "sweep_cells_sent",
+                "sweeps_ignored",
+                "sweeps_refused",
+                "sweeps_requested",
+                "sweeps_served",
+            ]
+        );
+        assert_eq!(
+            keys(&body["store_stats"]),
+            [
+                "active_cells",
+                "cell_capacity",
+                "cell_store_full_rejects",
+                "node_dictionary_full_rejects",
+                "node_slots_capacity",
+                "node_slots_used",
+                "rule_dictionary_full_rejects",
+                "rule_slots_capacity",
+                "rule_slots_used",
+            ]
+        );
+        assert_eq!(
+            keys(&body["peers"][0]),
+            [
+                "addr",
+                "answer",
+                "node_id",
+                "own_unacked",
+                "relay_unacked",
+                "role",
+                "unanswered_ms",
+                "zone"
+            ]
+        );
+        assert_eq!(body["peers"][0]["role"], "unheard");
+        assert_eq!(body["peers"][0]["zone"], "unknown");
+        // A wait is shown exactly while an answer is awaited: none while only
+        // greetings have gone out (a greeting waits on nothing), and from the
+        // heartbeat that sends a hit.
+        assert_eq!(body["peers"][0]["answer"], "settled");
+        assert!(body["peers"][0]["unanswered_ms"].is_null());
+        let fingerprint = rule_table.rules()[0].fingerprint();
+        (client
+            .record(fingerprint, KeyHash(2), BucketEpoch(0), 1, 1_000_000, 0)
+            .await)
+            .expect("recorded");
+        tokio::time::sleep(tick + tick / 2).await;
+        let peer = &snapshot().await["peers"][0];
+        assert_eq!(peer["answer"], "owed");
+        assert_eq!(peer["unanswered_ms"], tick.as_millis() as u64 / 2);
+        assert_eq!(
+            keys(&body["rules"][0]),
+            [
+                "bucket_millis",
+                "descriptors",
+                "domain",
+                "domain_hash",
+                "fingerprint",
+                "id",
+                "limit",
+                "live_buckets",
+                "mode",
+                "name",
+                "window_millis",
+            ]
+        );
+        assert_eq!(keys(&body["rules"][0]["descriptors"][0]), ["key", "value"]);
 
-        let peers = body["peers"].as_array().expect("peers");
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0]["addr"], bootstrap.to_string());
-
-        // Full CellStoreStats projection — these are the regression
-        // targets for a serde rename or removed field.
-        let stats = &body["store"]["cell_store"];
-        for field in [
-            "active_cells",
-            "cell_capacity",
-            "rule_slots_used",
-            "rule_slots_capacity",
-            "node_slots_used",
-            "node_slots_capacity",
-            "cell_store_full_rejects",
-            "rule_dictionary_full_rejects",
-            "node_dictionary_full_rejects",
-        ] {
-            assert!(
-                stats.get(field).is_some(),
-                "missing store.cell_store.{field} in snapshot",
-            );
-        }
-
-        assert!(body["rules"].is_array(), "rules array missing");
-        assert!(body["gossip"]["local_dirty_len"].is_u64());
-        assert!(body["gossip"]["forwarded_dirty_len"].is_u64());
-        assert!(body["gossip"]["send_pending_depth"].is_u64());
+        assert_eq!(
+            body["local_identity"]["node_id"],
+            format!("{:#034x}", 0xBEEF_CAFE_u128)
+        );
+        assert_eq!(body["local_identity"]["incarnation"], 11);
+        assert_eq!(body["peers"][0]["addr"], bootstrap.to_string());
+        assert!(body["peers"][0]["node_id"].is_null());
+        assert_eq!(
+            body["rules"][0]["fingerprint"],
+            format!("{:#034x}", rule_table.rules()[0].fingerprint())
+        );
+        assert!(
+            body["rules"][0]["domain_hash"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 34 && hash.starts_with("0x"))
+        );
+        assert_eq!(body["rules"][0]["mode"], "enforce");
+        assert_eq!(body["aggregate_rows"], 1);
 
         client.shutdown().await.unwrap();
         let _ = handle.await;
@@ -153,10 +297,9 @@ fn snapshot_returns_full_state_via_axum_route() {
 #[test]
 fn readyz_returns_200_with_static_body() {
     run_local(async {
-        // `/readyz` is intentionally independent of the gossip runtime —
-        // the bench needs it to confirm the port-forward attached
-        // before it starts sampling, and the runtime might still be
-        // converging on peers at that point.
+        // `/readyz` is intentionally independent of the gossip runtime: a
+        // liveness probe must answer while the runtime is still converging
+        // on peers.
         let (admin_tx, admin_rx) = admin_channel();
         drop(admin_rx);
 
@@ -177,118 +320,51 @@ fn readyz_returns_200_with_static_body() {
     });
 }
 
+/// Both ways a stopped gossip task shows, a closed command channel and a
+/// dropped reply, answer 503 with the one `admin_unavailable` body, which
+/// sends the operator to the `gossip_stopped` line.
 #[test]
-fn introspection_returns_remote_cells_and_active_peers() {
+fn admin_answers_503_with_one_body_when_gossip_stopped() {
     run_local(async {
-        let sim = SimRouter::new();
-        let bind_addr = next_addr();
-        let transport = sim.bind(bind_addr);
-        let identity = NodeIdentity::new(NodeId(0xBEEF_CAFE), 11);
-        let store = CellStore::<u32>::new(CellStoreConfig::default(), identity);
-        let counts = Arc::new(DashMapStore::<u32>::with_capacity(64));
-
-        let bootstrap = next_addr();
-        let gossip_config = GossipConfig {
-            local_identity: identity,
-            bootstrap_peers: vec![bootstrap],
-            rng_seed: 7,
-            ..GossipConfig::default()
+        let snapshot = async |admin_tx| {
+            let request = Request::builder()
+                .uri("/snapshot")
+                .body(Body::empty())
+                .expect("request");
+            let response = build_router(admin_tx)
+                .oneshot(request)
+                .await
+                .expect("router responded");
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 4 * 1024)
+                .await
+                .expect("body");
+            (status, String::from_utf8(bytes.to_vec()).expect("utf8"))
         };
 
-        let (admin_tx, admin_rx) = admin_channel();
-        let (rt, client) = GossipRuntime::from_parts_with_admin(
-            transport,
-            TokioClock::from_millis(0),
-            gossip_config,
-            store,
-            counts.clone(),
-            Some(admin_rx),
-        );
-        let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+        let (closed_tx, closed_rx) = admin_channel();
+        drop(closed_rx);
+        let closed = snapshot(closed_tx).await;
 
-        let rule_table = Arc::new(RuleTable::new(vec![sample_rule()]));
-        let state = AdminState::new(rule_table, counts, admin_tx);
-        let app = router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/debug/introspection?max_cells=128&max_peers=8")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
+        let (dropping_tx, mut dropping_rx) = admin_channel();
+        let gossip = tokio::task::spawn_local(async move {
+            while let Some(command) = dropping_rx.recv().await {
+                drop(command);
+            }
+        });
+        let dropped = snapshot(dropping_tx).await;
+        gossip
             .await
-            .expect("router responded");
-        assert_eq!(response.status(), StatusCode::OK);
+            .expect("the stand-in gossip task ends with its channel");
 
-        let bytes = to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .expect("body");
-        let body: Value = serde_json::from_slice(&bytes).expect("json");
-
-        // The bench reads `peers.active_peers` (nested), not a top-level
-        // `peers` list — regression target if anyone "flattens" the
-        // shape.
-        let active_peers = body["peers"]["active_peers"]
-            .as_array()
-            .expect("peers.active_peers");
-        assert_eq!(active_peers.len(), 1);
-        assert_eq!(active_peers[0]["addr"], bootstrap.to_string());
-
-        // `remote_cells` is the list the bench sums over for
-        // `final_remote_total`. A fresh runtime with no inbound traffic
-        // has nothing, but the field must exist as an array.
-        assert!(body["remote_cells"].is_array(), "remote_cells missing");
-        // Gossip chart-only fields must serialize even when the runtime
-        // doesn't track them yet — the bench reader does
-        // `gossip.get("merge_cells", 0)` and similar.
-        for field in [
-            "remote_active_cells",
-            "decode_errors",
-            "merge_cells",
-            "send_bytes",
-            "recv_bytes",
-            "digest_mismatch",
-        ] {
-            assert!(
-                body["gossip"].get(field).is_some(),
-                "missing gossip.{field}",
-            );
+        for (status, body) in [closed, dropped] {
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body, UNAVAILABLE.1);
         }
-
-        client.shutdown().await.unwrap();
-        let _ = handle.await;
-    });
-}
-
-#[test]
-fn snapshot_returns_service_unavailable_when_gossip_is_down() {
-    run_local(async {
-        // No runtime ever started — drop the receiver so the admin
-        // sender's first `send` errs, exercising the 503 path.
-        let (admin_tx, admin_rx) = admin_channel();
-        drop(admin_rx);
-
-        let app = build_router(admin_tx);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/snapshot")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("router responded");
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-        let bytes = to_bytes(response.into_body(), 4 * 1024)
-            .await
-            .expect("body");
-        let text = std::str::from_utf8(&bytes).expect("utf8");
         assert!(
-            text.contains("gossip runtime is shut down"),
-            "unexpected error body: {text:?}",
+            UNAVAILABLE.1.contains("`gossip_stopped`"),
+            "the body names the log line that says why: {:?}",
+            UNAVAILABLE.1,
         );
     });
 }

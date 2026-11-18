@@ -1,0 +1,70 @@
+//! Small regimes for the harness's own tests.
+
+use super::regime::Regime;
+
+/// A five-pod regime small enough to run in well under a second, with every
+/// feature switched on: hot keys, a burst, loss, a rollout and a crash.
+pub fn tiny() -> Regime {
+    regime(serde_json::json!({
+        "id": "tiny",
+        "description": "test fixture",
+        "duration_s": 30,
+        "warmup_s": 5,
+        "nodes": 5,
+        "rule": { "limit": 20, "window_ms": 4000, "bucket_ms": 1000 },
+        "traffic": {
+            "site_rate_rps": 10,
+            "site_period_ms": 2000,
+            "site_jitter": 0.5,
+            "hot_keys": [{ "limit_multiple": 2.0 }],
+            "bursts": [{ "rate_rps": 30, "start_s": 10, "duration_s": 5 }]
+        },
+        "network": { "loss": 0.05 },
+        "churn": {
+            "rollouts": [{ "at_s": 12, "count": 2, "interval_ms": 1000, "overlap_ms": 2000 }],
+            "crashes": [{ "at_s": 20 }]
+        },
+        "tracked_sample_keys": 10
+    }))
+}
+
+/// `nodes` pods and nothing else: no traffic, no loss, no churn.
+pub fn quiet(nodes: u32) -> Regime {
+    regime(serde_json::json!({
+        "id": "quiet",
+        "description": "test fixture",
+        "duration_s": 10,
+        "warmup_s": 0,
+        "nodes": nodes,
+        "rule": { "limit": 10, "window_ms": 3000, "bucket_ms": 1000 },
+        "traffic": { "site_rate_rps": 1, "site_period_ms": 1000, "site_jitter": 0.0 },
+        "tracked_sample_keys": 1
+    }))
+}
+
+/// Six pods with availability zone 0 cut off from `14 s` to `30 s`, longer
+/// than the 10 s window, so hits admitted early in the cut expire unrepaired.
+pub fn partitioned() -> Regime {
+    regime(serde_json::json!({
+        "id": "partitioned",
+        "description": "test fixture",
+        "duration_s": 60,
+        "warmup_s": 5,
+        "nodes": 6,
+        "rule": { "limit": 50, "window_ms": 10000, "bucket_ms": 1000 },
+        "traffic": {
+            "site_rate_rps": 10,
+            "site_period_ms": 2000,
+            "site_jitter": 0.5,
+            "hot_keys": [{ "limit_multiple": 2.0 }]
+        },
+        "churn": { "partitions": [{ "at_s": 14, "heal_s": 30, "az": 0 }] },
+        "tracked_sample_keys": 10
+    }))
+}
+
+fn regime(json: serde_json::Value) -> Regime {
+    let regime: Regime = serde_json::from_value(json).expect("fixture regime parses");
+    regime.validate().expect("fixture regime is valid");
+    regime
+}

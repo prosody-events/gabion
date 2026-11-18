@@ -8,35 +8,39 @@
 //!
 //! `GossipRuntime` is `!Send`, so each leadership term is a `spawn_local`
 //! task on a `LocalSet` that polls the gossip runtime and the queue drain
-//! in one `select!`, sharing plain `Rc<...>` handles.
+//! in one `select!`, sharing plain `Rc<...>` handles. Beside the campaign,
+//! leading or not, the thread logs the zone's bypass counters every lease
+//! tick (`log_bypasses`); the request path never logs them.
 
+use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Context;
-use futures::StreamExt;
 use tokio::sync::watch;
 use tokio::task::LocalSet;
 
-use gabion::crdt::{CellStore, CellStoreConfig, KeyHash, NodeIdentity, RuleDescriptor};
-use gabion::defaults;
-use gabion::discovery::{self, DiscoveryConfig, PeerDiscovery, PeerEvent};
-use gabion::gossip::{GossipClient, GossipConfig, GossipRuntime, TokioClock, UdpTransport};
-use gabion::wire::FrameLimits;
+use gabion::crdt::{CellStore, NodeIdentity, ValidStorageConfig};
+use gabion::gossip::{GossipClient, GossipRuntime, TokioClock, UdpTransport, ValidGossipConfig};
+use gabion::rules::CardinalityLimit;
+use gabion::settings::{MIN_LIMIT_QUEUE_CAPACITY, Setting};
+use gabion::throttle;
 
-use crate::identity::fresh_incarnation;
 use crate::rules::CompiledRules;
 use crate::shm::ShmRegion;
 use crate::shm::aggregate::ShmAggregateStore;
 use crate::shm::lease::now_millis;
+use crate::shm::queue::{QueueEvent, QueueSlot};
 
-/// Events the drain hands the runtime per pass, and the depth of the runtime's
-/// request queue. The drain waits for the runtime to take one batch before
-/// popping the next, so a backlog waits in SHM, and a queue this shallow
-/// recycles tokio's storage instead of allocating.
-const DRAIN_BATCH: usize = 32;
+/// Events the drain hands the runtime per pass: the whole depth of the
+/// runtime's request queue under `with_shallow_limit_queue`. The drain waits
+/// for the runtime to take one batch before popping the next, so a backlog
+/// waits in SHM.
+const DRAIN_BATCH: NonZeroUsize = MIN_LIMIT_QUEUE_CAPACITY;
 
 /// How often the drain polls an empty SHM queue.
 const DRAIN_TICK: Duration = Duration::from_millis(5);
@@ -61,104 +65,16 @@ const LONE_NODE_BIND: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LO
 #[derive(Clone, Debug)]
 pub struct LeaderConfig {
     pub worker_id: u32,
-    /// `None` runs this node alone: the leader still folds its hits into
-    /// the shared counts, but nothing can reach it to gossip.
-    pub gossip_bind: Option<SocketAddr>,
-    pub gossip: GossipSettings,
-    pub discovery: DiscoveryConfig,
-    pub cell_store: CellStoreConfig,
-    pub rng_seed: u64,
+    /// The gossip config. Without a bind in its membership this node runs
+    /// alone: the leader still folds its hits into the shared counts, but
+    /// nothing can reach it to gossip.
+    pub gossip: ValidGossipConfig,
+    pub cell_store: ValidStorageConfig,
     pub lease_tick: Duration,
-}
-
-impl Default for LeaderConfig {
-    fn default() -> Self {
-        Self {
-            worker_id: 0,
-            gossip_bind: None,
-            gossip: GossipSettings::default(),
-            discovery: DiscoveryConfig::default(),
-            cell_store: production_cell_store_config(),
-            rng_seed: defaults::random_rng_seed().expect("OS entropy for gossip RNG seed"),
-            lease_tick: DEFAULT_LEASE_TICK,
-        }
-    }
-}
-
-/// Gossip tuning knobs. Mirrors `gabion_server::config::GossipSettings`.
-#[derive(Clone, Debug)]
-pub struct GossipSettings {
-    pub tick_interval: Duration,
-    pub fanout: usize,
-    pub max_payload_bytes: usize,
-    pub max_cells_per_frame: u32,
-    pub max_cells_per_tick: usize,
-    pub send_queue_capacity: usize,
-    pub cluster_id_hash: u128,
-    /// Per-rule error budget for threshold-triggered anti-entropy, in
-    /// basis points of the rule's own limit. See
-    /// [`gabion::defaults::GOSSIP_TARGET_ERR_BPS`] for the derivation.
-    pub target_err_bps: u32,
-    /// Floor between two threshold-fire emissions. See
-    /// [`gabion::defaults::GOSSIP_MIN_EMIT_INTERVAL_MS`].
-    pub min_emit_interval: Duration,
-}
-
-impl Default for GossipSettings {
-    /// Matches `gabion_server::config::GossipSettings::default()` so an
-    /// out-of-the-box nginx + gabiond cluster gossips with identical
-    /// frame/queue tuning.
-    fn default() -> Self {
-        Self {
-            tick_interval: Duration::from_millis(defaults::GOSSIP_TICK_INTERVAL_MILLIS),
-            fanout: defaults::GOSSIP_FANOUT,
-            max_payload_bytes: defaults::GOSSIP_MAX_PAYLOAD_BYTES,
-            max_cells_per_frame: defaults::GOSSIP_MAX_CELLS_PER_FRAME,
-            max_cells_per_tick: defaults::GOSSIP_MAX_CELLS_PER_TICK,
-            send_queue_capacity: defaults::GOSSIP_SEND_QUEUE_CAPACITY,
-            cluster_id_hash: defaults::GOSSIP_CLUSTER_ID_HASH,
-            target_err_bps: defaults::GOSSIP_TARGET_ERR_BPS,
-            min_emit_interval: Duration::from_millis(defaults::GOSSIP_MIN_EMIT_INTERVAL_MS),
-        }
-    }
-}
-
-pub fn production_cell_store_config() -> CellStoreConfig {
-    CellStoreConfig {
-        cell_capacity: defaults::STORAGE_MAX_CELLS as u32,
-        rule_dictionary_capacity: defaults::STORAGE_RULE_DICTIONARY_CAPACITY,
-        node_dictionary_capacity: defaults::STORAGE_NODE_DICTIONARY_CAPACITY,
-        local_dirty_capacity: defaults::STORAGE_LOCAL_DIRTY_CAPACITY,
-        forwarded_dirty_capacity: defaults::STORAGE_FORWARDED_DIRTY_CAPACITY,
-        peer_capacity: defaults::STORAGE_PEER_CAPACITY,
-    }
 }
 
 #[cfg(test)]
 mod tests;
-
-impl GossipSettings {
-    pub fn into_runtime_config(self, identity: NodeIdentity, rng_seed: u64) -> GossipConfig {
-        GossipConfig {
-            local_identity: identity,
-            cluster_id_hash: self.cluster_id_hash,
-            bootstrap_peers: Vec::new(),
-            fanout: self.fanout,
-            max_cells_per_tick: self.max_cells_per_tick,
-            wire_limits: FrameLimits {
-                max_payload_bytes: self.max_payload_bytes,
-                max_cells: self.max_cells_per_frame,
-            },
-            send_queue_capacity: self.send_queue_capacity,
-            limit_queue_capacity: DRAIN_BATCH,
-            tick_interval: self.tick_interval,
-            auth_key: None,
-            rng_seed,
-            target_err_bps: self.target_err_bps,
-            min_emit_interval: self.min_emit_interval,
-        }
-    }
-}
 
 /// A worker's leader thread, and the means to stop it.
 pub struct LeaderHandle {
@@ -186,7 +102,8 @@ impl LeaderHandle {
 /// `current_thread` tokio runtime + `LocalSet` and campaigns for the SHM
 /// lease every `lease_tick`: whichever worker holds it drives gossip, and
 /// the rest stand by to take over when that worker exits or its leader
-/// fails. Call [`LeaderHandle::stop`] before the worker exits.
+/// fails. Every tick it also logs the zone's bypass counters. Call
+/// [`LeaderHandle::stop`] before the worker exits.
 ///
 /// Returns the OS error if the thread can't be spawned; the caller is an
 /// `extern "C"` hook, so it logs and leaves the worker up without a leader
@@ -216,6 +133,7 @@ fn run_leader(
         Ok(runtime) => runtime,
         Err(error) => {
             tracing::error!(
+                code = "leader_runtime_failed",
                 worker_id = config.worker_id,
                 %error,
                 "gabion: could not start the leader thread's async runtime, so \
@@ -228,7 +146,13 @@ fn run_leader(
             return;
         }
     };
-    LocalSet::new().block_on(&runtime, campaign(shm, rules, config, stopped));
+    let bypasses = log_bypasses_every(config.lease_tick, shm, config.cell_store);
+    LocalSet::new().block_on(&runtime, async {
+        tokio::select! {
+            () = campaign(shm, rules, config, stopped) => {}
+            never = bypasses => match never {},
+        }
+    });
     // Dropping the runtime would wait on any `spawn_blocking` DNS lookup the
     // Kubernetes client left behind, holding up the worker's exit.
     runtime.shutdown_background();
@@ -258,6 +182,7 @@ async fn campaign(
         if !lease.try_acquire(config.worker_id, now_millis(), LEASE_TTL_MILLIS) {
             if !announced_follower {
                 tracing::info!(
+                    code = "leader_standby",
                     worker_id = config.worker_id,
                     "gabion: worker did not win leader lease; standing by to take over gossip if \
                      the leader exits",
@@ -268,6 +193,7 @@ async fn campaign(
         }
 
         tracing::info!(
+            code = "leader_won",
             worker_id = config.worker_id,
             "gabion: worker won leader lease"
         );
@@ -286,6 +212,7 @@ async fn campaign(
             retry_delay = LEASE_TTL;
         }
         tracing::error!(
+            code = "leader_stopped",
             worker_id = config.worker_id,
             error = format!("{error:#}"),
             retry_in = ?retry_delay,
@@ -314,39 +241,42 @@ async fn leader_main(
     mut stopped: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     // Stamp a fresh incarnation into the SHM header so peers see a new
-    // `(node_id, incarnation)` for this takeover. `fresh_incarnation` has
-    // one-second resolution, so step past the previous leader's in case it
-    // led within the same second; reusing its identity with an empty
-    // `CellStore` would have peers max-merge away this leader's counts.
+    // `(node_id, incarnation)` for this takeover. It comes from wall-clock
+    // milliseconds and steps past the previous leader's, so peers see a
+    // restart; reusing it would have peers max-merge this leader's counts
+    // into the old incarnation's cells, and this node credit acks written for
+    // the old one.
     let new_incarnation =
-        fresh_incarnation().max(shm.header().identity.load_incarnation().saturating_add(1));
+        gabion::identity::incarnation(Some(shm.header().identity.load_incarnation()));
     shm.header().identity.store_incarnation(new_incarnation);
     let node_id = shm.header().identity.load_node_id();
     let identity = NodeIdentity::new(gabion::crdt::NodeId(node_id), new_incarnation);
 
-    let mut cell_store = CellStore::<u32>::new(config.cell_store, identity);
-    register_rules(&mut cell_store, &rules);
-    let gossip_cfg = config
-        .gossip
-        .clone()
-        .into_runtime_config(identity, config.rng_seed);
+    let cell_store = CellStore::new(config.cell_store, identity, rules.table());
 
     // A lone node still needs a socket for the runtime; an ephemeral
-    // loopback port can't collide with another nginx on the same host, and
-    // there is no one to discover.
-    let (bind, peers) = match config.gossip_bind {
-        Some(bind) => (bind, discovery_stream(config.discovery).left_stream()),
-        None => (LONE_NODE_BIND, futures::stream::empty().right_stream()),
+    // loopback port can't collide with another nginx on the same host, there
+    // is no one to discover, and it asks for the smallest buffers, since it
+    // sends nothing.
+    let (bind, gossip) = match config.gossip.membership().bind() {
+        Some(bind) => {
+            config.gossip.note_startup();
+            (bind, config.gossip)
+        }
+        None => (LONE_NODE_BIND, config.gossip.with_minimal_socket_buffers()),
     };
+    let peers = gossip.membership().peer_events();
     // Bind before the store empties the count table: a term that cannot
     // start leaves the last counts in force, with no leader to refill them.
-    let transport = UdpTransport::bind(bind)
+    let transport = UdpTransport::bind(bind, &gossip)
         .await
         .context("bind the gossip socket")?;
     let (gossip_rt, gossip_client) = GossipRuntime::from_parts(
         transport,
         TokioClock::new(),
-        gossip_cfg,
+        // The setting sizes the SHM queue; the runtime's own queue only needs
+        // room for one drain batch.
+        gossip.with_shallow_limit_queue(),
         cell_store,
         Rc::new(ShmAggregateStore::new(shm)),
     );
@@ -362,35 +292,7 @@ async fn leader_main(
     }
 }
 
-fn discovery_stream(cfg: DiscoveryConfig) -> impl futures::Stream<Item = PeerEvent> {
-    discovery::from_config(cfg)
-        .peer_events()
-        .filter_map(|res| async move {
-            match res {
-                Ok(event) => Some(event),
-                Err(error) => {
-                    tracing::warn!(error = %error, "peer discovery error");
-                    None
-                }
-            }
-        })
-}
-
-fn register_rules(cell_store: &mut CellStore<u32>, rules: &CompiledRules) {
-    for compiled in rules.rules() {
-        let spec = compiled.rule.spec();
-        let _ = cell_store.intern_rule(RuleDescriptor {
-            fingerprint: spec.fingerprint,
-            window_millis: spec.window_millis.min(u32::MAX as u64) as u32,
-            bucket_millis: spec.bucket_millis.min(u32::MAX as u64) as u32,
-            limit: spec.limit,
-            flags: 0,
-            local_rule_id: spec.id,
-        });
-    }
-}
-
-async fn drain_loop(client: GossipClient<u32>, shm: ShmRegion, worker_id: u32) -> anyhow::Error {
+async fn drain_loop(client: GossipClient, shm: ShmRegion, worker_id: u32) -> anyhow::Error {
     let lease = shm.lease();
     let queue = shm.queue();
     let stats = shm.stats();
@@ -400,7 +302,7 @@ async fn drain_loop(client: GossipClient<u32>, shm: ShmRegion, worker_id: u32) -
         if !lease.try_acquire(worker_id, now_millis(), LEASE_TTL_MILLIS) {
             return anyhow::anyhow!("worker {worker_id} lost the leader lease to another worker");
         }
-        let Ok(permits) = client.reserve(DRAIN_BATCH).await else {
+        let Ok(permits) = client.reserve(DRAIN_BATCH.get()).await else {
             return anyhow::anyhow!("gossip runtime shut down");
         };
         // `zip` takes a permit before each pop, so no event leaves SHM
@@ -409,7 +311,7 @@ async fn drain_loop(client: GossipClient<u32>, shm: ShmRegion, worker_id: u32) -
         for (permit, ev) in permits.zip(std::iter::from_fn(|| queue.pop())) {
             permit.record(
                 ev.rule_fingerprint,
-                KeyHash(ev.key_hash),
+                ev.key_hash,
                 ev.bucket,
                 ev.hits,
                 ev.rule_limit,
@@ -421,5 +323,96 @@ async fn drain_loop(client: GossipClient<u32>, shm: ShmRegion, worker_id: u32) -
         if drained == 0 {
             tokio::time::sleep(DRAIN_TICK).await;
         }
+    }
+}
+
+/// Log the bypass counters every `tick`, whether or not this worker leads. It
+/// runs beside the campaign rather than inside a leadership term, so a node
+/// whose terms fail to start, or whose drain has stopped, still reaches the
+/// log; the zone's marks let the first thread to read a power of two log it.
+async fn log_bypasses_every(
+    tick: Duration,
+    shm: ShmRegion,
+    storage: ValidStorageConfig,
+) -> Infallible {
+    let handover = LEASE_TTL + tick;
+    let mut tick = tokio::time::interval(tick);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        log_bypasses(shm, &storage, handover);
+    }
+}
+
+/// Log each counter workers bump on a bypass or a descriptor-limit rejection
+/// whose total passed a power of two since a leader thread last logged it
+/// (`throttle::catch_up` on the zone's `LeaderLine::logged` marks).
+fn log_bypasses(shm: ShmRegion, storage: &ValidStorageConfig, handover: Duration) {
+    let stats = shm.stats();
+    let (workers, logged) = (&stats.workers, &stats.leader.logged);
+    let overflowed = workers.matched_rule_overflows.load(Ordering::Relaxed);
+    if let Some(overflowed_total) = throttle::catch_up(&logged.matched_rule_overflows, overflowed) {
+        let cap = storage.max_matched_rules().get();
+        tracing::warn!(
+            code = "matched_rule_overflow",
+            cap,
+            overflowed_total,
+            config_key = Setting::StorageMaxMatchedRules.yaml_key(),
+            "gabion: a request matched more than {cap} rate-limit rules, the most this node \
+             counts per request. It was allowed, and only the first {cap} matched rules counted \
+             it, so the rest under-count. Usually overlapping rules on one location. Remove or \
+             narrow rules on that location, or raise `gabion_storage_max_matched_rules`; each \
+             extra rule costs {} bytes per worker, reserved once on the worker's first request.",
+            size_of::<QueueEvent>(),
+        );
+    }
+    let dropped = stats.leader.queue_dropped.load(Ordering::Relaxed);
+    if let Some(dropped_total) = throttle::catch_up(&logged.queue_dropped, dropped) {
+        let capacity = shm.layout().queue_capacity;
+        tracing::warn!(
+            code = "queue_dropped",
+            dropped_total,
+            capacity,
+            config_key = Setting::GossipLimitQueueCapacity.yaml_key(),
+            "gabion: the shared-memory request queue was full ({capacity} hits), so counted hits \
+             were dropped: their requests were allowed, and limits under-count them. Either the \
+             gossip leader stopped draining it (look for a recent `gabion: this worker stopped \
+             leading gossip` error) or this node admits more counted hits than the queue holds \
+             across a leader handover (about {handover:?}). Raise \
+             `gabion_gossip_limit_queue_capacity`; each slot uses {} bytes of the \
+             `gabion_limit_zone` SIZE, so raise SIZE by the same amount to keep the count table's \
+             size.",
+            size_of::<QueueSlot>(),
+        );
+    }
+    let declined = workers.declines_invalid_descriptor.load(Ordering::Relaxed);
+    if let Some(declined_total) = throttle::catch_up(&logged.declines_invalid_descriptor, declined)
+    {
+        tracing::warn!(
+            code = "invalid_descriptor_declined",
+            declined_total,
+            "gabion: a rate-limit rule read a key value that is not valid UTF-8, so that rule let \
+             the request through without counting it, and its limit under-counts. Usually a \
+             client sends binary data in a header a rule keys on. Key the rule on a different \
+             variable, or normalise the value with `map`.",
+        );
+    }
+    let rejected = workers.rejected_cardinality.load(Ordering::Relaxed);
+    if let Some(rejected_total) = throttle::catch_up(&logged.rejected_cardinality, rejected) {
+        let (limit, setting) = CardinalityLimit::Bytes.describe();
+        let max = storage.cardinality.max_descriptor_bytes();
+        tracing::warn!(
+            code = "cardinality_rejected",
+            limit,
+            max,
+            rejected_total,
+            config_key = setting.yaml_key(),
+            "gabion: a request's rate-limit descriptor took more than {max} bytes, the most \
+             `gabion_storage_max_descriptor_bytes` allows, so that rule did not count it. If no \
+             other rule on the location allowed or rejected the request, nginx rejected it with \
+             400; if another allowed it, this rule under-counts it. Usually a misbehaving client \
+             or an attack trying to exhaust gabion's tracking memory. If the traffic is \
+             legitimate, raise `gabion_storage_max_descriptor_bytes`.",
+        );
     }
 }

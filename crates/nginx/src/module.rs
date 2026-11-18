@@ -3,8 +3,8 @@
 //! leader thread. All cross-process state lives in the SHM zone allocated by
 //! [`set_zone`] during the master process's config phase.
 
+use std::cell::Cell;
 use std::ffi::{c_char, c_void};
-use std::net::SocketAddr;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,63 +25,48 @@ use ngx::http::{
 };
 use ngx::{http_request_handler, ngx_string};
 
-use gabion::crdt::CellStoreConfig;
-use gabion::defaults;
-use gabion::discovery::DiscoveryConfig;
-use gabion::rules::EnforcementMode;
+use gabion::crdt::ValidStorageConfig;
+use gabion::gossip::ValidGossipConfig;
+use gabion::settings::{Setting, Settings};
 
 use crate::access::{
-    AccessCtx, AccessOutcome, AllowInfo, CardinalitySettings, RejectInfo, VariableLookup,
-    decide_all,
+    AccessCtx, AccessOutcome, AllowInfo, RejectInfo, VariableLookup, decide_all, find_query_arg,
 };
 use crate::headers::AdmissionHeaders;
-use crate::identity::derive_identity;
-use crate::leader::{self, GossipSettings, LeaderConfig, LeaderHandle};
+use crate::leader::{self, LeaderConfig, LeaderHandle};
 use crate::log;
 use crate::rules::{
-    BindingCompiler, BindingLookup, CompiledRules, DEFAULT_DOMAIN, DescriptorBinding, RuleConfig,
-    is_descriptor_key, is_dns_label, is_single_ident, is_zone_name, parse_binding, parse_rate,
-    resolve_rate,
+    BindingCompiler, BindingLookup, CompiledRules, RuleConfig, is_zone_name, parse_rule_directive,
 };
 use crate::shm::lease::now_millis;
-use crate::shm::{Layout, MIN_AGGREGATE_CAPACITY, ShmRegion};
+use crate::shm::queue::QueueEvent;
+use crate::shm::{Layout, MIN_AGGREGATE_CAPACITY, QueueSlot, ShmRegion};
+
+/// Report an `nginx -t` error at the line nginx is reading. The message ends
+/// with ` code=<code>`, the key of its entry in the NGINX README's
+/// configuration errors, as `tracing` lines end with their fields; `code`
+/// must be a string literal, so hygiene's catalogue gate sees every one.
+/// The expansion dereferences `cf`, so it belongs only in a function whose
+/// safety contract makes `cf` the live `ngx_conf_t` nginx passed it.
+macro_rules! conf_error {
+    ($cf:expr, code = $code:literal, $fmt:literal $(, $arg:expr)* $(,)?) => {{
+        const _: &str = $code;
+        ngx::ngx_conf_log_error!(
+            NGX_LOG_EMERG,
+            $cf,
+            concat!("gabion: ", $fmt, " code=", $code)
+            $(, $arg)*
+        );
+    }};
+}
 
 static LEADER_THREAD: Mutex<Option<LeaderHandle>> = Mutex::new(None);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct StorageSettings {
-    max_cells: usize,
-    rule_dictionary_capacity: u16,
-    node_dictionary_capacity: u16,
-    local_dirty_capacity: usize,
-    forwarded_dirty_capacity: usize,
-    peer_capacity: u16,
-}
-
-impl Default for StorageSettings {
-    fn default() -> Self {
-        Self {
-            max_cells: defaults::STORAGE_MAX_CELLS,
-            rule_dictionary_capacity: defaults::STORAGE_RULE_DICTIONARY_CAPACITY,
-            node_dictionary_capacity: defaults::STORAGE_NODE_DICTIONARY_CAPACITY,
-            local_dirty_capacity: defaults::STORAGE_LOCAL_DIRTY_CAPACITY,
-            forwarded_dirty_capacity: defaults::STORAGE_FORWARDED_DIRTY_CAPACITY,
-            peer_capacity: defaults::STORAGE_PEER_CAPACITY,
-        }
-    }
-}
-
-impl StorageSettings {
-    fn cell_store_config(self) -> CellStoreConfig {
-        CellStoreConfig {
-            cell_capacity: self.max_cells.max(1) as u32,
-            rule_dictionary_capacity: self.rule_dictionary_capacity,
-            node_dictionary_capacity: self.node_dictionary_capacity,
-            local_dirty_capacity: self.local_dirty_capacity,
-            forwarded_dirty_capacity: self.forwarded_dirty_capacity,
-            peer_capacity: self.peer_capacity,
-        }
-    }
+thread_local! {
+    /// This worker's admission scratch, which `decide_all` reserves on the
+    /// worker's first request and never grows after. The access handler
+    /// takes it for one request and puts it back.
+    static EVENTS: Cell<Vec<QueueEvent>> = const { Cell::new(Vec::new()) };
 }
 
 struct Module;
@@ -91,13 +76,12 @@ impl http::HttpModule for Module {
         // SAFETY: `ngx_http_gabion_module` is initialised once at static-init
         // time and is only read (never written) after that. nginx enumerates
         // modules single-threaded from the master process during config
-        // parsing, so there is no concurrent access. `&raw`-style borrow via
-        // a shared reference is sound because the data is immutable for the
-        // remainder of the process lifetime, and the `'static` reference we
-        // hand out points to memory that lives for the whole program. See
-        // the nomicon chapter on `static mut` (Send/Sync, "Working with
-        // Unsafe").
-        #[allow(static_mut_refs)]
+        // parsing, so there is no concurrent access. A shared reference is
+        // sound, which makes the lint a false positive here: nothing writes
+        // the static after static init, so no `&mut` can alias it, and it
+        // lives for the whole program. See the nomicon chapter on
+        // `static mut` (Send/Sync, "Working with Unsafe").
+        #[expect(static_mut_refs)]
         unsafe {
             &ngx_http_gabion_module
         }
@@ -124,12 +108,12 @@ impl http::HttpModule for Module {
         let main = Module::main_conf_mut(unsafe { &*cf });
         let (Some(variable), Ok(index), Some(main)) = (variable, usize::try_from(index), main)
         else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+            conf_error!(
                 cf,
-                "gabion: could not register `$gabion_decided`, the variable gabion uses to count \
-                 each request once across internal redirects. Look for an earlier error naming \
-                 it: another module may define `$gabion_decided` too."
+                code = "decided_variable_unregistered",
+                "could not register `$gabion_decided`, the variable gabion uses to count each \
+                 request once across internal redirects. Look for an earlier error naming it: \
+                 another module may define `$gabion_decided` too.",
             );
             return core::Status::NGX_ERROR.into();
         };
@@ -145,7 +129,7 @@ impl http::HttpModule for Module {
     /// calls `ngx_palloc(size_of::<T>())` and ignores `align_of::<T>()`.
     /// nginx's pool only guarantees `NGX_ALIGNMENT` (= `sizeof(unsigned
     /// long)` = 8 on amd64). `MainConfig` contains
-    /// [`leader::GossipSettings::cluster_id_hash: u128`], so
+    /// [`Settings::cluster_id_hash`], a `NonZeroU128`, so
     /// `align_of::<MainConfig>() == 16`; writing a 16-aligned value into an
     /// 8-aligned pool slot is UB. Native linux/amd64 traps when LLVM
     /// lowers a u128 access to aligned SSE (`movdqa`); macOS arm64 uses
@@ -219,66 +203,104 @@ impl http::HttpModule for Module {
             *handler = Some(gabion_access_handler);
         }
 
-        // Compile the rules now that every `gabion_limit_*` directive has
-        // been read. Bindings resolve against this cycle's variables and
-        // pool, so each config keeps its own compiled rules: workers forked
-        // from it read them, and a reload compiles fresh ones.
-        if let Some(main) = Module::main_conf_mut(&*cf)
-            && !main.rules.is_empty()
-        {
-            if main.layout.is_none() {
-                ngx::ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
-                    cf,
-                    "gabion: rules are declared but `gabion_limit_zone` is not set, so no request \
-                     would ever be counted or limited: the zone is the shared memory that holds \
-                     the counts. Add `gabion_limit_zone zone=gabion:64m;` to the http {{}} block."
-                );
+        let Some(main) = Module::main_conf_mut(&*cf) else {
+            return core::Status::NGX_OK.into();
+        };
+        // Every setting directive has been read: validate them together, once.
+        let (gossip, storage) = match main.settings.validate() {
+            Ok(valid) => valid,
+            Err(error) => {
+                conf_error!(cf, code = "setting_invalid", "{}", error);
                 return core::Status::NGX_ERROR.into();
             }
-            let mut compiler = NgxBindingCompiler { cf };
-            match CompiledRules::compile_with(&main.rules, main.cardinality, &mut compiler) {
-                Ok(rules) => main.compiled = Some(Arc::new(rules)),
-                Err(error) => {
-                    ngx::ngx_conf_log_error!(
-                        NGX_LOG_EMERG,
+        };
+        // The queue takes its share of the zone first, so the layout waits for
+        // `gabion_gossip_limit_queue_capacity`, wherever it appears.
+        if let Some(bytes) = main.zone_bytes {
+            let queue = main.settings.limit_queue_capacity.get();
+            // SAFETY: `ngx_pagesize` is read by value; nginx set it at startup,
+            // before parsing any config, and never writes it again.
+            match Layout::for_zone(bytes, unsafe { ngx_pagesize }, queue) {
+                Ok(layout) => main.layout = Some(layout),
+                Err(needed) => {
+                    conf_error!(
                         cf,
-                        "gabion: rule compile failed: {}",
-                        error
+                        code = "limit_zone_too_small",
+                        "`gabion_limit_zone` size {} bytes is too small to hold gabion's request \
+                         queue (`gabion_gossip_limit_queue_capacity` × {} bytes, {} bytes) and at \
+                         least {} counter slots. Raise SIZE to at least {}k, or lower the queue \
+                         capacity; the gabion NGINX README's zone-sizing notes give the formula.",
+                        bytes,
+                        size_of::<QueueSlot>(),
+                        queue.next_power_of_two() * size_of::<QueueSlot>(),
+                        MIN_AGGREGATE_CAPACITY,
+                        needed.div_ceil(1024),
                     );
                     return core::Status::NGX_ERROR.into();
                 }
             }
         }
+        // Compile the rules now that every `gabion_limit_*` directive has
+        // been read. Bindings resolve against this cycle's variables and
+        // pool, so each config keeps its own compiled rules: workers forked
+        // from it read them, and a reload compiles fresh ones.
+        if !main.rules.is_empty() {
+            if main.zone_bytes.is_none() {
+                conf_error!(
+                    cf,
+                    code = "rules_without_limit_zone",
+                    "rules are declared but `gabion_limit_zone` is not set, so no request would \
+                     ever be counted or limited: the zone is the shared memory that holds the \
+                     counts. Add `gabion_limit_zone zone=gabion:32m;` to the http {{}} block: \
+                     262,144 counters, the table `gabiond` builds by default (the zone-sizing \
+                     notes in the gabion NGINX README).",
+                );
+                return core::Status::NGX_ERROR.into();
+            }
+            let mut compiler = NgxBindingCompiler { cf };
+            match CompiledRules::compile_with(&main.rules, &storage, &mut compiler) {
+                Ok(rules) => main.compiled = Some(Arc::new(rules)),
+                Err(error) => {
+                    conf_error!(cf, code = "rule_compile_failed", "{}", error);
+                    return core::Status::NGX_ERROR.into();
+                }
+            }
+        }
+        main.valid = Some((gossip, storage));
         core::Status::NGX_OK.into()
     }
 }
 
 #[derive(Debug, Default)]
 struct MainConfig {
-    /// Set by `gabion_limit_zone`.
+    /// SIZE of `gabion_limit_zone`, set by that directive.
+    zone_bytes: Option<usize>,
+    /// The zone's layout, set in `postconfiguration`.
     layout: Option<Layout>,
     /// Set by `init_zone` once nginx has mapped the zone.
     region: Option<ShmRegion>,
     rules: Vec<RuleConfig>,
     /// `rules` compiled against this config, set in `postconfiguration`.
     compiled: Option<Arc<CompiledRules>>,
-    discovery: DiscoveryConfig,
-    gossip: GossipSettings,
-    storage: StorageSettings,
-    cardinality: CardinalitySettings,
-    gossip_bind: Option<SocketAddr>,
+    /// Every setting directive's value, set by `set_setting`.
+    settings: Settings,
+    /// `settings`, validated once in `postconfiguration`.
+    valid: Option<(ValidGossipConfig, ValidStorageConfig)>,
     /// `$gabion_decided`'s `r->variables` index, set in `preconfiguration`.
     decided: Option<usize>,
-    identity_seed: Option<Box<str>>,
-    rng_seed: Option<u64>,
 }
 
 impl MainConfig {
-    /// The shared region and compiled rules, once a zone and a rule are
-    /// configured.
-    fn active(&self) -> Option<(ShmRegion, &Arc<CompiledRules>)> {
-        Some((self.region?, self.compiled.as_ref()?))
+    /// The shared region, the compiled rules and the validated settings,
+    /// once a zone and a rule are configured.
+    fn active(
+        &self,
+    ) -> Option<(
+        ShmRegion,
+        &Arc<CompiledRules>,
+        &(ValidGossipConfig, ValidStorageConfig),
+    )> {
+        Some((self.region?, self.compiled.as_ref()?, self.valid.as_ref()?))
     }
 }
 
@@ -314,23 +336,16 @@ unsafe extern "C" fn drop_main_config(data: *mut c_void) {
     unsafe { drop(Box::from_raw(data.cast::<MainConfig>())) };
 }
 
-// SAFETY: `HttpModuleMainConf` is an `unsafe trait` in ngx-rs because nginx's
-// configuration slot machinery is implemented in C: nginx allocates a block of
-// memory of size `size_of::<MainConf>()` in `create_main_conf`, treats it as
-// an opaque `void*`, and hands it back to our directive callbacks. The trait
-// requires that `MainConf` be a plain old data type whose default-initialised
-// bit pattern is a valid Rust value, and that no extra invariant ride on top
-// of what ngx-rs already documents. `MainConfig` derives `Default` and
-// contains only `Option`/`Vec`/`String`/integer fields (all safe to
-// default-construct), so it satisfies the contract. No additional invariant
-// beyond what ngx-rs requires. See the nomicon chapters on unsafe traits and
-// FFI.
+// SAFETY: ngx-rs 0.5.1 requires that `MainConf` is the configuration type
+// stored in this module's main-conf slot. `MainConf` is `MainConfig`, the type
+// this module's `create_main_conf` allocates (a `Box<MainConfig>` whose
+// pointer it returns), so every `main_conf` access reads a `MainConfig`.
 unsafe impl HttpModuleMainConf for Module {
     type MainConf = MainConfig;
 }
 
 // No `align_of::<MainConfig>() <= NGX_ALIGNMENT` assert here. `MainConfig`
-// transitively contains `GossipSettings::cluster_id_hash: u128`, so its
+// transitively contains `Settings::cluster_id_hash: NonZeroU128`, so its
 // alignment is 16 — greater than `NGX_ALIGNMENT` (= 8 on amd64). What
 // keeps that sound is `Module::create_main_conf` above: instead of letting
 // ngx-rs `Pool::allocate::<MainConfig>` the value into the pool, we
@@ -345,10 +360,11 @@ unsafe impl HttpModuleMainConf for Module {
 // the CI native-amd64 nginx smokes crash inside the config phase. Keep
 // the override; the heap path is the only thing making this safe.
 
-// SAFETY: Same justification as `HttpModuleMainConf` above — `LocationConfig`
-// is a POD type with a safe `Default` impl, fitting the ngx-rs contract for
-// nginx's C-managed per-location config slot. See the nomicon chapter on
-// unsafe traits.
+// SAFETY: ngx-rs 0.5.1 requires that `LocationConf` is the configuration type
+// stored in this module's location-conf slot. `LocationConf` is
+// `LocationConfig`, the type ngx-rs's default `create_loc_conf` allocates for
+// this module (`Pool::allocate::<Self::LocationConf>`), so every `loc_conf`
+// access reads a `LocationConfig`.
 unsafe impl HttpModuleLocationConf for Module {
     type LocationConf = LocationConfig;
 }
@@ -401,42 +417,44 @@ impl http::Merge for LocationConfig {
     }
 }
 
-/// Build the static `[ngx_command_t; N + 1]` table nginx expects, sized
-/// automatically from the entry list and terminated with
-/// `ngx_command_t::empty()`. Avoids the previous footgun where adding or
-/// removing a directive required hand-bumping a hardcoded length and
-/// remembering to keep the sentinel at the end.
-macro_rules! ngx_command_table {
-    (static mut $name:ident = [ $($cmd:expr),* $(,)? ];) => {
-        static mut $name: [ngx_command_t;
-            <[()]>::len(&[$(ngx_command_table!(@unit $cmd)),*]) + 1]
-        = [
-            $($cmd,)*
-            ngx_command_t::empty(),
-        ];
-    };
-    (@unit $_e:expr) => { () };
-}
+/// The four core directives, one directive per setting that has an NGINX
+/// spelling, and nginx's terminator.
+const COMMAND_COUNT: usize = {
+    let mut count = 5;
+    let mut index = 0;
+    while index < Setting::ALL.len() {
+        if Setting::ALL[index].nginx_directive().is_some() {
+            count += 1;
+        }
+        index += 1;
+    }
+    count
+};
 
-ngx_command_table! {
-static mut NGX_HTTP_GABION_COMMANDS = [
-    ngx_command_t {
+static mut NGX_HTTP_GABION_COMMANDS: [ngx_command_t; COMMAND_COUNT] = commands();
+
+/// The command table, its setting directives derived from the library's
+/// settings table, so none can be missing or spelled differently. Each
+/// setting's entry points `post` at the setting, which [`set_setting`] reads.
+const fn commands() -> [ngx_command_t; COMMAND_COUNT] {
+    let mut table = [const { ngx_command_t::empty() }; COMMAND_COUNT];
+    table[0] = ngx_command_t {
         name: ngx_string!("gabion_limit_zone"),
         type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(set_zone),
         conf: NGX_HTTP_MAIN_CONF_OFFSET,
         offset: 0,
         post: ptr::null_mut(),
-    },
-    ngx_command_t {
+    };
+    table[1] = ngx_command_t {
         name: ngx_string!("gabion_limit_rule"),
         type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_1MORE) as ngx_uint_t,
         set: Some(set_rule),
         conf: NGX_HTTP_MAIN_CONF_OFFSET,
         offset: 0,
         post: ptr::null_mut(),
-    },
-    ngx_command_t {
+    };
+    table[2] = ngx_command_t {
         name: ngx_string!("gabion_limit"),
         type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE)
             as ngx_uint_t,
@@ -444,8 +462,8 @@ static mut NGX_HTTP_GABION_COMMANDS = [
         conf: NGX_HTTP_LOC_CONF_OFFSET,
         offset: 0,
         post: ptr::null_mut(),
-    },
-    ngx_command_t {
+    };
+    table[3] = ngx_command_t {
         name: ngx_string!("gabion"),
         type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1)
             as ngx_uint_t,
@@ -453,200 +471,27 @@ static mut NGX_HTTP_GABION_COMMANDS = [
         conf: NGX_HTTP_LOC_CONF_OFFSET,
         offset: 0,
         post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_gossip_bind"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_gossip_bind),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_gossip_fanout"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_gossip_fanout),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_gossip_cluster"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_gossip_cluster),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_gossip_tick_interval"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_gossip_tick_interval),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_gossip_max_payload_bytes"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_gossip_max_payload_bytes),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_gossip_max_cells_per_frame"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_gossip_max_cells_per_frame),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_gossip_max_cells_per_tick"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_gossip_max_cells_per_tick),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_gossip_send_queue_capacity"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_gossip_send_queue_capacity),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_gossip_target_err_bps"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_gossip_target_err_bps),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_gossip_min_emit_interval"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_gossip_min_emit_interval),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_storage_max_cells"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_storage_max_cells),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_storage_rule_dictionary_capacity"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_storage_rule_dictionary_capacity),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_storage_node_dictionary_capacity"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_storage_node_dictionary_capacity),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_storage_local_dirty_capacity"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_storage_local_dirty_capacity),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_storage_forwarded_dirty_capacity"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_storage_forwarded_dirty_capacity),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_storage_peer_capacity"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_storage_peer_capacity),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_storage_max_descriptor_count"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_storage_max_descriptor_count),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_storage_max_descriptor_bytes"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_storage_max_descriptor_bytes),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_storage_max_key_bytes"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_storage_max_key_bytes),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_runtime_rng_seed"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_runtime_rng_seed),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_node_id_seed"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_identity_seed),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_discovery_namespace_allow"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_discovery_namespace),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_discovery_service_allow"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_discovery_service),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
-        name: ngx_string!("gabion_discovery_self_addr"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_discovery_self_addr),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-];
+    };
+    let mut next = 4;
+    let mut index = 0;
+    while index < Setting::ALL.len() {
+        if let Some(name) = Setting::ALL[index].nginx_directive_cstr() {
+            table[next] = ngx_command_t {
+                name: ngx_str_t {
+                    len: name.count_bytes(),
+                    data: name.as_ptr().cast_mut().cast(),
+                },
+                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+                set: Some(set_setting),
+                conf: NGX_HTTP_MAIN_CONF_OFFSET,
+                offset: 0,
+                post: ptr::from_ref(&Setting::ALL[index]).cast_mut().cast(),
+            };
+            next += 1;
+        }
+        index += 1;
+    }
+    table
 }
 
 static NGX_HTTP_GABION_MODULE_CTX: ngx_http_module_t = ngx_http_module_t {
@@ -702,7 +547,7 @@ http_request_handler!(gabion_access_handler, |request: &mut http::Request| {
     let Some(main) = Module::main_conf(request) else {
         return core::Status::NGX_DECLINED;
     };
-    let (Some((region, rules)), Some(index)) = (main.active(), main.decided) else {
+    let (Some((region, rules, (_, storage))), Some(index)) = (main.active(), main.decided) else {
         return core::Status::NGX_DECLINED;
     };
     // Internal redirects rerun this handler but keep `r->variables`, so a
@@ -725,13 +570,16 @@ http_request_handler!(gabion_access_handler, |request: &mut http::Request| {
         aggregate: region.aggregate(),
         queue: region.queue(),
         stats: region.stats(),
-        domain: DEFAULT_DOMAIN,
-        cardinality: main.cardinality,
+        cardinality: storage.cardinality,
+        max_matched_rules: storage.max_matched_rules(),
     };
     let vars = RequestVariables { request };
     let now = wall_millis();
+    let mut events = EVENTS.take();
+    let outcome = decide_all(ctx, rule_indices, &vars, now, &mut events);
+    EVENTS.set(events);
     // A pass that counted nothing leaves the next limited location to decide.
-    let (status, counted) = match decide_all(ctx, rule_indices, &vars, now) {
+    let (status, counted) = match outcome {
         AccessOutcome::Allow(Some(info)) => {
             apply_admit_headers(request, info);
             (core::Status::NGX_DECLINED, true)
@@ -854,27 +702,6 @@ impl VariableLookup for RequestVariables<'_> {
     }
 }
 
-fn find_query_arg<'a>(args: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
-    let mut rest = args;
-    while !rest.is_empty() {
-        let next = rest
-            .iter()
-            .position(|byte| *byte == b'&')
-            .unwrap_or(rest.len());
-        let pair = &rest[..next];
-        if let Some(eq) = pair.iter().position(|byte| *byte == b'=')
-            && &pair[..eq] == name
-        {
-            return Some(&pair[eq + 1..]);
-        }
-        if next == rest.len() {
-            break;
-        }
-        rest = &rest[next + 1..];
-    }
-    None
-}
-
 // -- directives -------------------------------------------------------------
 
 /// nginx directive handler for `gabion_limit_zone`. Accepts a single
@@ -883,7 +710,15 @@ fn find_query_arg<'a>(args: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
 /// master process during the config phase. nginx guarantees `cf` points to a
 /// valid `ngx_conf_t` and `conf` points to the `MainConfig` slot it
 /// allocated via `create_main_conf`.
-extern "C" fn set_zone(
+///
+/// # Safety
+///
+/// Only nginx calls this, as the directive's `set` handler during the
+/// single-threaded config phase: `cf` is non-null and points at a valid
+/// `ngx_conf_t` whose `args` and `log` nginx populated, and `conf` points at
+/// this module's configuration slot for the directive's level. Every
+/// directive handler below has the same contract.
+unsafe extern "C" fn set_zone(
     cf: *mut ngx_conf_t,
     _command: *mut ngx_command_t,
     conf: *mut c_void,
@@ -895,76 +730,65 @@ extern "C" fn set_zone(
     // `ngx_str_t` populated by nginx's tokenizer; the pointer arithmetic
     // below is bounded by the `nelts` check, and each `ngx_str_t` is a
     // valid borrowed view of the config file's token storage which outlives
-    // this call. `ngx_pagesize` is read by value; nginx set it at startup,
-    // before parsing any config, and never writes it again. See the nomicon
-    // chapters on FFI and raw pointers.
+    // this call. `cf` is the valid `ngx_conf_t` that `single_arg` and
+    // `conf_error!` read. See the nomicon chapters on FFI and raw pointers.
     unsafe {
         let main = &mut *(conf as *mut MainConfig);
-        if main.layout.is_some() {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+        if main.zone_bytes.is_some() {
+            conf_error!(
                 cf,
-                "gabion: `gabion_limit_zone` declared twice; only one zone is supported per http \
-                 {{}} block"
+                code = "limit_zone_declared_twice",
+                "`gabion_limit_zone` is declared twice in this http {{}} block, but gabion keeps \
+                 one limit zone per block. Remove one and size the other for every rule (the \
+                 zone-sizing notes in the gabion NGINX README).",
             );
             return core::NGX_CONF_ERROR;
         }
         let Some(arg) = single_arg(cf) else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+            conf_error!(
                 cf,
-                "gabion: `gabion_limit_zone` requires one argument of the form `zone=NAME:SIZE` \
-                 (e.g. `zone=api:128m`)"
+                code = "limit_zone_arg_count",
+                "`gabion_limit_zone` takes one argument, `zone=NAME:SIZE` (for example \
+                 `zone=api:2m`). Write it in that form, then run `nginx -t`.",
             );
             return core::NGX_CONF_ERROR;
         };
         let Some(rest) = arg.strip_prefix("zone=") else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+            conf_error!(
                 cf,
-                "gabion: `gabion_limit_zone` argument must start with `zone=` (e.g. \
-                 `zone=api:128m`)"
+                code = "limit_zone_missing_prefix",
+                "`gabion_limit_zone` argument must start with `zone=` (for example \
+                 `zone=api:2m`). Write it as `zone=NAME:SIZE`, then run `nginx -t`.",
             );
             return core::NGX_CONF_ERROR;
         };
         let Some((name, size)) = rest.split_once(':') else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+            conf_error!(
                 cf,
-                "gabion: `gabion_limit_zone` value `{}` is missing `:SIZE` (e.g. `zone=api:128m`)",
-                rest
+                code = "limit_zone_missing_size",
+                "`gabion_limit_zone` value `{}` is missing `:SIZE` (for example `zone=api:2m`). \
+                 Write it as `zone=NAME:SIZE`, then run `nginx -t`.",
+                rest,
             );
             return core::NGX_CONF_ERROR;
         };
         if !is_zone_name(name) {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+            conf_error!(
                 cf,
-                "gabion: `gabion_limit_zone` zone name `{}` must match `[A-Za-z0-9_]+` (matches \
-                 nginx core's `limit_req_zone` grammar)",
-                name
+                code = "limit_zone_bad_name",
+                "`gabion_limit_zone` zone name `{}` must match `[A-Za-z0-9_]+` (matches nginx \
+                 core's `limit_req_zone` grammar). Rename the zone, then run `nginx -t`.",
+                name,
             );
             return core::NGX_CONF_ERROR;
         }
         let Ok(bytes) = parse_size_bytes(size) else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+            conf_error!(
                 cf,
-                "gabion: `gabion_limit_zone` size `{}` is not a valid byte count (use suffix \
-                 k/m/g)",
-                size
-            );
-            return core::NGX_CONF_ERROR;
-        };
-        let Some(layout) = Layout::for_zone(bytes, ngx_pagesize) else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                cf,
-                "gabion: `gabion_limit_zone` size `{}` is too small to hold gabion's request \
-                 queue and at least {} counter slots. Use at least `1m`; see the zone sizing \
-                 notes in the gabion nginx README to size it for your traffic.",
+                code = "limit_zone_bad_size",
+                "`gabion_limit_zone` size `{}` is not a valid byte count. Write a number with the \
+                 suffix k, m or g, for example `2m`; then run `nginx -t`.",
                 size,
-                MIN_AGGREGATE_CAPACITY
             );
             return core::NGX_CONF_ERROR;
         };
@@ -983,7 +807,7 @@ extern "C" fn set_zone(
         }
         (*shm_zone).init = Some(init_zone);
         (*shm_zone).data = ptr::from_mut(main).cast();
-        main.layout = Some(layout);
+        main.zone_bytes = Some(bytes);
         core::NGX_CONF_OK
     }
 }
@@ -1010,10 +834,24 @@ unsafe extern "C" fn init_zone(shm_zone: *mut ngx_shm_zone_t, data: *mut c_void)
         return core::Status::NGX_ERROR.into();
     };
     let region = match previous.and_then(|previous| previous.region) {
+        Some(region) if region.layout() != layout => {
+            tracing::error!(
+                code = "limit_queue_resized_on_reload",
+                running = region.layout().queue_capacity,
+                configured = layout.queue_capacity,
+                "gabion: this reload changes `gabion_gossip_limit_queue_capacity`, but nginx \
+                 reuses the `gabion_limit_zone` shared memory across a reload while its name and \
+                 size stay the same, and the running workers still use its queue. nginx keeps the \
+                 previous configuration. Change SIZE in `gabion_limit_zone` along with the queue \
+                 capacity, so nginx maps a fresh zone, or restart nginx.",
+            );
+            return core::Status::NGX_ERROR.into();
+        }
         Some(region) => region,
         None => {
             if LEADER_THREAD.lock().is_ok_and(|slot| slot.is_some()) {
                 tracing::error!(
+                    code = "limit_zone_change_needs_restart",
                     "gabion: this reload changes `gabion_limit_zone`, but with `master_process \
                      off` the running leader thread still uses the old zone, which nginx is about \
                      to free. nginx keeps the previous configuration. Restart nginx to change the \
@@ -1028,6 +866,7 @@ unsafe extern "C" fn init_zone(shm_zone: *mut ngx_shm_zone_t, data: *mut c_void)
             let base = unsafe { ngx_slab_alloc(zone.shm.addr.cast(), layout.total_bytes) };
             if base.is_null() {
                 tracing::error!(
+                    code = "limit_zone_no_room",
                     zone_bytes = zone.shm.size,
                     needed_bytes = layout.total_bytes,
                     "gabion: the `gabion_limit_zone` zone had no room for gabion's state, so \
@@ -1047,16 +886,18 @@ unsafe extern "C" fn init_zone(shm_zone: *mut ngx_shm_zone_t, data: *mut c_void)
     // Stamp the identity on every config load so a changed
     // `gabion_node_id_seed` takes effect, and anchor the lease clock, both
     // before fork.
-    let identity = derive_identity(main.identity_seed.as_deref());
-    region.header().identity.store_node_id(identity.node_id.0);
+    let node_id = gabion::identity::node_id(main.settings.node_id_seed.as_deref());
+    region.header().identity.store_node_id(node_id.0);
     now_millis();
     main.region = Some(region);
     tracing::info!(
-        zone = %String::from_utf8_lossy(zone.shm.name.as_bytes()),
+        code = "limit_zone_ready",
+        limit_zone = %String::from_utf8_lossy(zone.shm.name.as_bytes()),
         bytes = zone.shm.size,
         slots = region.layout().aggregate_capacity,
+        queue = region.layout().queue_capacity,
         reused = previous.is_some(),
-        "gabion: zone ready",
+        "gabion: limit zone ready",
     );
     core::Status::NGX_OK.into()
 }
@@ -1068,21 +909,14 @@ unsafe extern "C" fn init_zone(shm_zone: *mut ngx_shm_zone_t, data: *mut c_void)
 ///                          rate=Nr/<s|m|h|d|DURATION>
 ///                          [window=W] [bucket=B]
 ///                          [mode=enforce|dry_run|disabled] [dry_run]
-///                          [except_if=$var] [domain=NAME];
+///                          [except_if=$var] [domain=NAME]
+///                          [value=KEY:LITERAL];
 /// ```
 ///
-/// Positional arguments after the rule name are descriptor bindings — `$var`
-/// auto-keyed by the variable name, or `name:$var` with an explicit key.
-/// Named arguments are recognised by their `keyword=` prefix; the bare
-/// `dry_run` flag is an alias for `mode=dry_run`.
-///
-/// `rate=` carries the sustained allowance, `window=` widens the time
-/// horizon (defaults to the rate's period), and `bucket=` controls the
-/// granularity inside the window (defaults to the resolved window, i.e.
-/// one fixed-window bucket). When `window=` is set, the resolved internal
-/// limit scales up to `floor(rate_count * window_millis / period_millis)`
-/// — see the README's "Rate, window, and bucket" section.
-extern "C" fn set_rule(
+/// [`parse_rule_directive`] reads the arguments, reporting any syntax error
+/// at this line; `postconfiguration` builds the rule once every setting is
+/// read. See the README's "Rate, window, and bucket" section.
+unsafe extern "C" fn set_rule(
     cf: *mut ngx_conf_t,
     _command: *mut ngx_command_t,
     conf: *mut c_void,
@@ -1096,221 +930,34 @@ extern "C" fn set_rule(
     unsafe {
         let main = &mut *(conf as *mut MainConfig);
         let args = (*(*cf).args).elts as *mut ngx_str_t;
-        let nelts = (*(*cf).args).nelts;
-        if args.is_null() || nelts < 2 {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                cf,
-                "gabion: `gabion_limit_rule` requires at least a rule name"
-            );
-            return core::NGX_CONF_ERROR;
-        }
-        let Ok(name) = (*args.add(1)).to_str() else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                cf,
-                "gabion: `gabion_limit_rule` rule name is not valid UTF-8"
-            );
-            return core::NGX_CONF_ERROR;
+        let nelts = if args.is_null() {
+            0
+        } else {
+            (*(*cf).args).nelts
         };
-
-        let mut bucket: Option<Duration> = None;
-        let mut window: Option<Duration> = None;
-        let mut domain = DEFAULT_DOMAIN.to_string();
-        let mut bindings: Vec<DescriptorBinding> = Vec::new();
-        let mut mode = EnforcementMode::Enforce;
-        let mut mode_explicit = false;
-        let mut rate: Option<(u64, Duration)> = None;
-        let mut except_if: Option<Box<str>> = None;
-
-        for index in 2..nelts {
-            let Ok(value) = (*args.add(index)).to_str() else {
-                ngx::ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
-                    cf,
-                    "gabion: `gabion_limit_rule` argument is not valid UTF-8"
-                );
-                return core::NGX_CONF_ERROR;
+        let mut words = Vec::with_capacity(nelts);
+        for index in 1..nelts {
+            let Ok(word) = (*args.add(index)).to_str() else {
+                return arg_not_utf8(cf, "gabion_limit_rule");
             };
-            match parse_rule_arg(value) {
-                RuleArg::Rate(count, period) => rate = Some((count, period)),
-                RuleArg::Window(d) => window = Some(d),
-                RuleArg::Bucket(d) => bucket = Some(d),
-                RuleArg::Domain(d) => domain = d,
-                RuleArg::Mode(m) => {
-                    mode = m;
-                    mode_explicit = true;
-                }
-                RuleArg::DryRunFlag => {
-                    if mode_explicit && mode != EnforcementMode::DryRun {
-                        ngx::ngx_conf_log_error!(
-                            NGX_LOG_EMERG,
-                            cf,
-                            "gabion: `gabion_limit_rule` `dry_run` flag conflicts with explicit \
-                             `mode=`"
-                        );
-                        return core::NGX_CONF_ERROR;
-                    }
-                    mode = EnforcementMode::DryRun;
-                    mode_explicit = true;
-                }
-                RuleArg::ExceptIf(var) => except_if = Some(var.into()),
-                RuleArg::Binding(b) => bindings.push(b),
-                RuleArg::Invalid(reason) => {
-                    ngx::ngx_conf_log_error!(
-                        NGX_LOG_EMERG,
-                        cf,
-                        "gabion: `gabion_limit_rule` argument `{}` is invalid: {}",
-                        value,
-                        reason
-                    );
-                    return core::NGX_CONF_ERROR;
-                }
+            words.push(word);
+        }
+        match parse_rule_directive(&words) {
+            Ok(rule) => {
+                main.rules.push(rule);
+                core::NGX_CONF_OK
             }
-        }
-
-        let Some((rate_count, period)) = rate else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                cf,
-                "gabion: `gabion_limit_rule` rule `{}` is missing the required `rate=Nr/s` \
-                 argument",
-                name
-            );
-            return core::NGX_CONF_ERROR;
-        };
-        if bindings.is_empty() {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                cf,
-                "gabion: `gabion_limit_rule` rule `{}` declares no descriptor bindings; add at \
-                 least one `$variable` (e.g. `$remote_addr`)",
-                name
-            );
-            return core::NGX_CONF_ERROR;
-        }
-        if main.rules.iter().any(|r| r.name.as_ref() == name) {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                cf,
-                "gabion: `gabion_limit_rule` rule `{}` is declared more than once; rule names \
-                 must be unique within an http {{}} block",
-                name
-            );
-            return core::NGX_CONF_ERROR;
-        }
-
-        // `window=` defaults to the rate's period (today's behavior);
-        // `bucket=` defaults to the resolved window (one fixed-window
-        // bucket per rule). With an explicit `window=` the rate is
-        // scaled up to a window-sized budget — see the README's
-        // "Rate, window, and bucket" section for the burstable-vs-paced
-        // gotcha when bucket is left at its default. Each
-        // `RateResolveError` already carries the operator-facing
-        // three-question message via `Display`; we forward it verbatim.
-        let resolved = match resolve_rate(rate_count, period, window, bucket) {
-            Ok(r) => r,
-            Err(err) => {
-                ngx::ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
+            Err(error) => {
+                conf_error!(
                     cf,
-                    "gabion: `gabion_limit_rule` rule `{}`: {}",
-                    name,
-                    err
+                    code = "limit_rule_invalid",
+                    "`gabion_limit_rule` {}",
+                    error,
                 );
-                return core::NGX_CONF_ERROR;
+                core::NGX_CONF_ERROR
             }
-        };
-        main.rules.push(RuleConfig {
-            name: name.into(),
-            domain: domain.into(),
-            bindings,
-            limit: resolved.limit,
-            window: Duration::from_millis(resolved.window_millis),
-            bucket: Duration::from_millis(resolved.bucket_millis),
-            mode,
-            except_if,
-        });
-        core::NGX_CONF_OK
-    }
-}
-
-/// Parsed shape of one `gabion_limit_rule` argument.
-enum RuleArg {
-    /// `rate=Nr/<period>` — `(count, period)`. Period comes from the unit
-    /// letter (`s|m|h|d`) or a humantime-parsed duration (`30s`, `5m`).
-    Rate(u64, Duration),
-    /// `window=DURATION` — the time horizon the rate is enforced over.
-    /// When set, the resolved `limit` scales from the rate's count up to
-    /// the window-sized budget. Defaults to the rate's period when
-    /// omitted (preserving today's behavior).
-    Window(Duration),
-    Bucket(Duration),
-    Domain(String),
-    Mode(EnforcementMode),
-    DryRunFlag,
-    ExceptIf(String),
-    Binding(DescriptorBinding),
-    Invalid(&'static str),
-}
-
-fn parse_rule_arg(value: &str) -> RuleArg {
-    if value == "dry_run" {
-        return RuleArg::DryRunFlag;
-    }
-    if let Some(rest) = value.strip_prefix("rate=") {
-        return match parse_rate(rest) {
-            Ok((count, period)) => RuleArg::Rate(count, period),
-            Err(reason) => RuleArg::Invalid(reason),
-        };
-    }
-    // `window=` and `bucket=` share the same shape — a humantime duration
-    // string that must parse and be non-zero. Zero is rejected in
-    // `resolve_rate` (so the operator sees the same wording whether it
-    // arrived as `window=0s` or as a window-vs-period mismatch); here we
-    // only reject unparseable values.
-    if let Some(rest) = value.strip_prefix("window=") {
-        return parse_duration_arg(rest, "expected `window=DURATION` (e.g. `window=5h`)")
-            .map_or_else(RuleArg::Invalid, RuleArg::Window);
-    }
-    if let Some(rest) = value.strip_prefix("bucket=") {
-        return parse_duration_arg(rest, "expected `bucket=DURATION` (e.g. `bucket=1s`)")
-            .map_or_else(RuleArg::Invalid, RuleArg::Bucket);
-    }
-    if let Some(rest) = value.strip_prefix("domain=") {
-        if !is_descriptor_key(rest) {
-            return RuleArg::Invalid(
-                "`domain=` must match `[A-Za-z_][A-Za-z0-9_.-]*` (e.g. `domain=api`)",
-            );
         }
-        return RuleArg::Domain(rest.to_string());
     }
-    if let Some(rest) = value.strip_prefix("mode=") {
-        return match rest {
-            "enforce" => RuleArg::Mode(EnforcementMode::Enforce),
-            "dry_run" => RuleArg::Mode(EnforcementMode::DryRun),
-            "disabled" => RuleArg::Mode(EnforcementMode::Disabled),
-            _ => RuleArg::Invalid("expected `mode=enforce|dry_run|disabled`"),
-        };
-    }
-    if let Some(rest) = value.strip_prefix("except_if=") {
-        let var = rest.strip_prefix('$').unwrap_or(rest);
-        if var.is_empty() || !is_single_ident(var) {
-            return RuleArg::Invalid("`except_if=` expects `$variable_name`");
-        }
-        return RuleArg::ExceptIf(var.to_string());
-    }
-    match parse_binding(value) {
-        Ok(b) => RuleArg::Binding(b),
-        Err(reason) => RuleArg::Invalid(reason),
-    }
-}
-
-/// Parse a humantime duration argument and return the original
-/// operator-facing example on a parse error. Zero durations are accepted
-/// here and rejected with a domain-specific message by `resolve_rate`.
-fn parse_duration_arg(rest: &str, unparseable_msg: &'static str) -> Result<Duration, &'static str> {
-    humantime::parse_duration(rest).map_err(|_| unparseable_msg)
 }
 
 /// nginx directive handler for `gabion_limit`. Valid at the http, server,
@@ -1326,7 +973,7 @@ fn parse_duration_arg(rest: &str, unparseable_msg: &'static str) -> Result<Durat
 /// declaring `gabion_limit` at a child level replaces the parent's set
 /// rather than appending to it. Multiple `gabion_limit` directives within
 /// the same level accumulate (dedup on duplicates).
-extern "C" fn set_limit(
+unsafe extern "C" fn set_limit(
     cf: *mut ngx_conf_t,
     _command: *mut ngx_command_t,
     conf: *mut c_void,
@@ -1340,47 +987,33 @@ extern "C" fn set_limit(
     unsafe {
         let location = &mut *(conf as *mut LocationConfig);
         let Some(main) = Module::main_conf(&*cf) else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+            conf_error!(
                 cf,
-                "gabion: `gabion_limit` could not access the main config"
+                code = "limit_main_conf_missing",
+                "`gabion_limit` could not read gabion's http-level configuration, which nginx \
+                 always provides. This is a gabion bug: report it with your nginx version.",
             );
             return core::NGX_CONF_ERROR;
         };
         let args = (*(*cf).args).elts as *mut ngx_str_t;
         let nelts = (*(*cf).args).nelts;
         if args.is_null() || nelts < 2 {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+            conf_error!(
                 cf,
-                "gabion: `gabion_limit` requires at least one rule name (or `off`)"
+                code = "limit_missing_rule",
+                "`gabion_limit` names no rule. List rules declared with `gabion_limit_rule`, or \
+                 write `gabion_limit off;` to turn them off here.",
             );
             return core::NGX_CONF_ERROR;
         }
 
-        // Detect `gabion_limit off`. Must be the only argument when used.
-        let first = match (*args.add(1)).to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                ngx::ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
-                    cf,
-                    "gabion: `gabion_limit` argument is not valid UTF-8"
-                );
-                return core::NGX_CONF_ERROR;
-            }
+        // `gabion_limit off;` alone means "no rules" at this level: record an
+        // empty set so it overrides parent inheritance. An `off` among rule
+        // names is refused in the loop below.
+        let Ok(first) = (*args.add(1)).to_str() else {
+            return arg_not_utf8(cf, "gabion_limit");
         };
-        if first == "off" {
-            if nelts != 2 {
-                ngx::ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
-                    cf,
-                    "gabion: `gabion_limit off` does not take additional arguments"
-                );
-                return core::NGX_CONF_ERROR;
-            }
-            // `off` at this level means "no rules"; record an empty set so
-            // it overrides parent inheritance.
+        if first == "off" && nelts == 2 {
             location.rule_indices = Some(Vec::new());
             return core::NGX_CONF_OK;
         }
@@ -1391,28 +1024,25 @@ extern "C" fn set_limit(
         let indices = location.rule_indices.get_or_insert_with(Vec::new);
         for i in 1..nelts {
             let Ok(rule_name) = (*args.add(i)).to_str() else {
-                ngx::ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
-                    cf,
-                    "gabion: `gabion_limit` rule name is not valid UTF-8"
-                );
-                return core::NGX_CONF_ERROR;
+                return arg_not_utf8(cf, "gabion_limit");
             };
             if rule_name == "off" {
-                ngx::ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
+                conf_error!(
                     cf,
-                    "gabion: `gabion_limit off` cannot be mixed with rule names"
+                    code = "limit_off_mixed",
+                    "`gabion_limit off` turns off every rule at this level, so it takes no rule \
+                     names. Write `gabion_limit off;` alone, or list only rule names.",
                 );
                 return core::NGX_CONF_ERROR;
             }
             let Some(index) = main.rules.iter().position(|r| r.name.as_ref() == rule_name) else {
-                ngx::ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
+                conf_error!(
                     cf,
-                    "gabion: `gabion_limit` references rule `{}`, which is not declared via \
-                     `gabion_limit_rule`",
-                    rule_name
+                    code = "limit_unknown_rule",
+                    "`gabion_limit` references rule `{}`, which no `gabion_limit_rule` in this \
+                     http {{}} block declares. Usually a typo, or a rule in a file this block \
+                     does not include. Declare it or correct the name.",
+                    rule_name,
                 );
                 return core::NGX_CONF_ERROR;
             };
@@ -1428,7 +1058,7 @@ extern "C" fn set_limit(
 /// disables the access handler entirely for this scope (no rules evaluated,
 /// no access-phase work). `on` re-enables it where a parent had it off.
 /// Valid at the http, server, and location levels.
-extern "C" fn set_gabion(
+unsafe extern "C" fn set_gabion(
     cf: *mut ngx_conf_t,
     _command: *mut ngx_command_t,
     conf: *mut c_void,
@@ -1441,30 +1071,27 @@ extern "C" fn set_gabion(
         let location = &mut *(conf as *mut LocationConfig);
         let args = (*(*cf).args).elts as *mut ngx_str_t;
         if args.is_null() || (*(*cf).args).nelts != 2 {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+            conf_error!(
                 cf,
-                "gabion: `gabion` requires exactly one argument (`on` or `off`)"
+                code = "gabion_arg_count",
+                "`gabion` takes one argument. Write `gabion on;` or `gabion off;`.",
             );
             return core::NGX_CONF_ERROR;
         }
         let Ok(value) = (*args.add(1)).to_str() else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                cf,
-                "gabion: `gabion` argument is not valid UTF-8"
-            );
-            return core::NGX_CONF_ERROR;
+            return arg_not_utf8(cf, "gabion");
         };
         match value {
             "on" => location.off = Some(false),
             "off" => location.off = Some(true),
             other => {
-                ngx::ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
+                conf_error!(
                     cf,
-                    "gabion: `gabion {}` is not a valid value; use `on` or `off`",
-                    other
+                    code = "gabion_bad_value",
+                    "`gabion {}` is not a valid value: `gabion` only switches gabion on or off \
+                     here, so a rule name belongs in `gabion_limit`. Write `gabion on;` or \
+                     `gabion off;`, then run `nginx -t`.",
+                    other,
                 );
                 return core::NGX_CONF_ERROR;
             }
@@ -1473,505 +1100,59 @@ extern "C" fn set_gabion(
     }
 }
 
-/// nginx directive handler for `gabion_gossip_bind`. Invoked once per
-/// occurrence in the config from the master process during the config phase;
-/// `cf` and `conf` follow the standard nginx callback contract.
-extern "C" fn set_gossip_bind(
+/// nginx directive handler for every setting's directive: parses the
+/// argument into the setting `commands` pointed `post` at. Invoked once per
+/// occurrence from the master process during the config phase; nginx has
+/// already checked that there is exactly one argument.
+unsafe extern "C" fn set_setting(
     cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
+    command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    set_scalar(
-        cf,
-        conf,
-        "expected a host:port socket address (e.g. `0.0.0.0:9000`, `[::]:9000`)",
-        |v| v.parse::<SocketAddr>().ok(),
-        |main, addr| main.gossip_bind = Some(addr),
-    )
-}
-
-/// nginx directive handler for `gabion_gossip_fanout`. Standard nginx
-/// callback contract (see `set_gossip_bind`).
-extern "C" fn set_gossip_fanout(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_usize(
-        cf,
-        conf,
-        "expected a positive integer (peers per tick, e.g. `6`)",
-        |main, value| {
-            main.gossip.fanout = value.max(1);
-        },
-    )
-}
-
-/// nginx directive handler for `gabion_gossip_cluster`. Standard nginx
-/// callback contract (see `set_gossip_bind`).
-extern "C" fn set_gossip_cluster(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_scalar(
-        cf,
-        conf,
-        "expected a non-zero 128-bit cluster identifier shared by every peer, in decimal or \
-         `0x`-prefixed hex (e.g. `1`, `0xc0ffee`)",
-        gabion::gossip::parse_cluster_id,
-        |main, cluster| main.gossip.cluster_id_hash = cluster.get(),
-    )
-}
-
-extern "C" fn set_gossip_tick_interval(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_duration(
-        cf,
-        conf,
-        "expected a duration like `100ms` or `1s`",
-        |main, value| {
-            main.gossip.tick_interval = value;
-        },
-    )
-}
-
-extern "C" fn set_gossip_max_payload_bytes(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_usize(
-        cf,
-        conf,
-        "expected a positive byte count (e.g. `65536`)",
-        |main, value| {
-            main.gossip.max_payload_bytes = value.max(1);
-        },
-    )
-}
-
-extern "C" fn set_gossip_max_cells_per_frame(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_u32(
-        cf,
-        conf,
-        "expected a positive integer (cells/frame, e.g. `4096`)",
-        |main, value| {
-            main.gossip.max_cells_per_frame = value.max(1);
-        },
-    )
-}
-
-extern "C" fn set_gossip_max_cells_per_tick(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_usize(
-        cf,
-        conf,
-        "expected a positive integer (cells/tick)",
-        |main, value| {
-            main.gossip.max_cells_per_tick = value.max(1);
-        },
-    )
-}
-
-extern "C" fn set_gossip_send_queue_capacity(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_usize(
-        cf,
-        conf,
-        "expected a positive integer (send-queue slots)",
-        |main, value| {
-            main.gossip.send_queue_capacity = value.max(1);
-        },
-    )
-}
-
-extern "C" fn set_gossip_target_err_bps(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_u32(
-        cf,
-        conf,
-        "expected basis points of the rule's limit (e.g. `100` = 1%)",
-        |main, value| {
-            main.gossip.target_err_bps = value;
-        },
-    )
-}
-
-extern "C" fn set_gossip_min_emit_interval(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_duration(
-        cf,
-        conf,
-        "expected a duration like `5ms` or `100ms`",
-        |main, value| {
-            main.gossip.min_emit_interval = value;
-        },
-    )
-}
-
-extern "C" fn set_storage_max_cells(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_usize(
-        cf,
-        conf,
-        "expected a positive integer (CRDT cell capacity, e.g. `131072`)",
-        |main, value| {
-            main.storage.max_cells = value.max(1);
-        },
-    )
-}
-
-extern "C" fn set_storage_rule_dictionary_capacity(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_u16(
-        cf,
-        conf,
-        "expected a positive integer that fits u16 (e.g. `1024`)",
-        |main, value| {
-            main.storage.rule_dictionary_capacity = value.max(1);
-        },
-    )
-}
-
-extern "C" fn set_storage_node_dictionary_capacity(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_u16(
-        cf,
-        conf,
-        "expected a positive integer that fits u16 (e.g. `1024`)",
-        |main, value| {
-            main.storage.node_dictionary_capacity = value.max(1);
-        },
-    )
-}
-
-extern "C" fn set_storage_local_dirty_capacity(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_usize(
-        cf,
-        conf,
-        "expected a positive integer (local dirty-ring slots)",
-        |main, value| {
-            main.storage.local_dirty_capacity = value.max(1);
-        },
-    )
-}
-
-extern "C" fn set_storage_forwarded_dirty_capacity(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_usize(
-        cf,
-        conf,
-        "expected a positive integer (forwarded dirty-ring slots)",
-        |main, value| {
-            main.storage.forwarded_dirty_capacity = value.max(1);
-        },
-    )
-}
-
-extern "C" fn set_storage_peer_capacity(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_u16(
-        cf,
-        conf,
-        "expected a positive integer that fits u16 (e.g. `256`)",
-        |main, value| {
-            main.storage.peer_capacity = value.max(1);
-        },
-    )
-}
-
-extern "C" fn set_storage_max_descriptor_count(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_scalar(
-        cf,
-        conf,
-        "expected a positive integer no greater than the compiled-in cap (see \
-         `gabion::defaults::STORAGE_MAX_DESCRIPTOR_COUNT`)",
-        |v| {
-            let count = v.parse::<usize>().ok()?;
-            if count == 0 || count > crate::rules::MAX_DESCRIPTORS {
-                return None;
-            }
-            Some(count)
-        },
-        |main, value| main.cardinality.max_descriptor_count = value,
-    )
-}
-
-extern "C" fn set_storage_max_descriptor_bytes(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_usize(
-        cf,
-        conf,
-        "expected a positive byte budget per request (e.g. `512`)",
-        |main, value| {
-            main.cardinality.max_descriptor_bytes = value.max(1);
-        },
-    )
-}
-
-extern "C" fn set_storage_max_key_bytes(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_usize(
-        cf,
-        conf,
-        "expected a positive byte budget per descriptor key (e.g. `64`)",
-        |main, value| {
-            main.cardinality.max_key_bytes = value.max(1);
-        },
-    )
-}
-
-extern "C" fn set_runtime_rng_seed(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_u64(
-        cf,
-        conf,
-        "expected a u64 seed for deterministic peer sampling (e.g. `42`)",
-        |main, value| {
-            main.rng_seed = Some(value);
-        },
-    )
-}
-
-/// nginx directive handler for `gabion_node_id_seed`. Standard nginx callback
-/// contract (see `set_gossip_bind`).
-extern "C" fn set_identity_seed(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_scalar(
-        cf,
-        conf,
-        "expected a non-empty seed string (e.g. a pod name)",
-        |v| (!v.is_empty()).then(|| v.to_string()),
-        |main, value| main.identity_seed = Some(value.into()),
-    )
-}
-
-/// nginx directive handler for `gabion_discovery_namespace_allow`. Standard
-/// nginx callback contract (see `set_gossip_bind`).
-extern "C" fn set_discovery_namespace(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_scalar(
-        cf,
-        conf,
-        "expected a Kubernetes DNS label `[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?` (lower-case, ≤63 \
-         chars)",
-        |v| is_dns_label(v).then(|| v.to_string()),
-        |main, value| main.discovery.namespace_allow.push(value),
-    )
-}
-
-extern "C" fn set_discovery_service(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_scalar(
-        cf,
-        conf,
-        "expected a Kubernetes DNS label `[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?` (lower-case, ≤63 \
-         chars)",
-        |v| is_dns_label(v).then(|| v.to_string()),
-        |main, value| main.discovery.service_allow.push(value),
-    )
-}
-
-extern "C" fn set_discovery_self_addr(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_scalar(
-        cf,
-        conf,
-        "expected a host:port socket address to exclude from discovered peers",
-        |v| v.parse::<SocketAddr>().ok(),
-        |main, addr| main.discovery.self_addr = Some(addr),
-    )
-}
-
-/// Resolve a single string-typed argument and parse it through `parse`,
-/// applying the result via `apply`. On parse failure logs an EMERG line of
-/// the operator-grade shape:
-///
-/// ```text
-/// gabion: `<directive>` rejected value `<offending>`: <expected>
-/// ```
-///
-/// where `<directive>` is read from `(*cf).args[0]` (always populated by
-/// nginx) and `<expected>` is the per-directive format hint. The hint
-/// should be a short, complete sentence that names the expected shape and
-/// gives an example (e.g. `"expected a positive integer (e.g. 4096)"`).
-fn set_scalar<T>(
-    cf: *mut ngx_conf_t,
-    conf: *mut c_void,
-    expected: &str,
-    parse: impl FnOnce(&str) -> Option<T>,
-    apply: impl FnOnce(&mut MainConfig, T),
-) -> *mut c_char {
-    // SAFETY: `conf` is the `MainConfig` slot nginx allocated for this
-    // module (HttpModuleMainConf contract), uniquely owned for the
-    // duration of this single-threaded config-phase callback; `cf` is a
-    // valid `ngx_conf_t`.
-    unsafe {
-        let main = &mut *(conf as *mut MainConfig);
-        let directive = directive_name(cf);
-        let Some(value) = single_arg(cf) else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                cf,
-                "gabion: `{}` requires exactly one argument; {}",
-                directive,
-                expected
-            );
-            return core::NGX_CONF_ERROR;
+    // SAFETY: nginx single-threadedly invokes this handler during config
+    // parsing with `command` pointing at this module's own table entry, whose
+    // `post` `commands` pointed at an element of the `'static`
+    // `Setting::ALL`, and `conf` at the `MainConfig` slot `create_main_conf`
+    // allocated (HttpModuleMainConf contract), so the read is valid and the
+    // `&mut` borrow unique. `cf` satisfies `single_arg`'s contract, and
+    // `arg_not_utf8`'s and `conf_error!`'s below.
+    let (setting, main, value) = unsafe {
+        (
+            *(*command).post.cast::<Setting>(),
+            &mut *conf.cast::<MainConfig>(),
+            single_arg(cf),
+        )
+    };
+    let Some(value) = value else {
+        // SAFETY: as above.
+        return unsafe {
+            arg_not_utf8(cf, setting.nginx_directive().unwrap_or(setting.yaml_key()))
         };
-        match parse(value) {
-            Some(parsed) => {
-                apply(main, parsed);
-                core::NGX_CONF_OK
-            }
-            None => {
-                ngx::ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
-                    cf,
-                    "gabion: `{}` rejected value `{}`: {}",
-                    directive,
-                    value,
-                    expected
-                );
-                core::NGX_CONF_ERROR
-            }
+    };
+    match main.settings.apply(setting, value) {
+        Ok(()) => core::NGX_CONF_OK,
+        Err(error) => {
+            conf_error!(cf, code = "directive_bad_value", "{}", error);
+            core::NGX_CONF_ERROR
         }
     }
 }
 
-fn set_usize(
-    cf: *mut ngx_conf_t,
-    conf: *mut c_void,
-    expected: &str,
-    apply: impl FnOnce(&mut MainConfig, usize),
-) -> *mut c_char {
-    set_scalar(cf, conf, expected, |v| v.parse::<usize>().ok(), apply)
-}
-
-fn set_u16(
-    cf: *mut ngx_conf_t,
-    conf: *mut c_void,
-    expected: &str,
-    apply: impl FnOnce(&mut MainConfig, u16),
-) -> *mut c_char {
-    set_scalar(cf, conf, expected, |v| v.parse::<u16>().ok(), apply)
-}
-
-fn set_u32(
-    cf: *mut ngx_conf_t,
-    conf: *mut c_void,
-    expected: &str,
-    apply: impl FnOnce(&mut MainConfig, u32),
-) -> *mut c_char {
-    set_scalar(cf, conf, expected, |v| v.parse::<u32>().ok(), apply)
-}
-
-fn set_u64(
-    cf: *mut ngx_conf_t,
-    conf: *mut c_void,
-    expected: &str,
-    apply: impl FnOnce(&mut MainConfig, u64),
-) -> *mut c_char {
-    set_scalar(cf, conf, expected, |v| v.parse::<u64>().ok(), apply)
-}
-
-fn set_duration(
-    cf: *mut ngx_conf_t,
-    conf: *mut c_void,
-    expected: &str,
-    apply: impl FnOnce(&mut MainConfig, Duration),
-) -> *mut c_char {
-    set_scalar(
+/// Fails a directive whose argument is not UTF-8 (`directive_arg_not_utf8`).
+///
+/// # Safety
+///
+/// `cf` must be the non-null, valid `ngx_conf_t`, with its `log` set, that
+/// nginx passed the calling directive handler: `conf_error!` dereferences it.
+unsafe fn arg_not_utf8(cf: *mut ngx_conf_t, directive: &str) -> *mut c_char {
+    conf_error!(
         cf,
-        conf,
-        expected,
-        |v| humantime::parse_duration(v).ok(),
-        apply,
-    )
-}
-
-/// Read the directive name from `(*cf).args[0]`. nginx always populates
-/// this with the keyword that triggered the callback, so it never panics
-/// in practice; the fallback covers a hypothetical malformed `ngx_conf_t`
-/// without taking down the master process.
-fn directive_name(cf: *mut ngx_conf_t) -> &'static str {
-    // SAFETY: Same contract as `single_arg`: `cf` is a valid `ngx_conf_t`
-    // owned for the duration of this single-threaded callback;
-    // `(*cf).args` is an `ngx_array_t` of `ngx_str_t` with at least one
-    // element (the directive name itself). The `&'static str` lifetime is
-    // a convenience cast; the byte view borrows from cycle-pool memory
-    // valid for the call.
-    unsafe {
-        let args = (*(*cf).args).elts as *mut ngx_str_t;
-        if args.is_null() || (*(*cf).args).nelts == 0 {
-            return "<gabion-directive>";
-        }
-        (*args).to_str().unwrap_or("<gabion-directive>")
-    }
+        code = "directive_arg_not_utf8",
+        "an argument of `{}` is not valid UTF-8, which gabion cannot read. Re-save the file as \
+         UTF-8, then run `nginx -t`.",
+        directive,
+    );
+    core::NGX_CONF_ERROR
 }
 
 /// Internal helper invoked only from the directive handlers above; marked
@@ -2019,14 +1200,10 @@ struct NgxBindingCompiler {
 
 #[derive(Debug, thiserror::Error)]
 enum NgxBindingError {
-    #[error(
-        "could not resolve variable `${0}`; load the providing module before `gabion_limit_rule`"
-    )]
-    UnknownVariable(String),
-    #[error("could not compile template `{0}` as a complex value")]
-    ComplexCompile(String),
-    #[error("could not allocate {0} bytes from the cycle pool")]
-    PoolAlloc(usize),
+    #[error("the template is not valid; check its `$variable` names and quoting")]
+    ComplexCompile,
+    #[error("nginx could not allocate memory for it in the configuration pool")]
+    OutOfMemory,
 }
 
 impl BindingCompiler for NgxBindingCompiler {
@@ -2053,7 +1230,7 @@ impl BindingCompiler for NgxBindingCompiler {
             // and copies the name internally.
             let index = unsafe { ngx::ffi::ngx_http_get_variable_index(self.cf, &mut name_str) };
             if index == ngx::core::Status::NGX_ERROR.0 {
-                return Err(NgxBindingError::UnknownVariable(stripped.to_string()));
+                return Err(NgxBindingError::OutOfMemory);
             }
             return Ok(BindingLookup::IndexedVariable {
                 name: stripped.into(),
@@ -2069,12 +1246,16 @@ impl BindingCompiler for NgxBindingCompiler {
         let cv_ptr: *mut ngx::ffi::ngx_http_complex_value_t =
             unsafe { ngx::ffi::ngx_palloc((*self.cf).pool, cv_size).cast() };
         if cv_ptr.is_null() {
-            return Err(NgxBindingError::PoolAlloc(cv_size));
+            return Err(NgxBindingError::OutOfMemory);
         }
         let mut value_str = ngx_str_t {
             len: source.len(),
             data: source.as_ptr() as *mut _,
         };
+        // SAFETY: `ngx_http_compile_complex_value_t` is a C struct of
+        // pointers, integers and bitfields, for which all-zero is a valid
+        // value; nginx's own modules initialise it the same way
+        // (`ngx_memzero`).
         let mut ccv: ngx::ffi::ngx_http_compile_complex_value_t = unsafe { std::mem::zeroed() };
         ccv.cf = self.cf;
         ccv.value = &mut value_str;
@@ -2085,7 +1266,7 @@ impl BindingCompiler for NgxBindingCompiler {
         // allocating any auxiliary arrays against the pool.
         let rc = unsafe { ngx::ffi::ngx_http_compile_complex_value(&mut ccv) };
         if rc != ngx::core::Status::NGX_OK.0 {
-            return Err(NgxBindingError::ComplexCompile(source.to_string()));
+            return Err(NgxBindingError::ComplexCompile);
         }
         Ok(BindingLookup::ComplexValue {
             source: source.into(),
@@ -2107,40 +1288,15 @@ unsafe extern "C" fn gabion_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
     let Some(main) = Module::main_conf(unsafe { &*cycle }) else {
         return core::Status::NGX_OK.into();
     };
-    let Some((region, rules)) = main.active() else {
+    let Some((region, rules, (gossip, storage))) = main.active() else {
         return core::Status::NGX_OK.into();
     };
 
     let worker_id = std::process::id();
-    let rng_seed = match main.rng_seed {
-        Some(seed) => seed,
-        None => match defaults::random_rng_seed() {
-            Ok(seed) => seed,
-            Err(error) => {
-                // Not NGX_ERROR: nginx never respawns a worker whose
-                // `init_process` fails, and every worker runs this, so
-                // failing here would take down the whole server.
-                tracing::error!(
-                    worker_id,
-                    %error,
-                    "gabion: failed to draw gossip RNG seed, so this worker \
-                     will never drive gossip. It is still serving requests \
-                     against the shared SHM aggregate. Usually a sandbox is \
-                     denying `/dev/urandom`; lift the restriction or set \
-                     `gabion_runtime_rng_seed N`, then restart nginx.",
-                );
-                return core::Status::NGX_OK.into();
-            }
-        },
-    };
-
     let cfg = LeaderConfig {
         worker_id,
-        gossip_bind: main.gossip_bind,
-        gossip: main.gossip.clone(),
-        discovery: main.discovery.clone(),
-        cell_store: main.storage.cell_store_config(),
-        rng_seed,
+        gossip: gossip.clone(),
+        cell_store: *storage,
         lease_tick: leader::DEFAULT_LEASE_TICK,
     };
 
@@ -2150,6 +1306,7 @@ unsafe extern "C" fn gabion_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
             // Panicking here would unwind into nginx's C frame, so log and
             // leave the worker up without a leader thread.
             tracing::error!(
+                code = "leader_spawn_failed",
                 worker_id,
                 %error,
                 "gabion: failed to spawn the leader thread. Usually the host \
@@ -2167,7 +1324,11 @@ unsafe extern "C" fn gabion_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
         *slot = Some(handle);
     }
     watch_for_shutdown();
-    tracing::info!(worker_id, "gabion: leader thread spawned");
+    tracing::info!(
+        code = "leader_thread_spawned",
+        worker_id,
+        "gabion: leader thread spawned"
+    );
     core::Status::NGX_OK.into()
 }
 
@@ -2193,7 +1354,10 @@ fn watch_for_shutdown() {
         if let Ok(slot) = LEADER_THREAD.lock()
             && let Some(handle) = slot.as_ref()
         {
-            tracing::info!("gabion: worker is shutting down; stopping its leader thread");
+            tracing::info!(
+                code = "leader_thread_stopping",
+                "gabion: worker is shutting down; stopping its leader thread"
+            );
             handle.request_stop();
         }
     })
@@ -2205,7 +1369,7 @@ fn watch_for_shutdown() {
 /// `gabion_init_process`.
 unsafe extern "C" fn gabion_exit_process(cycle: *mut ngx_cycle_t) {
     // SAFETY: nginx passes a valid cycle, per `gabion_init_process`.
-    let Some((region, _)) = Module::main_conf(unsafe { &*cycle }).and_then(MainConfig::active)
+    let Some((region, ..)) = Module::main_conf(unsafe { &*cycle }).and_then(MainConfig::active)
     else {
         return;
     };
@@ -2223,6 +1387,7 @@ unsafe extern "C" fn gabion_exit_process(cycle: *mut ngx_cycle_t) {
             .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
             .unwrap_or("panic payload is not a string");
         tracing::error!(
+            code = "leader_panicked",
             panic,
             "gabion: leader thread panicked, so this worker had stopped campaigning for the \
              leader lease before it exited. Other workers still campaign and take over gossip. \

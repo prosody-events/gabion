@@ -1,0 +1,1330 @@
+use quickcheck::{Arbitrary, Gen};
+use quickcheck_macros::quickcheck;
+
+use super::*;
+use crate::crdt::NodeId;
+use crate::gossip::transport::Sent;
+
+/// Twice the capacity: inserts hit Present and Full, and removes hit and miss.
+const POOL: u8 = 16;
+const CAPACITY: NonZeroU16 = NonZeroU16::new(8).unwrap();
+/// A few floors, so data in flight often times out between acks, and a whole
+/// number of them, so `Op::Advance` lands exactly on the timeout.
+const RTO: u64 = 4 * FLOOR;
+const FLOOR: u64 = 5;
+/// Four timeouts.
+const SUSPECT_AFTER: u64 = 4 * RTO;
+
+/// Both families, so both arms of `addr_hash` run. Each odd address is the
+/// IPv4-mapped twin of the even one before it, so the two hash equal but are
+/// distinct peers.
+fn addr(i: u8) -> SocketAddr {
+    let ip = Ipv4Addr::new(10, 0, 0, i & !1);
+    if i.is_multiple_of(2) {
+        SocketAddr::from((ip, 9000))
+    } else {
+        SocketAddr::from((ip.to_ipv6_mapped(), 9000))
+    }
+}
+
+fn table() -> PeerTable {
+    PeerTable::with_capacity(CAPACITY, 7, None, RTO, SUSPECT_AFTER)
+}
+
+/// The heads of an own stream at `own` and an empty relay stream.
+fn heads(own: u64) -> PerStream<u64> {
+    PerStream { own, relay: 0 }
+}
+
+/// The stream range `(lower, upper]`; every caller passes `lower < upper`.
+fn range(lower: u64, upper: u64) -> StreamRange {
+    StreamRange::new(lower, upper).expect("lower < upper")
+}
+
+/// A table holding one zone peer, at row 0.
+fn one_row() -> PeerTable {
+    let mut table = table();
+    assert_eq!(table.insert(Peer::new(addr(0)), 0), Insert::Added);
+    table.apply_role(0, Role::Zone);
+    table
+}
+
+/// After any mix of inserts, removes and contacts, `find` returns exactly the
+/// row a linear scan finds, and the rows hold exactly the model's peers with
+/// their identities.
+#[quickcheck]
+fn peer_table_index_matches_linear_scan(ops: Vec<(u8, u8, u8)>) {
+    let mut table = table();
+    let mut model: Vec<(SocketAddr, Option<NodeId>)> = Vec::new();
+    for (op, x, y) in ops {
+        let a = addr(x % POOL);
+        match op % 3 {
+            0 => {
+                let expected = if model.iter().any(|p| p.0 == a) {
+                    Insert::Present
+                } else if model.len() == usize::from(CAPACITY.get()) {
+                    Insert::Full
+                } else {
+                    model.push((a, None));
+                    Insert::Added
+                };
+                assert_eq!(table.insert(Peer::new(a), 0), expected);
+            }
+            1 => {
+                let had = model.iter().any(|p| p.0 == a);
+                model.retain(|p| p.0 != a);
+                assert_eq!(table.remove(a).is_some(), had);
+            }
+            _ => {
+                if let Some(row) = table.find(a) {
+                    let id = NodeId(u128::from(y));
+                    table.contact(row, NodeIdentity::new(id, 1), None);
+                    if let Some(p) = model.iter_mut().find(|p| p.0 == a) {
+                        p.1 = Some(id);
+                    }
+                }
+            }
+        }
+        for i in 0..POOL {
+            let a = addr(i);
+            let scan = (0..table.len()).find(|&row| table.addr(row) == a);
+            assert_eq!(table.find(a), scan, "{a}");
+        }
+        let mut rows: Vec<_> = table.entries(0).map(|e| (e.addr, e.node_id)).collect();
+        rows.sort_by_key(|p| p.0);
+        model.sort_by_key(|p| p.0);
+        assert_eq!(rows, model);
+    }
+}
+
+/// One step on a row's streams. Values are small, so sends, acks and gap
+/// reports land on, below and above the head and the marks.
+#[derive(Clone, Copy, Debug)]
+enum Op {
+    /// The head rises by this much: new own cells.
+    Issue(u8),
+    /// A send closing through `sent + n`, capped at the head.
+    Send(u8),
+    Ack(u8),
+    Gap(u8),
+    /// The round's timeout check, rewinding a timed-out stream.
+    Service,
+    /// Time moves this many relay floors. The timeout and the report times
+    /// are whole floors, so time lands exactly on each.
+    Advance(u8),
+    /// A packet of the peer's own stream closing `(lower, lower + len]`.
+    Receive(u8, u8),
+    /// The round's gap-report check.
+    Report,
+}
+
+impl Arbitrary for Op {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let x = u8::arbitrary(g) % 8;
+        let y = u8::arbitrary(g) % 4 + 1;
+        match u8::arbitrary(g) % 8 {
+            0 => Op::Issue(x),
+            1 => Op::Send(x + 1),
+            2 => Op::Ack(x * 2),
+            3 => Op::Gap(x * 2),
+            4 => Op::Service,
+            5 => Op::Advance(x),
+            6 => Op::Receive(x, y),
+            _ => Op::Report,
+        }
+    }
+}
+
+/// The sender rules the `peer` module documents on `StreamTx`, written out
+/// on plain fields.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TxModel {
+    sent: u64,
+    acked: u64,
+    timer: u64,
+}
+
+impl TxModel {
+    fn send(&mut self, upper: u64, now: u64) {
+        if self.acked == self.sent {
+            self.timer = now;
+        }
+        self.sent = self.sent.max(upper);
+    }
+
+    fn ack(&mut self, ack: u64, head: u64, now: u64) {
+        if ack <= head && ack > self.acked {
+            self.acked = ack;
+            self.sent = self.sent.max(ack);
+            if ack < self.sent {
+                self.timer = now;
+            }
+        }
+    }
+
+    fn gap(&mut self, ack: u64, head: u64, now: u64) {
+        if ack <= head {
+            (self.acked, self.sent, self.timer) = (ack, ack, now);
+        }
+    }
+
+    fn service(&mut self, now: u64) {
+        if self.acked < self.sent && now - self.timer >= RTO {
+            (self.sent, self.timer) = (self.acked, now);
+        }
+    }
+}
+
+/// The own stream's sender follows the model through any mix of sends,
+/// acks, gap reports and timeouts, and keeps `acked ≤ sent ≤ head`: an ack
+/// above the head changes nothing, a gap report below `acked` leaves
+/// `acked == sent == ack`, a send while data is in flight leaves the timer,
+/// and ack progress with data left restarts it.
+#[quickcheck]
+fn outbound_matches_model(ops: Vec<Op>) {
+    let mut table = one_row();
+    let (mut head, mut now) = (0_u64, 1_000_u64);
+    let mut model = TxModel::default();
+    for op in ops {
+        let before = (table.sent.own[0], table.link[0].out.own);
+        match op {
+            Op::Issue(n) => head += u64::from(n),
+            Op::Send(n) => {
+                let upper = (table.sent.own[0] + u64::from(n)).min(head);
+                if upper > table.sent.own[0] {
+                    let in_flight = model.acked < model.sent;
+                    table.tx(0, Stream::Own).note_sent(upper, now);
+                    model.send(upper, now);
+                    if in_flight {
+                        assert_eq!(table.link[0].out.own.timer_ms, before.1.timer_ms);
+                    }
+                }
+            }
+            Op::Ack(a) => {
+                let ack = u64::from(a);
+                table.tx(0, Stream::Own).note_ack(ack, head, now);
+                model.ack(ack, head, now);
+                if ack > head {
+                    assert_eq!((table.sent.own[0], table.link[0].out.own), before);
+                }
+                if ack > before.1.acked && ack <= head && ack < table.sent.own[0] {
+                    assert_eq!(table.link[0].out.own.timer_ms, now);
+                }
+            }
+            Op::Gap(a) => {
+                let ack = u64::from(a);
+                let owed = table.tx(0, Stream::Own).gap_report(ack, head, now);
+                model.gap(ack, head, now);
+                if ack <= head {
+                    assert_eq!((table.link[0].out.own.acked, table.sent.own[0]), (ack, ack));
+                    assert_eq!(owed, ack < head);
+                }
+            }
+            Op::Service => {
+                if table.own_timer(0).is_some_and(|at| at <= now) {
+                    table.tx(0, Stream::Own).rewind(now);
+                }
+                model.service(now);
+            }
+            Op::Advance(n) => now += u64::from(n) * FLOOR,
+            Op::Receive(..) | Op::Report => {}
+        }
+        let own = table.link[0].out.own;
+        assert!(own.acked <= table.sent.own[0] && table.sent.own[0] <= head);
+        let row = TxModel {
+            sent: table.sent.own[0],
+            acked: own.acked,
+            timer: own.timer_ms,
+        };
+        assert_eq!(row, model, "after {op:?}");
+    }
+}
+
+/// The receiver's gap rules the `peer` module documents on `Inbound`,
+/// written out.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RxModel {
+    have: u64,
+    gap: Gap,
+}
+
+impl RxModel {
+    fn receive(&mut self, lower: u64, upper: u64, now: u64) {
+        let stash_of = |gap: Gap| match gap {
+            Gap::Open { stash, .. } | Gap::Abandoned { stash } => Some(stash),
+            Gap::Closed => None,
+        };
+        if lower > self.have {
+            let stash = stash_of(self.gap).map_or((lower, upper), |s| {
+                if lower <= s.1 && upper >= s.0 {
+                    (s.0.min(lower), s.1.max(upper))
+                } else if lower > s.0 {
+                    (lower, upper)
+                } else {
+                    s
+                }
+            });
+            self.gap = match self.gap {
+                Gap::Open {
+                    report_at_ms,
+                    reports,
+                    ..
+                } => Gap::Open {
+                    stash,
+                    report_at_ms,
+                    reports,
+                },
+                Gap::Closed | Gap::Abandoned { .. } => Gap::Open {
+                    stash,
+                    report_at_ms: now + FLOOR,
+                    reports: 0,
+                },
+            };
+        } else if upper > self.have {
+            self.have = upper;
+            if let Some(stash) = stash_of(self.gap) {
+                if stash.0 <= self.have {
+                    self.have = self.have.max(stash.1);
+                    self.gap = Gap::Closed;
+                } else {
+                    let report_at_ms = match self.gap {
+                        Gap::Open { report_at_ms, .. } => report_at_ms,
+                        _ => now + FLOOR,
+                    };
+                    self.gap = Gap::Open {
+                        stash,
+                        report_at_ms,
+                        reports: 0,
+                    };
+                }
+            }
+        }
+    }
+
+    fn report(&mut self, now: u64) -> GapDue {
+        match self.gap {
+            Gap::Open {
+                stash,
+                report_at_ms,
+                reports,
+            } if now >= report_at_ms => {
+                if reports == GOSSIP_GAP_REPORTS {
+                    self.gap = Gap::Abandoned { stash };
+                    GapDue::Abandoned {
+                        missing: stash.0 - self.have,
+                    }
+                } else {
+                    self.gap = Gap::Open {
+                        stash,
+                        report_at_ms: now + 4 * FLOOR,
+                        reports: reports + 1,
+                    };
+                    GapDue::Report
+                }
+            }
+            _ => GapDue::Nothing,
+        }
+    }
+}
+
+/// The own stream's receiver follows the model through any mix of ranges,
+/// reports and time: `have` never decreases and never jumps a hole, an
+/// abandoned gap never reports until a range above `have` reopens it, and
+/// progress resets the report count.
+#[quickcheck]
+fn inbound_gap_matches_model(ops: Vec<Op>) {
+    let mut inbound = Inbound::default();
+    let mut model = RxModel::default();
+    let mut now = 1_000_u64;
+    for op in ops {
+        let before = inbound;
+        match op {
+            Op::Receive(lower, len) => {
+                let (lower, upper) = (u64::from(lower), u64::from(lower + len));
+                inbound.receive(range(lower, upper), now, FLOOR);
+                model.receive(lower, upper, now);
+                if lower > before.have {
+                    assert_eq!(inbound.have, before.have, "jumped a hole");
+                }
+                if inbound.have > before.have
+                    && let Gap::Open { reports, .. } = inbound.gap
+                {
+                    assert_eq!(reports, 0);
+                }
+            }
+            Op::Report => {
+                let due = inbound.take_report(now, FLOOR);
+                assert_eq!(due, model.report(now));
+                if matches!(before.gap, Gap::Abandoned { .. }) {
+                    assert_eq!(due, GapDue::Nothing);
+                }
+            }
+            Op::Advance(n) => now += u64::from(n) * FLOOR,
+            _ => {}
+        }
+        assert!(inbound.have >= before.have);
+        assert_eq!(inbound, Inbound::from(model), "after {op:?}");
+    }
+}
+
+impl From<RxModel> for Inbound {
+    fn from(model: RxModel) -> Self {
+        Self {
+            have: model.have,
+            gap: model.gap,
+        }
+    }
+}
+
+/// After any mix of stream and gap events, a row's deadline is the earlier
+/// of its stream timeout (while data is in flight) and its gap's next report,
+/// and never when neither is pending.
+#[quickcheck]
+fn deadline_is_min_of_row_timers(ops: Vec<Op>) {
+    let mut table = one_row();
+    let (mut head, mut now) = (0_u64, 1_000_u64);
+    for op in ops {
+        match op {
+            Op::Issue(n) => head += u64::from(n),
+            Op::Send(n) => {
+                let upper = (table.sent.own[0] + u64::from(n)).min(head);
+                table.tx(0, Stream::Own).note_sent(upper, now);
+            }
+            Op::Ack(a) => {
+                table.tx(0, Stream::Own).note_ack(u64::from(a), head, now);
+            }
+            Op::Gap(a) => {
+                table.tx(0, Stream::Own).gap_report(u64::from(a), head, now);
+            }
+            Op::Service => {
+                if table.own_timer(0).is_some_and(|at| at <= now) {
+                    table.tx(0, Stream::Own).rewind(now);
+                }
+            }
+            Op::Advance(n) => now += u64::from(n) * FLOOR,
+            Op::Receive(lower, len) => {
+                let (lower, upper) = (u64::from(lower), u64::from(lower + len));
+                table.link[0]
+                    .own_in
+                    .receive(range(lower, upper), now, FLOOR);
+            }
+            Op::Report => {
+                table.link[0].own_in.take_report(now, FLOOR);
+            }
+        }
+        table.refresh_deadline(0);
+        let link = table.link[0];
+        let timeout =
+            (link.out.own.acked < table.sent.own[0]).then_some(link.out.own.timer_ms + RTO);
+        let report = match link.own_in.gap {
+            Gap::Open { report_at_ms, .. } => Some(report_at_ms),
+            _ => None,
+        };
+        let expected = timeout.into_iter().chain(report).min();
+        let deadline = table.deadline[0];
+        assert_eq!(
+            (deadline != Deadline::NEVER).then_some(deadline.0),
+            expected
+        );
+        assert_eq!(table.flags(0).has(PeerFlags::GAP_OPEN), report.is_some());
+    }
+}
+
+/// A zone hash for tests.
+fn zone(raw: u32) -> ZoneHash {
+    ZoneHash::from_wire(raw).expect("not 0")
+}
+
+/// A peer discovery placed in zone `raw`.
+fn placed(addr: SocketAddr, raw: u32) -> Peer {
+    Peer {
+        addr,
+        zone: Some(zone(raw)),
+    }
+}
+
+/// A peer's new incarnation resets its whole row, its zone to the new
+/// header's and its flags to one owed ack; a late packet from the
+/// incarnation before changes nothing, and a zone-0 header never clears a
+/// known zone.
+#[test]
+fn incarnation_change_resets_the_whole_row() {
+    let mut table = one_row();
+    let old = NodeIdentity::new(NodeId(9), 1);
+    let new = NodeIdentity::new(NodeId(9), 2);
+    table.set_flag(0, PeerFlags::ACK_DUE, false);
+    assert_eq!(table.contact(0, old, Some(zone(1))), Contact::First);
+    assert!(!table.flags(0).has(PeerFlags::ACK_DUE));
+    assert_eq!(table.contact(0, old, None), Contact::Current);
+    assert_eq!(table.link(0).zone(), Some(zone(1)));
+    for stream in [Stream::Own, Stream::Relay] {
+        table.tx(0, stream).note_sent(5, 1_000);
+        table.tx(0, stream).note_ack(3, 5, 1_000);
+    }
+    table.receive_own(0, range(0, 4), false, 1_000, FLOOR);
+    table.receive_own(0, range(6, 7), true, 1_000, FLOOR);
+    table.receive_relay(0, range(2, 3), 1_000, FLOOR);
+    table.note_send(
+        0,
+        Sent {
+            bytes: 1,
+            waits: true,
+        },
+        1_000,
+    );
+    for bits in [PeerFlags::REPLY_DUE, PeerFlags::RESEND_OWN] {
+        table.set_flag(0, bits, true);
+    }
+    table.refresh_deadline(0);
+    assert!(table.flags(0).has(PeerFlags::GAP_OPEN));
+    assert_eq!(table.link(0).answer, Answer::Owed { since_ms: 1_000 });
+
+    assert_eq!(table.contact(0, new, Some(zone(2))), Contact::Restarted);
+    let link = *table.link(0);
+    assert_eq!((link.out.own, table.sent.own[0]), (Outbound::default(), 0));
+    assert_eq!(
+        (link.out.relay, table.sent.relay[0]),
+        (Outbound::default(), 0)
+    );
+    for mark in [link.own_in, link.gateway_in, link.relay_in] {
+        assert_eq!(mark, Inbound::default());
+    }
+    assert_eq!(
+        (link.own_mode, link.answer),
+        (OwnMode::Direct, Answer::Settled)
+    );
+    assert_eq!(link.zone(), Some(zone(2)));
+    assert_eq!(table.flags(0), PeerFlags::default());
+    assert_eq!(link.prev_incarnation, Some(1));
+    assert_eq!(link.identity(), Some(new));
+    assert_eq!(table.deadline[0], Deadline::NEVER);
+
+    table.tx(0, Stream::Own).note_sent(2, 2_000);
+    assert_eq!(table.contact(0, old, Some(zone(3))), Contact::Late);
+    assert_eq!(
+        (table.sent.own[0], table.link(0).identity()),
+        (2, Some(new))
+    );
+    assert_eq!(table.link(0).zone(), Some(zone(2)));
+    assert_eq!(table.contact(0, new, None), Contact::Current);
+}
+
+/// Each node ranks the same peers by its own key: the top-weighted of the
+/// distinct-hash addresses differs between local keys 1 and 2 (two keys
+/// checked to disagree), so a weight that ignores the key or the address
+/// ranks them alike.
+#[test]
+fn rendezvous_ranking_depends_on_the_local_key() {
+    let top = |local_key| {
+        (0..8)
+            .map(|i| addr(2 * i))
+            .max_by_key(|&peer| rendezvous_weight(local_key, peer))
+    };
+    assert_ne!(top(1), top(2));
+}
+
+/// A table of `members` peers at `addr(1..)`, all heard in zone 2, for a node
+/// in zone 1 whose id hashes to `local_key`, roles refreshed.
+fn zoned_table(local_key: u64, members: u8, capacity: u16) -> PeerTable {
+    let capacity = NonZeroU16::new(capacity).unwrap();
+    let mut table =
+        PeerTable::with_capacity(capacity, local_key, Some(zone(1)), RTO, SUSPECT_AFTER);
+    for i in 1..=members {
+        assert_eq!(table.insert(Peer::new(addr(2 * i)), 0), Insert::Added);
+        let row = table.find(addr(2 * i)).unwrap();
+        table.contact(
+            row,
+            NodeIdentity::new(NodeId(u128::from(i)), 1),
+            Some(zone(2)),
+        );
+    }
+    table.refresh(0, |_| {});
+    table
+}
+
+fn gateway(table: &PeerTable) -> Option<SocketAddr> {
+    (0..table.len())
+        .find(|&row| table.role(row) == Role::Gateway)
+        .map(|row| table.addr(row))
+}
+
+/// Rendezvous gateways: removing a member moves only the origins whose
+/// gateway it was, different origins pick different members, a suspect ranks
+/// below every live member, an all-suspect zone picks the earliest
+/// suspicion, and an answer restores the weight order.
+#[quickcheck]
+fn rendezvous_moves_only_the_removed_members_origins(members: u8, removed: u8) {
+    let members = members % 11 + 2;
+    let removed = addr(2 * (removed % members + 1));
+    let mut gateways = Vec::new();
+    for local_key in 1..=16 {
+        let mut table = zoned_table(local_key, members, 16);
+        let before = gateway(&table).unwrap();
+        gateways.push(before);
+        table.remove(removed);
+        table.refresh(0, |_| {});
+        assert_eq!(gateway(&table).unwrap() != before, before == removed);
+    }
+    gateways.sort();
+    gateways.dedup();
+    assert!(members < 4 || gateways.len() >= 2, "{gateways:?}");
+
+    let mut table = zoned_table(1, members, 16);
+    let first = gateway(&table).unwrap();
+    let row = table.find(first).unwrap();
+    table.link[row].answer = Answer::Owed { since_ms: 0 };
+    table.refresh_deadline(row);
+    table.judge(SUSPECT_AFTER, |_| {});
+    table.refresh(SUSPECT_AFTER, |_| {});
+    assert_ne!(gateway(&table), Some(first));
+    for row in 0..table.len() {
+        table.link[row].answer = Answer::Owed { since_ms: 0 };
+    }
+    let late = table.find(addr(2)).unwrap();
+    table.link[late].answer = Answer::CannotRelay { since_ms: 5 };
+    table.stale = true;
+    table.judge(SUSPECT_AFTER, |_| {});
+    table.refresh(SUSPECT_AFTER, |_| {});
+    // `CannotRelay` from 5 began before `Owed` from 0 turns suspect.
+    assert_eq!(gateway(&table), Some(addr(2)));
+    for row in 0..table.len() {
+        let answer = AckInfo {
+            incarnation: 7,
+            probe_reply: true,
+            ..AckInfo::default()
+        };
+        table.credit(row, answer, 7, heads(0), SUSPECT_AFTER);
+    }
+    table.refresh(SUSPECT_AFTER, |_| {});
+    assert_eq!(gateway(&table), Some(first));
+}
+
+/// One row of a refresh case: its headers' zone (0 = none), whether it speaks
+/// another version, its answer, whether it has been heard, and the zone
+/// discovery named for it (0 = none).
+#[derive(Clone, Debug)]
+struct RefreshCase {
+    local: u32,
+    rows: Vec<(u32, bool, Answer, bool, u32)>,
+}
+
+impl Arbitrary for RefreshCase {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let n = usize::arbitrary(g) % 64 + 1;
+        // Up to one zone per peer.
+        let zones = u32::arbitrary(g) % n as u32 + 1;
+        let answer = |g: &mut Gen| match u8::arbitrary(g) % 4 {
+            0 | 1 => Answer::Settled,
+            2 => Answer::Owed {
+                since_ms: u64::arbitrary(g) % 50,
+            },
+            _ => Answer::CannotRelay {
+                since_ms: u64::arbitrary(g) % 50,
+            },
+        };
+        Self {
+            local: u32::arbitrary(g) % 3,
+            rows: (0..n)
+                .map(|_| {
+                    (
+                        u32::arbitrary(g) % (zones + 1),
+                        bool::arbitrary(g) && bool::arbitrary(g),
+                        answer(g),
+                        bool::arbitrary(g) || bool::arbitrary(g),
+                        if bool::arbitrary(g) {
+                            u32::arbitrary(g) % (zones + 1)
+                        } else {
+                            0
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The two-pass refresh gives each row the role an O(n²) reference gives:
+/// a row of a known remote zone is its gateway iff no other row of that
+/// zone that speaks this version outranks it, by the reference's own rank:
+/// live members by weight, then suspects by the earliest suspicion, then the
+/// address. The zone table is sized to the rows, so the one-zone-per-peer
+/// case fills it exactly; a zone discovery named routes an unheard row as a
+/// heard one's would, a heard header's zone replaces it when the header names
+/// one, and a row neither heard nor placed keeps `Unheard`.
+#[quickcheck]
+fn role_refresh_equals_brute_force(case: RefreshCase) {
+    // At `NOW` an `Owed` answer from 40 ms or earlier is suspect, and every
+    // `CannotRelay` is.
+    const NOW: u64 = SUSPECT_AFTER + 40;
+    let n = case.rows.len();
+    let capacity = NonZeroU16::new(n as u16).unwrap();
+    let local = ZoneHash::from_wire(case.local);
+    let mut table = PeerTable::with_capacity(capacity, 3, local, RTO, SUSPECT_AFTER);
+    let addr_of = |row: usize| SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 1000 + row as u16));
+    for (i, &(z, muted, answer, heard, p)) in case.rows.iter().enumerate() {
+        let zone = ZoneHash::from_wire(p);
+        table.insert(
+            Peer {
+                addr: addr_of(i),
+                zone,
+            },
+            0,
+        );
+        if heard {
+            table.contact(
+                i,
+                NodeIdentity::new(NodeId(i as u128), 1),
+                ZoneHash::from_wire(z),
+            );
+        }
+        if muted {
+            table.mute(i);
+        }
+        table.link[i].answer = answer;
+    }
+    table.judge(NOW, |_| {});
+    table.stale = true;
+    table.refresh(NOW, |_| {});
+    let zone_of = |row: usize| {
+        let (z, _, _, heard, p) = case.rows[row];
+        // A header naming no zone keeps the one discovery named.
+        if heard && z != 0 { z } else { p }
+    };
+    let known = |row: usize| case.rows[row].3 || case.rows[row].4 != 0;
+    let eligible = |row: usize| {
+        let z = zone_of(row);
+        known(row) && !case.rows[row].1 && z != 0 && case.local != 0 && z != case.local
+    };
+    let rank = |row: usize| {
+        let suspect_from = match case.rows[row].2 {
+            Answer::Settled => None,
+            Answer::Owed { since_ms } => Some(since_ms + SUSPECT_AFTER),
+            Answer::CannotRelay { since_ms } => Some(since_ms),
+        };
+        match suspect_from.filter(|&from| from <= NOW) {
+            Some(from) => (false, u64::MAX - from, addr_of(row)),
+            None => (true, rendezvous_weight(3, addr_of(row)), addr_of(row)),
+        }
+    };
+    for row in 0..n {
+        let expected = if case.rows[row].1 {
+            Role::Incompatible
+        } else if !known(row) {
+            Role::Unheard
+        } else if !eligible(row) {
+            Role::Zone
+        } else if (0..n).any(|other| {
+            other != row
+                && eligible(other)
+                && zone_of(other) == zone_of(row)
+                && rank(other) > rank(row)
+        }) {
+            Role::Remote
+        } else {
+            Role::Gateway
+        };
+        assert_eq!(table.role(row), expected, "row {row} of {case:?}");
+    }
+}
+
+/// One event on a row's answer state.
+#[derive(Clone, Copy, Debug)]
+enum AnswerOp {
+    /// A send that starts a wait or not: one that asks for no answer, or
+    /// is held, starts none.
+    Send {
+        waits: bool,
+    },
+    /// Data goes out on one stream: it is owed while the role receives it.
+    Data(Stream),
+    /// Per stream, an ack of everything sent or a repeat of the stuck one,
+    /// flagged `CANNOT_RELAY` or not.
+    Ack {
+        progress: PerStream<bool>,
+        cannot_relay: bool,
+    },
+    ProbeReply,
+    Role(u8),
+    Mute,
+    Restart,
+    /// A held packet leaves after this many floors, on a round whose `now`
+    /// may trail the round that held it by up to a floor (a late heartbeat),
+    /// so the shift can reach past `now`.
+    Shift(u8),
+    Advance(u8),
+}
+
+impl Arbitrary for AnswerOp {
+    fn arbitrary(g: &mut Gen) -> Self {
+        match u8::arbitrary(g) % 10 {
+            0 => Self::Send {
+                waits: bool::arbitrary(g),
+            },
+            1 => Self::Data(*g.choose(&[Stream::Own, Stream::Relay]).unwrap()),
+            2 | 3 => Self::Ack {
+                progress: PerStream {
+                    own: bool::arbitrary(g),
+                    relay: bool::arbitrary(g),
+                },
+                cannot_relay: bool::arbitrary(g),
+            },
+            4 => Self::ProbeReply,
+            5 => Self::Role(u8::arbitrary(g) % 3),
+            6 if u8::arbitrary(g) % 4 == 0 => Self::Mute,
+            7 if u8::arbitrary(g) % 4 == 0 => Self::Restart,
+            8 => Self::Shift(u8::arbitrary(g) % 8),
+            _ => Self::Advance(u8::arbitrary(g) % 8),
+        }
+    }
+}
+
+/// A row's answer state follows the transitions [`Answer`] lists through
+/// any mix of sends, acks, probe answers, role changes, restarts and
+/// held time, and it is suspect exactly when `suspect_after` has passed since
+/// its oldest unanswered packet or it said it cannot relay; for two
+/// `suspect_after` values.
+#[quickcheck]
+fn answer_matches_its_model(ops: Vec<AnswerOp>) {
+    for suspect_after in [4 * RTO, 3 * RTO] {
+        let mut table = PeerTable::with_capacity(CAPACITY, 7, None, RTO, suspect_after);
+        table.insert(Peer::new(addr(0)), 0);
+        let mut identity = NodeIdentity::new(NodeId(9), 1);
+        table.contact(0, identity, None);
+        let (mut model, mut now, mut head) = (Answer::Settled, 1_000_u64, PerStream::default());
+        for op in &ops {
+            let suspect = |answer: Answer, judged| match answer {
+                Answer::Settled => false,
+                Answer::Owed { since_ms } => since_ms + suspect_after <= judged,
+                Answer::CannotRelay { since_ms } => since_ms <= judged,
+            };
+            let was = suspect(model, table.judged_ms);
+            // Per stream the role receives, whether data is in flight.
+            let in_flight = |table: &PeerTable| {
+                let (role, link) = (table.role(0), &table.link[0]);
+                PerStream {
+                    own: role.gets_own() && link.out.own.acked < table.sent.own[0],
+                    relay: role == Role::Zone && link.out.relay.acked < table.sent.relay[0],
+                }
+            };
+            let owed = |table: &PeerTable| in_flight(table).any();
+            let acks = |table: &PeerTable, progress: PerStream<bool>, probe_reply, cannot_relay| {
+                let link = &table.link[0];
+                let own = if progress.own {
+                    table.sent.own[0]
+                } else {
+                    link.out.own.acked
+                };
+                AckInfo {
+                    incarnation: 7,
+                    own: if table.role(0) == Role::Gateway {
+                        OwnAck::AsGateway(own)
+                    } else {
+                        OwnAck::Direct(own)
+                    },
+                    relay: if progress.relay {
+                        table.sent.relay[0]
+                    } else {
+                        link.out.relay.acked
+                    },
+                    probe_reply,
+                    cannot_relay,
+                    ..AckInfo::default()
+                }
+            };
+            match *op {
+                AnswerOp::Send { waits } => {
+                    table.note_send(0, Sent { bytes: 0, waits }, now);
+                    if waits && model == Answer::Settled {
+                        model = Answer::Owed { since_ms: now };
+                    }
+                }
+                AnswerOp::Data(stream) => {
+                    head[stream] += 1;
+                    table.tx(0, stream).note_sent(head[stream], now);
+                    table.note_send(
+                        0,
+                        Sent {
+                            bytes: 1,
+                            waits: true,
+                        },
+                        now,
+                    );
+                    if model == Answer::Settled {
+                        model = Answer::Owed { since_ms: now };
+                    }
+                }
+                AnswerOp::Ack {
+                    progress,
+                    cannot_relay,
+                } => {
+                    let flight = in_flight(&table);
+                    let moved = (progress.own && flight.own) || (progress.relay && flight.relay);
+                    let counts =
+                        cannot_relay && matches!(table.role(0), Role::Gateway | Role::Remote);
+                    table.credit(0, acks(&table, progress, false, cannot_relay), 7, head, now);
+                    // A counting `CANNOT_RELAY` packet's acks are no progress.
+                    if counts {
+                        let from = match model {
+                            Answer::Settled => now,
+                            Answer::Owed { since_ms } => since_ms + suspect_after,
+                            Answer::CannotRelay { since_ms } => since_ms,
+                        };
+                        model = Answer::CannotRelay {
+                            since_ms: from.min(now),
+                        };
+                    } else if moved {
+                        model = if owed(&table) {
+                            Answer::Owed { since_ms: now }
+                        } else {
+                            Answer::Settled
+                        };
+                    }
+                }
+                AnswerOp::ProbeReply => {
+                    let owed_before = owed(&table);
+                    let reply = acks(&table, PerStream::default(), true, false);
+                    table.credit(0, reply, 7, head, now);
+                    if !owed_before {
+                        model = Answer::Settled;
+                    } else if was {
+                        // A suspect's answer rewinds each owed stream; it is
+                        // not progress.
+                        assert!(!owed(&table), "after {op:?}");
+                    }
+                }
+                AnswerOp::Role(role) => {
+                    let role = [Role::Zone, Role::Gateway, Role::Remote][usize::from(role)];
+                    if table.role(0) != Role::Incompatible
+                        && table.apply_role(0, role)
+                        && role == Role::Remote
+                        && !was
+                    {
+                        model = Answer::Settled;
+                    }
+                }
+                AnswerOp::Mute => {
+                    table.mute(0);
+                    model = Answer::Settled;
+                }
+                AnswerOp::Restart => {
+                    identity.incarnation += 1;
+                    table.contact(0, identity, None);
+                    model = Answer::Settled;
+                    head = PerStream::default();
+                }
+                AnswerOp::Shift(held) => {
+                    let held = u64::from(held) * FLOOR;
+                    now += held.saturating_sub(FLOOR);
+                    table.shift_owed(held, now);
+                    if let Answer::Owed { since_ms } = &mut model {
+                        *since_ms = (*since_ms + held).min(now);
+                    }
+                }
+                AnswerOp::Advance(n) => {
+                    now += u64::from(n) * FLOOR;
+                    table.judge(now, |_| {});
+                }
+            }
+            assert_eq!(table.link[0].answer, model, "after {op:?}");
+            assert_eq!(
+                table.suspect(0),
+                suspect(model, table.judged_ms),
+                "after {op:?}"
+            );
+        }
+    }
+}
+
+/// An own-stream ack counts on an `Unheard` or `Zone` row only as a direct
+/// ack and on a `Gateway` row only as a gateway ack, and a `GAP_OWN` report
+/// rewinds a forgotten stream only when its kind matches the role; becoming
+/// the gateway rewinds the own stream to 0. A peer's first packet is credited
+/// before the roles refresh, so its row is still `Unheard` then.
+#[test]
+fn own_acks_count_only_in_the_kind_the_role_receives() {
+    for (role, counted, ignored) in [
+        (Role::Unheard, OwnAck::Direct(3), OwnAck::AsGateway(3)),
+        (Role::Zone, OwnAck::Direct(3), OwnAck::AsGateway(3)),
+        (Role::Gateway, OwnAck::AsGateway(3), OwnAck::Direct(3)),
+    ] {
+        let mut table = table();
+        table.insert(Peer::new(addr(0)), 0);
+        table.contact(0, NodeIdentity::new(NodeId(9), 1), None);
+        table.apply_role(0, role);
+        assert_eq!(table.role(0), role);
+        table.tx(0, Stream::Own).note_sent(5, 1_000);
+        let acks = |own, gap_own| AckInfo {
+            incarnation: 7,
+            own,
+            gap_own,
+            ..AckInfo::default()
+        };
+        table.credit(0, acks(ignored, false), 7, heads(5), 1_000);
+        assert_eq!(table.link[0].out.own.acked, 0, "{role:?}");
+        table.credit(0, acks(counted, false), 7, heads(5), 1_000);
+        assert_eq!(table.link[0].out.own.acked, 3, "{role:?}");
+        // A forgotten stream: a gap report below `acked`.
+        let below = |own: OwnAck| match own {
+            OwnAck::Direct(_) => OwnAck::Direct(1),
+            OwnAck::AsGateway(_) => OwnAck::AsGateway(1),
+        };
+        table.credit(0, acks(below(ignored), true), 7, heads(5), 1_000);
+        assert_eq!(table.link[0].out.own.acked, 3, "{role:?}");
+        table.credit(0, acks(below(counted), true), 7, heads(5), 1_000);
+        assert_eq!((table.link[0].out.own.acked, table.sent.own[0]), (1, 1));
+    }
+    let mut table = one_row();
+    table.tx(0, Stream::Own).note_sent(5, 1_000);
+    table.tx(0, Stream::Own).note_ack(5, 5, 1_000);
+    assert!(table.apply_role(0, Role::Gateway));
+    assert_eq!((table.link[0].out.own.acked, table.sent.own[0]), (0, 0));
+    assert!(table.flags(0).has(PeerFlags::RESEND_OWN));
+}
+
+/// An unheard row starts its own stream at the head it was added at; the
+/// first packet that gives it a role receiving that stream rewinds it to 0 as
+/// prompt work, so the peer gets the whole window at once rather than after a
+/// gap report of its own.
+#[test]
+fn first_heard_row_rewinds_its_own_stream() {
+    for (peer_zone, role) in [(zone(1), Role::Zone), (zone(2), Role::Gateway)] {
+        let mut table = PeerTable::with_capacity(CAPACITY, 7, Some(zone(1)), RTO, SUSPECT_AFTER);
+        table.insert(Peer::new(addr(0)), 5);
+        assert_eq!((table.link[0].out.own.acked, table.sent.own[0]), (5, 5));
+        table.contact(0, NodeIdentity::new(NodeId(9), 1), Some(peer_zone));
+        table.refresh(1_000, |_| {});
+        assert_eq!(table.role(0), role);
+        assert_eq!((table.link[0].out.own.acked, table.sent.own[0]), (0, 0));
+        assert!(table.flags(0).has(PeerFlags::RESEND_OWN), "{role:?}");
+    }
+}
+
+/// A peer discovery placed in a zone is routed by it before it is heard: in
+/// this node's zone it is a zone peer, sent both streams from 0 and owed a
+/// greeting, and in another it is that zone's gateway when it outranks the
+/// heard members, owed none; one placed in no zone stays unheard. Its header
+/// then wins: the same zone changes nothing, another zone re-roles it, and
+/// discovery re-reporting a zone, or another one, moves only a peer whose
+/// headers named no zone, and an unheard one routed to another zone owes no
+/// greeting.
+#[test]
+fn discovered_zone_routes_a_peer_until_its_header_wins() {
+    let mut table = PeerTable::with_capacity(CAPACITY, 7, Some(zone(1)), RTO, SUSPECT_AFTER);
+    let mut ranked = [addr(2), addr(4)];
+    ranked.sort_by_key(|&a| Reverse(rendezvous_weight(7, a)));
+    let [hi, lo] = ranked;
+    let (same, late) = (addr(6), addr(8));
+    let heard = |node| NodeIdentity::new(NodeId(node), 1);
+    let roles = |table: &PeerTable, addrs: &[SocketAddr]| -> Vec<Role> {
+        addrs
+            .iter()
+            .map(|&a| table.role(table.find(a).unwrap()))
+            .collect()
+    };
+    table.insert(placed(same, 1), 5);
+    table.insert(placed(hi, 2), 5);
+    table.insert(Peer::new(lo), 5);
+    table.insert(Peer::new(late), 5);
+    table.contact(2, heard(1), Some(zone(2)));
+    table.refresh(0, |_| {});
+    let expected = [Role::Zone, Role::Gateway, Role::Remote, Role::Unheard];
+    assert_eq!(roles(&table, &[same, hi, lo, late]), expected);
+    for (row, greeted) in [(0, true), (1, false)] {
+        let flags = table.flags(row);
+        assert_eq!((table.sent.own[row], table.link[row].out.own.acked), (0, 0));
+        assert!(flags.has(PeerFlags::RESEND_OWN));
+        assert_eq!(flags.has(PeerFlags::ACK_DUE), greeted, "row {row}");
+    }
+
+    let mut tx = table.tx(0, Stream::Own);
+    tx.note_sent(5, 10);
+    tx.note_ack(3, 5, 10);
+    table.set_flag(0, PeerFlags::RESEND_OWN, false);
+    assert_eq!(table.contact(0, heard(2), Some(zone(1))), Contact::First);
+    assert_eq!(table.refresh(10, |_| {}), 0);
+    assert_eq!((table.sent.own[0], table.link[0].out.own.acked), (5, 3));
+    assert!(!table.flags(0).has(PeerFlags::RESEND_OWN));
+
+    table.contact(1, heard(3), Some(zone(1)));
+    table.refresh(10, |_| {});
+    assert_eq!(roles(&table, &[hi, lo]), [Role::Zone, Role::Gateway]);
+
+    assert_eq!(table.insert(placed(late, 3), 5), Insert::Present);
+    assert_eq!(table.insert(placed(lo, 3), 5), Insert::Present);
+    table.refresh(10, |_| {});
+    assert_eq!(roles(&table, &[late, lo]), [Role::Gateway, Role::Gateway]);
+    assert!(
+        !table.flags(3).has(PeerFlags::ACK_DUE),
+        "late is routed to zone 3 unheard"
+    );
+
+    assert_eq!(table.insert(placed(late, 1), 5), Insert::Present);
+    table.refresh(10, |_| {});
+    assert_eq!(roles(&table, &[late]), [Role::Zone]);
+}
+
+/// A peer heard before it knows its own zone keeps the zone discovery gave
+/// it: a header naming no zone moves nothing, so each row keeps the role that
+/// zone gives it, and discovery may still move it. A header naming a zone,
+/// on a later packet too, then wins, and holds for the incarnation.
+#[test]
+fn zoneless_header_keeps_the_discovered_zone() {
+    let mut table = PeerTable::with_capacity(CAPACITY, 7, Some(zone(1)), RTO, SUSPECT_AFTER);
+    let mut ranked = [addr(2), addr(4)];
+    ranked.sort_by_key(|&a| Reverse(rendezvous_weight(7, a)));
+    let [hi, lo] = ranked;
+    let (same, unplaced) = (addr(6), addr(8));
+    let roles = |table: &PeerTable| -> Vec<Role> { (0..4).map(|row| table.role(row)).collect() };
+    for peer in [
+        placed(same, 1),
+        placed(hi, 2),
+        placed(lo, 2),
+        Peer::new(unplaced),
+    ] {
+        assert_eq!(table.insert(peer, 5), Insert::Added);
+    }
+    table.refresh(0, |_| {});
+    let routed = [Role::Zone, Role::Gateway, Role::Remote, Role::Unheard];
+    assert_eq!(roles(&table), routed);
+    for (row, node) in (0..4).zip(1..) {
+        let first = table.contact(row, NodeIdentity::new(NodeId(node), 1), None);
+        assert_eq!(first, Contact::First);
+    }
+    // Only the row discovery placed in no zone changes: `Unheard` to `Zone`.
+    assert_eq!(table.refresh(0, |_| {}), 1);
+    assert_eq!(
+        roles(&table),
+        [Role::Zone, Role::Gateway, Role::Remote, Role::Zone]
+    );
+    let zones: Vec<_> = (0..4).map(|row| table.link(row).zone()).collect();
+    assert_eq!(zones, [Some(zone(1)), Some(zone(2)), Some(zone(2)), None]);
+
+    // Discovery still moves a row whose headers named no zone.
+    assert_eq!(table.insert(placed(unplaced, 3), 5), Insert::Present);
+    table.refresh(0, |_| {});
+    assert_eq!(table.role(3), Role::Gateway);
+
+    // A later header naming another zone re-roles the row, and that zone holds.
+    let lo_id = NodeIdentity::new(NodeId(3), 1);
+    assert_eq!(table.contact(2, lo_id, Some(zone(1))), Contact::Current);
+    assert_eq!(table.refresh(0, |_| {}), 1);
+    assert_eq!(table.role(2), Role::Zone);
+    assert_eq!(table.contact(2, lo_id, None), Contact::Current);
+    assert_eq!(table.insert(placed(lo, 2), 5), Insert::Present);
+    assert_eq!(table.link(2).zone(), Some(zone(1)));
+    assert!(!table.stale());
+}
+
+/// A new incarnation at the same address resets the row but keeps its zone
+/// as provisional: a first header naming no zone keeps its role, a late
+/// packet from the incarnation before still changes nothing, and a later
+/// header naming another zone re-roles it.
+#[test]
+fn restart_keeps_the_zone_provisionally() {
+    let mut table = PeerTable::with_capacity(CAPACITY, 7, Some(zone(1)), RTO, SUSPECT_AFTER);
+    table.insert(Peer::new(addr(2)), 0);
+    let old = NodeIdentity::new(NodeId(9), 1);
+    let new = NodeIdentity::new(NodeId(9), 2);
+    table.contact(0, old, Some(zone(2)));
+    table.refresh(0, |_| {});
+    assert_eq!(table.role(0), Role::Gateway);
+
+    assert_eq!(table.contact(0, new, None), Contact::Restarted);
+    let link = *table.link(0);
+    assert_eq!((link.identity(), link.zone()), (Some(new), Some(zone(2))));
+    assert_eq!(link.prev_incarnation, Some(1));
+    assert_eq!(table.refresh(0, |_| {}), 0);
+    assert_eq!(table.role(0), Role::Gateway);
+
+    assert_eq!(table.contact(0, old, Some(zone(1))), Contact::Late);
+    assert_eq!(table.link(0).zone(), Some(zone(2)));
+    assert_eq!(table.contact(0, new, Some(zone(1))), Contact::Current);
+    assert_eq!(table.refresh(0, |_| {}), 1);
+    assert_eq!(table.role(0), Role::Zone);
+}
+
+/// A direct own range from a peer whose header named another zone is merged
+/// but not tracked, since that peer stops once it hears this node's zone; one
+/// from a peer discovery placed in another zone whose header named none is
+/// tracked and owes an ack, since that peer does not know its zone and keeps
+/// sending every peer its own stream directly.
+#[test]
+fn zoneless_sender_of_another_zone_is_acked() {
+    let mut table = PeerTable::with_capacity(CAPACITY, 7, Some(zone(1)), RTO, SUSPECT_AFTER);
+    table.insert(placed(addr(2), 2), 0);
+    table.refresh(0, |_| {});
+    let id = NodeIdentity::new(NodeId(9), 1);
+    table.contact(0, id, None);
+    table.set_flag(0, PeerFlags::ACK_DUE, false);
+    table.receive_own(0, range(0, 3), false, 1_000, FLOOR);
+    assert_eq!(table.link(0).own_ack(), OwnAck::Direct(3));
+    assert!(table.flags(0).has(PeerFlags::ACK_DUE));
+
+    table.set_flag(0, PeerFlags::ACK_DUE, false);
+    table.contact(0, id, Some(zone(2)));
+    table.receive_own(0, range(3, 5), false, 1_000, FLOOR);
+    assert_eq!(table.link(0).own_ack(), OwnAck::Direct(3));
+    assert!(!table.flags(0).has(PeerFlags::ACK_DUE));
+}
+
+/// A zone row's suspicion is a stalled relay, and counts toward
+/// `CANNOT_RELAY`, only once the peer is heard: one discovery placed in this
+/// zone that has not answered may not have discovered this node yet.
+#[test]
+fn unheard_zone_rows_neither_stall_nor_impair_the_relay() {
+    let mut table = PeerTable::with_capacity(CAPACITY, 7, Some(zone(1)), RTO, SUSPECT_AFTER);
+    let id = |row: usize| NodeIdentity::new(NodeId(row as u128 + 1), 1);
+    for i in 1..=4 {
+        table.insert(placed(addr(2 * i), 1), 0);
+    }
+    for row in [0, 3] {
+        table.contact(row, id(row), Some(zone(1)));
+    }
+    table.refresh(0, |_| {});
+    for row in [1, 2, 3] {
+        table.tx(row, Stream::Relay).note_sent(3, 0);
+        table.link[row].answer = Answer::Owed { since_ms: 0 };
+        table.refresh_deadline(row);
+    }
+    let mut stalled = Vec::new();
+    table.judge(SUSPECT_AFTER, |stall| stalled.push(stall.peer));
+    assert_eq!(stalled, [addr(8)]);
+    assert!(!table.impaired());
+    for row in [1, 2] {
+        table.contact(row, id(row), Some(zone(1)));
+    }
+    assert!(table.impaired());
+}
+
+const OWN_GAP: PerStream<GapDue> = PerStream {
+    own: GapDue::Report,
+    relay: GapDue::Nothing,
+};
+
+/// Gateway ranges move their own mark: a lost first flagged packet opens a
+/// gateway gap although the direct mark is past it, freshness is judged
+/// against the gateway mark, and only the gap of the kind received last is
+/// reported, with the ack of that kind.
+#[test]
+fn gateway_ranges_keep_their_own_mark() {
+    let mut table = one_row();
+    assert!(!table.receive_own(0, range(0, 10), false, 1_000, FLOOR));
+    assert!(table.receive_own(0, range(3, 6), true, 1_000, FLOOR));
+    let link = table.link[0];
+    assert_eq!((link.own_in.have, link.gateway_in.have), (10, 0));
+    assert_eq!(link.own_ack(), OwnAck::AsGateway(0));
+    assert!(table.flags(0).has(PeerFlags::GAP_OPEN));
+    let reports = table.take_reports(0, 1_000 + FLOOR, FLOOR);
+    assert_eq!(reports, OWN_GAP);
+    // The lost packet arrives late: fresh, as it lies above the gateway mark.
+    assert!(table.receive_own(0, range(0, 3), true, 1_010, FLOOR));
+    assert_eq!(table.link[0].gateway_in.have, 6);
+    assert!(!table.receive_own(0, range(2, 6), true, 1_010, FLOOR));
+    // A direct packet makes the direct mark the one acked and reported.
+    table.receive_own(0, range(12, 14), false, 1_010, FLOOR);
+    assert_eq!(table.link[0].own_ack(), OwnAck::Direct(10));
+    let reports = table.take_reports(0, 1_010 + FLOOR, FLOOR);
+    assert_eq!(reports, OWN_GAP);
+}
+
+/// A row's deadline also holds the relay stream's timeout, the relay gap's
+/// report, and the moment an awaited answer turns the row suspect; once
+/// judged suspect, that moment leaves it.
+#[test]
+fn deadline_holds_the_relay_and_suspicion_timers() {
+    let mut table = one_row();
+    table.tx(0, Stream::Relay).note_sent(2, 1_000);
+    table.refresh_deadline(0);
+    assert_eq!(table.deadline[0], Deadline(1_000 + RTO));
+    table.receive_relay(0, range(4, 5), 1_000, FLOOR);
+    assert_eq!(table.deadline[0], Deadline(1_000 + FLOOR));
+    assert!(table.flags(0).has(PeerFlags::GAP_OPEN));
+
+    let mut table = one_row();
+    table.apply_role(0, Role::Remote);
+    table.note_send(
+        0,
+        Sent {
+            bytes: 1,
+            waits: true,
+        },
+        1_000,
+    );
+    table.tx(0, Stream::Own).restart(1_000 + SUSPECT_AFTER);
+    table.refresh_deadline(0);
+    assert_eq!(table.deadline[0], Deadline(1_000 + SUSPECT_AFTER));
+    table.judge(1_000 + SUSPECT_AFTER, |_| {});
+    assert!(table.suspect(0));
+    // Only the suspect's next probe remains.
+    assert_eq!(table.deadline[0], Deadline(1_000 + SUSPECT_AFTER + RTO));
+}
+
+/// A heartbeat stamped before the last judgment (`F_r` behind the clock,
+/// after a threshold round) leaves a row judged suspect still suspect, and the
+/// next round does not judge its crossing, and its stalled relay, again.
+#[test]
+fn late_heartbeat_judges_no_row_twice() {
+    let mut table = one_row();
+    table.contact(0, NodeIdentity::new(NodeId(9), 1), None);
+    table.tx(0, Stream::Relay).note_sent(2, 1_000);
+    let sent = Sent {
+        bytes: 1,
+        waits: true,
+    };
+    table.note_send(0, sent, 1_000);
+    let mut stalls = 0;
+    for now in [
+        1_001 + SUSPECT_AFTER,
+        1_000 + SUSPECT_AFTER - 1,
+        1_005 + SUSPECT_AFTER,
+    ] {
+        table.judge(now, |_| stalls += 1);
+        assert!(table.suspect(0), "{now}");
+    }
+    assert_eq!(stalls, 1);
+}
+
+/// A repeated `CANNOT_RELAY` from a suspect gateway, or a repeated packet of
+/// another version from a muted peer, changes no rank, so the roles stay
+/// fresh and no refresh runs for it.
+#[test]
+fn repeated_signals_leave_the_roles_fresh() {
+    let mut table = zoned_table(1, 2, 16);
+    let row = table.find(gateway(&table).unwrap()).unwrap();
+    let cannot_relay = AckInfo {
+        incarnation: 7,
+        cannot_relay: true,
+        ..AckInfo::default()
+    };
+    table.credit(row, cannot_relay, 7, heads(0), 1_000);
+    assert!(table.stale());
+    table.judge(1_000, |_| {});
+    table.refresh(1_000, |_| {});
+    table.credit(row, cannot_relay, 7, heads(0), 1_100);
+    assert!(!table.stale());
+
+    table.mute(row);
+    table.refresh(1_100, |_| {});
+    table.mute(row);
+    assert!(!table.stale());
+}
+
+/// An abandoned gap reopens on the next range above `have`: reported again
+/// a relay floor later, so a sender that still sends is asked again, not
+/// waited out until its timeout.
+#[test]
+fn abandoned_gap_reopens_on_the_next_range() {
+    let mut inbound = Inbound::default();
+    inbound.receive(range(1, 2), 0, FLOOR);
+    let mut now = FLOOR;
+    for _ in 0..GOSSIP_GAP_REPORTS {
+        assert_eq!(inbound.take_report(now, FLOOR), GapDue::Report);
+        now += 4 * FLOOR;
+    }
+    assert_eq!(
+        inbound.take_report(now, FLOOR),
+        GapDue::Abandoned { missing: 1 }
+    );
+    inbound.receive(range(2, 3), now, FLOOR);
+    assert_eq!(inbound.take_report(now + FLOOR, FLOOR), GapDue::Report);
+}

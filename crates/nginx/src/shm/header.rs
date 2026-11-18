@@ -1,24 +1,19 @@
-//! SHM zone header: magic, version, identity, geometry summary, rule digest,
-//! aggregate write sequence.
+//! SHM zone header: magic, version, identity, aggregate write sequence.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const SHM_MAGIC: u32 = 0x4742_4e58; // "GBNX"
-pub const SHM_VERSION: u32 = 3;
+pub const SHM_VERSION: u32 = 5;
 
-/// Node identity fields stored cross-process. `node_id` is stamped once by
-/// the master process before fork; `incarnation` is updated atomically by
-/// each leader takeover so peers see fresh `(node_id, incarnation)` pairs
-/// after a flip.
+/// Node identity fields stored cross-process. `node_id` is stamped by the
+/// master on every config load, before fork; `incarnation` is updated
+/// atomically by each leader takeover so peers see fresh `(node_id,
+/// incarnation)` pairs after a flip.
 ///
 /// `node_id` is logically a `u128` but stored as a paired
-/// `(AtomicU64, AtomicU64)` for the same reason `MainConfig` in
-/// `module.rs` is `Box::new`'d: the SHM mapping only guarantees
-/// `align_of::<u64>` = 8, and a 16-aligned `u128` placed directly here
-/// would be UB on amd64 (LLVM lowers u128 access to aligned SSE). See
-/// `Module::create_main_conf`'s doc comment for the same hazard in the
-/// nginx pool. `shm/queue.rs` and `shm/aggregate.rs` use the same
-/// paired-u64 convention for their own logical-u128 fields.
+/// `(AtomicU64, AtomicU64)`: stable Rust has no 128-bit atomic.
+/// `shm/queue.rs` and `gabion::aggregate` use the same paired-u64
+/// convention for their own logical-u128 fields.
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct NodeIdentityFields {
@@ -81,13 +76,3 @@ impl Default for Header {
         }
     }
 }
-
-impl Header {
-    pub fn is_initialized(&self) -> bool {
-        self.magic.load(Ordering::Acquire) == SHM_MAGIC
-            && self.version.load(Ordering::Acquire) == SHM_VERSION
-    }
-}
-
-#[cfg(test)]
-mod tests;
