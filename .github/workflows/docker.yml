@@ -212,6 +212,14 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+          # Stamp the PR number into the image config so a PR image never
+          # shares a manifest digest with a `build`-job image or another
+          # PR's. Builds are reproducible: without this, an unchanged
+          # amd64 image pushes the same manifest that `build` pushes by
+          # digest for `main`, both land on one GHCR package version, and
+          # ghcr-cleanup's PR-close sweep deletes that version, and with
+          # it the digest behind `:main`.
+          labels: io.github.prosody-events.gabion.pr=${{ github.event.pull_request.number }}
           build-args: |
             ${{ matrix.base-arg != '' && format('{0}={1}', matrix.base-arg, matrix.base-image) || '' }}
           # Registry-backed cache on GHCR — not the Actions cache, whose
