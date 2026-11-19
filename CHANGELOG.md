@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.3](https://github.com/prosody-events/gabion/compare/v0.3.2...v0.3.3) (2026-11-19)
+
+
+### Bug fixes
+
+* **ci:** keep PR images from sharing digests with main's per-arch images ([#143](https://github.com/prosody-events/gabion/issues/143)) ([2dd49a8](https://github.com/prosody-events/gabion/commit/2dd49a8baedb45d49309b330cb7b78a8ac5ddb22))
+
+
+### Build / CI
+
+* **docker:** rebuild images on upstream base changes daily, and on demand ([#139](https://github.com/prosody-events/gabion/issues/139)) ([db6f469](https://github.com/prosody-events/gabion/commit/db6f469a70edf3d3636f017a8f84c59b2a0a7acc))
+* **openresty:** add a patched bookworm flavor for apt-based images ([#142](https://github.com/prosody-events/gabion/issues/142)) ([8838bab](https://github.com/prosody-events/gabion/commit/8838bab00582bdbaaec1edccae1f07ee7a9c747f))
+* **openresty:** publish an OpenResty image patched for CVE-2026-123007 ([#140](https://github.com/prosody-events/gabion/issues/140)) ([d197a22](https://github.com/prosody-events/gabion/commit/d197a22fb3834b86b3dd46aba9e71a49e06ae8f1))
+
 ## [0.3.2](https://github.com/prosody-events/gabion/compare/v0.3.1...v0.3.2) (2026-10-23)
 
 
