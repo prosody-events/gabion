@@ -175,9 +175,9 @@ built on this one can keep pinning it and installing `openresty-opm`,
 
 Both flavors then build `Dockerfile.openresty` on the patched base. The
 images still report `openresty/1.31.8.1`. To see which fixes they carry,
-read the `io.gabion.nginx-fix-commits` label. The workflow runs on every PR
-that changes it and publishes when it lands on `main`. To build another
-gabion release, run it by hand with `gabion-ref`.
+read the `io.gabion.nginx-fix-commits` label. Automatic runs are disabled:
+the workflow runs only by hand. To build another gabion release, run it
+with `gabion-ref`.
 
 The regular `openresty` tags are unchanged and keep tracking the official
 images. Once an OpenResty release bundles nginx 1.31.9 or later, the
