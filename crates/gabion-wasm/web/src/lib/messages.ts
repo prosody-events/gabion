@@ -428,8 +428,8 @@ export function sentenceOf(d: MessageDetail, says: Says): string {
     case 'GapReport': {
       const own = (d.header.flags & GAP_OWN) !== 0;
       first = own
-        ? `${capital(from)} told ${to} it is missing ${to}'s changes from position ${d.header.own_ack + 1} on: a gap report, gabion's NAK.`
-        : `${capital(from)} told ${to} it is missing ${to}'s relays from position ${d.header.relay_ack + 1} on: a gap report, gabion's NAK.`;
+        ? `${capital(from)} told ${to} it is missing ${to}'s changes from position ${d.header.own_ack + 1} on: a gap report.`
+        : `${capital(from)} told ${to} it is missing ${to}'s relays from position ${d.header.relay_ack + 1} on: a gap report.`;
       break;
     }
     case 'Probe':

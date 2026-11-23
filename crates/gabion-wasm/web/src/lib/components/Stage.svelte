@@ -320,7 +320,7 @@
       bit: MARK.GAP,
       glyph: 'gap',
       text: ['square: gap report'],
-      tip: 'A gap report, gabion’s NAK: it asks for a repeat. Messages, beside Details at the top of the pane, lists each one.',
+      tip: 'A gap report: it asks for a repeat. Messages, beside Details at the top of the pane, lists each one.',
     },
   ]);
 

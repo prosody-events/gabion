@@ -115,7 +115,7 @@
       it cannot relay. A suspect is not used as a gateway.
     </dd>
     <dt>gap report</dt>
-    <dd>Gabion's NAK: "I am missing your changes from position N on; repeat them".</dd>
+    <dd>A message that says "I am missing your changes from position N on; repeat them".</dd>
     <dt>cannot relay</dt>
     <dd>A flag a node sets on every message while it cannot pass hits on into its zone; only a node in another zone acts on it.</dd>
     <dt>backstop</dt>
@@ -135,11 +135,11 @@
   <dl class="glossary serif">
     <dt>the next action</dt>
     <dd>
-      The one dark button is what to press next, and the line under the goal names it; when nothing is dark, watch the meter.
+      The one filled button is what to press next, and the line under the goal names it; when no button is filled, watch the meter.
     </dd>
     <dt>time</dt>
     <dd>
-      A Send pressed while paused plays until every node has the hits, then pauses again; while playing, it keeps playing.
+      A Send pressed while paused plays until every node has the hits, then pauses again; in Propagation it stops before each wave, and Step flies the next. While playing, it keeps playing.
       The node admits the requests in order while its window has room and rejects the rest.
     </dd>
     <dt>the network</dt>

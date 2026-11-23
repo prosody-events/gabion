@@ -1252,13 +1252,15 @@
         {/if}{#each run.cuts as c, i (i)}{' · '}<Sentence parts={cutName(c, cluster.zones)} field="status-cut" />{/each}
       </p>
     {/if}
-    <p class="once">
-      <span class="one-run">One simulated run ·</span>
-      <a href={`${import.meta.env.BASE_URL}study/dashboard/`}>measured results in the study</a>
-    </p>
-    <button class="btn-tertiary help" aria-expanded={helpOpen} aria-controls="glossary" onclick={() => (helpOpen = !helpOpen)}
-      >How to read this</button
-    >
+    <div class="links">
+      <p class="once">
+        <span class="one-run">One simulated run ·</span>
+        <a href={`${import.meta.env.BASE_URL}study/dashboard/`}>measured results in the study</a>
+      </p>
+      <button class="btn-tertiary help" aria-expanded={helpOpen} aria-controls="glossary" onclick={() => (helpOpen = !helpOpen)}
+        >How to read this</button
+      >
+    </div>
     {#if helpOpen && width === 'narrow'}
       <div class="glossary-flow"><Glossary /></div>
     {/if}
@@ -1418,7 +1420,7 @@
                   />
                 </div>
               {:else}
-              <div id="pane-details" role="tabpanel" aria-labelledby="pane-tab-details">
+              <div id="pane-details" class="details-panel" role="tabpanel" aria-labelledby="pane-tab-details">
               <Charts
                 {cluster}
                 history={r.history}
@@ -1530,8 +1532,16 @@
     font-weight: 600;
   }
 
+  /* The study link and the help toggle wrap as one group, at the right. */
+  .links {
+    display: flex;
+    align-items: baseline;
+    gap: var(--gap-md);
+    margin-left: auto;
+  }
+
   .once {
-    margin: 0 0 0 auto;
+    margin: 0;
     font-size: var(--font-size-caption);
     color: var(--color-fg-muted);
   }
@@ -1676,6 +1686,13 @@
     min-height: 0;
     overflow-y: auto;
     container-type: inline-size;
+  }
+
+  /* The charts and the node's sections keep the pane's step between them. */
+  .details-panel {
+    display: flex;
+    flex-direction: column;
+    gap: var(--gap-md);
   }
 
   .messages-panel {
