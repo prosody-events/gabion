@@ -308,12 +308,19 @@
       text: ['zone cut off'],
       tip: 'A dashed zone ring: every packet between this zone and the others is lost. Inside the zone, its nodes still hear each other.',
     },
-    { bit: MARK.LOST, glyph: 'lost', text: ['lost packet'], tip: 'A packet the network dropped: it stops partway, and is resent.' },
+    { bit: MARK.LOST, glyph: 'lost', text: ['lost packet'], tip: 'A packet the network dropped: it stops partway, and is repeated.' },
+    { bit: MARK.DOT, glyph: 'ack', text: ['dot: answers'], tip: 'An acknowledgement or an answer: it carries no hits.' },
     {
-      bit: MARK.DOT,
-      glyph: 'ack',
-      text: ['dot: ack, probe, gap report or sweep request'],
-      tip: 'Control packets carry no hits: acknowledgements, probes, gap reports and requests for a join sweep.',
+      bit: MARK.ASK,
+      glyph: 'ask',
+      text: ['ring: asks'],
+      tip: 'Asks for an answer: a probe or a sweep request. Messages, beside Details at the top of the pane, lists each one.',
+    },
+    {
+      bit: MARK.GAP,
+      glyph: 'gap',
+      text: ['square: gap report'],
+      tip: 'A gap report, gabion’s NAK: it asks for a repeat. Messages, beside Details at the top of the pane, lists each one.',
     },
   ]);
 

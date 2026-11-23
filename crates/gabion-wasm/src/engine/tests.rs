@@ -88,7 +88,8 @@ where
     local.block_on(&rt, async move {
         let (tx, rx) = mpsc::channel(16);
         let valid = config.validate().expect("test config validates");
-        let engine = tokio::task::spawn_local(run_engine(valid, rx));
+        let engine =
+            tokio::task::spawn_local(run_engine(valid, crate::capture::Capture::shared(), rx));
         driver(tx.clone()).await;
         drop(tx);
         engine
@@ -916,8 +917,11 @@ where
         .build()
         .expect("build paused current-thread runtime");
     LocalSet::new().block_on(&rt, async move {
-        let state = super::EngineState::build(config.validate().expect("config validates"))
-            .expect("every node's settings validate");
+        let state = super::EngineState::build(
+            config.validate().expect("config validates"),
+            crate::capture::Capture::shared(),
+        )
+        .expect("every node's settings validate");
         let mut state = body(state).await;
         state.shutdown().await;
     });
@@ -1126,10 +1130,10 @@ fn sent(events: &[Event], src: u32, kind: PacketKind) -> Vec<(u32, Tier, u64)> {
             EventKind::PacketSent {
                 src: s,
                 dst,
-                kind: k,
+                role,
                 tier,
                 ..
-            } if s == src && k == kind => Some((dst, tier, e.virtual_ms)),
+            } if s == src && role.kind() == kind => Some((dst, tier, e.virtual_ms)),
             _ => None,
         })
         .collect()
@@ -1168,18 +1172,19 @@ fn assert_bytes_by_tier_and_sender(events: &[Event], state: &ClusterState) {
         if let EventKind::PacketSent {
             src,
             bytes,
-            kind,
+            role,
             tier,
             ..
         }
         | EventKind::PacketDropped {
             src,
             bytes,
-            kind,
+            role,
             tier,
             ..
         } = event.kind
         {
+            let kind = role.kind();
             let data = matches!(
                 kind,
                 PacketKind::Own | PacketKind::Relay | PacketKind::Sweep
@@ -1402,11 +1407,11 @@ fn one_way_cut_is_repaired_by_the_backstop() {
             failed_over |= failover(&events, 0, 1, g).is_some();
             if t1.is_none() {
                 t1 = events.iter().find_map(|e| match e.kind {
-                    EventKind::PacketDropped {
-                        src,
-                        kind: PacketKind::Relay,
-                        ..
-                    } if src == g => Some(e.virtual_ms),
+                    EventKind::PacketDropped { src, role, .. }
+                        if src == g && role.kind() == PacketKind::Relay =>
+                    {
+                        Some(e.virtual_ms)
+                    }
                     _ => None,
                 });
                 if let Some(t1) = t1 {
@@ -1735,12 +1740,9 @@ fn full_round_at_max_nodes_drops_nothing_under_pass() {
         let mut dropped = 0;
         for event in &batch.events {
             match event.kind {
-                EventKind::PacketSent {
-                    src,
-                    dst,
-                    kind: PacketKind::Own,
-                    ..
-                } => *own.entry((src, dst)).or_default() += 1,
+                EventKind::PacketSent { src, dst, role, .. } if role.kind() == PacketKind::Own => {
+                    *own.entry((src, dst)).or_default() += 1
+                }
                 EventKind::PacketDropped { .. } => dropped += 1,
                 _ => {}
             }

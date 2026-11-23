@@ -22,6 +22,7 @@
     onSilence,
     onCutFromZone,
     onPreview,
+    onMessages,
   }: {
     node: NodeState;
     /** The node's peer table, as the snapshot inspecting it reports it. */
@@ -38,6 +39,8 @@
     onCutFromZone: (gateway: number, zone: number) => void;
     /** A node the route sentence or a fault names, previewed on the stage. */
     onPreview: (node: number | null) => void;
+    /** Show the Messages view, scoped to this node. */
+    onMessages: () => void;
   } = $props();
 
   // The node's gateways, one per remote zone, in zone order.
@@ -68,7 +71,7 @@
 <section class="inspector" aria-label={`node ${node.id} details`}>
   <section class="section">
     <h3 class="section-head">Gossip targets</h3>
-    <GossipTargets {node} {peers} {zones} {zoneMode} {onPreview} />
+    <GossipTargets {node} {peers} {zones} {zoneMode} {onPreview} {onMessages} />
     <!-- With no zone the route sentence already says there are no gateways. -->
     {#if offered && zoneMode === 'Configured'}
       {#if gateways.length === 0}

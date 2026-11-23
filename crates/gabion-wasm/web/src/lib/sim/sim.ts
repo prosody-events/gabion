@@ -5,6 +5,7 @@
 
 import init, { Sim as WasmSim, default_config, max_zones } from '../../wasm/gabion_wasm.js';
 import type { Cut } from '../cuts';
+import { ROWS_LEN, type MessageDetail, type MessageFilter } from '../messages';
 import type { ClusterState, EventBatch, LinkPolicyKind, SimConfig, StepUntil } from './types';
 
 /** A live node as a fault reads it: its id and zone. */
@@ -14,11 +15,15 @@ export interface Member {
 }
 
 let initPromise: Promise<unknown> | null = null;
+// The module's memory, whose buffer the capture's rows are read through.
+let memory: WebAssembly.Memory | null = null;
 
 /** Initialize the wasm module exactly once, even under concurrent callers. */
 function ensureInit(): Promise<unknown> {
   if (initPromise === null) {
-    initPromise = init();
+    initPromise = init().then((out) => {
+      memory = out.memory;
+    });
   }
   return initPromise;
 }
@@ -49,6 +54,9 @@ const sameCut = (a: Cut, b: Cut): boolean =>
  *  and keeps the faults the page made as a list of what each means. */
 export class Sim {
   #inner: WasmSim;
+  // The capture's rows buffer, as one view, rebuilt only when a growth of
+  // the module's memory detaches it.
+  #rows: Float64Array | null = null;
   // Every fault made since the last heal, in the order made, each once: the
   // engine keeps link policies, not what they were for. Replaced, never
   // mutated, so a reader may keep the list it was given.
@@ -193,6 +201,34 @@ export class Sim {
     assertBoundary(batch);
     this.#cuts = this.#cuts.filter((c) => c.kind === 'zone' || c.node !== id);
     return batch;
+  }
+
+  /** Start the run's message log: the next message is number 1. */
+  markRunStart(): void {
+    this.#inner.mark_run_start();
+  }
+
+  /** Set the Messages view's filter; the view is rebuilt at once. */
+  setMessageFilter(filter: MessageFilter): void {
+    this.#inner.set_message_filter(filter);
+  }
+
+  /** Write the view's head and up to `count` rows from ordinal `first` into
+   *  the rows buffer, and return the buffer and the rows written. The buffer
+   *  is shared: read it before the next call. */
+  messageRows(first: number, count: number): { rows: Float64Array; written: number } {
+    const written = this.#inner.message_rows(first, count);
+    if (memory === null) throw new Error('the wasm module is not initialized');
+    if (this.#rows === null || this.#rows.buffer !== memory.buffer) {
+      this.#rows = new Float64Array(memory.buffer, this.#inner.message_rows_ptr(), ROWS_LEN);
+    }
+    return { rows: this.#rows, written };
+  }
+
+  /** Select message `seq`, or clear the selection, and return its detail,
+   *  decoded now; undefined once it is no longer kept. */
+  selectMessage(seq: number | null): MessageDetail | undefined {
+    return (this.#inner.select_message(seq ?? undefined) ?? undefined) as MessageDetail | undefined;
   }
 
   /** End the session and tear every runtime down. */

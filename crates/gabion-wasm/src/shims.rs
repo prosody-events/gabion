@@ -15,6 +15,7 @@ use gabion::gossip::GossipTransport;
 use gabion::gossip::sim::{SimRouter, SimTransport};
 use gabion::wire::read_header;
 
+use crate::capture::SharedCapture;
 use crate::engine::CLUSTER_ID_HASH;
 use crate::event::{EventKind, Tier};
 
@@ -103,8 +104,9 @@ impl AggregateStore for EventEmittingAggregateStore {
 }
 
 /// Transport wrapper that logs one packet event per send/receive. Each sent
-/// packet is tagged with its kind, read with the library's own header reader,
-/// and its tier, by placement. Wraps a `SimTransport` and consults the shared
+/// packet is recorded whole in the capture, which numbers it and reads its
+/// role from the library's own header reader, and tagged with its tier, by
+/// placement. Wraps a `SimTransport` and consults the shared
 /// `SimRouter` to tell a delivered send (the packet was enqueued at `dst`)
 /// from a dropped one — the router's `received_count` increments only on
 /// actual delivery, so a diff of one across the inner send is exactly "did
@@ -117,16 +119,17 @@ pub struct LoggingSimTransport {
     zone: u8,
     addresses: AddressBook,
     log: EventLog,
+    capture: SharedCapture,
 }
 
 impl LoggingSimTransport {
     pub fn new(
         inner: SimTransport,
         router: SimRouter,
-        src: u32,
-        zone: u8,
+        (src, zone): (u32, u8),
         addresses: AddressBook,
         log: EventLog,
+        capture: SharedCapture,
     ) -> Self {
         Self {
             inner,
@@ -135,6 +138,7 @@ impl LoggingSimTransport {
             zone,
             addresses,
             log,
+            capture,
         }
     }
 }
@@ -157,24 +161,39 @@ impl GossipTransport for LoggingSimTransport {
                 header.is_ok(),
                 "the runtime sends only what its encoder wrote: {header:?}"
             );
-            if let Ok((header, _)) = header {
+            if let Ok((header, cells)) = header {
                 let delivered = self.router.received_count(dst_addr) > before;
                 let (src, dst_id, bytes) = (self.src, dst.id, n as u32);
-                let (kind, tier) = (header.payload.into(), Tier::between(self.zone, dst.zone));
+                let tier = Tier::between(self.zone, dst.zone);
+                let (seq, role, riders, repeat) = self.capture.borrow_mut().record(
+                    buf,
+                    (&header, cells),
+                    (src, dst_id),
+                    tier,
+                    delivered,
+                );
                 let event = if delivered {
                     EventKind::PacketSent {
+                        seq,
                         src,
                         dst: dst_id,
                         bytes,
-                        kind,
+                        role,
+                        riders,
+                        repeat,
+                        cells,
                         tier,
                     }
                 } else {
                     EventKind::PacketDropped {
+                        seq,
                         src,
                         dst: dst_id,
                         bytes,
-                        kind,
+                        role,
+                        riders,
+                        repeat,
+                        cells,
                         tier,
                     }
                 };

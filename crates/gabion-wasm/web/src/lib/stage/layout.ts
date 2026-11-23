@@ -6,6 +6,8 @@
 // Everything is screen-size, so labels never scale with the stage. It also
 // holds the beam encoding the pool packs and the audit reads.
 
+import { KIND, type MessageRole } from '../sim/types';
+
 /** A ring's radius as a share of half the gap between neighbouring ring
  *  centres: the largest value that keeps every cross-zone beam clear of a third
  *  ring. */
@@ -23,12 +25,40 @@ export const CROSS_WIDTH = 3;
 /** How long a line takes to fade from full ink to nothing: one second of
  *  simulated time. */
 export const FADE_MS = 1000;
-/** The beam pool's flag bits: across zones, a control packet (no cells), a
- *  relay, lost. */
+/** The beam pool's flag bits: across zones, a control packet (a mark, not an
+ *  arrowhead), a relay, lost, and, with `CONTROL`, which mark: a ring asks
+ *  for an answer, a square reports a gap, and neither is a dot, which
+ *  answers. */
 export const CROSS = 1;
 export const CONTROL = 2;
 export const RELAY = 4;
 export const DROPPED = 8;
+export const RING = 16;
+export const SQUARE = 32;
+
+/** Each role's mark: data that carries cells is an arrowhead, so a line
+ *  with a head means counts moved; a probe or a sweep request asks for an
+ *  answer (a ring); a gap report asks for a repeat (a square); everything
+ *  else answers (a dot). Exhaustive over the roles, so a new role is a type
+ *  error until it is classed. */
+const MARK_FLAGS: Readonly<Record<MessageRole, number>> = {
+  OwnData: 0,
+  RelayData: 0,
+  SweepPage: 0,
+  OwnSkip: CONTROL,
+  RelaySkip: CONTROL,
+  Ack: CONTROL,
+  ProbeAnswer: CONTROL,
+  Probe: CONTROL | RING,
+  SweepRequest: CONTROL | RING,
+  GapReport: CONTROL | SQUARE,
+};
+
+/** A message's flags from its role and cells: its mark, and whether it is a
+ *  relay, the selected node's own when its gateway sends it. An empty sweep
+ *  page answers, so it is a dot. */
+export const markFlags = (role: MessageRole, cells: number): number =>
+  (role === 'SweepPage' && cells === 0 ? CONTROL : MARK_FLAGS[role]) | (KIND[role] === 'Relay' ? RELAY : 0);
 /** A node's ring (the share of the cluster's hits it has heard): its gap
  *  outside the disc and its stroke width, px, and how far it reaches. */
 export const ARC_GAP = 4;

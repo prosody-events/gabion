@@ -258,6 +258,29 @@ selection and the preview); and the stage pane publishes `data-clock` (what
 time does: `paused`, `playing`, `capped`, `settled`, `per-wave` or
 `before-wave`) and `data-playing`.
 
+## Messages
+
+The detail pane's second view, **Details · Messages**, is a network inspector:
+every message the cluster sent since the run's first paint, one row each, in
+send order. The engine keeps them in a bounded capture
+(`src/capture.rs`): fixed columns for the newest 32,768 messages, their raw
+86-byte headers and a 2 MiB arena for bodies, all allocated when the `Sim` is
+built, plus markers (a node's decision, a gateway switch, a join, a removal, a
+heal) and a filtered view the page reads a window of rows from, through one
+preallocated `f64` buffer (`Sim.message_rows`). The capture counts By type and
+filters (scope, direction, tier, types, lost only), so the page tallies
+nothing. Selecting a message decodes it then, with the library's own
+`read_header` and `decode`, and links it to what it answers or caused (its
+ack, its gap report, its repeat, its probe answer), found by bounded scans of
+the same pair's kept messages.
+
+Each message has one role, read once from its header (`MessageRole::of`), and
+riders for its other signals; the stage draws the role's mark: data an
+arrowhead, an answer a dot, an ask (probe, sweep request) a ring, a gap report
+a square. The frame (`lib/frame.ts`) mirrors `write_header` field by field;
+`tests/messages.spec.ts` checks every byte of a real packet belongs to exactly
+one field and each field reads the engine's decoded value.
+
 ## Fonts
 
 Source Sans 3 (the interface, counts and numerals), Source Serif 4 (the goal

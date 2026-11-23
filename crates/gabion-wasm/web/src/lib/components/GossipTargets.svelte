@@ -15,6 +15,7 @@
     zones,
     zoneMode,
     onPreview,
+    onMessages,
   }: {
     node: NodeState;
     peers: PeerView[];
@@ -22,6 +23,8 @@
     zoneMode: ZoneMode;
     /** A node the route sentence names, previewed on the stage. */
     onPreview: (node: number | null) => void;
+    /** Show the Messages view, scoped to this node. */
+    onMessages: () => void;
   } = $props();
 
   const own = $derived(zones[node.zone]);
@@ -104,14 +107,24 @@
     <tr class="counters">
       <th scope="row">Counters</th>
       <td>
+        <span data-field="gap-reports">{fmtCount(node.gap_reports_sent)}</span>
+        <InfoTip text="Gap reports sent counts flags: a message reporting gaps in both streams counts twice."
+          >gap {noun(node.gap_reports_sent, 'report')} sent</InfoTip
+        > ·
+        <span data-field="repeats">{fmtCount(node.rto_rewinds_own + node.rto_rewinds_relay)}</span>
+        <InfoTip
+          text={`Counts each time this node went back to repeat what a peer had not acknowledged: after waiting too long, or after an answer showed packets still owed. It counts going back, not the messages repeated; repeats after a gap report are not in it.`}
+          >{node.rto_rewinds_own + node.rto_rewinds_relay === 1 ? 'time' : 'times'} it repeated</InfoTip
+        > ·
+        <span data-field="gaps-abandoned">{fmtCount(node.gaps_abandoned)}</span>
+        <InfoTip text="After four gap reports a node stops asking.">{noun(node.gaps_abandoned, 'gap')} given up</InfoTip> ·
         <span data-field="failovers">{fmtCount(node.gateway_failovers)}</span> gateway
         {noun(node.gateway_failovers, 'change')} ·
-        <span data-field="gap-reports">{fmtCount(node.gap_reports_sent)}</span> gap
-        {noun(node.gap_reports_sent, 'report')} sent ·
-        <span data-field="retransmissions">{fmtCount(node.rto_rewinds_own + node.rto_rewinds_relay)}</span>
-        {noun(node.rto_rewinds_own + node.rto_rewinds_relay, 'retransmission')} ·
         <span data-field="sweeps">{fmtCount(node.sweeps_served)}</span>
-        {noun(node.sweeps_served, 'sweep')} served
+        {noun(node.sweeps_served, 'sweep')} served ·
+        <button class="btn-tertiary messages-link" onclick={onMessages}
+          >See node <span data-field="node">{node.id}</span>'s messages</button
+        >
       </td>
     </tr>
     <tr class="budget">
@@ -164,5 +177,9 @@
     width: 6.5rem;
     font-weight: 600;
     color: var(--color-fg-muted);
+  }
+
+  .messages-link {
+    min-height: 24px;
   }
 </style>

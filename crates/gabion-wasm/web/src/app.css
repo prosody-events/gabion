@@ -103,6 +103,12 @@ button:disabled {
   cursor: not-allowed;
 }
 
+/* Hex, wire names and short ids: the monospace, and nothing else. */
+code,
+.mono {
+  font-family: var(--font-mono);
+}
+
 /* Instruction and glossary prose: the serif, its figures proportional. */
 .serif {
   font-family: var(--font-serif);

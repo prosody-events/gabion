@@ -52,6 +52,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, LocalSet};
 
+use crate::capture::{LostBy, MarkerKind, SharedCapture};
 use crate::clock::{ManualClock, SharedNow, Tickers};
 use crate::config::{MAX_NODES, MAX_ZONES, SimConfig, ValidSimConfig, ZONE_NAMES, ZoneMode};
 use crate::event::{
@@ -374,17 +375,19 @@ pub enum Command {
 /// `Shutdown` arrives.
 pub async fn run_engine(
     valid: ValidSimConfig,
+    capture: SharedCapture,
     cmd_rx: mpsc::Receiver<Command>,
 ) -> Result<(), EngineError> {
     let local = LocalSet::new();
-    local.run_until(engine_loop(valid, cmd_rx)).await
+    local.run_until(engine_loop(valid, capture, cmd_rx)).await
 }
 
 async fn engine_loop(
     valid: ValidSimConfig,
+    capture: SharedCapture,
     mut cmd_rx: mpsc::Receiver<Command>,
 ) -> Result<(), EngineError> {
-    let mut state = EngineState::build(valid)?;
+    let mut state = EngineState::build(valid, capture)?;
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             Command::SubmitRequest {
@@ -477,6 +480,9 @@ struct NodeHandle {
     prompt_due: Option<u64>,
     /// The positions whose link into this node blocks.
     blocked_from: NodeSet,
+    /// The positions whose link into this node drops some packets: what it
+    /// loses there is loss, not a full queue.
+    lossy_from: NodeSet,
     /// Hits this node admitted since it joined, of every key.
     admitted_hits: u64,
     /// Hits this node rejected since it joined, of every key.
@@ -512,6 +518,8 @@ struct EngineState {
     /// and addresses / gossip `NodeId`s derived from it never collide.
     next_id: u32,
     log: EventLog,
+    /// Every message sent, kept for the page's Messages view.
+    capture: SharedCapture,
     /// Shared virtual time every node reads. The engine moves it and fires
     /// gossip ticks per node, so the runtimes never touch `tokio::time` (which
     /// panics on wasm at `std::time::Instant::now`).
@@ -556,6 +564,7 @@ impl EngineState {
             spec,
             zone_names,
         }: ValidSimConfig,
+        capture: SharedCapture,
     ) -> Result<Self, EngineError> {
         let log: EventLog = Rc::new(RefCell::new(Vec::new()));
         let addresses: AddressBook = Rc::new(RefCell::new(HashMap::new()));
@@ -578,6 +587,7 @@ impl EngineState {
             node_id_index: HashMap::with_capacity(initial_nodes),
             next_id: 0,
             log,
+            capture,
             now,
             virtual_ms: 0,
             substeps: 0,
@@ -623,6 +633,11 @@ impl EngineState {
         self.router
             .set_link_policy(self.nodes[src].addr, self.nodes[dst].addr, policy.into());
         self.nodes[dst].blocked_from.set(src, blocks(policy));
+        let lossy = matches!(
+            policy,
+            LinkPolicyKind::DropProb { .. } | LinkPolicyKind::DropFirst { .. }
+        );
+        self.nodes[dst].lossy_from.set(src, lossy);
     }
 
     /// Give every link between position `pos` and a lower position the
@@ -675,10 +690,10 @@ impl EngineState {
         let transport = LoggingSimTransport::new(
             self.router.bind(addr),
             self.router.clone(),
-            id,
-            zone,
+            (id, zone),
             self.addresses.clone(),
             self.log.clone(),
+            self.capture.clone(),
         );
 
         let aggregate = Rc::new(EventEmittingAggregateStore::new(
@@ -725,6 +740,7 @@ impl EngineState {
             next_heartbeat: first_heartbeat(id, period, self.virtual_ms),
             prompt_due: None,
             blocked_from: NodeSet::EMPTY,
+            lossy_from: NodeSet::EMPTY,
             admitted_hits: 0,
             rejected_hits: 0,
         });
@@ -763,8 +779,8 @@ impl EngineState {
         let before = self.outbox.len();
         self.drain_log();
         self.outbox[before..].iter().any(|event| match event.kind {
-            EventKind::PacketSent { kind, .. } | EventKind::PacketDropped { kind, .. } => {
-                kind.carries_cells()
+            EventKind::PacketSent { role, .. } | EventKind::PacketDropped { role, .. } => {
+                role.kind().carries_cells()
             }
             _ => false,
         })
@@ -778,6 +794,7 @@ impl EngineState {
             "one sub-step at a time"
         );
         self.sub_step = SubStep::Open(self.router.begin_deferred());
+        self.capture.borrow_mut().open();
     }
 
     /// The close half: deliver the held packets at the current instant, let
@@ -788,6 +805,7 @@ impl EngineState {
             return;
         };
         self.router.release_deferred(deferral);
+        self.capture.borrow_mut().close();
         self.drain_pending().await;
         self.drain_log();
         self.observe().await;
@@ -847,6 +865,14 @@ impl EngineState {
                 return Err(EngineError::Gossip { node, source });
             }
         }
+        self.capture.borrow_mut().mark(
+            now,
+            MarkerKind::Request {
+                node,
+                admitted,
+                rejected,
+            },
+        );
         // Only recorded requests are reported admitted. An eager flush's
         // threshold round runs on the runtime's next turn, so the drain puts
         // its packets in this batch, after the decision.
@@ -887,6 +913,9 @@ impl EngineState {
     /// correct after churn; writing a policy also clears any drop counter.
     async fn heal(&mut self) {
         self.close_sub_step().await;
+        self.capture
+            .borrow_mut()
+            .mark(self.virtual_ms, MarkerKind::Heal);
         let baseline = self.baseline_policy();
         for src in 0..self.nodes.len() {
             for dst in 0..self.nodes.len() {
@@ -926,6 +955,9 @@ impl EngineState {
         let live_addrs: Vec<SocketAddr> = self.nodes.iter().map(|h| h.addr).collect();
         let id = self.spawn_node(zone, &live_addrs)?;
         self.baseline_links(self.nodes.len() - 1);
+        self.capture
+            .borrow_mut()
+            .mark(self.virtual_ms, MarkerKind::Added { node: id });
         let newcomer_addr = addr_of_id(id);
 
         // Tell every survivor (everyone but the just-pushed newcomer) the
@@ -953,6 +985,9 @@ impl EngineState {
     async fn remove_node(&mut self, id: u32) -> Result<EventBatch, EngineError> {
         let pos = position_of(&self.nodes, id).ok_or(EngineError::UnknownNode { id })?;
         self.close_sub_step().await;
+        self.capture
+            .borrow_mut()
+            .mark(self.virtual_ms, MarkerKind::Removed { node: id });
         let addr = self.nodes[pos].addr;
         let node_id = self.nodes[pos].identity.node_id.0;
 
@@ -978,6 +1013,7 @@ impl EngineState {
         drop(handle);
         for survivor in &mut self.nodes {
             survivor.blocked_from.remove_shift(pos);
+            survivor.lossy_from.remove_shift(pos);
         }
         self.addresses.borrow_mut().remove(&addr);
         self.node_id_index.remove(&node_id);
@@ -1107,45 +1143,63 @@ impl EngineState {
     }
 
     /// Drain the shims' raw events into the outbox, stamping each with the
-    /// current virtual time. Every packet sent or dropped also counts into
-    /// `bytes_by_tier`, and into its sender's `own_data_bytes` when it is an
-    /// `Own` packet; a packet sent wakes its receiver, which is marked
-    /// touched.
+    /// current virtual time and settling each message in the capture. Every
+    /// packet sent or dropped also counts into `bytes_by_tier`, and into its
+    /// sender's `own_data_bytes` when it is an `Own` packet; a packet sent
+    /// wakes its receiver, which is marked touched.
     fn drain_log(&mut self) {
         let virtual_ms = self.virtual_ms;
         let nodes = &mut self.nodes;
         let touched = &mut self.touched;
         let bytes_by_tier = &mut self.bytes_by_tier;
+        let mut capture = self.capture.borrow_mut();
         let mut log = self.log.borrow_mut();
         self.outbox.extend(log.drain(..).map(|kind| {
-            if let EventKind::PacketSent {
-                src,
-                bytes,
-                kind,
-                tier,
-                ..
-            }
-            | EventKind::PacketDropped {
-                src,
-                bytes,
-                kind,
-                tier,
-                ..
-            } = &kind
-            {
-                bytes_by_tier.add(*tier, *kind, *bytes);
-                // A sender removed since (its last packets drain after the
-                // removal) is skipped: the page weights live origins only.
-                if *kind == PacketKind::Own
-                    && let Some(pos) = position_of(nodes, *src)
-                {
-                    nodes[pos].own_data_bytes += u64::from(*bytes);
+            match &kind {
+                EventKind::PacketSent {
+                    seq,
+                    src,
+                    dst,
+                    bytes,
+                    role,
+                    tier,
+                    ..
+                } => {
+                    bytes_by_tier.add(*tier, role.kind(), *bytes);
+                    count_own(nodes, *src, role.kind(), *bytes);
+                    capture.settle(*seq, virtual_ms, None);
+                    if let Some(pos) = position_of(nodes, *dst) {
+                        touched.insert(pos);
+                    }
                 }
-            }
-            if let EventKind::PacketSent { dst, .. } = &kind
-                && let Some(pos) = position_of(nodes, *dst)
-            {
-                touched.insert(pos);
+                EventKind::PacketDropped {
+                    seq,
+                    src,
+                    dst,
+                    bytes,
+                    role,
+                    tier,
+                    ..
+                } => {
+                    bytes_by_tier.add(*tier, role.kind(), *bytes);
+                    count_own(nodes, *src, role.kind(), *bytes);
+                    // A cut link is exact from the receiver's blocked set; a
+                    // link that drops packets loses them; a link that drops
+                    // none can only have been full.
+                    let link = position_of(nodes, *src).zip(position_of(nodes, *dst));
+                    let on = |set: fn(&NodeHandle) -> NodeSet| {
+                        link.is_some_and(|(s, d)| set(&nodes[d]).contains(s))
+                    };
+                    let by = if on(|n| n.blocked_from) {
+                        LostBy::Blocked
+                    } else if on(|n| n.lossy_from) {
+                        LostBy::Loss
+                    } else {
+                        LostBy::QueueFull
+                    };
+                    capture.settle(*seq, virtual_ms, Some(by));
+                }
+                _ => {}
             }
             Event { virtual_ms, kind }
         }));
@@ -1223,6 +1277,15 @@ impl EngineState {
         let before = std::mem::replace(&mut node.gateways, gateways);
         for zone in 0..self.zone_names.len() {
             if before[zone] != gateways[zone] {
+                self.capture.borrow_mut().mark(
+                    virtual_ms,
+                    MarkerKind::GatewayChanged {
+                        origin: node.id,
+                        zone: zone as u8,
+                        from: before[zone],
+                        to: gateways[zone],
+                    },
+                );
                 self.outbox.push(Event {
                     virtual_ms,
                     kind: EventKind::GatewayChanged {
@@ -1438,6 +1501,7 @@ impl EngineState {
                 rounds_heartbeat: counters.rounds_heartbeat,
                 gateway_failovers: counters.gateway_failovers,
                 gap_reports_sent: counters.gap_reports_sent,
+                gaps_abandoned: counters.gaps_abandoned,
                 rto_rewinds_own: counters.rto_rewinds_own,
                 rto_rewinds_relay: counters.rto_rewinds_relay,
                 sweeps_served: counters.sweeps_served,
@@ -1666,6 +1730,17 @@ fn blocks(policy: LinkPolicyKind) -> bool {
 
 /// Position in `nodes` of the live node with stable id `id`, or `None` if no
 /// live node has it; `nodes` is sorted by id (see `NodeHandle`).
+/// Count an `Own` packet's bytes into its sender's `own_data_bytes`. A sender
+/// removed since (its last packets drain after the removal) is skipped: the
+/// page weights live origins only.
+fn count_own(nodes: &mut [NodeHandle], src: u32, kind: PacketKind, bytes: u32) {
+    if kind == PacketKind::Own
+        && let Some(pos) = position_of(nodes, src)
+    {
+        nodes[pos].own_data_bytes += u64::from(bytes);
+    }
+}
+
 fn position_of(nodes: &[NodeHandle], id: u32) -> Option<usize> {
     nodes.binary_search_by_key(&id, |h| h.id).ok()
 }

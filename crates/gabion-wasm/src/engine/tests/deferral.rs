@@ -14,10 +14,10 @@ fn packets(events: &[Event], kind: PacketKind) -> Vec<(u32, u32, Tier, u64)> {
             EventKind::PacketSent {
                 src,
                 dst,
-                kind: k,
+                role,
                 tier,
                 ..
-            } if k == kind => Some((src, dst, tier, e.virtual_ms)),
+            } if role.kind() == kind => Some((src, dst, tier, e.virtual_ms)),
             _ => None,
         })
         .collect()

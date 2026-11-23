@@ -1,5 +1,5 @@
 import { expect, test as base, type Page } from '@playwright/test';
-import { CARRIES_CELLS, type AnswerState, type ClusterState, type EventBatch } from '../src/lib/sim/types';
+import { type AnswerState, type ClusterState, type EventBatch } from '../src/lib/sim/types';
 import { WATCHED_KEY } from '../src/lib/presets';
 import { CONTROL } from '../src/lib/stage/layout';
 import { breakGateway, pauseIfPlaying, send, sendButton, setRange, setSpeed, step, stepUntil, virtualMs } from './drive';
@@ -515,7 +515,7 @@ test('a Send that flushes at once draws its packets as it sends', async ({ page 
 
   type Route = { src: number; dst: number; data: boolean };
   type Log = { sent: Route[]; drawn: Route[]; send: Route[] };
-  await page.evaluate(({ carries, control }) => {
+  await page.evaluate(({ control }) => {
     const log = window as unknown as Log;
     log.sent = [];
     log.drawn = [];
@@ -523,7 +523,9 @@ test('a Send that flushes at once draws its packets as it sends', async ({ page 
     const sim = window.sim!;
     const routesOf = (batch: EventBatch): Route[] =>
       batch.events.flatMap(({ kind }) =>
-        kind.type === 'PacketSent' || kind.type === 'PacketDropped' ? [{ src: kind.src, dst: kind.dst, data: carries[kind.kind] }] : [],
+        kind.type === 'PacketSent' || kind.type === 'PacketDropped'
+          ? [{ src: kind.src, dst: kind.dst, data: kind.cells > 0 && ['OwnData', 'RelayData', 'SweepPage'].includes(kind.role) }]
+          : [],
       );
     const record = (batch: EventBatch): EventBatch => {
       log.sent.push(...routesOf(batch));
@@ -546,7 +548,7 @@ test('a Send that flushes at once draws its packets as it sends', async ({ page 
       log.drawn.push({ src, dst, data: (flags & control) === 0 });
       push(path, start, src, dst, flags);
     };
-  }, { carries: CARRIES_CELLS, control: CONTROL });
+  }, { control: CONTROL });
 
   await sendButton(page).click();
   await expect

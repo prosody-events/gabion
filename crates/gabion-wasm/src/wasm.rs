@@ -29,14 +29,18 @@ use gabion::crdt::KeyHash;
 use tokio::sync::{mpsc, oneshot};
 use wasm_bindgen::prelude::*;
 
+use crate::capture::{Capture, Filter, SharedCapture};
 use crate::config::{MAX_ZONES, SimConfig};
 use crate::engine::{Command, EngineError, LinkPolicyKind, StepUntil, run_engine};
 
 /// A live simulation the page drives. Holds the sender end of the engine's
-/// command channel; every method round-trips one command and awaits its reply.
+/// command channel, whose methods round-trip one command and await its reply,
+/// and the message capture, whose methods are synchronous: they touch only
+/// the capture, never the engine, so a read can never deliver a held wave.
 #[wasm_bindgen]
 pub struct Sim {
     cmd_tx: mpsc::Sender<Command>,
+    capture: SharedCapture,
 }
 
 #[wasm_bindgen]
@@ -52,15 +56,55 @@ impl Sim {
             .validate()
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let capture = Capture::shared();
+        let engine_capture = capture.clone();
         // The engine drives virtual time itself through `ManualClock` (see the
         // module-level R2 note), so it needs no tokio time driver —
         // `spawn_local` is all the executor it requires. The node smoke
         // test confirms the spawned task runs the full submit → gossip
         // → snapshot loop on the wasm microtask queue.
         wasm_bindgen_futures::spawn_local(async move {
-            let _ = run_engine(valid, cmd_rx).await;
+            let _ = run_engine(valid, engine_capture, cmd_rx).await;
         });
-        Ok(Sim { cmd_tx })
+        Ok(Sim { cmd_tx, capture })
+    }
+
+    /// Start the run's message log here: the next message is number 1, and
+    /// nothing before it is listed.
+    pub fn mark_run_start(&self) {
+        self.capture.borrow_mut().mark_run_start();
+    }
+
+    /// Set the Messages view's filter, a [`Filter`] as a plain JS object, and
+    /// rebuild the view. An invalid filter (a pair of one node) throws.
+    pub fn set_message_filter(&self, filter: JsValue) -> Result<(), JsValue> {
+        let filter: Filter = serde_wasm_bindgen::from_value(filter)?;
+        self.capture.borrow_mut().set_filter(filter);
+        Ok(())
+    }
+
+    /// Write the view's head and its rows from ordinal `first`, at most
+    /// `count` and at most 64, into the rows buffer; returns the rows written.
+    pub fn message_rows(&self, first: f64, count: u32) -> u32 {
+        self.capture
+            .borrow_mut()
+            .write_rows(first.max(0.0) as u64, count as usize) as u32
+    }
+
+    /// The rows buffer's address in the module's memory: read once.
+    pub fn message_rows_ptr(&self) -> u32 {
+        self.capture.borrow().rows().as_ptr() as u32
+    }
+
+    /// Select message `seq`, or clear the selection, and return its detail,
+    /// decoded now: a copy the page owns. `undefined` once it is no longer
+    /// kept.
+    pub fn select_message(&self, seq: Option<f64>) -> Result<JsValue, JsValue> {
+        let detail = self
+            .capture
+            .borrow_mut()
+            .select(seq.map(|seq| seq.max(0.0) as u64));
+        to_js(&detail)
     }
 
     /// A burst of `requests` one-hit requests for `key_id` at `node`, at the

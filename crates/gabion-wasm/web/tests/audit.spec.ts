@@ -1,7 +1,7 @@
 import { inflateSync } from 'node:zlib';
 import { expect, test, type Locator, type Page } from '@playwright/test';
 import { ChartHistory, SLOTS, slotIndex } from '../src/lib/charts/history';
-import { CARRIES_CELLS, missingFor, type ClusterState, type EventBatch, type PacketKind, type StepUntil, type Tier } from '../src/lib/sim/types';
+import { CARRIES_CELLS, KIND, missingFor, type ClusterState, type EventBatch, type MessageRole, type PacketKind, type StepUntil, type Tier } from '../src/lib/sim/types';
 import {
   ARC_GAP,
   ARC_WIDTH,
@@ -12,9 +12,11 @@ import {
   LABEL_GAP,
   PORT_GAP,
   RELAY,
+  RING,
   R_MAX,
   SELECTION_GAP,
   SELECTION_WIDTH,
+  SQUARE,
   STRATA_MIN_INNER,
   beamPath,
   pointOn,
@@ -401,7 +403,8 @@ async function checkData(page: Page, name: string, series: ClusterState[]): Prom
     const counters = {
       failovers: state.gateway_failovers,
       'gap-reports': state.gap_reports_sent,
-      retransmissions: state.rto_rewinds_own + state.rto_rewinds_relay,
+      repeats: state.rto_rewinds_own + state.rto_rewinds_relay,
+      'gaps-abandoned': state.gaps_abandoned,
       sweeps: state.sweeps_served,
     };
     for (const [key, want] of Object.entries(counters)) {
@@ -1281,11 +1284,25 @@ test("every drawn beam carries its packet's kind, tier and fate", async ({ page 
   await open(page);
   await loadPreset(page, 'Sandbox');
 
-  // What each packet should wear, derived here from the packet kinds rather
-  // than read from the renderer's `kindFlags`: an acknowledgement or a sweep
-  // request is a dot, a relay is marked so its gateway's beams stay the
-  // selected origin's.
-  const KIND: Record<PacketKind, number> = { Ack: CONTROL, SweepRequest: CONTROL, Own: 0, Relay: RELAY, Sweep: 0 };
+  // What each packet should wear, derived here from the roles rather than
+  // read from the renderer's `markFlags`: data with cells is an arrowhead; a
+  // probe or a sweep request asks (a ring), a gap report is a square, and
+  // the rest answer (a dot); a relay is marked so its gateway's beams stay
+  // the selected origin's.
+  const ROLE: Record<MessageRole, number> = {
+    OwnData: 0,
+    RelayData: RELAY,
+    SweepPage: 0,
+    OwnSkip: CONTROL,
+    RelaySkip: CONTROL | RELAY,
+    GapReport: CONTROL | SQUARE,
+    Probe: CONTROL | RING,
+    SweepRequest: CONTROL | RING,
+    ProbeAnswer: CONTROL,
+    Ack: CONTROL,
+  };
+  const wears = (p: Packet): number => (p.role === 'SweepPage' && p.cells === 0 ? CONTROL : ROLE[p.role]);
+  const KINDS = new Set(Object.values(KIND));
   type Beam = { src: number; dst: number; flags: number };
   type Log = { beams: Beam[] };
 
@@ -1325,11 +1342,11 @@ test("every drawn beam carries its packet's kind, tier and fate", async ({ page 
       route({
         src: p.src,
         dst: p.dst,
-        flags: KIND[p.kind] | (p.tier === 'CrossZone' ? CROSS : 0) | (p.dropped ? DROPPED : 0),
+        flags: wears(p) | (p.tier === 'CrossZone' ? CROSS : 0) | (p.dropped ? DROPPED : 0),
       }),
     );
     expect(beams.map(route).sort(), 'the beams drawn are the packets sent, one each').toEqual(sent.sort());
-    return packets.map((p) => p.kind);
+    return packets.map((p) => KIND[p.role]);
   };
 
   // A Send's waves are own streams, relays and acknowledgements. Once every
@@ -1350,9 +1367,9 @@ test("every drawn beam carries its packet's kind, tier and fate", async ({ page 
   const joined = await take();
   const name = ({ src, dst }: { src: number; dst: number }): string => `node ${src} to node ${dst}`;
   expect(joined.beams.map(name).sort(), "the join's beams are its packets, one each").toEqual(joined.packets.map(name).sort());
-  for (const p of joined.packets) seen.add(p.kind);
+  for (const p of joined.packets) seen.add(KIND[p.role]);
   await send(page, 0, true);
-  for (let i = 0; i < 40 && seen.size < Object.keys(KIND).length; i++) {
+  for (let i = 0; i < 40 && seen.size < KINDS.size; i++) {
     for (const kind of await checkStep()) seen.add(kind);
   }
   expect([...seen].sort(), 'every packet kind was sent and drawn').toEqual([
@@ -1458,7 +1475,7 @@ test('a paused stage lays its labels out once, not per snapshot', async ({ page 
 // -- How every preset opens, goes quiet and fails over ---------------------------
 
 /** A packet the engine reported sent or lost, at its instant. */
-type Packet = { t: number; src: number; dst: number; kind: PacketKind; tier: Tier; dropped: boolean };
+type Packet = { t: number; src: number; dst: number; role: MessageRole; cells: number; tier: Tier; dropped: boolean };
 
 /** Log every packet in the batches of the page's engine, its steps and its
  *  submits alike, from now on. Installed once per engine. */
@@ -1472,8 +1489,8 @@ async function logPackets(page: Page): Promise<void> {
     const record = (batch: EventBatch): EventBatch => {
       for (const { virtual_ms: t, kind } of batch.events) {
         if (kind.type === 'PacketSent' || kind.type === 'PacketDropped') {
-          const { src, dst, tier } = kind;
-          w.packets.push({ t, src, dst, kind: kind.kind, tier, dropped: kind.type === 'PacketDropped' });
+          const { src, dst, tier, role, cells } = kind;
+          w.packets.push({ t, src, dst, role, cells, tier, dropped: kind.type === 'PacketDropped' });
         }
       }
       return batch;
@@ -1529,13 +1546,13 @@ test('every preset opens warmed and settled', async ({ page }, info) => {
       page,
       async () => {
         log.push(...(await takePackets(page)));
-        return seeded.every((id) => log.some((p) => p.src === id && p.kind === 'Own'));
+        return seeded.every((id) => log.some((p) => p.src === id && KIND[p.role] === 'Own'));
       },
       4,
       `${name}: every seeded node sent its hits`,
     );
     for (const id of seeded) {
-      const own = log.filter((p) => p.src === id && p.kind === 'Own');
+      const own = log.filter((p) => p.src === id && KIND[p.role] === 'Own');
       const across = own.filter((p) => p.t === own[0].t && p.tier === 'CrossZone').length;
       expect(across, `${name}: node ${id}'s first wave crossed a zone ${across} times`).toBe(load.zones.length - 1);
     }
@@ -1562,7 +1579,7 @@ test('runs go quiet after agreement', async ({ page }, info) => {
   await takePackets(page);
   for (let i = 0; i < 5; i++) await period(page);
   const after = await takePackets(page);
-  expect(after.filter((p) => CARRIES_CELLS[p.kind]), 'Propagation: data after agreement').toEqual([]);
+  expect(after.filter((p) => CARRIES_CELLS[p.role]), 'Propagation: data after agreement').toEqual([]);
   expect(
     after.filter((p) => p.t >= at + PERIOD_MS && p.t < at + 2 * PERIOD_MS),
     'Propagation: a packet in the second period after agreement',
@@ -1581,7 +1598,7 @@ test('runs go quiet after agreement', async ({ page }, info) => {
   await stepUntil(page, () => agreed(page), 16, 'Sandbox agreed');
   await takePackets(page);
   for (let i = 0; i < 5; i++) await period(page);
-  expect((await takePackets(page)).filter((p) => CARRIES_CELLS[p.kind]), 'Sandbox: data after agreement').toEqual([]);
+  expect((await takePackets(page)).filter((p) => CARRIES_CELLS[p.role]), 'Sandbox: data after agreement').toEqual([]);
 
   // Packet loss: its resends are not asserted away, but once agreed it stays so.
   await loadPreset(page, 'Packet loss');

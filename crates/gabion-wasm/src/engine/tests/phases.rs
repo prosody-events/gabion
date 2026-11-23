@@ -196,8 +196,8 @@ fn sent_at(events: &[Event], src: Option<u32>, kind: PacketKind, at: u64) -> usi
         .iter()
         .filter(|e| {
             e.virtual_ms == at
-                && matches!(e.kind, EventKind::PacketSent { src: s, kind: k, .. }
-                    if k == kind && src.is_none_or(|src| src == s))
+                && matches!(e.kind, EventKind::PacketSent { src: s, role, .. }
+                    if role.kind() == kind && src.is_none_or(|src| src == s))
         })
         .count()
 }

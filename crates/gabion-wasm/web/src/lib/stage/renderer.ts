@@ -38,9 +38,23 @@
 import { gsap } from 'gsap';
 import { Application, Container, Graphics, Text, TextStyle, type Ticker } from 'pixi.js';
 import { zoneLabel } from '../format';
-import { barrier, brim as brimLine, chord, dashedRing, discHatch, hatch, port as portGlyph, stopBar } from '../glyphs';
+import {
+  RING_R,
+  RING_WIDTH,
+  SQUARE_HALF,
+  barrier,
+  brim as brimLine,
+  chord,
+  dashedRing,
+  discHatch,
+  hatch,
+  messageRing,
+  messageSquare,
+  port as portGlyph,
+  stopBar,
+} from '../glyphs';
 import { VESSEL_SCALE } from '../limit';
-import { CARRIES_CELLS, type Admission, type ClusterState, type Lag, type PacketKind, type SimEvent } from '../sim/types';
+import type { Admission, ClusterState, Lag, SimEvent } from '../sim/types';
 import { BEAM_ALPHA, FADED_ALPHA, type Theme } from '../theme';
 import {
   ARC_GAP,
@@ -59,14 +73,17 @@ import {
   PORT_GAP,
   PREVIEW_DASH,
   RELAY,
+  RING,
   RING_REACH,
   SELECTION_GAP,
   SELECTION_REACH,
   SELECTION_WIDTH,
+  SQUARE,
   STRATA_MIN_INNER,
   STRATUM_GAP,
   STRATUM_MIN,
   beamPath,
+  markFlags,
   pointOn,
   portAt,
   reachT,
@@ -146,14 +163,6 @@ const EXIT_MS = 340;
 const GLIDE_MS = 520;
 const ENTER_SCALE = 0.25;
 
-/** Each packet kind's flags: a kind that carries no cells is a dot, and a
- *  relay is the selected node's own when its gateway sends it. Read from
- *  `CARRIES_CELLS`, the mirror of `PacketKind::carries_cells`, and exhaustive
- *  through `CARRIES_CELLS`, so a new kind is a type error until it is
- *  classed. */
-const kindFlags = (kind: PacketKind): number =>
-  (CARRIES_CELLS[kind] ? 0 : CONTROL) | (kind === 'Relay' ? RELAY : 0);
-
 /** The kinds of mark the stage draws now, as bits: the key lists exactly
  *  these, in this order. */
 export const MARK = {
@@ -169,6 +178,8 @@ export const MARK = {
   ZONE_CUT: 512,
   LOST: 1024,
   DOT: 2048,
+  ASK: 4096,
+  GAP: 8192,
 } as const;
 
 /** A ring's colour role: caught up (neutral, closed) or behind (amber arc). */
@@ -407,6 +418,7 @@ export class StageRenderer {
   #crossStroke: Stroke = { width: CROSS_WIDTH, color: 0, alpha: 1 };
   #lostStroke: Stroke = { width: CROSS_WIDTH, color: 0, alpha: 1 };
   #controlStroke: Stroke = { width: CONTROL_WIDTH, color: 0, alpha: 1 };
+  #ringStroke: Stroke = { width: RING_WIDTH, color: 0, alpha: 1 };
   #mutedFill: Fill = { color: 0, alpha: 1 };
   #fgFill: Fill = { color: 0, alpha: 1 };
   #ringCaughtUp: Stroke = { width: ARC_WIDTH, color: 0, alpha: 1 };
@@ -783,7 +795,7 @@ export class StageRenderer {
       // `PacketDelivered` is the receiver-side echo of a `PacketSent` already
       // drawn at the sender, so it would double the lines: skip it.
       if (kind.type !== 'PacketSent' && kind.type !== 'PacketDropped') continue;
-      let flags = kindFlags(kind.kind) | (kind.tier === 'CrossZone' ? CROSS : 0);
+      let flags = markFlags(kind.role, kind.cells) | (kind.tier === 'CrossZone' ? CROSS : 0);
       if (kind.type === 'PacketDropped') flags |= DROPPED;
       this.#beam(kind.src, kind.dst, flags, events[i].virtual_ms);
     }
@@ -838,6 +850,7 @@ export class StageRenderer {
     this.#crossStroke = { width: CROSS_WIDTH, color: fg, alpha: 1, cap: 'round' };
     this.#lostStroke = { width: CROSS_WIDTH, color: muted, alpha: 1, cap: 'round' };
     this.#controlStroke = { width: CONTROL_WIDTH, color: muted, alpha: 1, cap: 'round' };
+    this.#ringStroke = { width: RING_WIDTH, color: muted, alpha: 1 };
     this.#mutedFill = { color: muted, alpha: 1 };
     this.#fgFill = { color: fg, alpha: 1 };
     this.#ringCaughtUp = { width: ARC_WIDTH, color: axis, alpha: 1 };
@@ -1405,7 +1418,7 @@ export class StageRenderer {
     pool.push(this.#path, sent, src, dst, flags);
     this.#drawLine(pool.len - 1);
     this.#dirty = true;
-    const mark = (flags & DROPPED) !== 0 ? MARK.LOST : (flags & CONTROL) !== 0 ? MARK.DOT : 0;
+    const mark = (flags & DROPPED) !== 0 ? MARK.LOST : (flags & CONTROL) === 0 ? 0 : (flags & RING) !== 0 ? MARK.ASK : (flags & SQUARE) !== 0 ? MARK.GAP : MARK.DOT;
     if ((this.#beamMarks | mark) !== this.#beamMarks) {
       this.#beamMarks |= mark;
       this.#publishMarks();
@@ -1443,10 +1456,21 @@ export class StageRenderer {
     } else {
       const reach = (this.#nodes.get(pool.dst[i])?.radius ?? 0) + RING_REACH + HEAD_GAP;
       if (control) {
-        this.#route(g, reachT(path, reach + 2 * DOT_R, at));
+        // The mark's reach along the route: a dot's radius, a ring's outer
+        // radius, a square's half side.
+        const half = (flags & RING) !== 0 ? RING_R : (flags & SQUARE) !== 0 ? SQUARE_HALF : DOT_R;
+        this.#route(g, reachT(path, reach + 2 * half, at));
         g.stroke(this.#controlStroke);
-        pointOn(path, reachT(path, reach + DOT_R, at), at);
-        g.circle(at.x, at.y, DOT_R).fill(this.#mutedFill);
+        pointOn(path, reachT(path, reach + half, at), at);
+        if ((flags & RING) !== 0) {
+          messageRing(g, at.x, at.y);
+          g.stroke(this.#ringStroke);
+        } else if ((flags & SQUARE) !== 0) {
+          messageSquare(g, at.x, at.y);
+          g.fill(this.#mutedFill);
+        } else {
+          g.circle(at.x, at.y, DOT_R).fill(this.#mutedFill);
+        }
       } else {
         const len = cross ? ARROW_LEN : IN_ARROW_LEN;
         this.#route(g, reachT(path, reach + len, at));

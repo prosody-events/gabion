@@ -1256,7 +1256,7 @@ test('the pane is one column that never swaps (A5)', async ({ page }, info) => {
   await open(page);
   const order = (): Promise<string[]> =>
     page.locator('.rail-body').evaluate((body) =>
-      [...body.querySelectorAll(':scope > .pane-title, .charts h3, .inspector .section-head, :scope > .pane-foot')].map((el) => (el.textContent ?? '').replace(/\s+/g, ' ').trim()),
+      [...body.querySelectorAll('.pane-head > .pane-title, .charts h3, .inspector .section-head, .pane-foot')].map((el) => (el.textContent ?? '').replace(/\s+/g, ' ').trim()),
     );
   const before = await order();
   expect(before[0]).toMatch(/^node 0 selected · zone a$/);

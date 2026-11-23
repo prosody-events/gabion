@@ -10,7 +10,7 @@
 //! `crate::hex`).
 
 use gabion::gossip::{AnswerState, Role};
-use gabion::wire::{CellPayload, Payload};
+use gabion::wire::{CellPayload, Header, Payload};
 use serde::Serialize;
 use std::num::NonZeroU64;
 
@@ -40,28 +40,37 @@ pub enum EventKind {
     Tick { node: u32 },
     /// A threshold round ran on `node`.
     ThresholdFire { node: u32 },
-    /// `src` enqueued a packet of `kind` bound for `dst`, and the router
-    /// accepted it: it lands at the end of its sub-step, which may be the
-    /// next engine call. `tier` is by placement, never by the zone either
+    /// `src` enqueued message `seq` bound for `dst`, and the router accepted
+    /// it: it lands at the end of its sub-step, which may be the next engine
+    /// call. Its `role`, `riders` and `repeat` are read once from its header
+    /// ([`MessageRole::of`]); `tier` is by placement, never by the zone either
     /// node reports.
     PacketSent {
+        seq: Seq,
         src: u32,
         dst: u32,
         bytes: u32,
-        kind: PacketKind,
+        role: MessageRole,
+        riders: Riders,
+        repeat: Option<ListedRepeat>,
+        cells: u16,
         tier: Tier,
     },
     /// `dst` consumed a packet from `src`.
     PacketDelivered { src: u32, dst: u32, bytes: u32 },
-    /// `src`'s packet to `dst` was lost on the link, refused by a full router
-    /// queue, or `dst` had no receiver. Distinct from
+    /// `src`'s message `seq` to `dst` was lost on the link, refused by a full
+    /// router queue, or `dst` had no receiver. Distinct from
     /// [`EventKind::PacketSent`]: a dropped packet never produces a matching
-    /// delivery. `kind` and `tier` are as for [`EventKind::PacketSent`].
+    /// delivery. The other fields are as for [`EventKind::PacketSent`].
     PacketDropped {
+        seq: Seq,
         src: u32,
         dst: u32,
         bytes: u32,
-        kind: PacketKind,
+        role: MessageRole,
+        riders: Riders,
+        repeat: Option<ListedRepeat>,
+        cells: u16,
         tier: Tier,
     },
     /// `origin`'s gateway into remote zone `zone` changed, as its runtime
@@ -103,7 +112,7 @@ pub enum EventKind {
     },
 }
 
-/// A packet's kind, read from its header: the kinds of the wire format.
+/// A packet's kind on the wire, derived from its [`MessageRole`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum PacketKind {
     Ack,
@@ -134,6 +143,239 @@ impl From<Payload> for PacketKind {
             Payload::Cells(CellPayload::Sweep) => Self::Sweep,
             Payload::SweepRequest => Self::SweepRequest,
         }
+    }
+}
+
+/// A message's number in the run: 1 for the first captured after the run's
+/// start, then one more per message. Crosses as a JS number, exact to 2⁵³.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct Seq(pub u64);
+
+/// The one role a message is listed and drawn as. Precedence, first match
+/// wins: data roles by payload; then, on an ack-kind packet, gap report >
+/// probe > probe answer > ack. Cannot relay is never a role: it is a
+/// [`Riders::CANNOT_RELAY`] rider.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum MessageRole {
+    /// `Own` with cells.
+    OwnData,
+    /// `Relay` with cells.
+    RelayData,
+    /// `Sweep`, with or without cells.
+    SweepPage,
+    /// `Own` with a range and no cells: changes that expired before they
+    /// were sent.
+    OwnSkip,
+    /// `Relay` with a range and no cells.
+    RelaySkip,
+    /// An ack-kind packet with a gap flag.
+    GapReport,
+    /// An ack-kind packet with `PROBE`; a greeting is the same bytes.
+    Probe,
+    SweepRequest,
+    /// An ack-kind packet with `PROBE_REPLY`.
+    ProbeAnswer,
+    /// An ack-kind packet with no other listed signal.
+    Ack,
+}
+
+/// Every other signal a message carries that its receiver acts on, one bit
+/// each. The role's own signal is never a rider.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct Riders(u8);
+
+impl Riders {
+    /// `CANNOT_RELAY` on a message that crosses zones, the only place a
+    /// receiver acts on it.
+    pub const CANNOT_RELAY: Self = Self(8);
+    /// `RELAY_INTO_ZONE`: the gateway passes these changes on into its zone.
+    pub const FOR_ZONE: Self = Self(16);
+    /// A gap flag on a message that is not a gap report.
+    pub const GAP_REPORT: Self = Self(1);
+    pub const NONE: Self = Self(0);
+    /// `PROBE` on a message that is not a probe: a greeting riding data to a
+    /// peer not heard yet, or riding a gap report.
+    pub const PROBE: Self = Self(2);
+    /// `PROBE_REPLY` on a message that is not a probe answer.
+    pub const PROBE_ANSWER: Self = Self(4);
+
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0 && other.0 != 0
+    }
+
+    fn with(self, other: Self, on: bool) -> Self {
+        if on { Self(self.0 | other.0) } else { self }
+    }
+
+    /// The bits, as the page and the capture store them.
+    pub fn bits(self) -> u8 {
+        self.0
+    }
+}
+
+/// Why a data message repeats what its sender already sent, where the list
+/// can say so from the capture alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum ListedRepeat {
+    /// `PROBE` on data to a peer the sender has heard: its retransmission
+    /// timer fell due.
+    AfterTimeout,
+    /// The first data on its link and stream after a delivered gap report
+    /// whose mark its range starts at or below.
+    AfterGapReport,
+}
+
+impl MessageRole {
+    /// The role, riders and header-derived repeat of a message of `cells`
+    /// cells with `header`, sent across `tier`. Total over every header the
+    /// decoder admits.
+    pub fn of(header: &Header, cells: u16, tier: Tier) -> (Self, Riders, Option<ListedRepeat>) {
+        let acks = header.acks;
+        let gap = acks.gap_own || acks.gap_relay;
+        let (role, probe, for_zone) = match header.payload {
+            Payload::Cells(CellPayload::Own {
+                relay_into_zone,
+                probe,
+                ..
+            }) => (
+                if cells > 0 {
+                    Self::OwnData
+                } else {
+                    Self::OwnSkip
+                },
+                probe,
+                relay_into_zone,
+            ),
+            Payload::Cells(CellPayload::Relay { probe, .. }) => (
+                if cells > 0 {
+                    Self::RelayData
+                } else {
+                    Self::RelaySkip
+                },
+                probe,
+                false,
+            ),
+            Payload::Cells(CellPayload::Sweep) => (Self::SweepPage, false, false),
+            Payload::SweepRequest => (Self::SweepRequest, false, false),
+            Payload::Ack { probe } => (
+                if gap {
+                    Self::GapReport
+                } else if probe {
+                    Self::Probe
+                } else if acks.probe_reply {
+                    Self::ProbeAnswer
+                } else {
+                    Self::Ack
+                },
+                probe,
+                false,
+            ),
+        };
+        // On data, PROBE to a peer already heard is a timeout repeat; to one
+        // not heard yet it is a greeting riding the data.
+        let data = matches!(role.kind(), PacketKind::Own | PacketKind::Relay);
+        let repeat = (data && probe && acks.incarnation != 0).then_some(ListedRepeat::AfterTimeout);
+        let riders = Riders::NONE
+            .with(Riders::GAP_REPORT, gap && role != Self::GapReport)
+            .with(
+                Riders::PROBE,
+                probe && role != Self::Probe && repeat.is_none(),
+            )
+            .with(
+                Riders::PROBE_ANSWER,
+                acks.probe_reply && role != Self::ProbeAnswer,
+            )
+            .with(
+                Riders::CANNOT_RELAY,
+                acks.cannot_relay && tier == Tier::CrossZone,
+            )
+            .with(Riders::FOR_ZONE, for_zone);
+        (role, riders, repeat)
+    }
+
+    /// The wire kind this role is sent as.
+    pub fn kind(self) -> PacketKind {
+        match self {
+            Self::OwnData | Self::OwnSkip => PacketKind::Own,
+            Self::RelayData | Self::RelaySkip => PacketKind::Relay,
+            Self::SweepPage => PacketKind::Sweep,
+            Self::SweepRequest => PacketKind::SweepRequest,
+            Self::GapReport | Self::Probe | Self::ProbeAnswer | Self::Ack => PacketKind::Ack,
+        }
+    }
+}
+
+/// One row of the page's By type table, the type filter: not every row is a
+/// role ("repeat" is the repeat column, "skip" two roles, "cannot relay" a
+/// rider), so a message with two signals matches two rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+pub enum MessageType {
+    OwnData,
+    RelayData,
+    Repeat,
+    Skip,
+    Ack,
+    GapReport,
+    Probe,
+    ProbeAnswer,
+    CannotRelay,
+    SweepRequest,
+    SweepPage,
+}
+
+impl MessageType {
+    /// Every type, in the table's fixed order.
+    pub const ALL: [Self; 11] = [
+        Self::OwnData,
+        Self::RelayData,
+        Self::Repeat,
+        Self::Skip,
+        Self::Ack,
+        Self::GapReport,
+        Self::Probe,
+        Self::ProbeAnswer,
+        Self::CannotRelay,
+        Self::SweepRequest,
+        Self::SweepPage,
+    ];
+
+    /// Whether a message of `role` with `riders` and `repeat` is of this type.
+    pub fn matches(self, role: MessageRole, riders: Riders, repeat: Option<ListedRepeat>) -> bool {
+        match self {
+            Self::OwnData => role == MessageRole::OwnData,
+            Self::RelayData => role == MessageRole::RelayData,
+            Self::Repeat => repeat.is_some(),
+            Self::Skip => matches!(role, MessageRole::OwnSkip | MessageRole::RelaySkip),
+            Self::Ack => role == MessageRole::Ack,
+            Self::GapReport => {
+                role == MessageRole::GapReport || riders.contains(Riders::GAP_REPORT)
+            }
+            Self::Probe => role == MessageRole::Probe || riders.contains(Riders::PROBE),
+            Self::ProbeAnswer => {
+                role == MessageRole::ProbeAnswer || riders.contains(Riders::PROBE_ANSWER)
+            }
+            Self::CannotRelay => riders.contains(Riders::CANNOT_RELAY),
+            Self::SweepRequest => role == MessageRole::SweepRequest,
+            Self::SweepPage => role == MessageRole::SweepPage,
+        }
+    }
+}
+
+/// A set of [`MessageType`]s, one bit each in `ALL`'s order; empty means
+/// every type.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TypeSet(pub u16);
+
+impl TypeSet {
+    /// Whether a message passes this filter.
+    pub fn admits(self, role: MessageRole, riders: Riders, repeat: Option<ListedRepeat>) -> bool {
+        self.0 == 0
+            || MessageType::ALL
+                .iter()
+                .enumerate()
+                .any(|(i, t)| self.0 & (1 << i) != 0 && t.matches(role, riders, repeat))
     }
 }
 
@@ -360,6 +602,8 @@ pub struct NodeState {
     pub gateway_failovers: u64,
     /// Gap reports sent: a peer's stream skipped positions.
     pub gap_reports_sent: u64,
+    /// Gaps given up after their reports went unanswered.
+    pub gaps_abandoned: u64,
     /// Own-stream timeouts that resent from the last ack.
     pub rto_rewinds_own: u64,
     /// The same for the relay stream.

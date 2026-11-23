@@ -129,7 +129,11 @@ fn measure(limit: u64, prelude: &[(u32, u64)], requests: u64) -> (u64, u64, Burs
     LocalSet::new().block_on(&rt, async move {
         let (tx, rx) = mpsc::channel(16);
         let valid = config.validate().expect("the config validates");
-        let engine = tokio::task::spawn_local(run_engine(valid, rx));
+        let engine = tokio::task::spawn_local(run_engine(
+            valid,
+            gabion_wasm::capture::Capture::shared(),
+            rx,
+        ));
         step(&tx, 1_000).await;
         for &(node, n) in prelude {
             submit(&tx, node, n, false).await;

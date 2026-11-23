@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { barrier, brim, chord, dashedRing, discHatch, port, SvgPen } from '../glyphs';
+  import { RING_WIDTH, barrier, brim, chord, dashedRing, discHatch, messageRing, messageSquare, port, SvgPen } from '../glyphs';
   import { PREVIEW_DASH } from '../stage/layout';
 
   // A node mark as the stage draws it, for the DOM: the key, the node table,
@@ -19,7 +19,9 @@
     | 'zone-cut'
     | 'rejected'
     | 'lost'
-    | 'ack';
+    | 'ack'
+    | 'ask'
+    | 'gap';
 
   let { kind }: { kind: Glyph } = $props();
 
@@ -43,6 +45,8 @@
   const silencedEdge = path((p) => dashedRing(p, R, [PREVIEW_DASH[0] / 2, PREVIEW_DASH[1] / 2]));
   const wall = path((p) => barrier(p, R + 2.5, Math.PI, 0.7));
   const cutZone = path((p) => dashedRing(p, 7, [3, 2]));
+  const ask = path((p) => messageRing(p, 0, 0));
+  const gap = path((p) => messageSquare(p, 0, 0));
 </script>
 
 <svg class="glyph" width="16" height="16" viewBox="-8 -8 16 16" aria-hidden="true" data-glyph={kind}>
@@ -86,6 +90,10 @@
     <path class="muted-stroke" d="M-7 0L2 0M2 -5L2 5" />
   {:else if kind === 'ack'}
     <circle class="muted" r="2" />
+  {:else if kind === 'ask'}
+    <path class="muted-stroke" style:stroke-width={RING_WIDTH} d={ask} />
+  {:else if kind === 'gap'}
+    <path class="muted" d={gap} />
   {/if}
 </svg>
 

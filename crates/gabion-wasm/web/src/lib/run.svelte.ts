@@ -5,6 +5,7 @@
 // back, so a scenario change, a Restart or a Rebuild is never a loss.
 
 import { ChartHistory } from './charts/history';
+import { FRESH_VIEW, type MessagesView } from './messages';
 import type { Cut } from './cuts';
 import type { Story } from './next';
 import { ORIGIN, type Gateways, type Held, type Knobs, type Preset, type SustainedTraffic } from './presets';
@@ -36,6 +37,10 @@ export class Run {
   story: Story = $state.raw() as Story;
   /** Ticks with each chart sample: the one signal the charts redraw on. */
   chartVersion = $state(0);
+  /** Which view the detail pane shows, and the Messages view's scope and
+   *  filters: Undo brings them back with the run. */
+  pane: 'details' | 'messages' = $state('details');
+  messages: MessagesView = $state.raw(FRESH_VIEW);
   readonly history = new ChartHistory();
   /** The reader's Sends: node, bucket, admitted and rejected. */
   readonly sends = new RequestLog();

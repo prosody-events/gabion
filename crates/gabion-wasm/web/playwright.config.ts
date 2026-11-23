@@ -9,7 +9,8 @@ import { defineConfig } from '@playwright/test';
 // `motion.spec.ts` checks each packet's line and its counts, cause before
 // effect, once at 1440 px in the light theme with motion on; the story walks
 // run there too. `next.spec.ts` checks the next action, the goals and the
-// heading as pure functions, with no page.
+// heading as pure functions, with no page. `messages.spec.ts` checks the
+// Messages view against the engine's own packets, once at 1440 px.
 const audits = [1440, 1280, 1100, 768, 400].flatMap((width) =>
   (['light', 'dark'] as const).map((colorScheme) => ({
     name: `audit-${width}-${colorScheme}`,
@@ -39,6 +40,11 @@ export default defineConfig({
       use: { viewport: { width: 1440, height: 900 } },
     },
     ...audits,
+    {
+      name: 'messages',
+      testMatch: /messages\.spec\.ts$/,
+      use: { viewport: { width: 1440, height: 900 }, colorScheme: 'light', reducedMotion: 'reduce' },
+    },
     {
       name: 'audit-1440-light-motion',
       testMatch: /(motion|story)\.spec\.ts$/,

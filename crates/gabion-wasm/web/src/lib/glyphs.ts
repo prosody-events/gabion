@@ -127,6 +127,28 @@ export function stopBar(pen: Pen, x: number, y: number, ux: number, uy: number, 
   pen.moveTo(x + uy * half, y - ux * half).lineTo(x - uy * half, y + ux * half);
 }
 
+/** A message that asks for an answer (a probe or a sweep request): a hollow
+ *  ring of outer radius `RING_R`, stroked `RING_WIDTH`. */
+export const RING_R = 3;
+export const RING_WIDTH = 1.25;
+export function messageRing(pen: Pen, cx: number, cy: number): void {
+  const r = RING_R - RING_WIDTH / 2;
+  pen.moveTo(cx + r, cy).arc(cx, cy, r, 0, 2 * Math.PI).closePath();
+}
+
+/** A gap report, gabion's NAK: a filled square `2·SQUARE_HALF` px a side,
+ *  axis-aligned. */
+export const SQUARE_HALF = 2.5;
+export function messageSquare(pen: Pen, cx: number, cy: number): void {
+  const h = SQUARE_HALF;
+  pen
+    .moveTo(cx - h, cy - h)
+    .lineTo(cx + h, cy - h)
+    .lineTo(cx + h, cy + h)
+    .lineTo(cx - h, cy + h)
+    .closePath();
+}
+
 /** 45° lines `step` px apart across the band between `yTop` and `yBottom`,
  *  wide enough to cover a disc of radius `r`: the refusal under reduced
  *  motion, clipped to the disc by its mask. */

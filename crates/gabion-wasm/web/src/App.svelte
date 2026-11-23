@@ -6,6 +6,7 @@
   import {
     ANSWER,
     CARRIES_CELLS,
+    KIND,
     admittedOf,
     waves,
     type Burst,
@@ -59,6 +60,7 @@
   import { Run, UNDO_MS } from './lib/run.svelte';
   import Stage from './lib/components/Stage.svelte';
   import Charts from './lib/components/Charts.svelte';
+  import Messages from './lib/components/Messages.svelte';
   import NodeInspector from './lib/components/NodeInspector.svelte';
   import ControlRail from './lib/components/ControlRail.svelte';
   import TransportBar from './lib/components/TransportBar.svelte';
@@ -323,6 +325,9 @@
     try {
       const gateways = await warm(fresh, config);
       const held = await preset.seed(fresh, config);
+      // The run's messages are listed from its first paint: a seed that
+      // settled before it is warm-up, one that waits plays after it.
+      fresh.markRunStart();
       const snap = await fresh.snapshot(ORIGIN, WATCHED_KEY);
       return new Run(fresh, preset, config, { ...k }, snap, requests, held, gateways);
     } catch (e) {
@@ -540,7 +545,7 @@
   function note(r: Run, batch: EventBatch): void {
     let wave = Number.NaN;
     for (const { kind, virtual_ms } of batch.events) {
-      if ((kind.type === 'PacketSent' || kind.type === 'PacketDropped') && CARRIES_CELLS[kind.kind]) {
+      if ((kind.type === 'PacketSent' || kind.type === 'PacketDropped') && CARRIES_CELLS[kind.role]) {
         if (kind.src === r.held?.node) r.held = null;
         dataSent += 1;
         if (kind.tier === 'CrossZone') dataCrossed += 1;
@@ -941,10 +946,10 @@
   function tellWave(r: Run, batch: EventBatch): void {
     if (r.traffic !== undefined) return;
     const data = batch.events.flatMap(({ kind }) =>
-      (kind.type === 'PacketSent' || kind.type === 'PacketDropped') && CARRIES_CELLS[kind.kind] ? [kind] : [],
+      (kind.type === 'PacketSent' || kind.type === 'PacketDropped') && CARRIES_CELLS[kind.role] ? [kind] : [],
     );
-    const own = data.filter((p) => p.kind === 'Own');
-    const relays = data.filter((p) => p.kind === 'Relay');
+    const own = data.filter((p) => KIND[p.role] === 'Own');
+    const relays = data.filter((p) => KIND[p.role] === 'Relay');
     const zones = r.cluster.zones;
     const zoneOf = (id: number): number => r.cluster.nodes.find((n) => n.id === id)?.zone ?? -1;
     if (own.length > 0 && own.every((p) => p.src === r.selected)) {
@@ -1016,6 +1021,27 @@
     } else if (event.key === 'Escape' && run !== null) {
       void select(subjectOf(run));
     }
+  }
+
+  /** The pane's tabs: ← and → move between them; Enter or Space activates. */
+  function paneTabKey(event: KeyboardEvent): void {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+    event.preventDefault();
+    const other = (event.currentTarget as HTMLElement).id === 'pane-tab-details' ? 'messages' : 'details';
+    document.getElementById(`pane-tab-${other}`)?.focus();
+  }
+
+  /** The words for the cut that blocks the link from `src` to `dst`, if one
+   *  does. */
+  function cutWordsOf(r: Run, src: number, dst: number): string | undefined {
+    const zoneOf = (id: number): number | undefined => r.cluster.nodes.find((n) => n.id === id)?.zone;
+    for (const c of r.cuts) {
+      if (c.kind === 'silenced' && (c.node === src || c.node === dst)) return `node ${c.node} is silenced`;
+      if (c.kind === 'zone' && (zoneOf(src) === c.zone) !== (zoneOf(dst) === c.zone)) return `${zoneAt(r.cluster.zones, c.zone)} is cut off`;
+      if (c.kind === 'unheard-in-zone' && c.node === src && zoneOf(dst) === c.zone)
+        return `node ${c.node} is cut off from ${zoneAt(r.cluster.zones, c.zone)}`;
+    }
+    return undefined;
   }
 
   /** "Skip to the next step": focus the filled control, or the action line in
@@ -1246,8 +1272,17 @@
         <dt>packet</dt>
         <dd>
           A line from sender to receiver, drawn the instant it is sent and fading over one simulated second: Pause holds it, Speed
-          stretches it. Data ends in an arrow; an ack, probe, gap report or sweep request in a dot.
+          stretches it. Data ends in an arrow; an answer in a dot, a message that asks for one in a ring, and a gap report in a
+          square.
         </dd>
+        <dt>message</dt>
+        <dd>One packet one node sent another. Messages, beside Details at the top of the pane, lists each one.</dd>
+        <dt>own data</dt>
+        <dd>A node's own changes to its count.</dd>
+        <dt>relay data</dt>
+        <dd>Other nodes' changes a gateway passes on into its zone.</dd>
+        <dt>skip</dt>
+        <dd>Changes that expired before they were sent, so the peer can count them as received.</dd>
         <dt>gateway</dt>
         <dd>
           <RoleGlyph kind="port" /> The member of a remote zone that the selected node sends its hits to. It relays them into its
@@ -1256,18 +1291,42 @@
         <dt>relay</dt>
         <dd>A gateway forwarding hits it received to the rest of its zone.</dd>
         <dt>ack</dt>
-        <dd>I hold every item of your stream so far. One number acknowledges everything below it.</dd>
-        <dt>retransmission timeout (RTO)</dt>
-        <dd>How long a sender waits for an ack before resending: one heartbeat.</dd>
+        <dd>"I have your changes through position N." One number acknowledges everything below it.</dd>
+        <dt>repeat</dt>
+        <dd>Data sent again, after a gap report or after waiting one heartbeat for an ack.</dd>
+        <dt>probe</dt>
+        <dd>"Answer me", which is also how a node greets a peer it has not heard.</dd>
+        <dt>probe answer</dt>
+        <dd>The answer to a probe, carrying the answering node's acks.</dd>
         <dt>suspect</dt>
         <dd>
           <RoleGlyph kind="suspect" /> A peer that left something unanswered for the suspect timeout, or a remote peer that said
           it cannot relay. A suspect is not used as a gateway.
         </dd>
         <dt>gap report</dt>
-        <dd>A receiver's message "I am missing part of your stream; resend from my ack".</dd>
+        <dd>Gabion's NAK: "I am missing your changes from position N on; repeat them".</dd>
+        <dt>cannot relay</dt>
+        <dd>A flag a node sets on every message while it cannot pass hits on into its zone; only a node in another zone acts on it.</dd>
         <dt>join sweep</dt>
-        <dd>A one-off copy of a node's whole live store, sent to a zone member that just joined.</dd>
+        <dd>
+          A one-off copy of a node's whole live store, sent to a zone member that just joined: a sweep request asks for it, and
+          sweep pages carry it.
+        </dd>
+        <dt>position</dt>
+        <dd>A node's changes are numbered in order; one change can carry many hits.</dd>
+        <dt>start</dt>
+        <dd>Which start of a node sent a message: a node that restarts counts again from a new start.</dd>
+        <dt>in flight</dt>
+        <dd>
+          In flight is the simulation's own state, while Step has stopped before a wave; a picture of a packet can still be
+          moving after it has arrived.
+        </dd>
+        <dt>lost</dt>
+        <dd>A message the network dropped: on a cut link, on a link that drops packets, or at a full queue.</dd>
+        <dt>ladder</dt>
+        <dd>Two nodes' conversation; time runs down, and a slanted rung shows order, not delay.</dd>
+        <dt>the frame</dt>
+        <dd>A message's bytes as gabion encodes them: an 86-byte header, then, with data, the cells.</dd>
         <dt>How the controls work</dt>
         <dd>
           A Send is a burst of one-hit requests, as many as Requests per Send says: the node admits them in order while its
@@ -1275,7 +1334,8 @@
           The one dark button is what to press next, and the line under the goal names it; when nothing is dark, watch the
           meter. A Send pressed while paused plays until every node has the hits, then pauses again; Space plays or pauses, →
           steps to the next event, and Escape returns the selection to the scenario's node. Restart keeps your settings, a
-          scenario button takes its own, and Undo brings back the run you left.
+          scenario button takes its own, and Undo brings back the run you left. In Messages: ↑ ↓ choose a message · Enter
+          reads it · Esc goes back.
         </dd>
         <dt>backstop</dt>
         <dd>A gateway that can reach the sender but not its own zone says it cannot relay, and the sender moves to another gateway.</dd>
@@ -1395,13 +1455,45 @@
         <div class="detail-rail">
           <div class="rail-body">
             {#if selectedNode !== null}
-              <h2 class="pane-title">
-                node <span data-field="node">{selectedNode.id}</span>
-                <span class="pane-sub">selected · {zoneAt(cluster.zones, selectedNode.zone)}</span>
-                {#if selectedNode.id !== subjectOf(r)}
-                  <span class="pane-esc">Esc returns to node <span data-field="esc-node">{subjectOf(r)}</span></span>
-                {/if}
-              </h2>
+              <div class="pane-head">
+                <h2 class="pane-title">
+                  node <span data-field="node">{selectedNode.id}</span>
+                  <span class="pane-sub">selected · {zoneAt(cluster.zones, selectedNode.zone)}</span>
+                  {#if selectedNode.id !== subjectOf(r)}
+                    <span class="pane-esc">Esc returns to node <span data-field="esc-node">{subjectOf(r)}</span></span>
+                  {/if}
+                </h2>
+                <div class="pane-tabs" role="tablist" aria-label="Pane view">
+                  {#each [['details', 'Details'], ['messages', 'Messages']] as const as [id, label] (id)}
+                    <button
+                      class="pane-tab"
+                      id={`pane-tab-${id}`}
+                      role="tab"
+                      aria-selected={r.pane === id}
+                      aria-controls={`pane-${id}`}
+                      tabindex={r.pane === id ? 0 : -1}
+                      onclick={() => (r.pane = id)}
+                      onkeydown={paneTabKey}>{label}</button
+                    >
+                  {/each}
+                </div>
+              </div>
+              {#if r.pane === 'messages'}
+                <div id="pane-messages" role="tabpanel" aria-labelledby="pane-tab-messages">
+                  <Messages
+                    sim={r.sim}
+                    selected={r.selected}
+                    bind:view={r.messages}
+                    version={r.chartVersion}
+                    live={r.traffic !== undefined}
+                    nodes={cluster.nodes}
+                    zones={cluster.zones}
+                    cutWords={(src, dst) => cutWordsOf(r, src, dst)}
+                    onPreview={(node) => (namedId = node)}
+                  />
+                </div>
+              {:else}
+              <div id="pane-details" role="tabpanel" aria-labelledby="pane-tab-details">
               <Charts
                 {cluster}
                 history={r.history}
@@ -1426,6 +1518,7 @@
                   onSilence={(node) => void cut({ kind: 'silenced', node })}
                   onCutFromZone={(node, zone) => void cut({ kind: 'unheard-in-zone', node, zone })}
                   onPreview={(node) => (namedId = node)}
+                  onMessages={() => (r.pane = 'messages')}
                 />
               {/if}
               <div class="pane-foot">
@@ -1441,6 +1534,8 @@
                 >
                 {#if cluster.nodes.length <= 1}<span class="reason" id="remove-reason">a cluster needs one node</span>{/if}
               </div>
+              </div>
+              {/if}
             {/if}
           </div>
         </div>
@@ -1672,10 +1767,48 @@
     container-type: size;
   }
 
+  .pane-head {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--gap-sm);
+  }
+
   .pane-title {
+    flex: 1;
+    min-width: 0;
     margin: 0;
     font-size: var(--font-size-body);
     font-weight: 600;
+  }
+
+  /* Details · Messages: a segmented control on the thing it switches. The
+     selected segment is tinted and ruled, never filled: ink fill is the
+     primary's alone. */
+  .pane-tabs {
+    display: inline-flex;
+    flex: none;
+  }
+
+  .pane-tab {
+    min-height: 28px;
+    padding: 0 8px;
+    border: 1px solid var(--chart-axis);
+    border-radius: 6px 0 0 6px;
+    background: var(--color-panel);
+    color: var(--color-fg);
+    font-size: var(--font-size-caption);
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .pane-tab + .pane-tab {
+    margin-left: -1px;
+    border-radius: 0 6px 6px 0;
+  }
+
+  .pane-tab[aria-selected='true'] {
+    background: var(--color-bg);
+    box-shadow: inset 0 -2px 0 var(--color-fg);
   }
 
   .pane-sub,

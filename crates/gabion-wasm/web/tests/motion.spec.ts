@@ -330,7 +330,7 @@ test('every preset changes each count only in the frame its line appears', async
     const submit = sim.submitRequest.bind(sim);
     sim.submitRequest = async (...args) => {
       const batch = await submit(...args);
-      if (batch.events.some((e) => e.kind.type === 'PacketSent' && e.kind.kind === 'Own')) w.feedFlushes += 1;
+      if (batch.events.some((e) => e.kind.type === 'PacketSent' && e.kind.role === 'OwnData')) w.feedFlushes += 1;
       return batch;
     };
   });
@@ -361,7 +361,7 @@ test('back-to-back Sends each flush at once, past the emit floor', async ({ page
     const submit = sim.submitRequest.bind(sim);
     sim.submitRequest = async (...args) => {
       const batch = await submit(...args);
-      w.own.push(batch.events.filter((e) => e.kind.type === 'PacketSent' && e.kind.kind === 'Own').length);
+      w.own.push(batch.events.filter((e) => e.kind.type === 'PacketSent' && e.kind.role === 'OwnData').length);
       return batch;
     };
   });

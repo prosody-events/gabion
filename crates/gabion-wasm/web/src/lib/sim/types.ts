@@ -52,18 +52,67 @@ export type LinkPolicyKind =
 
 // -- Events -----------------------------------------------------------------
 
-/** Mirror of `crate::event::PacketKind`, read from the packet's header. */
+/** Mirror of `crate::event::PacketKind`: a packet's kind on the wire. */
 export type PacketKind = 'Ack' | 'Own' | 'Relay' | 'Sweep' | 'SweepRequest';
 
-/** Mirror of `PacketKind::carries_cells`: whether a kind streams cells (data)
- *  rather than controlling the streams. */
-export const CARRIES_CELLS: Readonly<Record<PacketKind, boolean>> = {
-  Own: true,
-  Relay: true,
-  Sweep: true,
-  Ack: false,
-  SweepRequest: false,
+/** Mirror of `crate::event::MessageRole`, in its declaration order (the
+ *  capture's rows carry the index): the one role a message is listed and
+ *  drawn as, read once from its header. */
+export const ROLES = [
+  'OwnData',
+  'RelayData',
+  'SweepPage',
+  'OwnSkip',
+  'RelaySkip',
+  'GapReport',
+  'Probe',
+  'SweepRequest',
+  'ProbeAnswer',
+  'Ack',
+] as const;
+export type MessageRole = (typeof ROLES)[number];
+
+/** Mirror of `MessageRole::kind`: the wire kind each role is sent as. */
+export const KIND: Readonly<Record<MessageRole, PacketKind>> = {
+  OwnData: 'Own',
+  OwnSkip: 'Own',
+  RelayData: 'Relay',
+  RelaySkip: 'Relay',
+  SweepPage: 'Sweep',
+  SweepRequest: 'SweepRequest',
+  GapReport: 'Ack',
+  Probe: 'Ack',
+  ProbeAnswer: 'Ack',
+  Ack: 'Ack',
 };
+
+/** Mirror of `PacketKind::carries_cells` by role: whether a message streams
+ *  cells (data) rather than controlling the streams. A skip or an empty sweep
+ *  page counts as data, as its kind does. */
+export const CARRIES_CELLS: Readonly<Record<MessageRole, boolean>> = {
+  OwnData: true,
+  OwnSkip: true,
+  RelayData: true,
+  RelaySkip: true,
+  SweepPage: true,
+  SweepRequest: false,
+  GapReport: false,
+  Probe: false,
+  ProbeAnswer: false,
+  Ack: false,
+};
+
+/** Mirror of `crate::event::Riders`: the other signals a message carries. */
+export const RIDERS = {
+  GAP_REPORT: 1,
+  PROBE: 2,
+  PROBE_ANSWER: 4,
+  CANNOT_RELAY: 8,
+  FOR_ZONE: 16,
+} as const;
+
+/** Mirror of `crate::event::ListedRepeat`. */
+export type ListedRepeat = 'AfterTimeout' | 'AfterGapReport';
 
 /** How many waves `batch` holds: the distinct instants at which it sent or lost
  *  a packet that carries cells, the engine's own test
@@ -76,7 +125,7 @@ export function waves(batch: EventBatch): number {
   let at = Number.NaN;
   for (let i = 0; i < events.length; i++) {
     const { kind, virtual_ms } = events[i];
-    if ((kind.type === 'PacketSent' || kind.type === 'PacketDropped') && CARRIES_CELLS[kind.kind] && virtual_ms !== at) {
+    if ((kind.type === 'PacketSent' || kind.type === 'PacketDropped') && CARRIES_CELLS[kind.role] && virtual_ms !== at) {
       count += 1;
       at = virtual_ms;
     }
@@ -131,13 +180,27 @@ export type EventKind =
   | { type: 'Decided'; node: number; burst: Burst }
   | { type: 'Tick'; node: number }
   | { type: 'ThresholdFire'; node: number }
-  | { type: 'PacketSent'; src: number; dst: number; bytes: number; kind: PacketKind; tier: Tier }
+  | ({ type: 'PacketSent' } & Message)
   | { type: 'PacketDelivered'; src: number; dst: number; bytes: number }
-  | { type: 'PacketDropped'; src: number; dst: number; bytes: number; kind: PacketKind; tier: Tier }
+  | ({ type: 'PacketDropped' } & Message)
   | { type: 'GatewayChanged'; origin: number; zone: number; from: number | undefined; to: number | undefined }
   | { type: 'CellCreated'; node: number; rule: Hex; key: Hex; bucket: number; count: number }
   | { type: 'CellUpdated'; node: number; rule: Hex; key: Hex; bucket: number; count: number }
   | { type: 'CellExpired'; node: number; rule: Hex; key: Hex; bucket: number };
+
+/** A sent or dropped packet's fields: its number in the run, its route and
+ *  size, and what it says. */
+export interface Message {
+  seq: number;
+  src: number;
+  dst: number;
+  bytes: number;
+  role: MessageRole;
+  riders: number;
+  repeat: ListedRepeat | undefined;
+  cells: number;
+  tier: Tier;
+}
 
 /** Mirror of `crate::event::Event`. */
 export interface SimEvent {
@@ -245,6 +308,8 @@ export interface NodeState {
   gateway_failovers: number;
   /** Gap reports sent: a peer's stream skipped positions. */
   gap_reports_sent: number;
+  /** Gaps given up after their reports went unanswered. */
+  gaps_abandoned: number;
   /** Own-stream timeouts that resent from the last ack. */
   rto_rewinds_own: number;
   /** The same for the relay stream. */

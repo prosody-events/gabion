@@ -20,6 +20,7 @@
 //! with `cargo nextest`, so the engine and shims are validated without any
 //! wasm toolchain.
 
+pub mod capture;
 pub mod clock;
 pub mod config;
 pub mod engine;
