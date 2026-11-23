@@ -78,10 +78,31 @@ export const pauseIfPlaying = (page: Page): Promise<void> =>
     [...document.querySelectorAll<HTMLButtonElement>('.transport button')].find((b) => b.textContent?.trim() === 'Pause')?.click();
   });
 
+/** Arrange for Pause to be pressed the moment the next run starts: in the
+ *  microtask that shows it playing, before its first frame moves simulated
+ *  time, so where a paused run stands does not depend on how fast the machine
+ *  is. Returns a disarm, to call once the command that starts the run has
+ *  landed, so a run that never started leaves no Pause pending for a later
+ *  one. */
+export async function pauseOnStart(page: Page): Promise<() => Promise<void>> {
+  await page.evaluate(() => {
+    const pane = document.querySelector<HTMLElement>('.stage-pane');
+    if (pane === null) throw new Error('the stage pane is missing');
+    const observer = new MutationObserver(() => {
+      if (pane.dataset.playing !== '1') return;
+      observer.disconnect();
+      [...document.querySelectorAll<HTMLButtonElement>('.transport button')].find((b) => b.textContent?.trim() === 'Pause')?.click();
+    });
+    observer.observe(pane, { attributes: true, attributeFilter: ['data-playing'] });
+    (window as unknown as { pauseOnStart: MutationObserver }).pauseOnStart = observer;
+  });
+  return () => page.evaluate(() => (window as unknown as { pauseOnStart: MutationObserver }).pauseOnStart.disconnect());
+}
+
 /** Send at node `node` and return once the node has decided and, if the page
  *  was paused, the run the Send started has ended: the page stands still. With
- *  `pause`, the reader pauses the run as soon as it starts, so later Steps
- *  draw its waves one at a time. */
+ *  `pause`, the reader pauses the run as soon as it starts (`pauseOnStart`),
+ *  so later Steps draw its waves one at a time. */
 export async function send(page: Page, node: number, pause = false): Promise<void> {
   await select(page, node);
   const decided = async (): Promise<number> =>
@@ -91,10 +112,10 @@ export async function send(page: Page, node: number, pause = false): Promise<voi
     }, WATCHED_KEY);
   const before = await decided();
   const playing = (await page.locator('.stage-pane').getAttribute('data-playing')) === '1';
+  const disarm = pause && !playing ? await pauseOnStart(page) : null;
   await sendButton(page).click();
   await expect.poll(decided, { timeout: LANDING_MS }).toBeGreaterThan(before);
-  // The run may already have stopped by itself.
-  if (pause && !playing) await pauseIfPlaying(page);
+  await disarm?.();
   if (!playing) await still(page, 4 * LANDING_MS);
 }
 
@@ -236,31 +257,15 @@ export async function recordData(page: Page): Promise<() => Promise<Drawn[]>> {
 /** In a gateway story: Send at node 0, then press the fault the caption
  *  offers once that Send's run has ended, and return the gateway it broke.
  *  With `pause`, the reader pauses the fault's run as soon as it starts, so
- *  later Steps draw it one wave at a time. "As soon as" is exact: Pause is
- *  pressed in the microtask that shows the run playing, before its first
- *  frame moves simulated time, so where the run stands does not depend on how
- *  fast the machine is. */
+ *  later Steps draw it one wave at a time (`pauseOnStart`). */
 export async function breakGateway(page: Page, pause = false): Promise<number> {
   await send(page, 0);
   const fault = page.locator('#next-action [data-primary]');
   await expect(fault, 'the fault is the one filled control').toHaveText(/^(Silence node \d+|Cut node \d+ off from zone b)$/);
   const gateway = Number(/node (\d+)/.exec((await fault.textContent()) ?? '')?.[1]);
-  if (pause) {
-    await page.evaluate(() => {
-      const pane = document.querySelector<HTMLElement>('.stage-pane');
-      if (pane === null) throw new Error('the stage pane is missing');
-      const observer = new MutationObserver(() => {
-        if (pane.dataset.playing !== '1') return;
-        observer.disconnect();
-        [...document.querySelectorAll<HTMLButtonElement>('.transport button')].find((b) => b.textContent?.trim() === 'Pause')?.click();
-      });
-      observer.observe(pane, { attributes: true, attributeFilter: ['data-playing'] });
-      (window as unknown as { pauseOnStart: MutationObserver }).pauseOnStart = observer;
-    });
-  }
+  const disarm = pause ? await pauseOnStart(page) : null;
   await fault.click();
   await expect(page.locator('.lede')).toContainText(`node ${gateway}`);
-  // A run that never started leaves no Pause pending for a later one.
-  if (pause) await page.evaluate(() => (window as unknown as { pauseOnStart: MutationObserver }).pauseOnStart.disconnect());
+  await disarm?.();
   return gateway;
 }

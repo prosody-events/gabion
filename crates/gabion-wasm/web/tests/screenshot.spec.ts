@@ -156,18 +156,39 @@ test('boots settled, spreads a Send, and empties at the window edge', async ({ p
 // every receiver rises by exactly the hits admitted.
 test('the transport Send sends to the selection', async ({ page }) => {
   await boot(page);
-  // The counts in the discs: the table closed, the stage at its full size. At
-  // half speed the run lasts long enough to be seen playing.
+  // The counts in the discs: the table closed, the stage at its full size.
   await page.getByText('Show as table').click();
   await setSpeed(page, 0.5);
   await clickNode(page, 3);
   await expect(title(page)).toHaveText('3');
   await expect(sendButton(page)).toHaveText(/Send\s*25\s*requests to node\s*3/);
 
+  // The decision beside node 3 lasts only while the run plays, which is wall
+  // time: a check polled after the press can land after the run has paused
+  // itself and cleared it. So the page records, from the press on, the
+  // decision's text the first time it shows and whether the run was playing
+  // then.
+  await page.evaluate(() => {
+    const w = window as unknown as { decision?: { text: string; playing: boolean } };
+    delete w.decision;
+    const observer = new MutationObserver(() => {
+      const shown = document.querySelector('.decision[data-node="3"]');
+      if (shown === null) return;
+      observer.disconnect();
+      w.decision = {
+        text: (shown.textContent ?? '').replace(/\s+/g, ' ').trim(),
+        playing: document.querySelector<HTMLElement>('.stage-pane')?.dataset.playing === '1',
+      };
+    });
+    observer.observe(document.body, { subtree: true, childList: true, characterData: true });
+  });
   await sendButton(page).click();
   await expect(page.locator('[role="gridcell"][data-node="3"] .count')).toHaveText(BURST_REQUESTS);
-  await expect(page.locator('.decision[data-node="3"]')).toHaveText('+25 admitted');
-  await expect(page.getByRole('button', { name: 'Pause' })).toBeVisible();
+  await expect
+    .poll(() => page.evaluate(() => (window as unknown as { decision?: unknown }).decision), {
+      message: 'node 3 showed its decision while the run played',
+    })
+    .toEqual({ text: '+25 admitted', playing: true });
   await expect(page.locator('.count')).toHaveText(Array(NODES).fill(BURST_REQUESTS), { timeout: 15_000 });
   await expect(page.getByRole('button', { name: 'Play' })).toBeVisible({ timeout: 15_000 });
   await expect(page.locator('.stage-pane')).toHaveAttribute('data-clock', 'paused');
