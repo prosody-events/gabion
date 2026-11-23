@@ -1,6 +1,6 @@
 import { inflateSync } from 'node:zlib';
 import { expect, test, type Locator, type Page } from '@playwright/test';
-import { ChartHistory } from '../src/lib/charts/history';
+import { ChartHistory, SLOTS, slotIndex } from '../src/lib/charts/history';
 import { CARRIES_CELLS, missingFor, type ClusterState, type EventBatch, type PacketKind, type StepUntil, type Tier } from '../src/lib/sim/types';
 import {
   ARC_GAP,
@@ -25,9 +25,11 @@ import {
 } from '../src/lib/stage/layout';
 import { DROP_STOPS, MARK, RING_BEHIND, RING_CAUGHT_UP, STOP_BAR, type BeamPool, type GlyphTable } from '../src/lib/stage/renderer';
 import { VESSEL_SCALE } from '../src/lib/limit';
+import { GUTTER, MARGIN } from '../src/lib/charts/draw';
+import { requestLine, windowLine } from '../src/lib/charts/readout';
 import { zoneAt } from '../src/lib/format';
 import { PRESETS, WATCHED_KEY } from '../src/lib/presets';
-import { BAND_ALPHA, BEAM_ALPHA, readTheme, type Theme } from '../src/lib/theme';
+import { BEAM_ALPHA, readTheme, type Theme } from '../src/lib/theme';
 import timings from './phase-timings.json' with { type: 'json' };
 import { PERIOD_MS, period, refusal, send, sendButton, setSpeed, step, stepUntil, still, virtualMs } from './drive';
 
@@ -66,7 +68,6 @@ type Findings = Record<'A1' | 'A2' | 'A3' | 'A7' | 'A8' | 'A9', string[]>;
 // -- Formatting, written out here so the page's formatters are not reused --------
 
 const int = (n: number): string => n.toLocaleString('en-US');
-const percent = (x: number): string => `${(x * 100).toFixed(1)}%`;
 const duration = (ms: number): string => {
   const whole = Math.round(ms);
   return whole < 1000 ? `${whole} ms` : `${(ms / 1000).toFixed(1)} s`;
@@ -160,7 +161,7 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
     const series: ClusterState[] = [await snapshot(page)];
     for (let s = 0; s < STEPS; s++) await period(page, async () => void series.push(await snapshot(page)));
     converged += await page.locator('[data-template]', { hasText: /^✓/ }).count();
-    charted += await page.locator('.plot').count();
+    charted += await page.locator('.charts canvas').count();
     inspected += await page.locator('.inspector').count();
 
     let unforced: Theme | null = null;
@@ -185,7 +186,6 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
       const findings = await page.evaluate(audit, {
         theme: colours,
         beam: BEAM_ALPHA,
-        band: BAND_ALPHA,
       });
       expect(findings, where).toEqual({ A1: [], A2: [], A3: [], A7: [], A8: [], A9: [] });
       await checkGlyphs(page, where, name);
@@ -279,71 +279,17 @@ async function checkTooltips(page: Page, where: string): Promise<void> {
 
 // -- A4: the printed numbers, recomputed ---------------------------------------
 
-interface Totals {
-  t: number;
-  inData: number;
-  crossData: number;
-  own: Map<number, number>;
-}
-
-const totals = (s: ClusterState): Totals => ({
-  t: s.virtual_ms,
-  inData: s.bytes_by_tier.in_zone.data,
-  crossData: s.bytes_by_tier.cross_zone.data,
-  own: new Map(s.nodes.map((n) => [n.id, n.own_data_bytes])),
-});
-
-/** The cumulative totals the window ending at the last of `series` starts from.
- *  `series` holds a snapshot at every instant the page applied one. A snapshot
- *  is kept as a mark once `W / 128` has passed since the last kept one, and the
- *  window starts at the newest mark at or before `t − W`, or at the session
- *  start while the window reaches back past every mark. */
-function windowStart(series: ClusterState[]): Totals {
-  const now = series[series.length - 1].virtual_ms;
-  let start: ClusterState | undefined;
-  let kept: number | undefined;
-  for (const snap of series) {
-    if (kept !== undefined && snap.virtual_ms - kept < WINDOW_MS / 128) continue;
-    kept = snap.virtual_ms;
-    if (kept <= now - WINDOW_MS) start = snap;
-  }
-  return now <= WINDOW_MS || start === undefined
-    ? { t: 0, inData: 0, crossData: 0, own: new Map() }
-    : totals(start);
-}
-
-/** σ, the share of the window's data bytes that crossed zones, or null. */
-function share(series: ClusterState[]): number | null {
-  const now = series[series.length - 1];
-  const from = windowStart(series);
-  const cross = now.bytes_by_tier.cross_zone.data - from.crossData;
-  const all = cross + now.bytes_by_tier.in_zone.data - from.inData;
-  return all > 0 ? cross / all : null;
-}
-
-/** The two predictions of chart 1 from the placement and the window's bytes. */
-function predictions(series: ClusterState[]): { zones: number; nozone: number } | null {
-  const now = series[series.length - 1];
-  const n = now.nodes.length;
+/** S's two predictions from the placement alone: with zones a change crosses
+ *  Z − 1 of the N − 1 links; with none, N − n_z of them, averaged over the
+ *  nodes. */
+function predictions(snap: ClusterState): { zones: number; nozone: number } | null {
+  const n = snap.nodes.length;
   if (n < 2) return null;
-  const from = windowStart(series);
-  const live = now.zones.filter((z) => z.live > 0).length;
-  let weight = 0;
-  let weighted = 0;
-  let plain = 0;
-  for (const node of now.nodes) {
-    const across = (n - now.zones[node.zone].live) / (n - 1);
-    const bytes = node.own_data_bytes - (from.own.get(node.id) ?? 0);
-    weight += bytes;
-    weighted += bytes * across;
-    plain += across;
-  }
-  return { zones: (live - 1) / (n - 1), nozone: weight > 0 ? weighted / weight : plain / n };
+  const live = snap.zones.filter((z) => z.live > 0).length;
+  let nozone = 0;
+  for (const node of snap.nodes) nozone += (n - snap.zones[node.zone].live) / (n - 1);
+  return { zones: (live - 1) / (n - 1), nozone: nozone / n };
 }
-
-/** The spread of the views of `nodes`: most informed minus least. */
-const spread = (nodes: { window_total: number }[]): number =>
-  Math.max(...nodes.map((n) => n.window_total)) - Math.min(...nodes.map((n) => n.window_total));
 
 const text = async (locator: Locator): Promise<string> => ((await locator.textContent()) ?? '').trim();
 
@@ -391,37 +337,35 @@ async function checkData(page: Page, name: string, series: ClusterState[]): Prom
     else await expect(printed, `${where}: node ${node.id} gateway for`).toHaveText(int(want));
   }
 
-  // The charts (shown while no node is selected).
-  if ((await page.locator('.dashboard').count()) > 0) {
-    await expect(field(page, 'control-share'), where).toHaveText(
-      percent(
-        (() => {
-          const { in_zone: a, cross_zone: b } = snap.bytes_by_tier;
-          const control = a.control + b.control;
-          return control / (control + a.data + b.data);
-        })(),
-      ),
+  // The charts: R1 reads the selected node's window by bucket, R2 the
+  // engine's session counters, L lists every node in (zone, id) order, S's
+  // references follow the placement.
+  const selected = Number(await text(page.locator('.pane-title [data-field="node"]')));
+  const r1 = page.locator('figure[data-chart="window"]');
+  if ((await r1.count()) > 0) {
+    const at = nodes.findIndex((n) => n.id === selected);
+    const b = snap.oracle_buckets.length;
+    await expect(r1.locator('[data-field="r1-total"]'), `${where}: R1 total`).toHaveText(String(nodes[at].window_total));
+    await expect(r1.locator('canvas'), `${where}: R1 columns`).toHaveAttribute(
+      'data-columns',
+      snap.window_buckets.slice(at * b, (at + 1) * b).join(','),
     );
-    const sigma = share(series);
-    const seen = series.some((_, i) => share(series.slice(0, i + 1)) !== null);
-    if (snap.zones.length > 1 && seen) {
-      await expect(field(page, 'share'), `${where}: σ`).toHaveText(sigma === null ? '—' : percent(sigma));
-    }
-    const spreads = page.locator('section.block', { hasText: /^Disagreement by zone/ }).locator('figure');
-    const live = snap.zones.flatMap((z, i) => (z.live > 0 ? [i] : []));
-    await expect(spreads, where).toHaveCount(live.length + 1);
-    await expect(
-      page.locator('section.block', { hasText: /^Agreement by zone/ }).locator('figure'),
-      `${where}: agreement panels`,
-    ).toHaveCount(live.length);
-    for (const [i, zone] of live.entries()) {
-      await expect(spreads.nth(i).locator('[data-field="spread"]'), `${where}: zone ${zone} spread`).toHaveText(
-        int(spread(nodes.filter((n) => n.zone === zone))),
-      );
-    }
-    await expect(spreads.nth(live.length).locator('[data-field="spread"]'), `${where}: whole cluster`).toHaveText(
-      int(spread(nodes)),
-    );
+  }
+  const r2 = page.locator('figure[data-chart="requests"]');
+  if ((await r2.count()) > 0) {
+    await expect(r2.locator('[data-field="admitted"]'), `${where}: R2 admitted`).toHaveText(String(snap.admitted_hits));
+    await expect(r2.locator('[data-field="rejected"]'), `${where}: R2 rejected`).toHaveText(String(snap.rejected_hits));
+  }
+  const lanes = page.locator('figure[data-chart="behind"] canvas');
+  if ((await lanes.count()) > 0) {
+    const order = [...nodes].sort((x, y) => x.zone - y.zone || x.id - y.id).map((n) => n.id);
+    await expect(lanes, `${where}: L rows in (zone, id) order`).toHaveAttribute('data-rows', order.join(','));
+  }
+  const s = page.locator('figure[data-chart="share"]');
+  const refs = predictions(snap);
+  if ((await s.count()) > 0 && refs !== null) {
+    expect(Math.abs(Number(await s.getAttribute('data-ref-zones')) - refs.zones), `${where}: with zones`).toBeLessThan(1e-9);
+    expect(Math.abs(Number(await s.getAttribute('data-ref-nozone')) - refs.nozone), `${where}: without zones`).toBeLessThan(1e-9);
   }
 
   // The selected origin's Gossip targets: each remote zone's gateway, unacked
@@ -695,16 +639,17 @@ async function checkOrder(page: Page, name: string): Promise<void> {
     grid.flatMap((r) => r.ids).sort((a, b) => a - b),
   );
 
-  for (const title of ['Agreement by zone', 'Disagreement by zone']) {
-    const panels = await page
-      .locator('section.block', { hasText: new RegExp(`^${title}`) })
-      .locator('figure')
-      .evaluateAll((els) => els.map((el) => (el as HTMLElement).dataset.zone ?? null));
-    if (panels.length === 0) continue;
-    const zones = panels.filter((z) => z !== null).map(Number);
-    expect(ascending(zones), `${where}: ${title} panels by zone`).toBe(true);
-    // Chart 3 ends with the whole cluster, which has no zone.
-    if (title.startsWith('Disagreement')) expect(panels.at(-1), `${where}: whole cluster last`).toBeNull();
+  // The charts stand in one fixed order, R1, R2, L, S, whichever are shown.
+  const charts = await page.locator('figure[data-chart]').evaluateAll((els) => els.map((el) => (el as HTMLElement).dataset.chart ?? ''));
+  const rank = ['window', 'requests', 'behind', 'share'];
+  expect(ascending(charts.map((c) => rank.indexOf(c))), `${where}: charts in the order R1, R2, L, S`).toBe(true);
+  // Every chart the scenario lists shows, R1 only while the limit is on the
+  // vessels' scale.
+  const listed = PRESETS.find((p) => p.label === name)?.charts;
+  if (listed !== undefined) {
+    expect(charts, `${where}: the charts the scenario lists`).toEqual(
+      rank.filter((c) => (listed as readonly string[]).includes(c) && (c !== 'window' || charts.includes(c))),
+    );
   }
 
   const remote = await page
@@ -716,10 +661,10 @@ async function checkOrder(page: Page, name: string): Promise<void> {
 // -- In the page ---------------------------------------------------------------
 
 /** Runs in the page: findings for A1 (sideways scroll), A2, A3 (DOM text, canvas
- *  labels, legibility and chart marks), A7, A8 and A9, one sentence each, given
+ *  labels and legibility), A7, A8 and A9, one sentence each, given
  *  the canvas colours and the alphas of the translucent canvas marks.
  *  Self-contained: Playwright ships it to the page as source. */
-function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number }): Findings {
+function audit({ theme, beam }: { theme: Theme; beam: number }): Findings {
   type Rgba = [number, number, number, number];
   type Box = { left: number; right: number; top: number; bottom: number };
   const found: Findings = { A1: [], A2: [], A3: [], A7: [], A8: [], A9: [] };
@@ -905,26 +850,6 @@ function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number
     }
   }
 
-  // A3 chart marks: every value of every series lies inside its plot's y range,
-  // and every y axis shown labels at least two values, so the scale reads.
-  for (const host of document.querySelectorAll<HTMLElement & { uplot?: any }>('.plot')) {
-    const u = host.uplot;
-    if (u === undefined || !host.checkVisibility()) continue;
-    const ticks = (u.axes[1]._splits ?? []).length;
-    if (u.axes[1].show !== false && ticks < 2) {
-      found.A3.push(`a chart's y axis (zone ${host.closest('figure')?.dataset.zone}) labels ${ticks} value(s), not two or more`);
-    }
-    const { min, max } = u.scales.y;
-    for (let s = 1; s < u.data.length; s++) {
-      for (const v of u.data[s] as (number | null)[]) {
-        if (v !== null && v !== undefined && (v < min - 1e-9 || v > max + 1e-9)) {
-          found.A3.push(`a chart value ${v} (series ${s} of ${u.data.length - 1}, zone ${host.closest('figure')?.dataset.zone}, ${u.data[0].length} samples) lies outside its plot's range ${min} to ${max}`);
-          break;
-        }
-      }
-    }
-  }
-
   // A7 targets: at least 24 × 24 px. The exemptions are WCAG 2.5.8's: targets
   // inline in a sentence (links in prose, and the `InfoTip` terms, which are
   // buttons the browser lays out as inline blocks) and disabled controls.
@@ -967,19 +892,16 @@ function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number
     ['--color-ok', unpack(theme.ok), 3],
     ['--color-warn', unpack(theme.warn), 3],
   ]);
-  const plot = document.querySelector('.plot');
+  const plot = document.querySelector('.charts canvas');
   if (plot !== null) {
     const panel = backdrop(plot);
     check(panel, 'charts', [
       ['--color-fg', unpack(theme.fg), 4.5],
       ['--color-fg-muted', unpack(theme.fgMuted), 4.5],
-      ['--color-warn', unpack(theme.warn), 4.5],
-      ['--chart-muted', unpack(theme.muted), 3],
-      ['--chart-reference', unpack(theme.reference), 3],
+      ['--color-bad', unpack(theme.bad), 4.5],
+      ['--color-warn', unpack(theme.warn), 3],
+      ['--chart-axis', unpack(theme.axis), 3],
     ]);
-    // "REJECTING" is text drawn inside its own translucent warn band.
-    const warnBand = over(unpack(theme.warn, band), panel);
-    check(warnBand, 'REJECTING band', [['--color-fg', unpack(theme.fg), 4.5]]);
   }
 
   // A2 and A8: page-text scans. "CI" is case-sensitive so "ci" in words cannot match.
@@ -1006,9 +928,9 @@ function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number
   return found;
 }
 
-// -- A4: chart 1 across the window, and unequal zones ---------------------------
+// -- A4: S on its prediction, and unequal zones --------------------------------
 
-test('chart 1 prints the windowed share and follows the placement', async ({ page }, info) => {
+test('S sits on its prediction and follows the placement (A4)', async ({ page }, info) => {
   test.skip(
     !['audit-1440-light', 'audit-400-light'].includes(info.project.name),
     'the numbers are the same at every width and theme: checked at the widest and the narrowest',
@@ -1017,93 +939,32 @@ test('chart 1 prints the windowed share and follows the placement', async ({ pag
   await open(page);
   await setSpeed(page, 4);
 
-  // Steady state after one heartbeat period: σ is printed, not the empty
-  // state. A snapshot after every Step: the page applies one at each Step's
-  // instant, and the window's start depends on which of them it kept.
+  // Steady state past one window: with zones, each change crosses Z − 1 of the
+  // N − 1 links, and the share sits on that line.
   await loadPreset(page, 'Steady state');
-  const series: ClusterState[] = [await snapshot(page)];
-  const record = async (): Promise<void> => void series.push(await snapshot(page));
-  await period(page, record);
-  const first = share(series);
-  expect(first, 'one heartbeat period of Steady state sends data bytes').not.toBeNull();
-  await expect(field(page, 'share')).toHaveText(percent(first!));
-  await expect(page.getByText('No traffic yet')).toHaveCount(0);
-  // The axes read seconds of virtual time and percent: each tick's value
-  // from the split it labels (milliseconds, and a share of 1).
-  const ticks = await page
-    .locator('section.block', { hasText: 'Share of data bytes' })
-    .locator('.plot')
-    .evaluate((host: HTMLElement & { uplot?: any }) => host.uplot.axes.map((a: { _splits: number[]; _values: number[] }) => [a._splits, a._values]));
-  const [[xSplits, xValues], [ySplits, yValues]] = ticks as [number[], number[]][];
-  expect(xValues, 'the x axis reads seconds').toEqual(xSplits.map((t) => t / 1000));
-  expect(yValues, 'the y axis reads percent').toEqual(ySplits.map((t) => t * 100));
-  expect([yValues[0], yValues.at(-1)], 'the y axis runs from 0 to 100 %').toEqual([0, 100]);
+  for (let i = 0; i < 12; i++) await period(page);
+  const steady = await snapshot(page);
+  expect(steady.virtual_ms, 'the run is past one window').toBeGreaterThan(WINDOW_MS);
+  const refs = predictions(steady)!;
+  const share = Number((await text(field(page, 'share'))).replace('%', '')) / 100;
+  expect(Math.abs(share - refs.zones), `the share ${share} sits on (Z − 1) / (N − 1) = ${refs.zones}`).toBeLessThanOrEqual(0.02);
 
-  // Thirty periods on, the window (ten seconds) has slid past the start: σ is
-  // the share of the last window's bytes, not the whole run's.
-  for (let i = 0; i < 30; i++) await period(page, record);
-  const now = series[series.length - 1];
-  expect(now.virtual_ms, 'the run is past one window').toBeGreaterThan(WINDOW_MS);
-  await expect(field(page, 'share')).toHaveText(percent(share(series)!));
-  const refs = predictions(series)!;
-  const figure = page.locator('figure[data-ref-zones]');
-  expect(Math.abs(Number(await figure.getAttribute('data-ref-zones')) - refs.zones)).toBeLessThan(1e-9);
-  expect(Math.abs(Number(await figure.getAttribute('data-ref-nozone')) - refs.nozone)).toBeLessThan(1e-9);
-
-  // Sandbox with unequal zones: Add node in zone a (5, 4, 4), Sends at nodes 0
-  // and 1, then 26 heartbeat periods (past one window) with another Send at
-  // node 0 four periods from the end. Both references follow the placement and
-  // the bytes each origin sent in the window, which opens at a kept mark, not
-  // the session start, so the mark's per-origin bytes count.
+  // Sandbox with unequal zones: Add node in zone a (5, 4, 4) moves the
+  // no-zone prediction off (N − N/Z) / (N − 1).
   await loadPreset(page, 'Sandbox');
-  // Every snapshot the page takes is recorded as it takes it: a Send and an
-  // Add each run until the cluster settles, and the chart's marks are kept
-  // from every snapshot of that run.
-  await page.evaluate(() => {
-    const w = window as unknown as { taken: ClusterState[] };
-    w.taken = [];
-    const sim = window.sim! as typeof window.sim & { recorded?: boolean };
-    if (sim.recorded === true) return;
-    sim.recorded = true;
-    const take = sim.snapshot.bind(sim);
-    sim.snapshot = async (...args) => {
-      const snap = await take(...args);
-      w.taken.push(snap);
-      return snap;
-    };
-  });
   await page.getByRole('button', { name: 'Add node' }).click();
   await expect(page.locator('[data-field="status-nodes"]')).toHaveText('13');
   await expect(page.locator('.stage-pane')).toHaveAttribute('data-clock', 'paused', { timeout: 30_000 });
   await send(page, 0);
   await send(page, 1);
-  for (let i = 0; i < 26; i++) {
-    if (i === 22) await send(page, 0);
-    await period(page);
-  }
-  const sandbox = (await page.evaluate(() => (window as unknown as { taken: ClusterState[] }).taken)).filter(
-    (snap, i, all) => i === 0 || snap.virtual_ms >= all[i - 1].virtual_ms,
-  );
-  expect(sandbox[0].zones.map((z) => z.live), 'zones of 5, 4 and 4').toEqual([5, 4, 4]);
-  const opened = windowStart(sandbox);
-  expect(opened.t, 'the window opens at a kept mark').toBeGreaterThan(0);
-  expect(
-    Math.max(...opened.own.values()),
-    "the window's opening mark holds own bytes already sent, so its per-origin bytes count",
-  ).toBeGreaterThan(0);
-  const unequal = predictions(sandbox)!;
-  const chart = page.locator('figure[data-ref-zones]');
-  expect(Math.abs(Number(await chart.getAttribute('data-ref-zones')) - unequal.zones)).toBeLessThan(1e-9);
-  expect(Math.abs(Number(await chart.getAttribute('data-ref-nozone')) - unequal.nozone)).toBeLessThan(1e-9);
-  expect(unequal.nozone, 'unequal zones move the no-zone prediction off (N − N/Z) / (N − 1)').not.toBeCloseTo(
-    (13 - 13 / 3) / 12,
-    6,
-  );
+  const added = await snapshot(page);
+  expect(added.zones.map((z) => z.live), 'zones of 5, 4 and 4').toEqual([5, 4, 4]);
+  const unequal = predictions(added)!;
+  expect(unequal.nozone, 'unequal zones move the no-zone prediction').not.toBeCloseTo((13 - 13 / 3) / 12, 6);
   await setTable(page, true);
   await checkOrder(page, 'Sandbox after add');
 
-  // The same run with one node left: no reference line, attribute or label.
-  // The pane's Remove takes the selected node, and the selection moves on.
+  // One node left: R2 still counts the session's requests, and L has one row.
   const remove = page.locator('.pane-foot').getByRole('button', { name: /^Remove node/ });
   for (let left = 12; left >= 1; left--) {
     await remove.click();
@@ -1111,30 +972,89 @@ test('chart 1 prints the windowed share and follows the placement', async ({ pag
     // node just removed.
     await expect(page.locator('[data-field="status-nodes"]')).toHaveText(String(left));
   }
-  // The status sentence counts the zones with members, not the zones built.
   const left = await snapshot(page);
   expect(left.zones.filter((z) => z.live > 0).length, 'one node leaves one live zone of three').toBe(1);
   await expect(field(page, 'status-zones')).toHaveText('1');
-  const lone = page.locator('section.block', { hasText: 'Share of data bytes' }).locator('figure');
-  await expect(lone).toHaveCount(1);
-  await expect(lone).not.toHaveAttribute('data-ref-zones', /.*/);
-  await expect(lone).not.toHaveAttribute('data-ref-nozone', /.*/);
-  const labels = await lone.locator('canvas[data-label-boxes]').getAttribute('data-label-boxes');
-  expect(JSON.parse(labels ?? '[]'), 'no reference label with one node').toEqual([]);
+  const r2 = page.locator('figure[data-chart="requests"]');
+  await expect(r2.locator('[data-field="admitted"]')).toHaveText(String(left.admitted_hits));
+  await expect(page.locator('figure[data-chart="behind"] canvas')).toHaveAttribute('data-rows', String(left.nodes[0].id));
   await checkOrder(page, 'Sandbox after remove');
 });
 
-// -- A4: the share window at any snapshot rate ----------------------------------
+// -- A32, A33, A35: one frame, the lag raster, the keyboard ----------------------
 
-test('the share window holds at any snapshot rate', async ({}, info) => {
+test('the charts share one frame, mark who is behind, and read out by keyboard (A32, A33, A35)', async ({ page }, info) => {
+  test.skip(
+    !['audit-1440-light', 'audit-400-light'].includes(info.project.name),
+    'checked at the widest and the narrowest pane',
+  );
+  test.setTimeout(120_000);
+  await open(page);
+
+  // A33: in Zone partition, a Send at node 0 leaves zone c's rows marked
+  // behind while it is cut off; the rows run in (zone, id) order.
+  await loadPreset(page, 'Zone partition');
+  await send(page, 0);
+  const lanes = page.locator('figure[data-chart="behind"] canvas');
+  const cut = await snapshot(page);
+  const zoneC = cut.nodes.filter((n) => n.zone === 2).map((n) => n.id);
+  await expect
+    .poll(async () => {
+      const rows = ((await lanes.getAttribute('data-rows')) ?? '').split(',').map(Number);
+      const marked = ((await lanes.getAttribute('data-marked')) ?? '').split(',').map(Number);
+      return zoneC.every((id) => marked[rows.indexOf(id)] > 0);
+    }, { message: "zone c's rows are marked behind" })
+    .toBe(true);
+
+  // A32: every chart shown has the same plot left (the gutter) and width.
+  const widths = await page.locator('.charts canvas').evaluateAll((els) => els.map((el) => el.getBoundingClientRect().width));
+  expect(widths.length, 'R1, R2 and L show').toBe(3);
+  for (const w of widths) expect(Math.abs(w - widths[0]), 'every chart is as wide as the first').toBeLessThan(0.5);
+  expect(widths[0] - GUTTER - MARGIN, 'R1 keeps at least 160 px of plot').toBeGreaterThanOrEqual(160);
+
+  // A35: Tab reaches R1, the arrows move the readout one bucket at a time, and
+  // the readout equals the recomputation from the engine's snapshot.
+  // The pointer rests off the charts, so only the keys move the readout.
+  await page.mouse.move(0, 0);
+  const r1 = page.locator('figure[data-chart="window"] canvas');
+  await r1.focus();
+  await r1.press('End');
+  await r1.press('ArrowLeft');
+  const snap = await snapshot(page);
+  const at = snap.nodes.findIndex((n) => n.id === 0);
+  const b = snap.oracle_buckets.length;
+  const k = b - 2;
+  await expect(field(page, 'readout')).toHaveText(
+    windowLine(k, b, 1000, 0, snap.window_buckets[at * b + k], snap.oracle_buckets[k], snap.nodes[at].window_total, 100),
+  );
+  await expect(r1).toHaveAttribute('role', 'slider');
+  await expect(r1).toHaveAttribute('aria-label', /^Window by bucket: /);
+  await page.keyboard.press('Tab');
+  const r2 = page.locator('figure[data-chart="requests"] canvas');
+  await expect(r2).toBeFocused();
+  await expect(field(page, 'readout')).toHaveText(requestLine(1, 0, 25, 0));
+});
+
+// -- C40: the chart rings, by arithmetic ----------------------------------------
+
+/** A sample of `t` ms with these session totals and node states. */
+function sample(t: number, inData: number, crossData: number, admitted = 0, rejected = 0, nodes: ClusterState['nodes'] = []) {
+  return {
+    virtual_ms: t,
+    nodes,
+    bytes_by_tier: { in_zone: { data: inData, control: 0 }, cross_zone: { data: crossData, control: 0 } },
+    oracle_total: 0,
+    admitted_hits: admitted,
+    rejected_hits: rejected,
+  };
+}
+
+test('the share window is exact at slot boundaries at any snapshot rate (C40)', async ({}, info) => {
   test.skip(info.project.name !== 'audit-1440-light', 'pure arithmetic, checked once');
   // Twenty seconds at half the data bytes crossing zones, then twenty at a
-  // tenth: a window of the last ten seconds lies wholly in the second phase, so
-  // σ is 10 % however finely play slices virtual time. 17 ms is a 60 Hz frame
-  // at 1x, 67 ms at 4x, and 500 ms a Step. The page's own runs Step from wave
-  // to wave and jump to the window's edge, too coarse at the window's start to
-  // tell one mark spacing from another, so the spacing is checked here: every
-  // window opens within `W / 128` (plus one snapshot) of `t − W`.
+  // tenth: the window of the last ten seconds lies wholly in the second phase,
+  // so the share is 10 % however finely play slices virtual time. 17 ms is a
+  // 60 Hz frame at 1x, 67 ms at 4x, and 500 ms a Step.
   for (const stepMs of [17, 67, 500]) {
     const history = new ChartHistory();
     history.reset(WINDOW_MS);
@@ -1144,22 +1064,44 @@ test('the share window holds at any snapshot rate', async ({}, info) => {
       const cross = t < 20_000 ? 0.5 : 0.1;
       inData += stepMs * (1 - cross);
       crossData += stepMs * cross;
-      history.push({
-        virtual_ms: t,
-        nodes: [],
-        zones: [{ name: 'zone-a', live: 0 }],
-        bytes_by_tier: { in_zone: { data: inData, control: 0 }, cross_zone: { data: crossData, control: 0 } },
-        oracle_total: 0,
-      });
-      if (t > WINDOW_MS) {
-        const late = t - WINDOW_MS - history.windowStart(t).t;
-        const where = `at ${stepMs} ms snapshots, the window ending at ${t}: ms it opens before t − W`;
-        expect(late, where).toBeGreaterThanOrEqual(0);
-        expect(late, where).toBeLessThan(WINDOW_MS / 128 + stepMs);
+      history.push(sample(t, inData, crossData));
+      if (t > 20_000 + WINDOW_MS + 2 * stepMs) {
+        expect(history.shareAt(history.head), `σ at ${t} ms, ${stepMs} ms snapshots`).toBeCloseTo(0.1, 9);
       }
     }
-    expect(history.share.at(-1), `σ at ${stepMs} ms snapshots`).toBeCloseTo(0.1, 9);
+    expect(history.windowMs, 'the domain is one window').toBe(WINDOW_MS);
+    expect(history.slotMs * SLOTS, 'one window of slots').toBe(WINDOW_MS);
   }
+});
+
+test('the request rings count each slot once and never fall (C40)', async ({}, info) => {
+  test.skip(info.project.name !== 'audit-1440-light', 'pure arithmetic, checked once');
+  const history = new ChartHistory();
+  history.reset(WINDOW_MS);
+  const caught = { kind: 'CaughtUp' } as const;
+  const node = (id: number, behind: boolean) =>
+    ({ id, zone: 0, window_total: 0, lag: behind ? { kind: 'Behind', missing_for_ms: 0 } : caught }) as unknown as ClusterState['nodes'][number];
+  // 25 admitted at 1.05 s at node 0, then node 0 removed at 1.25 s: the
+  // session counters keep the 25, so no slot falls negative.
+  history.push(sample(1000, 0, 0, 0, 0, [node(0, false), node(1, false)]));
+  history.push(sample(1050, 0, 0, 25, 0, [node(0, false), node(1, true)]));
+  history.push(sample(1250, 0, 0, 25, 5, [node(1, false)]));
+  let admitted = 0;
+  let rejected = 0;
+  for (let i = 0; i < SLOTS; i++) {
+    expect(history.admitted[i], `slot ${i} admitted`).toBeGreaterThanOrEqual(0);
+    admitted += history.admitted[i];
+    rejected += history.rejected[i];
+  }
+  expect([admitted, rejected], 'the slots sum to the session counters').toEqual([25, 5]);
+  expect(history.admitted[slotIndex(10)], 'the 25 land in the slot of 1.05 s').toBe(25);
+  expect(history.rejected[slotIndex(12)], 'the 5 land in the slot of 1.25 s').toBe(5);
+  // Node 1 was behind from 1.05 s until the sample at 1.25 s: slots 10 and 11
+  // are marked, and slot 12 too, where it was still behind until that sample.
+  const behind = history.behind(1)!;
+  const marked = [9, 10, 11, 12, 13].map((k) => !Number.isNaN(behind[slotIndex(k)]));
+  expect(marked, 'node 1 is behind in slots 10 to 12').toEqual([false, true, true, true, false]);
+  expect(history.behind(0), "a departed node's row goes").toBeUndefined();
 });
 
 // -- A3: the stage's geometry for every zone count -----------------------------

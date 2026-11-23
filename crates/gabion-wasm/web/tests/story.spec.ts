@@ -1057,14 +1057,16 @@ test('the pane is one column that never swaps (A5)', async ({ page }, info) => {
   await open(page);
   const order = (): Promise<string[]> =>
     page.locator('.rail-body').evaluate((body) =>
-      [...body.querySelectorAll(':scope > .pane-title, .dashboard h3, .inspector .section-head, :scope > .pane-foot')].map((el) => (el.textContent ?? '').replace(/\s+/g, ' ').trim()),
+      [...body.querySelectorAll(':scope > .pane-title, .charts h3, .inspector .section-head, :scope > .pane-foot')].map((el) => (el.textContent ?? '').replace(/\s+/g, ' ').trim()),
     );
   const before = await order();
   expect(before[0]).toMatch(/^node 0 selected · zone a$/);
-  expect(before.slice(1, 5)).toEqual(['Aggregate vs. limit', 'Share of data bytes that crossed zones', 'Agreement by zone', 'Disagreement by zone']);
+  expect(before.slice(1, 4)).toEqual(['node 0’s window against the limit', 'Requests', 'Gossip targets']);
   expect(before.at(-1)).toMatch(/^Remove node 0$/);
   await page.locator('[role="gridcell"][data-node="4"]').press('Enter');
   await expect(page.locator('.pane-title [data-field="node"]')).toHaveText('4');
   const after = await order();
-  expect(after.slice(1, -1), 'selecting another node swaps nothing').toEqual(before.slice(1, -1));
+  // R1 follows the selection; nothing else changes, and nothing swaps.
+  const scoped = (titles: string[]): string[] => titles.slice(1, -1).map((t) => t.replace(/^node \d+’s window/, 'the window'));
+  expect(scoped(after), 'selecting another node swaps nothing').toEqual(scoped(before));
 });

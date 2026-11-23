@@ -1475,9 +1475,8 @@ impl EngineState {
             admitted_hits: self.admitted_hits,
             rejected_hits: self.rejected_hits,
             next_expiry_ms,
-            // The CRDT's own window position at this instant — the Strata
-            // right-anchors its fixed-width grid on this epoch instead of
-            // recomputing the boundary in TypeScript.
+            // The CRDT's own window position at this instant, so the page
+            // never recomputes the boundary in TypeScript.
             bucket_epoch_now: current.0,
         }
     }

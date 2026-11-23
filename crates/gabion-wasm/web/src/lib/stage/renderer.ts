@@ -490,8 +490,8 @@ export class StageRenderer {
     this.#restyle();
     this.#app.ticker.add(this.#tick, this);
     // The line pool, the Graphics its lines are drawn in (one per slot) and the
-    // glyph table, read by the design audit as Chart.svelte's `uplot` is: set
-    // once, so a frame pays nothing.
+    // glyph table, read by the design audit: set once, so a frame pays
+    // nothing.
     Object.assign(this.#app.canvas, { beams: this.#pool, beamGfx: this.#lines, glyphs: this.#glyphs });
   }
 

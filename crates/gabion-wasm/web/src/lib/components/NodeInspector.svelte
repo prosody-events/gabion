@@ -1,20 +1,17 @@
 <script lang="ts">
-  import type { Snippet } from 'svelte';
   import { fmtCount } from '../format';
   import type { NodeState, PeerView, ZoneMode, ZoneView } from '../sim/types';
   import GossipTargets from './GossipTargets.svelte';
   import InfoTip from './InfoTip.svelte';
 
   // The selected node's own sections in the detail pane, under the charts: its
-  // bucket window (`children`, the Strata), its gossip targets and, quietest
-  // and collapsed, its identity.
+  // gossip targets and, quietest and collapsed, its identity.
   let {
     node,
     peers,
     zones,
     zoneMode,
     onPreview,
-    children,
   }: {
     node: NodeState;
     /** The node's peer table, as the snapshot inspecting it reports it. */
@@ -23,24 +20,16 @@
     zoneMode: ZoneMode;
     /** A node the route sentence names, previewed on the stage. */
     onPreview: (node: number | null) => void;
-    children?: Snippet;
   } = $props();
 
   /** Shorten a 32-nibble hex id for display; the full value stays in the
-   *  identity footer. Mirrors the Strata's key shortening. */
+   *  identity footer. */
   function shortHex(hex: string): string {
     return hex.length > 12 ? `${hex.slice(0, 6)}…${hex.slice(-4)}` : hex;
   }
 </script>
 
 <section class="inspector" aria-label={`node ${node.id} details`}>
-  {#if children}
-    <section class="section">
-      <h3 class="section-head">Bucket window</h3>
-      {@render children()}
-    </section>
-  {/if}
-
   <section class="section">
     <h3 class="section-head">Gossip targets</h3>
     <GossipTargets {node} {peers} {zones} {zoneMode} {onPreview} />

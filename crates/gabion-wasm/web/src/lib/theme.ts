@@ -1,5 +1,5 @@
-// Canvas colours and type. PixiJS and uPlot take numbers and strings, not CSS
-// variables, so `readTheme` resolves the design tokens in `tokens.css` by
+// Canvas colours and type. PixiJS and the 2D charts take numbers and strings,
+// not CSS variables, so `readTheme` resolves the design tokens in `tokens.css` by
 // painting each colour and reading the pixel back: no colour string is parsed by
 // hand, whatever form the browser serialises it in.
 
@@ -72,11 +72,9 @@ export function fontsReady(): Promise<unknown> {
   return faces;
 }
 
-/** A line's peak alpha, at full ink, delivered or lost, and the REJECTING
- *  band's fill: the design audit composites each over its surface before
- *  checking contrast. */
+/** A line's peak alpha, at full ink, delivered or lost: the design audit
+ *  composites it over its surface before checking contrast. */
 export const BEAM_ALPHA = 0.8;
-export const BAND_ALPHA = 0.15;
 /** The share of its alpha a line keeps when a selection makes it context: a
  *  named exemption from the graphics contrast rule. The age fade, also exempt
  *  by name, takes a line below it only as it leaves. */
@@ -95,7 +93,7 @@ export function watchTheme(onChange: () => void): () => void {
   };
 }
 
-/** `color` as a CSS hex colour with `alpha` in [0, 1], for uPlot. */
+/** `color` as a CSS hex colour with `alpha` in [0, 1], for a 2D canvas. */
 export function cssColor(color: number, alpha = 1): string {
   return `#${(color * 256 + Math.round(alpha * 255)).toString(16).padStart(8, '0')}`;
 }

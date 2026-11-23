@@ -1,6 +1,6 @@
 // One run of one scenario: the engine and everything the page keeps about it
 // (the selection, Requests per Send, the staged knobs, the chart history, the
-// feed, the Sends it admitted, the hits a node holds for its heartbeat, its
+// feed, the reader's Sends, the hits a node holds for its heartbeat, its
 // place in its story). Undo swaps a whole run
 // back, so a scenario change, a Restart or a Rebuild is never a loss.
 
@@ -34,11 +34,11 @@ export class Run {
   readonly seededCuts: number;
   /** Where the run stands in its preset's story. */
   story: Story = $state.raw() as Story;
-  /** Ticks with each chart sample: the one signal the dashboard redraws on. */
+  /** Ticks with each chart sample: the one signal the charts redraw on. */
   chartVersion = $state(0);
   readonly history = new ChartHistory();
-  /** The Sends the run admitted, by node and bucket. */
-  readonly admissions = new RequestLog();
+  /** The reader's Sends: node, bucket, admitted and rejected. */
+  readonly sends = new RequestLog();
   /** The hits a node holds for its next heartbeat, whose sweep and countdown
    *  the page shows. */
   held: Held | null = $state.raw(null);

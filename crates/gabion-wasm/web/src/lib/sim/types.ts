@@ -319,7 +319,7 @@ export interface ClusterState {
    *  that holds hits; absent when no node's window holds any. */
   next_expiry_ms: number | undefined;
   /** The bucket epoch the watched rule sits in at `virtual_ms`, from
-   *  `RuleSpec::bucket_at`. The Strata right-anchors its fixed-width grid on
-   *  this epoch rather than recomputing the boundary in TS. */
+   *  `RuleSpec::bucket_at`: the page dates Sends and window events by it
+   *  rather than recomputing the boundary in TS. */
   bucket_epoch_now: number;
 }

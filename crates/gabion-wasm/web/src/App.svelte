@@ -55,9 +55,8 @@
   import * as say from './lib/narration';
   import { Run, UNDO_MS } from './lib/run.svelte';
   import Stage from './lib/components/Stage.svelte';
-  import Dashboard from './lib/components/Dashboard.svelte';
+  import Charts from './lib/components/Charts.svelte';
   import NodeInspector from './lib/components/NodeInspector.svelte';
-  import BucketStrata from './lib/components/BucketStrata.svelte';
   import ControlRail from './lib/components/ControlRail.svelte';
   import TransportBar from './lib/components/TransportBar.svelte';
   import StageHeading from './lib/components/StageHeading.svelte';
@@ -703,6 +702,8 @@
       const burst = event.kind.burst;
       decisions = new Map([[node, burst]]);
       decided = verdictOf(burst, before?.zone ?? 0);
+      const admitted = admittedOf(burst);
+      r.sends.push(node, r.cluster.bucket_epoch_now, admitted, burst.kind === 'Rejected' ? burst.rejected : 0);
       if (burst.kind === 'Rejected') {
         stage?.reject(node, burst.rejected);
         if (burst.admitted === 0) {
@@ -711,8 +712,6 @@
           return;
         }
       }
-      const admitted = admittedOf(burst);
-      r.admissions.push(node, r.cluster.bucket_epoch_now);
       const eager = waves(batch) > 0;
       hops = 0;
       dataSent = 0;
@@ -743,7 +742,7 @@
    *  the refusing node sees them all and more than one sent them. */
   function senders(r: Run, view: number): readonly number[] | null {
     if (view !== r.cluster.oracle_total) return null;
-    const nodes = r.admissions.nodesInWindow(r.cluster.bucket_epoch_now, buckets);
+    const nodes = r.sends.nodesInWindow(r.cluster.bucket_epoch_now, buckets);
     return nodes.length > 1 ? nodes : null;
   }
 
@@ -1333,15 +1332,22 @@
               <h2 class="pane-title">
                 node <span data-field="node">{selectedNode.id}</span>
                 <span class="pane-sub">selected · {zoneAt(cluster.zones, selectedNode.zone)}</span>
+                {#if selectedNode.id !== subjectOf(r)}
+                  <span class="pane-esc">Esc returns to node <span data-field="esc-node">{subjectOf(r)}</span></span>
+                {/if}
               </h2>
-              <Dashboard
+              <Charts
                 {cluster}
                 history={r.history}
                 version={r.chartVersion}
+                sends={r.sends}
                 {limit}
                 charts={r.preset.charts}
+                onScale={onScale(limit, r.requests)}
+                timeBins={r.preset.traffic !== undefined}
+                {bucketMs}
+                selected={r.selected}
                 {theme}
-                hotId={hoveredId ?? focusedId}
               />
               {#if inspected !== null && inspected.id === selectedNode.id}
                 <NodeInspector
@@ -1350,18 +1356,7 @@
                   zones={cluster.zones}
                   zoneMode={r.applied.zone_mode}
                   onPreview={(node) => (namedId = node)}
-                >
-                  <BucketStrata
-                    cells={inspected.cells}
-                    currentEpoch={cluster.bucket_epoch_now}
-                    epochFraction={(cluster.virtual_ms % bucketMs) / bucketMs}
-                    liveBuckets={buckets}
-                    windowMs={r.applied.rule_window_ms}
-                    {bucketMs}
-                    {limit}
-                    atLimit={selectedNode.brim.kind === 'Rejected'}
-                  />
-                </NodeInspector>
+                />
               {/if}
               <div class="pane-foot">
                 <button
@@ -1613,10 +1608,16 @@
     font-weight: 600;
   }
 
-  .pane-sub {
+  .pane-sub,
+  .pane-esc {
     font-size: var(--font-size-caption);
     font-weight: 400;
     color: var(--color-fg-muted);
+  }
+
+  .pane-esc {
+    float: right;
+    line-height: 24px;
   }
 
   .pane-foot {
@@ -1668,8 +1669,8 @@
   /* One scrolling column. `main` keeps a
      height so the absolutely positioned overlays stay visible; the square
      stage keeps the ring the same shape at every width. The rail body gets a
-     definite height, because the dashboard sizes its charts from
-     `height: 100%` rows, which collapse under an auto-height parent. */
+     definite height, so its scroller keeps a definite box under an
+     auto-height parent. */
   @media (width < 640px) {
     main {
       min-height: 50vh;

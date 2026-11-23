@@ -146,10 +146,11 @@ export interface Held {
   readonly hits: number;
 }
 
-/** A chart the detail pane shows, by what it plots: the share of data bytes
- *  that crossed zones, the agreement and disagreement panels, and the cluster
- *  total against the limit. */
-export type ChartId = 'share' | 'agreement' | 'spread' | 'limit';
+/** A chart the detail pane shows, by what it plots: the selected node's
+ *  window by bucket against the limit (R1), the requests admitted and
+ *  rejected (R2), who is behind and for how long (L), and the share of data
+ *  bytes that crossed a zone (S). The pane draws them in this order. */
+export type ChartId = 'window' | 'requests' | 'behind' | 'share';
 
 export type Preset = {
   readonly id: PresetId;
@@ -160,7 +161,7 @@ export type Preset = {
   /** The feed the play loop and Step drive, where traffic is the subject (the
    *  module header names them). */
   readonly traffic?: SustainedTraffic;
-  /** The charts the detail pane shows, in order. */
+  /** The charts the detail pane shows; it draws them in `ChartId`'s order. */
   readonly charts: readonly ChartId[];
   /** The story the caption tells, as it opens, with the scenario it hands
    *  over to. */
@@ -244,9 +245,6 @@ async function spreadOut(sim: Sim, c: SimConfig): Promise<Held | null> {
   return held;
 }
 
-const CHARTS: readonly ChartId[] = ['share', 'agreement', 'spread'];
-const LIMIT_FIRST: readonly ChartId[] = ['limit', 'share', 'agreement', 'spread'];
-
 /** The scenarios, in the rail's order. */
 export const PRESETS: readonly Preset[] = [
   {
@@ -254,7 +252,7 @@ export const PRESETS: readonly Preset[] = [
     label: 'Rate limiting',
     group: 0,
     config: { nodes: NODES, zones: ZONES, rule_limit: RATE_LIMIT },
-    charts: LIMIT_FIRST,
+    charts: ['window', 'requests'],
     story: { kind: 'rate-limiting', next: 'partition', act: 'open', zones: 0, sendBucket: null },
     async seed() {
       // Opens settled at 0: the reader's Sends are the story.
@@ -266,7 +264,7 @@ export const PRESETS: readonly Preset[] = [
     label: 'Propagation',
     group: 0,
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
-    charts: CHARTS,
+    charts: ['behind'],
     story: { kind: 'propagation', next: 'rate-limiting', act: 'open' },
     async seed(sim, c) {
       await sim.submitRequest(ORIGIN, WATCHED_KEY, SEED_REQUESTS);
@@ -284,7 +282,7 @@ export const PRESETS: readonly Preset[] = [
     // fills each node admits what expiry frees and rejects the rest.
     config: { nodes: NODES, zones: ZONES, rule_limit: 400 },
     traffic: { rate_per_sec: OVERLOAD_RATE_PER_SEC, at: 'every-node' },
-    charts: LIMIT_FIRST,
+    charts: ['window', 'requests', 'behind'],
     story: { kind: 'watch', watched: 'overload', next: 'rate-limiting' },
     async seed() {
       // No opening request: the sustained feed (driven during play) is the story.
@@ -296,7 +294,7 @@ export const PRESETS: readonly Preset[] = [
     label: 'Zone partition',
     group: 1,
     config: { nodes: NODES, zones: ZONES, rule_limit: RATE_LIMIT },
-    charts: LIMIT_FIRST,
+    charts: ['window', 'requests', 'behind'],
     story: { kind: 'partition', next: 'gateway-failure', act: 'open' },
     async seed(sim, c) {
       await sim.cut({ kind: 'zone', zone: c.zones - 1 }, buildNodes(c));
@@ -308,7 +306,7 @@ export const PRESETS: readonly Preset[] = [
     label: 'Packet loss',
     group: 1,
     config: { nodes: NODES, zones: ZONES, uniform_loss: 0.3, rule_limit: NARRATIVE_LIMIT },
-    charts: CHARTS,
+    charts: ['behind'],
     story: { kind: 'watch', watched: 'loss', next: 'rate-limiting' },
     seed: (sim) => opening(sim, ORIGIN, SEED_REQUESTS),
   },
@@ -317,7 +315,7 @@ export const PRESETS: readonly Preset[] = [
     label: 'Gateway failure',
     group: 1,
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
-    charts: CHARTS,
+    charts: ['behind'],
     story: { kind: 'watch', watched: 'gateway-failure', next: 'gateway-cut' },
     async seed(sim, c, gateways) {
       const g = gateways[ORIGIN]?.[1] ?? noGateway(1);
@@ -331,7 +329,7 @@ export const PRESETS: readonly Preset[] = [
     group: 1,
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
     traffic: { rate_per_sec: TRICKLE_RATE_PER_SEC, at: { node: ORIGIN } },
-    charts: CHARTS,
+    charts: ['behind'],
     story: { kind: 'watch', watched: 'gateway-cut', next: 'sandbox' },
     async seed(sim, c, gateways) {
       const g = gateways[ORIGIN]?.[1] ?? noGateway(1);
@@ -345,7 +343,7 @@ export const PRESETS: readonly Preset[] = [
     group: 2,
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
     traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC, at: 'every-node' },
-    charts: CHARTS,
+    charts: ['behind', 'share'],
     story: { kind: 'watch', watched: 'steady', next: 'rate-limiting' },
     seed: spreadOut,
   },
@@ -355,7 +353,7 @@ export const PRESETS: readonly Preset[] = [
     group: 2,
     config: { nodes: NODES, zones: ZONES, zone_mode: 'Unset', rule_limit: NARRATIVE_LIMIT },
     traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC, at: 'every-node' },
-    charts: CHARTS,
+    charts: ['behind', 'share'],
     story: { kind: 'watch', watched: 'no-zone', next: 'rate-limiting' },
     seed: spreadOut,
   },
@@ -367,7 +365,7 @@ export const PRESETS: readonly Preset[] = [
     // drives every hit. The far-off limit, so a request spreads at its node's
     // next heartbeat, one event at a time under Step.
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
-    charts: CHARTS,
+    charts: ['requests', 'behind'],
     story: { kind: 'sandbox' },
     async seed() {
       // Deliberately empty: the reader sends the first hit.

@@ -2,7 +2,7 @@ import { expect, test as base, type Page } from '@playwright/test';
 import { CARRIES_CELLS, type AnswerState, type ClusterState, type EventBatch } from '../src/lib/sim/types';
 import { WATCHED_KEY } from '../src/lib/presets';
 import { CONTROL } from '../src/lib/stage/layout';
-import { pauseIfPlaying, select, send, sendButton, setRange, setSpeed, step, stepUntil, virtualMs } from './drive';
+import { pauseIfPlaying, send, sendButton, setRange, setSpeed, step, stepUntil, virtualMs } from './drive';
 
 /** Every test fails on an error the page throws. */
 const test = base.extend<{ page: Page }>({
@@ -180,7 +180,7 @@ test('a click off the discs keeps the selection', async ({ page }) => {
   await expect(title(page)).toHaveText('3');
   await clickBare(page);
   await expect(title(page)).toHaveText('3');
-  await expect(page.locator('.dashboard')).toBeVisible();
+  await expect(page.locator('.charts')).toBeVisible();
 });
 
 // Removing the selected node moves the selection to the scenario's fallback:
@@ -205,13 +205,13 @@ test('the stage heading states the cluster', async ({ page }) => {
   const heading = page.locator('[data-template]');
   await expect(heading).toHaveAttribute('data-template', 'rl-0');
   await expect(heading).toHaveText(`All ${NODES} nodes see 0 of the 100 limit`);
-  await expect(page.locator('.dashboard')).toBeVisible();
+  await expect(page.locator('.charts')).toBeVisible();
 });
 
 // Sandbox: a Send runs its waves and pauses itself, every node agreeing; a
 // Send the reader pauses at once is then drawn by Step one wave at a time. The
-// Strata honesty invariant (Σ over the rendered slots equals the node's count)
-// holds throughout, and with no feed the hits age out to quiet.
+// requests chart counts what was admitted, and with no feed the hits age out
+// to quiet.
 test('a Send runs its waves and pauses itself; Step after Send goes one wave at a time', async ({ page }) => {
   await boot(page);
   await loadPreset(page, 'Sandbox');
@@ -220,8 +220,7 @@ test('a Send runs its waves and pauses itself; Step after Send goes one wave at 
   await send(page, 0);
   await expect(page.locator(COUNTS)).toHaveText(Array(NODES).fill(BURST_REQUESTS));
   await expect(page.getByRole('button', { name: 'Play' })).toBeVisible();
-  const strata = page.locator('.strata');
-  await expect(strata.locator('.sigma-value')).toHaveText(BURST_REQUESTS);
+  await expect(page.locator('figure[data-chart="requests"] [data-field="admitted"]')).toHaveText(BURST_REQUESTS);
 
   // Paused at once, the next Send waits for node 0's heartbeat; each Step
   // then lands one wave, so node 6 (a zone peer) counts it before node 1
@@ -236,37 +235,35 @@ test('a Send runs its waves and pauses itself; Step after Send goes one wave at 
   // With no feed to replenish it, the window empties and the cluster falls
   // quiet.
   await page.getByRole('button', { name: 'Play' }).click();
-  await expect(strata.locator('.no-traffic')).toBeVisible({ timeout: 20_000 });
-  await page.getByRole('button', { name: 'Pause' }).click();
-  await expect(view(page, 0)).toHaveText('0');
+  await expect(view(page, 0)).toHaveText('0', { timeout: 20_000 });
+  await pauseIfPlaying(page);
 });
 
-// The Strata is a fixed-width conveyor belt: the time channel is the track's
-// leftward scroll, the data channel is bar height — kept separate so a window
-// slide reads as motion, never as bars "growing in place". Its column count is
-// fixed for the whole session and never grows, shrinks, or stretches as virtual
-// time advances — the regression behind the old "bars stretch / overlap / scroll
-// off screen" report (a variable slot count re-distributing `flex:1` widths).
-// Default window is 10 s → liveBuckets 10 → 11 columns (the 10-bucket window
-// admission counts plus the emerging bucket scrolling in under "now"). Select the seeded node, then
-// drive time forward and confirm the column count is pinned throughout.
-test('the Strata keeps a fixed column count as the window scrolls', async ({ page }) => {
+// The Rate limiting script on the charts (A30): Sends at nodes 0, 1, 2 and 2
+// fill the window, and a fifth at node 2 is refused whole. R1 draws node 2's
+// window, whose buckets sum to its window total, with the refusal standing on
+// it, labelled; the table lists the five Sends in order, the fifth rejected.
+test('the charts tell the Rate limiting script', async ({ page }) => {
   await boot(page);
-  await loadPreset(page, 'Propagation');
-  await select(page, 0);
-
-  // One key (the watched key) → one strip; its track holds liveBuckets + 1 = 11
-  // fixed-width columns from the first render.
-  const cells = page.locator('.strata .strip .track .bar-cell');
-  await expect(cells).toHaveCount(11);
-
-  // Drive virtual time past several bucket boundaries (the window scrolls).
-  // The column count must not move — no insert, no re-distribution.
-  const from = await virtualMs(page);
-  await page.getByRole('button', { name: 'Play' }).click();
-  await expect.poll(async () => virtualMs(page), { timeout: 15_000 }).toBeGreaterThan(from + 4000);
-  await page.getByRole('button', { name: 'Pause' }).click();
-  await expect(cells).toHaveCount(11);
+  for (const node of [0, 1, 2, 2, 2]) await send(page, node);
+  const r1 = page.locator('figure[data-chart="window"]');
+  await expect(r1.locator('[data-field="r1-total"]')).toHaveText('100');
+  const canvas = r1.locator('canvas');
+  await expect
+    .poll(() => canvas.evaluate((c: HTMLCanvasElement) => (c.dataset.columns ?? '').split(',').reduce((a, v) => a + Number(v), 0)))
+    .toBe(100);
+  await expect
+    .poll(() => canvas.evaluate((c: HTMLCanvasElement) => (JSON.parse(c.dataset.labelBoxes ?? '[]') as { text: string }[]).map((l) => l.text)))
+    .toEqual(expect.arrayContaining(['limit 100', '25 rejected']));
+  const r2 = page.locator('figure[data-chart="requests"]');
+  await expect(r2.locator('[data-field="admitted"]')).toHaveText('100');
+  await expect(r2.locator('[data-field="rejected"]')).toHaveText('25');
+  await page.getByText('Show the charts as tables').click();
+  const rows = page.locator('details.table table').last().locator('tbody tr');
+  await expect(rows.locator('[data-field="node"]')).toHaveText(['0', '1', '2', '2', '2']);
+  await expect(rows.locator('[data-field="admitted"]')).toHaveText(['25', '25', '25', '25', '0']);
+  await expect(rows.locator('[data-field="rejected"]')).toHaveText(['0', '0', '0', '0', '25']);
+  await page.screenshot({ path: 'screenshots/charts-rate-limiting.png' });
 });
 
 // Live join: "+ Add node" spawns a fresh cold-start member into a settled
@@ -281,11 +278,9 @@ test('adding a node joins it live and it catches up by gossip', async ({ page })
   await boot(page);
   await loadPreset(page, 'Propagation');
 
-  // The dashboard before the join: the share, agreement and disagreement charts
-  // over the elapsed window. Pair with `dash-after-add` to eyeball that the join
-  // threads through this same window — the time axis keeps running, no restart
-  // at x = 0.
-  const dashboard = page.locator('.dashboard');
+  // The charts before the join. Pair with `dash-after-add` to eyeball that the
+  // join threads through this same window: the time axis keeps running.
+  const dashboard = page.locator('.charts');
   await dashboard.screenshot({ path: 'screenshots/dash-before-add.png' });
 
   // Add a fresh node: it takes id 12, joins zone a and starts cold (view zero).
@@ -408,7 +403,7 @@ test('a rebuild knob stages, keeps the section open, and applies on Rebuild', as
 
 // The rule knobs live in the same disclosure: a gossip-interval and window range
 // plus a limit number input. Moving the window updates its derived bucket-count
-// readout (the same `buckets.ts` math the Strata draws bars from); the explicit
+// readout (the `buckets.ts` math); the explicit
 // Rebuild then applies it — proof the readout and the rebuild are wired and the
 // engine still accepts the new window/bucket pairing (window stays a whole
 // number of 1 s buckets, so `SimConfig::validate` passes). The zone stepper
@@ -431,18 +426,22 @@ test('the window knob updates its bucket-count readout and rebuilds', async ({ p
   await expect(page.locator('label[for="knob-window"] .val')).toHaveText('5 s · 5 buckets');
 
   // Apply it. The rebuild left a healthy cluster of the same size, no errors,
-  // and the Strata draws the rebuilt window: 5 buckets plus the one scrolling
-  // in under "now".
+  // and the time charts span the rebuilt window.
   await page.getByRole('button', { name: 'Rebuild cluster' }).click();
   await expect(page.locator('.overlay')).toHaveCount(0);
   await expect(page.locator(COUNTS)).toHaveCount(NODES);
-  await expect(page.locator('.strata .strip .track .bar-cell')).toHaveCount(6);
+  await expect
+    .poll(() =>
+      page
+        .locator('figure[data-chart="behind"] canvas')
+        .evaluate((c: HTMLCanvasElement) => (JSON.parse(c.dataset.labelBoxes ?? '[]') as { text: string }[]).map((l) => l.text)),
+    )
+    .toContain('5\u202fs ago');
 });
 
 // The sustained-overload scenario feeds the cluster at a steady rate against a
 // low limit (400). Stepped, the nodes admit hits until their window holds the
-// limit and reject the rest — the "why gabion exists" story, and the one
-// scenario that surfaces the Aggregate-vs-Limit chart.
+// limit and reject the rest: the "why gabion exists" story.
 test('sustained overload rejects what passes the limit', async ({ page }) => {
   // About 20 s alone, each Step deciding the feed's requests one by one: the
   // default 30 s left too little room on a loaded runner.
@@ -454,66 +453,44 @@ test('sustained overload rejects what passes the limit', async ({ page }) => {
   // every node starts at zero until played.
   await expect(view(page, 0)).toHaveText('0');
 
-  // The REJECTING band fills the plot from its top down to the limit line and no
-  // further. Read from the drawn pixels of three rows across the plot's right
-  // half, 5 px clear of the top and of the dashed line, where no label (both sit
-  // at the left) and, before Play, no series reaches; the vertical grid lines
-  // cross all three rows alike.
-  const plot = page.locator('section.block', { hasText: 'Aggregate vs. limit' }).locator('.plot');
-  await expect
-    .poll(() =>
-      plot.evaluate((host: HTMLElement & { uplot?: any }, limit) => {
-        const u = host.uplot;
-        if (u === undefined) return null;
-        const gap = 5 * (u.pxRatio ?? devicePixelRatio);
-        const [x, w] = [Math.round(u.bbox.left + u.bbox.width / 2), Math.floor(u.bbox.width / 2)];
-        const line = u.valToPos(limit, 'y', true);
-        const at = (y: number): string => u.ctx.getImageData(x, Math.round(y), w, 1).data.join();
-        const [top, above, below] = [at(u.bbox.top + gap), at(line - gap), at(line + gap)];
-        return { 'one fill from the plot top to the limit': above === top, 'ends at the limit line': below !== above };
-      }, 400),
-    )
-    .toEqual({ 'one fill from the plot top to the limit': true, 'ends at the limit line': true });
-
   // The feed offers 40 hits a Step, so the window fills to the limit of 400
   // within a dozen Steps and the next requests are rejected; a node rejects
   // only once its own window holds the limit, so the cluster has admitted at
   // least that many by then.
   await stepUntil(page, async () => (await snapshot(page)).rejected_hits > 0, 40, 'a node rejected a request');
   expect((await snapshot(page)).admitted_hits, 'the window filled before any rejection').toBeGreaterThanOrEqual(400);
+  // Stepped and still, the requests chart prints the engine's counters.
+  const counted = await snapshot(page);
+  const r2 = page.locator('figure[data-chart="requests"]');
+  await expect(r2.locator('[data-field="admitted"]')).toHaveText(String(counted.admitted_hits));
+  await expect(r2.locator('[data-field="rejected"]')).toHaveText(String(counted.rejected_hits));
   await page.screenshot({ path: 'screenshots/ring-overload.png' });
-  // A dashboard-only frame, large enough to eyeball that the REJECTING band
-  // (the shaded regime above the dashed limit line) actually reads against the
-  // white panel — the full-page shot is too small to judge a pale fill.
-  await page.locator('.dashboard').screenshot({ path: 'screenshots/dash-overload.png' });
+  await page.locator('.charts').screenshot({ path: 'screenshots/dash-overload.png' });
 
 });
 
 // On a display with 2 device px per CSS px every chart label is still drawn at
-// its CSS size: each published box spans its text, set in the page's font at
-// the box's size in device px and measured back in CSS px, plus a 2 px halo each
-// side. (Measured at the device size, as drawn, because a system font's optical
-// sizes set 2 × 10 px text narrower than twice 10 px text.) Every other project
-// draws at 1 device px, where a label sized in device px looks the same.
+// its CSS size: the charts draw in CSS px through a device-pixel transform, so
+// each published box spans its text set in the page's font at the box's size,
+// measured the same way, plus a 2 px halo each side, and the canvas holds 2
+// device px per CSS px.
 test.describe('on a 2× display', () => {
   test.use({ deviceScaleFactor: 2 });
 
   test('chart labels keep their CSS size', async ({ page }) => {
     await boot(page);
-    await page.getByRole('button', { name: 'Sustained overload' }).click();
-    const canvas = page.locator('section.block', { hasText: 'Aggregate vs. limit' }).locator('canvas[data-label-boxes]');
+    const canvas = page.locator('figure[data-chart="window"] canvas[data-label-boxes]');
     await expect
       .poll(() =>
         canvas.evaluate((c: HTMLCanvasElement) => {
           const ctx = document.createElement('canvas').getContext('2d')!;
           const family = getComputedStyle(document.documentElement).fontFamily;
-          const dpr = window.devicePixelRatio;
           const labels = JSON.parse(c.dataset.labelBoxes ?? '[]') as { text: string; w: number; size: number }[];
           return {
-            dpr,
+            dpr: c.width / c.clientWidth,
             labels: labels.map((l) => {
-              ctx.font = `${l.size * dpr}px ${family}`;
-              const text = ctx.measureText(l.text).width / dpr;
+              ctx.font = `${l.size}px ${family}`;
+              const text = ctx.measureText(l.text).width;
               return { text: l.text, spansItsText: Math.abs(l.w - text - 4) < 0.5 };
             }),
           };
@@ -521,10 +498,7 @@ test.describe('on a 2× display', () => {
       )
       .toEqual({
         dpr: 2,
-        labels: [
-          { text: 'REJECTING', spansItsText: true },
-          { text: 'limit', spansItsText: true },
-        ],
+        labels: ['0', '50', 'limit 100', '10\u202fs ago', 'now'].map((text) => ({ text, spansItsText: true })),
       });
   });
 });
@@ -659,8 +633,7 @@ test('a node that joins a cut zone is cut off with it (A6)', async ({ page }) =>
 });
 
 // The detail pane surfaces the runtime's admin snapshot under the charts: the
-// bucket window, the gossip targets with its route sentence and the identity
-// footer.
+// gossip targets with its route sentence and the identity footer.
 test('the detail pane renders every section', async ({ page }) => {
 
   await boot(page);
@@ -669,9 +642,8 @@ test('the detail pane renders every section', async ({ page }) => {
   await expect(inspector).toBeVisible();
   await expect(page.locator('.pane-title')).toContainText('selected · zone a');
 
-  await expect(inspector.locator('.section-head', { hasText: 'Bucket window' })).toBeVisible();
   await expect(inspector.locator('.section-head', { hasText: 'Gossip targets' })).toBeVisible();
-  await expect(inspector.locator('.section-head')).toHaveCount(2);
+  await expect(inspector.locator('.section-head')).toHaveCount(1);
 
   // Gossip targets: the route sentence names exactly the gateways the stage
   // marks, then own zone, zone peers, one row per remote zone, counters and
@@ -691,12 +663,6 @@ test('the detail pane renders every section', async ({ page }) => {
   await identity.locator('summary').click();
   await expect(identity).toContainText('Cells held');
   expect(num(await identity.locator('[data-field="cells-held"]').textContent())).toBeGreaterThan(0);
-
-  // Honesty invariant: the Strata Σ equals the selected node's count, for the
-  // single watched key.
-  const sigma = num(await inspector.locator('.strata .sigma-value').first().textContent());
-  expect(sigma, "Strata Σ should equal node 0's count").toBe(num(await view(page, 0).textContent()));
-
 });
 
 // The pane tells a newcomer what node 0's runtime chose: one row per

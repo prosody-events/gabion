@@ -259,9 +259,9 @@ pub struct ClusterState {
     /// that holds hits, if any node's window holds some.
     pub next_expiry_ms: Option<u64>,
     /// The bucket epoch the watched rule sits in at `virtual_ms`, straight
-    /// from `RuleSpec::bucket_at` — so the Strata renders the CRDT's window
-    /// layout rather than recomputing it. Rule-global in v1 (one watched
-    /// rule); moves per-rule in the v1.1 multi-rule shape.
+    /// from `RuleSpec::bucket_at`, so the page dates Sends and window events
+    /// by the CRDT's own buckets rather than recomputing them. Rule-global in
+    /// v1 (one watched rule); moves per-rule in the v1.1 multi-rule shape.
     pub bucket_epoch_now: u32,
 }
 

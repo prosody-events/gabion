@@ -120,22 +120,44 @@ table" lists the same rows as a table; both are in (zone, id) order, never
 re-sorted. Every printed number is a `[data-field]` element, which is the DOM
 source the functional tests read.
 
-**Charts**, under the selected node's title, in the order the scenario lists
-them. Chart 1 plots σ, the share of data bytes
-(`Own`, `Relay` and `Sweep` packets) that crossed zones over the rule window, on
-a fixed 0–100 % axis, over two dashed predictions: with zones, `(Z−1)/(N−1)`, and
-with no zone, the mean of `(N − n_z)/(N − 1)` over the nodes weighted by each
-node's own data bytes in the window (the engine counts them per node as
-`own_data_bytes`). A window with no data leaves a gap. Charts 2 and 3 are one
-panel per zone with members, in zone order: the band from the least to the most
-informed node over the true total, and the spread (max − min) over a zero
-reference; chart 3 ends with a "whole cluster" panel. A hovered or focused node
-draws its own line in its zone's panel. Chart 4, the true total against the
-limit, shows first where the limit is on the scale (Rate limiting, Zone
-partition, Sustained overload).
+**Charts**, under the selected node's title, in one fixed order, each shown
+where the scenario lists it (`charts` in `lib/presets.ts`), drawn on 2D
+canvases that share one frame: a 40 px gutter for ticks and zone names, a
+76 px margin for direct labels, ticks only at 0 and the midpoint.
 
-**Detail pane.** One column that never swaps: the selected node's title, the
-scenario's charts, its bucket window, **Gossip targets** and its identity, and
+- **R1, the window by bucket** (Rate limiting, Sustained overload, Zone
+  partition; only while the limit is on the vessels' scale): one column per
+  live bucket of the selected node's window, oldest at the left, each bucket's
+  hits floating on the older buckets', so the top at "now" is the node's
+  `window_total`, on the vessel's 1.25 × limit scale with the limit at 0.8.
+  A dashed outline shows where the cluster counted more in a bucket than the
+  node heard; a refused Send stands on the current bucket as a hollow red
+  slashed block, labelled.
+- **R2, requests**: admitted above the axis, rejected below as a hollow red
+  slashed block. Without a feed it draws one bar per Send in order, the
+  node's id under each (`lib/requests.ts`); with a feed, requests per 100 ms
+  slot on the shared time axis, merged into seconds past 50 bars. Its caption
+  reads the engine's session counters.
+- **L, who is behind**: one 5 px row per node in (zone, id) order, zone names
+  in the gutter, an amber run in every slot the node's `lag` was not
+  `CaughtUp`.
+- **S, the share of data bytes that crossed a zone** over the window ending at
+  each slot, over two dashed predictions: with zones, `(Z−1)/(N−1)`, and with
+  no zone, the mean of `(N − n_z)/(N − 1)` over the nodes.
+
+The time charts (R2 with a feed, L and S) share one domain, the last rule
+window of virtual time, read from `lib/charts/history.ts`: preallocated rings
+of 100 slots that open as virtual time crosses each slot's start, never per
+frame. One x axis sits under the last time chart. A readout line under the
+stack names the item under the pointer, or under a focused chart's arrow keys
+(one bucket, request or slot per arrow, a second with Shift); each chart is a
+`role="slider"` with a sentence for its label, refreshed once a second; and
+"Show the charts as tables" lists the selected node's window by bucket and the
+Sends.
+
+**Detail pane.** One column that never swaps: the selected node's title (with
+"Esc returns to node N" while another node is selected), the scenario's charts,
+**Gossip targets** and its identity, and
 "Remove node N" at the foot. Gossip targets opens with the route sentence
 ("node 0 sends to its own zone directly, to zone b through node 4, and to zone
 c through node 8") and is one table: the node's own zone, its zone peers, one
@@ -212,9 +234,9 @@ reason: a decision, a run's end, a refusal with the nodes whose hits fill the
 window, an expiry, a wave on Step, a gateway change, a fresh start.
 
 `window.sim` is the live engine, the handle the audit and the console use
-(`sim.snapshot(inspect, watch)`); each chart's plot element carries its uPlot
-instance as `uplot`, which the audit reads to check every mark lies inside its
-plot; the stage canvas carries `beams`, the renderer's line pool (`len`,
+(`sim.snapshot(inspect, watch)`); R1's canvas publishes its columns
+(`data-columns`) and L's its rows and marked slots (`data-rows`,
+`data-marked`); the stage canvas carries `beams`, the renderer's line pool (`len`,
 `redraws`, `sent`, `alpha`, and the `push` and `removeAt` the audit wraps to
 see each line arrive and leave), `beamGfx`, the one Graphics per line slot,
 and `glyphs`, the `GlyphTable` of every node mark as drawn (vessel heights,
@@ -250,9 +272,9 @@ text until a face loads; the canvas and the charts wait for the faces
   browser floor at Chrome 123, Safari 17.5 and Firefox 120. The study dashboard
   keeps a byte-identical copy. `src/app.css` holds only the base element rules.
 - `src/lib/theme.ts` — `readTheme` resolves the colours and the canvas type
-  PixiJS and uPlot need as numbers, painting each colour and reading the pixel
-  back; `watchTheme` reports an OS scheme or `data-theme` change; `cssColor`
-  formats a colour for uPlot.
+  PixiJS and the charts need as numbers, painting each colour and reading the
+  pixel back; `watchTheme` reports an OS scheme or `data-theme` change;
+  `cssColor` formats a colour for a 2D canvas.
 - `src/lib/format.ts` — the one place a number or zone name becomes text.
 - `src/lib/sim/` — the wasm boundary. `types.ts` hand-mirrors the serde shapes
   (the generated `.d.ts` types every payload as `any`); `sim.ts` is the typed
@@ -265,20 +287,18 @@ text until a face loads; the canvas and the charts wait for the faces
 - `src/lib/next.ts`, `heading.ts`, `narration.ts`, `controls.ts`, `limit.ts`,
   `glyphs.ts`, `requests.ts` — the next action, the heading, the narration's
   sentences, the transport's labels, the limit's scale, the one glyph geometry
-  and the admitted requests' ring.
+  and the ring of the reader's Sends.
 - `src/lib/stage/` — `layout.ts` is the geometry (`stageLayout`, `beamPath`,
   `pointOn`, `reachT`, `nodeAt`); `renderer.ts` is the framework-agnostic
   `StageRenderer` that owns the PixiJS canvas, the line pool, the labels and
   the glyphs.
-- `src/lib/charts/` — `history.ts` is the bounded, column-major rolling
-  time-series with the windowed share; `options.ts` builds each uPlot chart's
-  options (shared cursor sync, references drawn first, labels through one
-  halo-and-record helper); `Chart.svelte` is the generic imperative uPlot
-  wrapper.
+- `src/lib/charts/` — `history.ts` holds the time charts' slot rings and the
+  windowed share; `draw.ts` draws R1, R2, L and S in one frame, every label
+  through one halo-and-record helper; `readout.ts` words the readout line.
 - `src/lib/components/` — `Stage` (the renderer and the key), `NodeGrid`
   (grid, counts, decisions, tooltip, table), `StageCaption` (goal and action
-  line), `StageHeading`, `Dashboard`, `NodeInspector` with `GossipTargets` and
-  `BucketStrata`, `ControlRail`, `TransportBar`, `RoleGlyph` and `Icon` (the
+  line), `StageHeading`, `Charts`, `NodeInspector` with `GossipTargets`,
+  `ControlRail`, `TransportBar`, `RoleGlyph` and `Icon` (the
   drawn marks), `Sentence` and `InfoTip`.
 - `src/lib/presets.ts` — the scenario presets: a config, the node
   it selects, Requests per Send, its charts, its story and the scenario it hands
@@ -365,9 +385,9 @@ Automated checks, run on every preset after a walk by Step:
 
 - A1: no page or console errors, no failed requests, no page-level horizontal overflow.
 - A2: no "NaN", "undefined", "null", "Infinity", "[object" or "e+" in page text.
-- A3: no two visible text boxes, DOM or canvas, overlap by 1 px or more, also in a converged state; no text is below the smallest type token (`--font-size-caption-sm`) and none is clipped by an `overflow: hidden` ancestor; every chart value lies inside its plot and every y axis labels at least two values; no glyph that carries meaning is set from a font; the stage names every node; tooltips stay inside the stage; and for every zone count the stage's rings (grown by the largest disc) and labels lie inside it, no two nodes of different rings touch, and no cross-zone `beamPath` comes within a disc and half a stroke of a third ring, and every line bends through the centre exactly when its nodes' zones differ and wears its packet's kind, tier and fate (a dot for an acknowledgement or a sweep request, a relay marked as one), one line per packet.
-- A4: data correctness, recomputed independently from the engine snapshot in the test's own code: the lede's counts, each node's behind-by and gateway-for count, the heading (A18: its form, truth, gap, countdown and censored "not caught up (≥ t)"), each chart-3 spread, the windowed share, both chart-1 predictions (with unequal zones, and absent with one node) and, for the selected node, its Gossip targets.
-- A5: fixed order across the grid, table, chart panels and Gossip-targets rows; the key lists exactly the marks drawn.
+- A3: no two visible text boxes, DOM or canvas, overlap by 1 px or more, also in a converged state; no text is below the smallest type token (`--font-size-caption-sm`) and none is clipped by an `overflow: hidden` ancestor; no glyph that carries meaning is set from a font; the stage names every node; tooltips stay inside the stage; and for every zone count the stage's rings (grown by the largest disc) and labels lie inside it, no two nodes of different rings touch, and no cross-zone `beamPath` comes within a disc and half a stroke of a third ring, and every line bends through the centre exactly when its nodes' zones differ and wears its packet's kind, tier and fate (a dot for an acknowledgement or a sweep request, a relay marked as one), one line per packet.
+- A4: data correctness, recomputed independently from the engine snapshot in the test's own code: the lede's counts, each node's behind-by and gateway-for count, the heading (A18: its form, truth, gap, countdown and censored "not caught up (≥ t)"), R1's total and columns for the selected node, R2's session counters, L's (zone, id) rows, both of S's predictions (with unequal zones) and, for the selected node, its Gossip targets.
+- A5: fixed order across the grid, table, the charts (R1, R2, L, S, as the scenario lists them) and Gossip-targets rows; the key lists exactly the marks drawn.
 - A42: every node mark against the layout and the snapshot: each port on its circle facing its zone and clear of its disc, every ring and count; the selection clear of facing rings; each name a node's name, smaller than the counts, inside the canvas and clear of every mark; the fill's top and brim on the vessel's scale, the cap with the brim decision, the ring's role with the lag.
 - A6: interaction: the zone stepper and Rebuild, each network action and heal, keyboard navigation with focus kept across a rebuild, a tooltip on hover, focus and tap, and the study link's form (`study/` joins the site only in the Pages build, so its href is checked, not followed).
 - A7: contrast from computed styles, text at 4.5:1 and graphics at 3:1 on the surface they sit on, translucent marks composited over it first, in both themes, with targets of at least 24 px.
@@ -433,9 +453,10 @@ story's hand-over and Undo. The design audit is ten projects (widths
 Its main test walks every preset a few heartbeat periods by Step at 4×, runs A1
 to A9, checks the stage tooltips, and recomputes A4 and A5 from the engine's
 snapshot, then repeats the page checks with `data-theme` forcing the other
-theme. Further tests check chart 1 across the rule window, with unequal zones
-over a window that opens at a kept mark, and with one node (at the widest and
-the narrowest stage); the share window at any snapshot rate; the stage geometry
+theme. Further tests check S on its prediction in Steady state and with unequal
+zones, and the charts with one node (at the widest and the narrowest stage);
+one frame for every chart, L's marks in Zone partition and the readout by
+keyboard; the share window and the request rings by arithmetic; the stage geometry
 for every zone count (at the widest and the narrowest stage, with facing discs
 of neighbouring rings kept apart); that the lines a Step draws are its packets,
 one each with its packet's kind, tier and fate, over packets of every kind (a
