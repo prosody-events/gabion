@@ -139,6 +139,51 @@ docker build -f deploy/nginx/Dockerfile.openresty \
   -t gabion-openresty:alpine .
 ```
 
+## Patched OpenResty for CVE-2026-123007
+
+nginx 1.31.9 and 1.30.7 fix ten CVEs, including two HTTP/2 remote code
+execution bugs (CVE-2026-123007, CVE-2026-123633) and a buffer overflow
+with `try_files` + `alias` (CVE-2026-125283). OpenResty 1.31.8.1 still
+bundles the vulnerable nginx 1.31.8. Until OpenResty releases a fixed
+version, `.github/workflows/openresty-cve-2026-123007.yml` publishes a
+separate OpenResty image with all ten fixes applied. The workflow lists
+each CVE next to its fix commits. The images:
+
+```sh
+docker pull ghcr.io/<repo>/openresty:v0.3.2-cve-2026-123007-openresty1.31.8.1           # alpine
+docker pull ghcr.io/<repo>/openresty:v0.3.2-cve-2026-123007-openresty1.31.8.1-bookworm  # apt-based
+```
+
+Dropping the `v0.3.2-` prefix gives the latest such build. The tags end in
+`-openresty<version>[-<distro>]` like the regular ones, so tools that parse
+the version and distro out of the tag still work.
+
+The **alpine** flavor builds OpenResty with upstream's
+[docker-openresty](https://github.com/openresty/docker-openresty) Alpine
+recipe, the one behind `openresty/openresty:alpine`, pinned to its
+`1.31.8.1-0` tag. It applies nginx's own fix commits to the bundled
+`nginx-1.31.8` before `./configure`.
+
+The **bookworm** flavor starts from the official `openresty/openresty:bookworm`
+image and replaces only its nginx binary
+(`Dockerfile.openresty-patched-deb`). The binary is rebuilt from the patched
+source with the `openresty` deb's own configure line and dpkg build flags,
+and the build fails unless its `nginx -V` configure arguments match the
+deb binary's exactly. dpkg still records the `openresty` deb, so images
+built on this one can keep pinning it and installing `openresty-opm`,
+`openresty-resty` and packages that depend on them.
+
+Both flavors then build `Dockerfile.openresty` on the patched base. The
+images still report `openresty/1.31.8.1`. To see which fixes they carry,
+read the `io.gabion.nginx-fix-commits` label. The workflow runs on every PR
+that changes it and publishes when it lands on `main`. To build another
+gabion release, run it by hand with `gabion-ref`.
+
+The regular `openresty` tags are unchanged and keep tracking the official
+images. Once an OpenResty release bundles nginx 1.31.9 or later, the
+weekly `docker.yml` rebuild picks it up. Then switch back to those tags
+and delete the workflow and this section.
+
 ## Binding layout check
 
 Every module build, and so every NGINX and OpenResty version in the
