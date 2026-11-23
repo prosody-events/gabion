@@ -6,11 +6,14 @@ export function fmtPercent(share: number): string {
   return `${(share * 100).toFixed(1)}%`;
 }
 
+/** A number and its SI unit, joined by a narrow no-break space (U+202F): "10 s". */
+export const unit = (value: number | string, symbol: string): string => `${value}\u202f${symbol}`;
+
 /** A span of virtual time: whole milliseconds below one second, else seconds
  *  with one decimal. */
 export function fmtDuration(ms: number): string {
   const whole = Math.round(ms);
-  return whole < 1000 ? `${whole} ms` : `${(ms / 1000).toFixed(1)} s`;
+  return whole < 1000 ? unit(whole, 'ms') : unit((ms / 1000).toFixed(1), 's');
 }
 
 /** A count with thousands separators, in a fixed locale. */
@@ -64,7 +67,7 @@ export function joined(items: readonly Blurb[]): Blurb {
 
 /** A countdown in seconds, floored to a tenth: "9.9 s". */
 export function fmtSeconds(ms: number): string {
-  return `${(Math.max(Math.floor(ms / 100), 0) / 10).toFixed(1)} s`;
+  return unit((Math.max(Math.floor(ms / 100), 0) / 10).toFixed(1), 's');
 }
 
 /** An engine zone name as it reads in a sentence: `zone-b` is `zone b`. */

@@ -148,7 +148,6 @@
   .route {
     margin: 0 0 var(--gap-sm);
     font-size: var(--font-size-caption);
-    line-height: 1.45;
   }
 
   .route :global([data-field]) {

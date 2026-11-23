@@ -2,15 +2,17 @@
 
 :root {
   font-family: var(--font-sans);
-  line-height: 1.5;
   color: var(--color-fg);
   background: var(--color-bg);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
 
+/* Every line a multiple of 4 px: 12/16, 14/20, 16/24 and 20/28. Each element
+   rounds its own, so a child set in another size never inherits its parent's. */
 * {
   box-sizing: border-box;
+  line-height: round(nearest, 1.4em, 4px);
 }
 
 html,
@@ -24,13 +26,6 @@ body {
   #app {
     height: 100vh;
   }
-}
-
-/* Tabular lining figures wherever a changing number is shown: every printed
-   number is a `data-field` element. */
-[data-field] {
-  font-variant-numeric: tabular-nums lining-nums;
-  font-feature-settings: 'tnum' 1, 'lnum' 1;
 }
 
 button {
@@ -115,20 +110,29 @@ code,
   font-variant-numeric: proportional-nums;
 }
 
-/* The first Tab stop: hidden until focused. */
-.skip-link {
+/* The first three Tab stops: a column above the page, shown while one of
+   them has focus. */
+.skips {
   position: absolute;
-  top: var(--gap-sm);
+  top: 0;
   left: var(--gap-sm);
   z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--gap-sm);
+  padding-top: var(--gap-sm);
+  transform: translateY(-100%);
+}
+
+.skips:focus-within {
+  transform: none;
+}
+
+.skip-link {
   padding: var(--gap-xs) var(--gap-sm);
   border-radius: var(--radius);
   background: var(--color-panel);
   color: var(--color-fg);
   font-weight: 600;
-  transform: translateY(-200%);
-}
-
-.skip-link:focus {
-  transform: none;
 }

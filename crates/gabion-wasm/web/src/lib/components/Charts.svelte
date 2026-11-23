@@ -375,7 +375,7 @@
           <thead><tr><th scope="col">bucket</th><th scope="col">node <span data-field="node">{selected}</span></th><th scope="col">cluster</th></tr></thead>
           <tbody>
             {#each tableRows as b, k (k)}
-              <tr><td data-field="age">{b.age === 0 ? 'current' : `${b.age / 1000} s ago`}</td><td data-field="own">{b.own}</td><td data-field="truth">{b.truth}</td></tr>
+              <tr><td data-field="age">{b.age === 0 ? 'current' : `${b.age / 1000}\u202fs ago`}</td><td data-field="own">{b.own}</td><td data-field="truth">{b.truth}</td></tr>
             {/each}
           </tbody>
         </table>

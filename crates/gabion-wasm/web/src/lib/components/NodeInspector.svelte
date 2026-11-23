@@ -200,7 +200,7 @@
     padding-bottom: var(--gap-xs);
     border-bottom: 1px solid var(--color-border-line);
     font-size: var(--font-size-caption);
-    font-weight: 650;
+    font-weight: 600;
     color: var(--color-fg-muted);
   }
 

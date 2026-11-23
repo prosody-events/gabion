@@ -222,7 +222,8 @@ miri-all: miri-lib miri-safety miri-safety-tb miri-ffi-alignment miri-ffi-alignm
 # for a log line (a code heading over a **Level** line) names a code its
 # crate's sources still emit; each catalogue is paired with those sources. The
 # visualizer's design rules (web/README.md "Design rules"): no colour literal
-# outside tokens.css, no pixel font-size, and every token named is defined.
+# outside tokens.css, every font-size one of the four-step scale's tokens (the
+# title is set at body size), and every token named is defined.
 CATALOGUE_SOURCES := crates/gabion/TROUBLESHOOTING.md=crates/gabion/src crates/server/README.md=crates/server/src crates/nginx/README.md=crates/nginx/src
 CATALOGUES := $(foreach pair,$(CATALOGUE_SOURCES),$(firstword $(subst =, ,$(pair))))
 # The study harness's adapter boundary (crates/gossip-bench/README.md, "The
@@ -248,7 +249,8 @@ hygiene:
 	done
 	@test "$$(rg --count-matches 'ngx_conf_log_error!' crates/nginx/src/module.rs)" = 1 || { echo "crates/nginx/src/module.rs calls ngx_conf_log_error! outside conf_error!; report every nginx -t error through conf_error!(cf, code = \"...\", ...) and give the code an entry in the README's configuration errors"; exit 1; }
 	rg -n '#[0-9a-fA-F]{3,8}\b|0x[0-9a-fA-F]{6}|rgba?\(|hsla?\(' $(WEB_DIR)/src --glob '!tokens.css'; test $$? -eq 1
-	rg -n 'font-size:\s*[0-9.]+px' $(WEB_DIR)/src; test $$? -eq 1
+	rg -n 'font-size:' $(WEB_DIR)/src | rg -v 'font-size:\s*(var\(--font-size-[a-z-]+\)|inherit);'; test $$? -eq 1
+	rg -n -- '--font-size-title' $(WEB_DIR)/src; test $$? -eq 1
 	@for token in $$(rg -oNI "(var\(|')(--[a-z][a-z0-9-]*)" -r '$$2' $(WEB_DIR)/src | sort -u); do \
 		rg -q -- "^\s*$$token:" $(WEB_DIR)/src/tokens.css || { echo "design token \`$$token\` is not defined in $(WEB_DIR)/src/tokens.css, so it resolves to nothing; use a token defined there (web/README.md \"Design rules\") or define it:"; rg -nF -- "$$token" $(WEB_DIR)/src; exit 1; }; \
 	done

@@ -50,7 +50,6 @@
     border: 1px solid var(--color-border-line);
     font-size: var(--font-size-caption-sm);
     font-weight: 400;
-    line-height: 1.4;
     letter-spacing: 0;
     text-transform: none;
     box-shadow: var(--shadow-popover);

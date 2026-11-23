@@ -322,7 +322,6 @@
     margin: 0 -1px -1px 0;
     background: var(--color-panel);
     font-size: var(--font-size-caption-sm);
-    line-height: 1.6;
     text-align: center;
     white-space: nowrap;
     font-variant-numeric: tabular-nums;

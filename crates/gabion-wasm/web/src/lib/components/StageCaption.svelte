@@ -145,10 +145,9 @@
   }
 
   .scenario {
-    max-width: 34em;
+    max-width: var(--measure);
     margin: 0;
     font-size: var(--font-size-body);
-    line-height: 1.5;
     text-wrap: pretty;
   }
 

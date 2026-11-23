@@ -3,7 +3,7 @@ import type { ClusterState } from '../src/lib/sim/types';
 import type { BeamPool, GlyphTable } from '../src/lib/stage/renderer';
 import { CROSS, RELAY, STRATA_MIN_INNER } from '../src/lib/stage/layout';
 import { readTheme } from '../src/lib/theme';
-import { breakGateway, pauseIfPlaying, recordData, send, sendButton, setRange, setSpeed, step, still } from './drive';
+import { breakGateway, openControls, pauseIfPlaying, recordData, send, sendButton, setRange, setSpeed, step, still } from './drive';
 import { WATCHES } from '../src/lib/next';
 import { PRESETS, WATCHED_KEY, presetById } from '../src/lib/presets';
 import { COMMANDS, clauses } from './next-actions';
@@ -26,8 +26,7 @@ const snapshot = (page: Page, inspect: number | null = null): Promise<ClusterSta
 async function open(page: Page): Promise<void> {
   await page.goto('/');
   await expect(page.locator('.stage canvas')).toBeVisible({ timeout: 30_000 });
-  const controls = page.locator('.controls > summary');
-  if (await controls.isVisible()) await controls.click();
+  await openControls(page);
 }
 
 /** Scenario `name`'s button in the preset list. */

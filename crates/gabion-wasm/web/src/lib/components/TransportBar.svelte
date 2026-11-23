@@ -9,6 +9,7 @@
   import type { Control } from '../next';
   import Icon from './Icon.svelte';
   import Sentence from './Sentence.svelte';
+  import Speed from './Speed.svelte';
 
   let {
     playing,
@@ -20,6 +21,7 @@
     sendValid,
     primary,
     bounded,
+    phone,
     onToggle,
     onStep,
     onSend,
@@ -41,6 +43,9 @@
     primary: Control | null;
     /** A command's bounded run is playing. */
     bounded: boolean;
+    /** Below 640 px: Play, Step and Send only, one sticky row; Speed is in
+     *  the Controls disclosure. */
+    phone: boolean;
     onToggle: () => void;
     onStep: () => void;
     onSend: () => void;
@@ -100,11 +105,9 @@
     >
   {/if}
 
-  <label class="speed">
-    <span>Speed</span>
-    <input type="range" min="0.1" max="4" step="0.1" bind:value={speed} aria-label="Playback speed" />
-    <span class="speed-value" data-field="speed">{speed.toFixed(1)}×</span>
-  </label>
+  {#if !phone}
+    <span class="speed"><Speed bind:speed /></span>
+  {/if}
 
   <div class="readout">
     <!-- Its space is kept before the first period has played, so the bar
@@ -159,21 +162,7 @@
   }
 
   .speed {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--gap-sm);
     margin-left: var(--gap-sm);
-    font-size: var(--font-size-caption);
-    color: var(--color-fg-muted);
-  }
-
-  /* Narrow enough that the bar stays one row at 1100 px. */
-  .speed input {
-    width: 5.5rem;
-  }
-
-  .speed-value {
-    min-width: 2.5rem;
   }
 
   .readout {
@@ -196,5 +185,22 @@
 
   .pending {
     visibility: hidden;
+  }
+
+  /* The phone's bar: one row of Play, Step and Send, 8 px apart, in the thumb
+     zone. The readout keeps its value for the page's own use but is not
+     shown. */
+  @media (width < 640px) {
+    .send {
+      margin-left: 0;
+    }
+
+    button:first-child {
+      min-width: 0;
+    }
+
+    .readout {
+      display: none;
+    }
   }
 </style>

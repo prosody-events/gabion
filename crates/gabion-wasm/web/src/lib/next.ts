@@ -521,9 +521,9 @@ function rateGoal(v: RunView, s: RateLimiting): Blurb {
     case 'filling':
       return v.brim.kind === 'Rejected'
         ? blurb`Every node now sees the limit, so node ${v.selected} decides on its own whether the next request fits.`
-        : blurb`The limit of ${v.limit} hits per ${seconds} s is shared by every node in all ${v.zoneCount} zones, and each request is one hit.`;
+        : blurb`The limit of ${v.limit} hits per ${seconds}\u202fs is shared by every node in all ${v.zoneCount} zones, and each request is one hit.`;
     case 'refused':
-      return blurb`A hit counts for ${seconds} s. When the oldest hits leave the window, node ${v.selected} admits again.`;
+      return blurb`A hit counts for ${seconds}\u202fs. When the oldest hits leave the window, node ${v.selected} admits again.`;
     case 'reopened':
     case 'sliding-refused':
     case 'drained':
@@ -589,7 +589,7 @@ function watchGoal(v: RunView, watched: WatchedPreset): Blurb {
     case 'overload':
       return ['Requests arrive faster than the limit allows; counts update as the engine computes them.'];
     case 'loss':
-      return blurb`Every link drops ${Math.round(v.loss * 100)}% of its packets, and resends still bring every node the hits.`;
+      return blurb`Every link drops ${Math.round(v.loss * 100)}% of its packets, and repeats still bring every node the hits.`;
     case 'steady':
       return ['The share of bytes that cross a zone sits on its with-zones line, far below the no-zone line.'];
     case 'no-zone':
@@ -603,7 +603,7 @@ export const GOES_TO: Readonly<Record<PresetId, string>> = {
   propagation: 'how a small change spreads in two waves',
   overload: 'the limit under a steady flood',
   partition: 'what a cut costs a rate limiter',
-  loss: 'resends through a lossy network',
+  loss: 'repeats through a lossy network',
   'gateway-failure': 'a gateway that goes silent',
   'gateway-cut': 'a gateway its zone cannot hear',
   steady: 'what zones save in bytes',

@@ -451,17 +451,11 @@
     cursor: pointer;
   }
 
-  /* Where the page scrolls, the stage keeps a shape of its own: 4 by 3 on
-     a tablet, a square on the phone, so the rings keep their size. */
+  /* Where the page scrolls, the stage keeps a shape of its own, a square,
+     so the rings keep their size beside the detail pane and on the phone. */
   @media (width < 1100px) {
     .stage {
       flex: none;
-      aspect-ratio: 4 / 3;
-    }
-  }
-
-  @media (width < 640px) {
-    .stage {
       aspect-ratio: 1;
     }
   }
@@ -487,8 +481,7 @@
     margin: 0;
     padding: var(--gap-sm) 0 var(--gap-xs);
     list-style: none;
-    font-size: var(--font-size-caption);
-    line-height: 1.25;
+    font-size: var(--font-size-caption-sm);
     color: var(--color-fg);
   }
 

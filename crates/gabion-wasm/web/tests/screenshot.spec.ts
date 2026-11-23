@@ -2,7 +2,7 @@ import { expect, test as base, type Page } from '@playwright/test';
 import { type AnswerState, type ClusterState, type EventBatch } from '../src/lib/sim/types';
 import { WATCHED_KEY } from '../src/lib/presets';
 import { CONTROL } from '../src/lib/stage/layout';
-import { breakGateway, pauseIfPlaying, send, sendButton, setRange, setSpeed, step, stepUntil, virtualMs } from './drive';
+import { breakGateway, openControls, pauseIfPlaying, send, sendButton, setRange, setSpeed, step, stepUntil, virtualMs } from './drive';
 
 /** Every test fails on an error the page throws. */
 const test = base.extend<{ page: Page }>({
@@ -54,6 +54,7 @@ async function settled(page: Page): Promise<void> {
 async function boot(page: Page): Promise<void> {
   await page.goto('/');
   await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await openControls(page);
   await page.getByText('Show as table').click();
   await expect(page.locator(COUNTS)).toHaveCount(NODES);
   await settled(page);
@@ -417,12 +418,12 @@ test('the window knob updates its bucket-count readout and rebuilds', async ({ p
   await expect(page.locator('#knob-zones')).toHaveAttribute('max', '6');
   // Default window is 10 s → 10 buckets, the ones admission counts (see
   // `buckets.ts`).
-  await expect(page.locator('label[for="knob-window"] .val')).toHaveText('10 s · 10 buckets');
+  await expect(page.locator('label[for="knob-window"] .val')).toHaveText('10 s · 10 buckets');
 
   // Move the window to 5 s → 5 buckets. The readout updates immediately (the
   // staged value), before any rebuild.
   await setRange(page.locator('#knob-window'), 5000);
-  await expect(page.locator('label[for="knob-window"] .val')).toHaveText('5 s · 5 buckets');
+  await expect(page.locator('label[for="knob-window"] .val')).toHaveText('5 s · 5 buckets');
 
   // Apply it. The rebuild left a healthy cluster of the same size, no errors,
   // and the time charts span the rebuilt window.

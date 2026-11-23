@@ -63,10 +63,11 @@
   import Messages from './lib/components/Messages.svelte';
   import NodeInspector from './lib/components/NodeInspector.svelte';
   import ControlRail from './lib/components/ControlRail.svelte';
+  import Speed from './lib/components/Speed.svelte';
+  import Glossary from './lib/components/Glossary.svelte';
   import TransportBar from './lib/components/TransportBar.svelte';
   import StageHeading from './lib/components/StageHeading.svelte';
   import StageCaption from './lib/components/StageCaption.svelte';
-  import RoleGlyph from './lib/components/RoleGlyph.svelte';
   import Sentence from './lib/components/Sentence.svelte';
 
   // The session runs one scenario at a time (`lib/presets.ts`), as a `Run`: a
@@ -128,7 +129,7 @@
   let width = $state<Width>(widthNow());
   // Below 640 px the rail folds into a "Controls" disclosure above the stage; at
   // and above it the rail is always open (its summary is hidden).
-  let controlsOpen = $state(widthNow() !== 'narrow');
+  let controlsOpen = $state(widthNow() === 'wide');
   let helpOpen = $state(false);
 
   // The run's clocks and bounds, from the knobs it was built with.
@@ -1051,6 +1052,9 @@
     target?.focus();
   }
 
+  /** The skip links after the first: the stage's keyboard grid, and Play. */
+  const skipTo = (selector: string) => (): void => document.querySelector<HTMLElement>(selector)?.focus();
+
   // -- What the page shows, derived from the run --------------------------
 
   // A gateway story's gateway: the one it broke, or before its fault the
@@ -1212,7 +1216,7 @@
     })();
     const unwatch = watchTheme(() => (theme = readTheme()));
     const unwidth = watchWidth((w) => {
-      if ((w === 'narrow') !== (width === 'narrow')) controlsOpen = w !== 'narrow';
+      if ((w === 'wide') !== (width === 'wide')) controlsOpen = w === 'wide';
       width = w;
     });
     return () => {
@@ -1226,7 +1230,11 @@
 
 <svelte:window onkeydown={onKeydown} />
 
-<button class="btn-secondary skip-link" onclick={skipToNext}>Skip to the next step</button>
+<div class="skips">
+  <button class="btn-secondary skip-link" onclick={skipToNext}>Skip to the next step</button>
+  <button class="btn-secondary skip-link" onclick={skipTo('[role="gridcell"][tabindex="0"]')}>Skip to the cluster</button>
+  <button class="btn-secondary skip-link" onclick={skipTo('.transport button')}>Skip to the time controls</button>
+</div>
 
 <div class="layout">
   <header>
@@ -1238,7 +1246,7 @@
           <span data-field="status-zones">{zoneCount}</span> {noun(zoneCount, 'zone')}{:else}, no zone configured,{/if}
         {#if scaled}
           enforce one rate limit: <span data-field="status-limit">{fmtCount(limit)}</span> hits per
-          <span data-field="status-window">{run.applied.rule_window_ms / 1000} s</span>
+          <span data-field="status-window">{run.applied.rule_window_ms / 1000} s</span>
         {:else}
           share one rate limit
         {/if}{#each run.cuts as c, i (i)}{' · '}<Sentence parts={cutName(c, cluster.zones)} field="status-cut" />{/each}
@@ -1251,95 +1259,8 @@
     <button class="btn-tertiary help" aria-expanded={helpOpen} aria-controls="glossary" onclick={() => (helpOpen = !helpOpen)}
       >How to read this</button
     >
-    {#if helpOpen}
-      <dl class="glossary serif" id="glossary">
-        <dt>node</dt>
-        <dd>
-          A vessel holding the hits it counts in its window, the count in its middle, and its name, "node 4", beside it. Each
-          node counts its own clients' hits; gossip spreads every node's count to the others.
-        </dd>
-        <dt>selected node</dt>
-        <dd>
-          <RoleGlyph kind="selected" /> The node Send goes to. Each node picks its own gateway into each other zone, so the ports
-          change when you select another node.
-        </dd>
-        <dt>zone</dt>
-        <dd>An availability zone. A node's zone is whatever the node says it is.</dd>
-        <dt>inside a zone</dt>
-        <dd>Delivery between nodes of one zone: a thin arrow that stays inside its ring.</dd>
-        <dt>across zones</dt>
-        <dd>Delivery between zones: a thick arrow that crosses the empty centre.</dd>
-        <dt>packet</dt>
-        <dd>
-          A line from sender to receiver, drawn the instant it is sent and fading over one simulated second: Pause holds it, Speed
-          stretches it. Data ends in an arrow; an answer in a dot, a message that asks for one in a ring, and a gap report in a
-          square.
-        </dd>
-        <dt>message</dt>
-        <dd>One packet one node sent another. Messages, beside Details at the top of the pane, lists each one.</dd>
-        <dt>own data</dt>
-        <dd>A node's own changes to its count.</dd>
-        <dt>relay data</dt>
-        <dd>Other nodes' changes a gateway passes on into its zone.</dd>
-        <dt>skip</dt>
-        <dd>Changes that expired before they were sent, so the peer can count them as received.</dd>
-        <dt>gateway</dt>
-        <dd>
-          <RoleGlyph kind="port" /> The member of a remote zone that the selected node sends its hits to. It relays them into its
-          zone, from the port on its rim.
-        </dd>
-        <dt>relay</dt>
-        <dd>A gateway forwarding hits it received to the rest of its zone.</dd>
-        <dt>ack</dt>
-        <dd>"I have your changes through position N." One number acknowledges everything below it.</dd>
-        <dt>repeat</dt>
-        <dd>Data sent again, after a gap report or after waiting one heartbeat for an ack.</dd>
-        <dt>probe</dt>
-        <dd>"Answer me", which is also how a node greets a peer it has not heard.</dd>
-        <dt>probe answer</dt>
-        <dd>The answer to a probe, carrying the answering node's acks.</dd>
-        <dt>suspect</dt>
-        <dd>
-          <RoleGlyph kind="suspect" /> A peer that left something unanswered for the suspect timeout, or a remote peer that said
-          it cannot relay. A suspect is not used as a gateway.
-        </dd>
-        <dt>gap report</dt>
-        <dd>Gabion's NAK: "I am missing your changes from position N on; repeat them".</dd>
-        <dt>cannot relay</dt>
-        <dd>A flag a node sets on every message while it cannot pass hits on into its zone; only a node in another zone acts on it.</dd>
-        <dt>join sweep</dt>
-        <dd>
-          A one-off copy of a node's whole live store, sent to a zone member that just joined: a sweep request asks for it, and
-          sweep pages carry it.
-        </dd>
-        <dt>position</dt>
-        <dd>A node's changes are numbered in order; one change can carry many hits.</dd>
-        <dt>start</dt>
-        <dd>Which start of a node sent a message: a node that restarts counts again from a new start.</dd>
-        <dt>in flight</dt>
-        <dd>
-          In flight is the simulation's own state, while Step has stopped before a wave; a picture of a packet can still be
-          moving after it has arrived.
-        </dd>
-        <dt>lost</dt>
-        <dd>A message the network dropped: on a cut link, on a link that drops packets, or at a full queue.</dd>
-        <dt>ladder</dt>
-        <dd>Two nodes' conversation; time runs down, and a slanted rung shows order, not delay.</dd>
-        <dt>the frame</dt>
-        <dd>A message's bytes as gabion encodes them: an 86-byte header, then, with data, the cells.</dd>
-        <dt>How the controls work</dt>
-        <dd>
-          A Send is a burst of one-hit requests, as many as Requests per Send says: the node admits them in order while its
-          window has room and rejects the rest.
-          The one dark button is what to press next, and the line under the goal names it; when nothing is dark, watch the
-          meter. A Send pressed while paused plays until every node has the hits, then pauses again; Space plays or pauses, →
-          steps to the next event, and Escape returns the selection to the scenario's node. Restart keeps your settings, a
-          scenario button takes its own, and Undo brings back the run you left. In Messages: ↑ ↓ choose a message · Enter
-          reads it · Esc goes back.
-        </dd>
-        <dt>backstop</dt>
-        <dd>A gateway that can reach the sender but not its own zone says it cannot relay, and the sender moves to another gateway.</dd>
-      </dl>
+    {#if helpOpen && width === 'narrow'}
+      <div class="glossary-flow"><Glossary /></div>
     {/if}
   </header>
 
@@ -1357,7 +1278,7 @@
       {@const r = run}
       <div class="workspace" aria-busy={busy}>
         <details class="controls" bind:open={controlsOpen}>
-          <summary>Controls</summary>
+          <summary>Scenario: {r.preset.label} · controls</summary>
           <ControlRail
             presets={PRESETS}
             activeId={r.preset.id}
@@ -1385,11 +1306,13 @@
             onHeal={() => void heal()}
             onAddNode={(to) => void addNode(to)}
             onPreview={(node) => (namedId = node)}
-          />
+          >
+            {#if width === 'narrow'}<Speed bind:speed />{/if}
+          </ControlRail>
         </details>
         <section
           class="stage-pane"
-          aria-label="Stage"
+          aria-labelledby="stage-heading"
           aria-describedby="next-action"
           data-clock={time.kind}
           data-playing={playing ? '1' : '0'}
@@ -1454,7 +1377,9 @@
         </section>
         <div class="detail-rail">
           <div class="rail-body">
-            {#if selectedNode !== null}
+            {#if helpOpen && width !== 'narrow'}
+              <Glossary />
+            {:else if selectedNode !== null}
               <div class="pane-head">
                 <h2 class="pane-title">
                   node <span data-field="node">{selectedNode.id}</span>
@@ -1557,6 +1482,7 @@
       sendValid={requestsValid}
       {primary}
       bounded={playing && (time.kind === 'settled' || time.kind === 'per-wave')}
+      phone={width === 'narrow'}
       onToggle={toggle}
       onStep={() => void stepOnce()}
       onSend={() => void sendBurst()}
@@ -1627,23 +1553,9 @@
     font-size: var(--font-size-caption);
   }
 
-  .glossary {
+  .glossary-flow {
     flex-basis: 100%;
-    display: grid;
-    grid-template-columns: max-content minmax(0, 80ch);
-    gap: var(--gap-xs) var(--gap-md);
-    max-height: 40vh;
-    margin: var(--gap-sm) 0 0;
-    overflow-y: auto;
-    font-size: var(--font-size-caption);
-  }
-
-  .glossary dt {
-    font-weight: 600;
-  }
-
-  .glossary dd {
-    margin: 0;
+    margin-top: var(--gap-sm);
   }
 
   main {
@@ -1652,9 +1564,9 @@
   }
 
   /* The three-pane chassis: the controls rail, the dominant stage, and the
-     detail pane. Three columns from 1100 px; two from 640 px (stage over the
-     controls on the left, the detail pane the full height on the right); one
-     scrolling column below. */
+     detail pane. Three columns from 1100 px; below, the controls fold into a
+     disclosure across the top, over the stage and the detail pane side by side
+     from 640 px and one scrolling column below. */
   .workspace {
     display: grid;
     grid-template-columns: clamp(200px, 16%, 260px) minmax(0, 1fr) clamp(300px, 28%, 380px);
@@ -1677,7 +1589,7 @@
     min-height: 0;
   }
 
-  /* Phone: the disclosure's bar above the stage. */
+  /* Below 1100 px: the disclosure's bar above the stage. */
   .controls > summary {
     padding: var(--gap-sm) var(--gap-md);
     background: var(--color-panel);
@@ -1709,11 +1621,10 @@
   }
 
   .narration {
-    max-width: 34em;
+    max-width: var(--measure);
     min-height: 2.5rem;
     margin: 0;
     font-size: var(--font-size-caption);
-    line-height: 1.43;
     color: var(--color-fg);
   }
 
@@ -1764,7 +1675,7 @@
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    container-type: size;
+    container-type: inline-size;
   }
 
   .messages-panel {
@@ -1859,53 +1770,55 @@
     color: var(--color-fg-muted);
   }
 
-  @media (width >= 640px) {
+  @media (width >= 1100px) {
     .controls > summary {
       display: none;
     }
+  }
 
+  @media (width >= 640px) {
     .detail-rail {
       overflow: hidden;
     }
   }
 
-  /* Two columns that scroll as a page: the stage over the controls on the
-     left, the detail pane on the right. */
-  @media (640px <= width < 1100px) {
+  /* Below 1100 px the page scrolls and nothing scrolls inside it: the
+     controls fold into a disclosure above the stage and the detail pane, and
+     the pane grows with its content. */
+  @media (width < 1100px) {
     .workspace {
-      grid-template-columns: minmax(0, 1fr) clamp(220px, 32%, 280px);
-      grid-template-areas:
-        'stage detail'
-        'rail detail';
-      grid-template-rows: auto auto;
       height: auto;
     }
 
     .rail-body {
-      flex: none;
-      height: 48rem;
-    }
-
-    /* The detail pane runs the height of both rows. */
-    .detail-rail .rail-body {
-      flex: 1;
-      height: auto;
+      overflow: visible;
     }
   }
 
-  /* One scrolling column. `main` keeps a
-     height so the absolutely positioned overlays stay visible; the square
-     stage keeps the ring the same shape at every width. The rail body gets a
-     definite height, so its scroller keeps a definite box under an
-     auto-height parent. */
+  /* The stage takes the left column, the detail pane the right. */
+  @media (640px <= width < 1100px) {
+    .workspace {
+      grid-template-columns: minmax(0, 1fr) clamp(260px, 38%, 340px);
+      grid-template-areas:
+        'rail rail'
+        'stage detail';
+      grid-template-rows: auto auto;
+    }
+  }
+
+  /* One scrolling column. `main` keeps a height so the absolutely positioned
+     overlays stay visible; the square stage keeps the ring the same shape at
+     every width. */
   @media (width < 640px) {
     main {
       min-height: 50vh;
     }
 
-    .rail-body {
-      flex: none;
-      height: 32rem;
+    /* The transport stays in the thumb zone as the page scrolls. */
+    footer {
+      position: sticky;
+      bottom: 0;
+      z-index: 5;
     }
 
     .workspace {
@@ -1914,15 +1827,10 @@
         'rail'
         'stage'
         'detail';
-      height: auto;
     }
 
     .stage-pane {
       padding: var(--gap-md);
-    }
-
-    .glossary {
-      grid-template-columns: minmax(0, 1fr);
     }
   }
 

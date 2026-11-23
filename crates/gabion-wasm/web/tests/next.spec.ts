@@ -126,7 +126,7 @@ test('the failover wait counts down on the silent gateway, then measures the run
   const from = { reason: 'failover' as const, virtualMs: 0, reopensMs: 0 };
   expect(progress(v, 'failover', from)).toBeCloseTo(0.6);
   expect(text(waitClause('failover', v))).toBe(
-    'node 0 has waited 1.2 s for node 4 to answer · it gives up at 2.0 s, then picks another gateway into zone b',
+    'node 0 has waited 1.2 s for node 4 to answer · it gives up at 2.0 s, then picks another gateway into zone b',
   );
   // Failed over: the run's share of the reachable nodes that have the hits.
   const after: RunView = { ...v, failovers: 1, nodes: BASE.nodes.map((n) => ({ ...n, lag: n.zone === 1 ? { kind: 'Behind', missing_for_ms: 5 } : n.lag })) };
@@ -229,7 +229,7 @@ test("the heading's forms (A18)", () => {
   const countdown = heading({ ...base, nodes: all(100), oracle: 100, badge: { hops: 2, afterMs: null }, brim: { kind: 'Rejected', total: 100, reopens_ms: 9_950 } });
   expect([countdown.id, text(countdown.parts)], 'the countdown beats the badge').toEqual([
     'rl-3',
-    'All 12 nodes see 100 of the 100 limit · node 2 admits again in 9.9 s',
+    'All 12 nodes see 100 of the 100 limit · node 2 admits again in 9.9 s',
   ]);
   expect(heading({ ...base, nodes: all(0), emptied: true }).id).toBe('rl-4');
   expect(heading({ ...base, nodes: all(75), oracle: 75 }).id).toBe('rl-5');

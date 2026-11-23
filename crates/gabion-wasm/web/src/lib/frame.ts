@@ -87,14 +87,14 @@ export function bodyFields(bytes: readonly number[], n: number): Field[] {
   push('rule-count', 1, 'rules', 'rule_dict_len', 'How many rules the cells name.');
   push('rules', 16 * rules, 'rule ids', 'rule_dict', 'The rules’ ids, once each.');
   const nodes = bytes[at] ?? 0;
-  push('node-count', 1, 'nodes', 'node_dict_len', 'How many origins the cells name.');
-  push('nodes', 16 * nodes, 'node ids', 'node_dict', 'The origins’ ids, once each.');
+  push('node-count', 1, 'nodes', 'node_dict_len', 'How many counting nodes the cells name.');
+  push('nodes', 16 * nodes, 'node ids', 'node_dict', 'The counting nodes’ ids, once each.');
   push('rule-slot', n, 'rule of each cell', 'rule_slot', 'Each cell’s rule, by its place.');
   push('key', 16 * n, 'key of each cell', 'key_hash', 'Each cell’s key.');
   push('bucket', 4 * n, 'second of each cell', 'bucket', 'Each cell’s window second.');
-  push('node-slot', n, 'origin of each cell', 'node_slot', 'Each cell’s origin, by its place.');
-  push('origin-start', 4 * n, 'origin’s start', 'origin_incarnation', 'Which start of the origin counted it.');
-  push('updated', 8 * n, 'last updated', 'last_update_millis', 'When the origin last changed it.');
+  push('node-slot', n, 'counting node of each cell', 'node_slot', 'The node that counted each cell, by its place.');
+  push('origin-start', 4 * n, 'counting node’s start', 'origin_incarnation', 'Which start of the counting node counted it.');
+  push('updated', 8 * n, 'last updated', 'last_update_millis', 'When the counting node last changed it.');
   push('count', 4 * n, 'count of each cell', 'count', 'Each cell’s total: the larger is kept.');
   return out;
 }

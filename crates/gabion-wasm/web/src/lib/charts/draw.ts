@@ -17,7 +17,7 @@ import type { RequestLog } from '../requests';
 
 /** The plot's left edge and the direct labels' room at its right, px. */
 export const GUTTER = 40;
-export const MARGIN = 76;
+export const MARGIN = 88;
 /** Room above a plot for a label centred on its top edge, and below it for a
  *  row of tick labels, px. */
 export const PAD = 10;

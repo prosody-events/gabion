@@ -8,6 +8,8 @@
 <link rel="preload" as="font" type="font/woff2" crossorigin href="fonts/SourceSerif4.woff2">
 <link rel="stylesheet" href="tokens.css">
 <style>
+  /* The dashboard's own title size: the visualizer sets its title at body size. */
+  :root { --font-size-title: 1.563rem; }
   html, body { background: var(--color-bg); color: var(--color-fg); }
   body { margin: 0; }
   #dash-root { padding: 24px clamp(16px, 4%, 40px); }

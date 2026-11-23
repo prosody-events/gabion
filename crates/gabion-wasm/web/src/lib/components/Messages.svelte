@@ -369,7 +369,7 @@
       {#if empty}
         <p class="empty">
           {#if head !== null && head.total === 0}
-            No messages yet · each wave of requests makes some: data to the sender's zone and its gateways, relays into the other zones, then acknowledgements
+            No messages yet · each wave of requests makes some: data to the sending node's zone and its gateways, relays into the other zones, then acknowledgements
           {:else if view.types !== 0 || view.lostOnly}
             No {typeToken ?? 'lost'} messages among {scopeWords.replace('the messages', 'the')} · a gap report asks for a repeat after a packet is lost; the Packet loss scenario has them
           {:else}

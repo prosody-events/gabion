@@ -18,7 +18,7 @@
 </script>
 
 <div class="stage-heading">
-  <h2 data-template={heading.id}><Sentence parts={heading.parts} field="heading" /></h2>
+  <h2 id="stage-heading" data-template={heading.id}><Sentence parts={heading.parts} field="heading" /></h2>
   {#if heading.repair !== null}
     <button
       class="repair {repairPrimary ? '' : 'btn-secondary'}"
@@ -43,7 +43,6 @@
     margin: 0;
     font-size: var(--font-size-heading);
     font-weight: 400;
-    line-height: 1.4;
     text-wrap: balance;
   }
 

@@ -379,7 +379,7 @@
   .count {
     font-size: var(--font-size-count);
     font-weight: 600;
-    line-height: 1;
+    line-height: 16px;
     color: var(--color-fg);
     paint-order: stroke;
     -webkit-text-stroke: 3px var(--color-panel);
@@ -394,7 +394,7 @@
     transform: translateY(-50%);
     font-size: var(--font-size-caption);
     font-weight: 600;
-    line-height: 1;
+    line-height: 16px;
     white-space: nowrap;
     color: var(--color-fg);
     paint-order: stroke;
@@ -419,7 +419,6 @@
     box-shadow: var(--shadow-popover);
     color: var(--color-fg);
     font-size: var(--font-size-caption);
-    line-height: 1.4;
   }
 
   .node-table {

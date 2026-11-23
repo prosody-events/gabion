@@ -18,6 +18,18 @@ export const PERIOD_MS = timings.heartbeat_ms;
  *  spare. */
 const LANDING_MS = 15_000;
 
+/** Open the controls as a reader who will use them does: the Controls
+ *  disclosure below 1100 px, then the rail's Network and Cluster groups. */
+export async function openControls(page: Page): Promise<void> {
+  const controls = page.locator('.controls > summary');
+  if (await controls.isVisible()) await controls.click();
+  // Opened as the page's own toggle would, leaving focus where a fresh page
+  // has it, so the first Tab is still the first skip link.
+  await page.locator('.rail').evaluate((rail) => {
+    for (const d of rail.querySelectorAll<HTMLDetailsElement>('details.group')) d.open = true;
+  });
+}
+
 /** The simulated-time readout's value. */
 export async function virtualMs(page: Page): Promise<number> {
   return Number(await page.locator('[data-field="virtual-time"]').getAttribute('data-ms'));

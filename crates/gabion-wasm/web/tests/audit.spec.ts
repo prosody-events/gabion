@@ -33,7 +33,7 @@ import { zoneAt } from '../src/lib/format';
 import { PRESETS, WATCHED_KEY } from '../src/lib/presets';
 import { BEAM_ALPHA, readTheme, type Theme } from '../src/lib/theme';
 import timings from './phase-timings.json' with { type: 'json' };
-import { PERIOD_MS, breakGateway, period, refusal, send, sendButton, setSpeed, step, stepUntil, still, virtualMs } from './drive';
+import { PERIOD_MS, breakGateway, openControls, period, refusal, send, sendButton, setSpeed, step, stepUntil, still, virtualMs } from './drive';
 
 // How far a node's ring and its selection outline reach outside its disc,
 // summed from the gap and stroke each is drawn with rather than read from the
@@ -65,14 +65,15 @@ const WINDOW_MS = 10_000;
 // read returned; the deadline covers the screenshot, not a wait.
 const PIXEL_MS = 30_000;
 
-type Findings = Record<'A1' | 'A2' | 'A3' | 'A7' | 'A8' | 'A9', string[]>;
+type Findings = Record<'A1' | 'A2' | 'A3' | 'A7' | 'A8' | 'A9' | 'A12' | 'A20', string[]>;
 
 // -- Formatting, written out here so the page's formatters are not reused --------
 
 const int = (n: number): string => n.toLocaleString('en-US');
+// A number and its unit join with a narrow no-break space, U+202F.
 const duration = (ms: number): string => {
   const whole = Math.round(ms);
-  return whole < 1000 ? `${whole} ms` : `${(ms / 1000).toFixed(1)} s`;
+  return whole < 1000 ? `${whole}\u202fms` : `${(ms / 1000).toFixed(1)}\u202fs`;
 };
 
 // -- Page helpers --------------------------------------------------------------
@@ -90,9 +91,9 @@ async function open(page: Page): Promise<Locator> {
   await page.goto('/');
   const canvas = page.locator('.stage canvas');
   await expect(canvas).toBeVisible({ timeout: 30_000 });
-  // Below 640 px the rail is a closed "Controls" disclosure; it stays open across rebuilds.
-  const controls = page.locator('.controls > summary');
-  if (await controls.isVisible()) await controls.click();
+  // Below 1100 px the rail is a closed "Controls" disclosure; it stays open
+  // across rebuilds. Its Network and Cluster groups open too.
+  await openControls(page);
   return canvas;
 }
 
@@ -189,7 +190,7 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
         theme: colours,
         beam: BEAM_ALPHA,
       });
-      expect(findings, where).toEqual({ A1: [], A2: [], A3: [], A7: [], A8: [], A9: [] });
+      expect(findings, where).toEqual({ A1: [], A2: [], A3: [], A7: [], A8: [], A9: [], A12: [], A20: [] });
       await checkGlyphs(page, where, name);
       await expect
         .poll(() => stagePixel(page, canvas), {
@@ -455,13 +456,13 @@ async function checkHeading(page: Page, where: string, snap: ClusterState): Prom
     expect(id === 'rl-3', `${where}: the heading reads ${id} while node ${selected}'s brim is ${brim?.kind}`).toBe(brim?.kind === 'Rejected');
   }
   if (id === 'rl-3' && brim?.kind === 'Rejected') {
-    expect(reopens, `${where}: the countdown`).toEqual([`${(Math.floor(brim.reopens_ms / 100) / 10).toFixed(1)} s`]);
+    expect(reopens, `${where}: the countdown`).toEqual([`${(Math.floor(brim.reopens_ms / 100) / 10).toFixed(1)}\u202fs`]);
   } else {
     expect(reopens, `${where}: no countdown while node ${selected} admits`).toEqual([]);
   }
   let longest = 0;
   for (const node of nodes) if (node.lag.kind === 'Behind') longest = Math.max(longest, node.lag.missing_for_ms);
-  const late = h.locator('[data-noun="behind"]', { hasText: /\d+(\.\d)? m?s/ });
+  const late = h.locator('[data-noun="behind"]', { hasText: /\d+(\.\d)?\u202fm?s/ });
   if (longest >= PERIOD_MS) await expect(late, `${where}: not caught up`).toHaveText(duration(longest));
   else await expect(late, `${where}: rule 12 prints from one period up`).toHaveCount(0);
 }
@@ -566,12 +567,14 @@ async function checkGlyphs(page: Page, where: string, name: string): Promise<voi
           if (d < g.r[s] + g.r[t] + k.SELECTION_REACH + k.RING_REACH - 1e-6) found.push(`the selection outline crosses node ${g.id[t]}'s ring`);
         }
       }
-      // The names: what they say, smaller than the counts (A3 keeps them inside
-      // the canvas), apart from one another and clear of every ring and count.
+      // The names: what they say, no larger than the counts (the same 12 px
+      // below 640 px, where weight and colour set the count apart; A3 keeps
+      // them inside the canvas), apart from one another and clear of every
+      // ring and count.
       for (const [i, l] of labels.entries()) {
         const id = Number(/^node (\d+)/.exec(l.text)?.[1]);
         if (l.text !== names[id]) found.push(`the name "${l.text}" is not node ${id}'s name, "${names[id]}"`);
-        if (boxes.length > 0 && l.size >= boxes[0].size) found.push(`the name "${l.text}" is not smaller than the counts`);
+        if (boxes.length > 0 && l.size > boxes[0].size) found.push(`the name "${l.text}" is larger than the counts`);
         const box = { x0: l.x, x1: l.x + l.w, y0: l.y, y1: l.y + l.h };
         for (const o of labels.slice(i + 1)) {
           const vertical = l.y < o.y + o.h && o.y < l.y + l.h;
@@ -665,13 +668,14 @@ async function checkOrder(page: Page, name: string): Promise<void> {
 // -- In the page ---------------------------------------------------------------
 
 /** Runs in the page: findings for A1 (sideways scroll), A2, A3 (DOM text, canvas
- *  labels and legibility), A7, A8 and A9, one sentence each, given
+ *  labels and legibility), A7, A8, A9, A12 (leading and measure) and A20
+ *  (one word per concept), one sentence each, given
  *  the canvas colours and the alphas of the translucent canvas marks.
  *  Self-contained: Playwright ships it to the page as source. */
 function audit({ theme, beam }: { theme: Theme; beam: number }): Findings {
   type Rgba = [number, number, number, number];
   type Box = { left: number; right: number; top: number; bottom: number };
-  const found: Findings = { A1: [], A2: [], A3: [], A7: [], A8: [], A9: [] };
+  const found: Findings = { A1: [], A2: [], A3: [], A7: [], A8: [], A9: [], A12: [], A20: [] };
 
   // Colour maths: paint a CSS colour into one pixel, so no colour string is parsed by hand.
   const ctx = new OffscreenCanvas(1, 1).getContext('2d', { willReadFrequently: true });
@@ -749,12 +753,17 @@ function audit({ theme, beam }: { theme: Theme; beam: number }): Findings {
     return { box: box.right - box.left >= 1 && box.bottom - box.top >= 1 ? box : null, cutOff };
   };
 
-  // The smallest type the page uses: every text node and canvas label is at least this.
-  const floor = theme.captionSmPx;
+  // The smallest type the page uses, and never below 12 px: every text node and
+  // canvas label is at least this.
+  const floor = Math.max(theme.captionSmPx, 12);
 
   // Text walk: A3 clipping, A3 overlaps (boxes collected here), A3 legibility and
   // A7 text contrast.
-  const boxes: { key: object; name: string; box: Box }[] = [];
+  // The phone's sticky transport is opaque and covers what scrolls under it:
+  // a box in the bar never overlaps one outside it.
+  const bar = document.querySelector('footer');
+  const sticky = bar !== null && getComputedStyle(bar).position === 'sticky';
+  const boxes: { key: object; name: string; box: Box; inBar: boolean }[] = [];
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
     const text = node as Text;
@@ -779,9 +788,16 @@ function audit({ theme, beam }: { theme: Theme; beam: number }): Findings {
         bottom: rect.bottom - inset,
       });
       cutOff ||= clipped.cutOff;
-      if (clipped.box !== null) boxes.push({ key: text, name, box: clipped.box });
+      if (clipped.box !== null) boxes.push({ key: text, name, box: clipped.box, inBar: sticky && bar?.contains(el) === true });
     }
     if (cutOff) found.A3.push(`"${name}" is cut off by an overflow: hidden box`);
+
+    // A12: every line a multiple of 4 px.
+    const leading = getComputedStyle(el).lineHeight;
+    const pitch = parseFloat(leading);
+    if (!(el instanceof SVGElement) && (Number.isNaN(pitch) || Math.abs(pitch / 4 - Math.round(pitch / 4)) > 0.01)) {
+      found.A12.push(`"${name}" sits on a ${leading} line, not a multiple of 4 px`);
+    }
 
     // A3 legibility: no text below the smallest type token.
     const size = parseFloat(getComputedStyle(el).fontSize);
@@ -828,7 +844,7 @@ function audit({ theme, beam }: { theme: Theme; beam: number }): Findings {
         bottom: at.top + l.y + l.h,
       });
       if (clipped.cutOff) found.A3.push(`canvas label "${l.text}" is cut off by an overflow: hidden box`);
-      if (clipped.box !== null) boxes.push({ key: l, name: `canvas "${l.text}"`, box: clipped.box });
+      if (clipped.box !== null) boxes.push({ key: l, name: `canvas "${l.text}"`, box: clipped.box, inBar: false });
     }
     // The stage names every node it draws: a node the labeller found no room
     // for leaves its disc unnamed.
@@ -845,12 +861,38 @@ function audit({ theme, beam }: { theme: Theme; beam: number }): Findings {
   for (let i = 0; i < boxes.length; i++) {
     for (let j = i + 1; j < boxes.length; j++) {
       const [a, b] = [boxes[i], boxes[j]];
-      if (a.key === b.key) continue;
+      if (a.key === b.key || a.inBar !== b.inBar) continue;
       const w = Math.min(a.box.right, b.box.right) - Math.max(a.box.left, b.box.left);
       const h = Math.min(a.box.bottom, b.box.bottom) - Math.max(a.box.top, b.box.top);
       if (w >= 1 && h >= 1) {
         found.A3.push(`${a.name.startsWith('canvas') ? a.name : `"${a.name}"`} overlaps ${b.name.startsWith('canvas') ? b.name : `"${b.name}"`} by ${w.toFixed(1)} × ${h.toFixed(1)} px`);
       }
+    }
+  }
+
+  // A12: serif prose at most 75 characters a line. Each character's box
+  // falls on the line its middle is in; the space a line breaks at may add
+  // one. The sans narration keeps the same 34em and its two lines.
+  for (const block of document.querySelectorAll<HTMLElement>('.scenario, .glossary dd')) {
+    if (!block.checkVisibility()) continue;
+    const top = block.getBoundingClientRect().top;
+    const pitch = parseFloat(getComputedStyle(block).lineHeight);
+    const lines = new Map<number, number>();
+    const chars = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+    for (let node = chars.nextNode(); node !== null; node = chars.nextNode()) {
+      const text = node.textContent ?? '';
+      for (let i = 0; i < text.length; i++) {
+        const range = document.createRange();
+        range.setStart(node, i);
+        range.setEnd(node, i + 1);
+        const rect = range.getClientRects()[0];
+        if (rect === undefined || rect.width <= 0) continue;
+        const line = Math.floor((rect.top + rect.height / 2 - top) / pitch);
+        lines.set(line, (lines.get(line) ?? 0) + 1);
+      }
+    }
+    for (const count of lines.values()) {
+      if (count > 76) found.A12.push(`"${label(block.textContent)}" sets ${count} characters on one line, over 75`);
     }
   }
 
@@ -916,9 +958,26 @@ function audit({ theme, beam }: { theme: Theme; beam: number }): Findings {
     }
   };
   scan(found.A2, [/\bNaN\b|\bundefined\b|\bnull\b|\bInfinity\b|\[object|\de\+\d/g]);
+  // A2: a number and its unit join with U+202F, a percent sign closes up, and
+  // a negative number takes a true minus.
+  scan(found.A2, [/\d (?:ms|s)\b|\d[ \u202f]%|(?:^|[\s(])-\d/g]);
   // A3: glyphs that carry meaning are drawn, never set from a font.
   scan(found.A3, [/[◆◇●▸❙❚↺]/g]);
   scan(found.A8, [/confidence|significant|p-value|standard error/gi, /\bCI\b/g, /\b\d{1,2}:\d{2}\b/g]);
+
+  // A20: one word per concept. None of the retired words shows, in the text
+  // or in an accessible name, and only Send's own button says "send".
+  const retired = /\b(?:ticks?|rounds?|converged|informed|lagging|RTO|relay floor|click any disc|aggregate|origins?|bursts?|servers?)\b|Σ/gi;
+  for (const match of pageText.matchAll(retired)) found.A20.push(`page text says "${match[0]}"`);
+  for (const el of document.querySelectorAll<HTMLElement>('[aria-label], [title], button, [role="tab"]')) {
+    if (!el.checkVisibility()) continue;
+    const name = el.getAttribute('aria-label') ?? el.innerText.trim();
+    const said = `${name} ${el.title}`;
+    for (const match of said.matchAll(retired)) found.A20.push(`"${label(name)}" says "${match[0]}"`);
+    if (el.matches('button') && /\bsend\b/i.test(name) && el.closest('.transport') === null) {
+      found.A20.push(`"${label(name)}" is not Send but its name says "send"`);
+    }
+  }
 
   // A9: no digit outside a data-bound element, visible or not. "level 0" and
   // "level 1" are the glossary's names for the two tiers, not numbers.
@@ -1387,9 +1446,10 @@ test("every drawn beam carries its packet's kind, tier and fate", async ({ page 
 // zone's title or a gateway's port (rule 19): a gateway's packet across its zone
 // passes the title at the ring's centre, where a bar half way along reads as a
 // glyph of it, and a bar against a port reads as one glyph with it, which the
-// key does not define. A route always has room either side of the centre and
-// clear of its ends' ports; a node's name beside a short chord may leave none,
-// so names are kept clear where the route allows, not checked here. It samples
+// key does not define. A route almost always has room either side of the
+// centre and clear of its ends' ports; a chord straight across one of the
+// phone's smallest rings may have none, and a node's name beside a short chord
+// may leave none, so both are kept clear where the route allows. It samples
 // the periods after each gateway story's fault, where node 0's packets to the
 // broken node 4 die, and a stop on such a route runs into node 4's port. The
 // check must have met such a route, or its port half proves nothing.
@@ -1397,13 +1457,14 @@ test("a lost packet's bar stands clear of every zone's title and gateway port", 
   test.skip(info.project.name.endsWith('-dark'), 'geometry, the same in either theme');
   await open(page);
   const beside = new Set<string>();
+  const tight = new Set<string>();
   for (const name of ['Gateway failure', 'Gateway cut']) {
     await loadPreset(page, name);
     await breakGateway(page, true);
     const bars = new Set<string>();
     const against = new Set<string>();
     const check = async (): Promise<void> => {
-      const { lines, labels, ports } = await page
+      const { lines, labels, ports, discs } = await page
         .locator('.stage canvas')
         .evaluate((c: HTMLCanvasElement & { beams: BeamPool; glyphs: GlyphTable }, dropped) => {
           const p = c.beams;
@@ -1416,8 +1477,10 @@ test("a lost packet's bar stands clear of every zone's title and gateway port", 
           for (let s = 0; s < g.id.length; s++) {
             if (!Number.isNaN(g.portX[s])) ports.push({ id: g.id[s], x: g.portX[s], y: g.portY[s], r: g.r[s] });
           }
+          const discs: { x: number; y: number; r: number }[] = [];
+          for (let s = 0; s < g.id.length; s++) if (g.id[s] >= 0) discs.push({ x: g.x[s], y: g.y[s], r: g.r[s] });
           const labels = JSON.parse(c.dataset.labelBoxes ?? '[]') as { text: string; x: number; y: number; w: number; h: number }[];
-          return { lines, labels: labels.filter((l) => l.text.startsWith('zone ')), ports };
+          return { lines, labels: labels.filter((l) => l.text.startsWith('zone ')), ports, discs };
         }, DROPPED);
       const port = (at: { x: number; y: number }) => ports.find((p) => Math.hypot(at.x - p.x, at.y - p.y) <= portHalf(p.r) + STOP_BAR / 2 + 1);
       for (const { route: [fx, fy, cx, cy, tx, ty], stop, src, dst } of lines) {
@@ -1426,11 +1489,20 @@ test("a lost packet's bar stands clear of every zone's title and gateway port", 
         if (DROP_STOPS.some((s) => port(pointOn(path, s, { x: 0, y: 0 })) !== undefined)) beside.add(`node ${src} to node ${dst}`);
         const bar = `node ${src} to node ${dst}, its bar at ${stop}`;
         bars.add(bar);
-        for (const l of labels) {
-          const nx = Math.max(l.x, Math.min(at.x, l.x + l.w));
-          const ny = Math.max(l.y, Math.min(at.y, l.y + l.h));
-          if (Math.hypot(at.x - nx, at.y - ny) <= STOP_BAR / 2 + 1) against.add(`${bar} stands against "${l.text}"`);
+        const title = (p: { x: number; y: number }) =>
+          labels.find((l) => Math.hypot(p.x - Math.max(l.x, Math.min(p.x, l.x + l.w)), p.y - Math.max(l.y, Math.min(p.y, l.y + l.h))) <= STOP_BAR / 2 + 1);
+        // A chord straight across a small ring, port to port through its
+        // title, has no clear place at all (the phone's smallest rings); the
+        // bar then stands furthest from both, and is not held to this.
+        const roomy = Array.from({ length: 49 }, (_, i) => pointOn(path, (i + 1) / 50, { x: 0, y: 0 })).some(
+          (p) => title(p) === undefined && port(p) === undefined && discs.every((d) => Math.hypot(p.x - d.x, p.y - d.y) > d.r + RING_REACH + STOP_BAR / 2),
+        );
+        if (!roomy) {
+          tight.add(`node ${src} to node ${dst}`);
+          continue;
         }
+        const on = title(at);
+        if (on !== undefined) against.add(`${bar} stands against "${on.text}"`);
         const by = port(at);
         if (by !== undefined) against.add(`${bar} stands against node ${by.id}'s port`);
       }
@@ -1446,7 +1518,7 @@ test("a lost packet's bar stands clear of every zone's title and gateway port", 
     expect(bars.size, `${name}: a lost packet was drawn`).toBeGreaterThan(0);
     expect([...against], name).toEqual([]);
   }
-  console.log(`routes with a stop against a port: ${[...beside].join(', ')}`);
+  console.log(`routes with a stop against a port: ${[...beside].join(', ')}; with no clear place: ${[...tight].join(', ')}`);
   expect(beside.size, "no lost packet's route had a stop against a port, so the port check was not exercised").toBeGreaterThan(0);
 });
 
@@ -1709,6 +1781,7 @@ test('both gateway presets fail over within the window', async ({ page }, info) 
 });
 
 test('the transport stays put when the heartbeat reading appears', async ({ page }, info) => {
+  test.skip((info.project.use.viewport?.width ?? 0) < 640, "the phone's bar shows no readout (A22)");
   await open(page);
   await page.evaluate(() => document.fonts.ready.then(() => undefined));
   const bar = page.locator('.transport');
@@ -1732,6 +1805,115 @@ test('the transport stays put when the heartbeat reading appears', async ({ page
   const play = (await page.getByRole('button', { name: 'Play' }).boundingBox())!.height;
   if ((page.viewportSize()?.width ?? 0) >= 1100) expect(before, 'the bar wrapped').toBeLessThan(2 * play);
   await bar.screenshot({ path: `audit-shots/${info.project.name}/transport-heartbeat.png` });
+});
+
+// -- A26: the glossary opens beside the stage and moves nothing ------------------
+
+test('the glossary opens beside the stage, moves nothing and uses the page words (A26, A20)', async ({ page }, info) => {
+  test.skip(info.project.use.colorScheme !== 'light', 'geometry and words, the same in either theme');
+  const width = info.project.use.viewport?.width ?? 0;
+  await open(page);
+  const canvas = page.locator('.stage canvas');
+  const before = (await canvas.boundingBox())!;
+  await page.getByRole('button', { name: 'How to read this' }).click();
+  const glossary = page.locator('#glossary');
+  await expect(glossary).toBeVisible();
+  if (width >= 640) {
+    // In the detail pane: the stage stays where it was, and nothing covers it.
+    expect(await canvas.boundingBox(), 'the stage moved when the glossary opened').toEqual(before);
+    const g = (await glossary.boundingBox())!;
+    const apart = g.x >= before.x + before.width || g.x + g.width <= before.x || g.y >= before.y + before.height || g.y + g.height <= before.y;
+    expect(apart, 'the glossary covers the stage').toBe(true);
+  }
+  expect(await glossary.locator('h3').allInnerTexts()).toEqual(['Reading the page', 'When something goes wrong', 'How the controls work']);
+  // "server" belongs to the node entry alone.
+  const words = await glossary.evaluate((el: HTMLElement) => el.innerText.replace('One gabion server.', ''));
+  expect(words.match(/\b(?:ticks?|rounds?|converged|informed|lagging|RTO|relay floor|click any disc|aggregate|origins?|bursts?|servers?|resends?|retransmissions?|senders?)\b|Σ/gi)).toBeNull();
+  for (const key of ['Space plays or pauses', '→ steps to the next event', 'Esc returns to the scenario', 'Enter reads it', 'Pause to point at a packet']) {
+    expect(words, `the controls name "${key}"`).toContain(key);
+  }
+});
+
+// -- A22: the page scrolls, nothing inside it does, and the phone's bar stays --
+
+test('the desktop rail fits with its groups closed, and the outline and skip links hold (A22, C24)', async ({ page }, info) => {
+  const width = info.project.use.viewport?.width ?? 0;
+  test.skip(info.project.use.colorScheme !== 'light' || width < 1100, 'from 1100 px, once per width');
+  await page.goto('/');
+  await expect(page.locator('.stage canvas')).toBeVisible({ timeout: 30_000 });
+  const presets = page.getByRole('group', { name: 'Scenario preset' }).getByRole('button');
+  for (const name of (await presets.allInnerTexts()).map((n) => n.trim())) {
+    await loadPreset(page, name);
+    // Network stays open once a cut opened it; with none listed, the reader closes it.
+    const rail = await page.locator('.rail').evaluate((el) => {
+      for (const d of el.querySelectorAll<HTMLDetailsElement>('details[open]')) if (d.querySelector('.cuts') === null) d.open = false;
+      return { scroll: el.scrollHeight, client: el.clientHeight };
+    });
+    expect(rail.scroll, `${name}: the rail scrolls with its groups closed`).toBeLessThanOrEqual(rail.client + 1);
+  }
+  // Network opens itself when a cut is listed.
+  await loadPreset(page, 'Zone partition');
+  await expect(page.locator('.rail details.group').first(), 'Network opens on a listed cut').toHaveAttribute('open', '');
+  // The outline runs H1, H2, H3 and never skips a level.
+  const levels = await page.evaluate(() =>
+    [...document.querySelectorAll('h1, h2, h3, h4')].filter((h) => h.checkVisibility()).map((h) => Number(h.tagName[1])),
+  );
+  expect(levels[0], 'the outline opens on the H1').toBe(1);
+  for (let i = 1; i < levels.length; i++) expect(levels[i] - levels[i - 1], `heading ${i} skips a level`).toBeLessThanOrEqual(1);
+  // Three skip links lead the Tab order of a fresh page.
+  await page.goto('/');
+  await expect(page.locator('.stage canvas')).toBeVisible({ timeout: 30_000 });
+  const skips: string[] = [];
+  for (let i = 0; i < 3; i++) {
+    await page.keyboard.press('Tab');
+    skips.push(await page.locator(':focus').innerText());
+  }
+  expect(skips).toEqual(['Skip to the next step', 'Skip to the cluster', 'Skip to the time controls']);
+  await page.keyboard.press('Enter');
+  await expect(page.locator(':focus')).toHaveText(/Play|Pause/);
+});
+
+test('nothing scrolls inside the page, and the phone keeps Play and Send in reach (A22)', async ({ page }, info) => {
+  const width = info.project.use.viewport?.width ?? 0;
+  test.skip(info.project.use.colorScheme !== 'light' || width >= 1100, 'below 1100 px only, once per width');
+  await open(page);
+  // Every scroller below 1100 px is the page itself.
+  const inner = await page.evaluate(() =>
+    [...document.querySelectorAll<HTMLElement>('.rail, .rail-body, .glossary')]
+      .filter((el) => el.checkVisibility() && el.scrollHeight > el.clientHeight + 1)
+      .map((el) => `${el.className}: ${el.scrollHeight} px in ${el.clientHeight} px`),
+  );
+  expect(inner, 'boxes that scroll inside the page').toEqual([]);
+  if (width >= 640) {
+    // The tablet's stage keeps discs large enough for three-digit counts.
+    const r = await page
+      .locator('.stage canvas')
+      .evaluate((c: HTMLCanvasElement & { glyphs: GlyphTable }) => Math.min(...[...c.glyphs.r].filter((_, s) => c.glyphs.id[s] >= 0)));
+    expect(r, 'the smallest disc radius on the tablet').toBeGreaterThanOrEqual(10.9);
+    return;
+  }
+  // The phone: one row of Play, Step and Send, at most 56 px, in the viewport
+  // at every 200 px of scroll.
+  const bar = page.locator('footer');
+  expect((await bar.boundingBox())!.height, 'the bar is more than one 56 px row').toBeLessThanOrEqual(56);
+  const tops = await page
+    .locator('.transport button')
+    .evaluateAll((els) => [...new Set(els.filter((el) => el.checkVisibility()).map((el) => Math.round(el.getBoundingClientRect().top)))]);
+  expect(tops.length, 'the bar wraps').toBe(1);
+  const reach = (name: string | RegExp): Promise<boolean> =>
+    page
+      .locator('.transport')
+      .getByRole('button', { name })
+      .evaluate((el) => {
+        const r = el.getBoundingClientRect();
+        return r.top >= 0 && r.bottom <= innerHeight;
+      });
+  const height = await page.evaluate(() => document.documentElement.scrollHeight);
+  for (let y = 0; y < height; y += 200) {
+    await page.evaluate((to) => window.scrollTo(0, to), y);
+    expect(await reach('Play'), `Play out of reach at ${y} px`).toBe(true);
+    expect(await reach(/^Send/), `Send out of reach at ${y} px`).toBe(true);
+  }
 });
 
 // -- A6: interaction -----------------------------------------------------------

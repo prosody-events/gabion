@@ -9,9 +9,30 @@ results, with credible intervals, are in the gossip study (`docs/study/`), which
 the page links to from its header.
 
 The page has a one-row header (the title, the lede that states the cluster and
-its limit, the one-run statement and a "How to read this" glossary), a
+its limit, the one-run statement and the "How to read this" toggle), a
 workspace of three panes (the control rail, the stage, and the detail pane) and
 a transport bar. It opens on Rate limiting, paused, with node 0 selected.
+
+From 1100 px the three panes sit side by side and only the rail and the detail
+pane scroll. Below 1100 px the page scrolls and nothing inside it does: the
+rail folds into a disclosure across the top whose summary names the scenario
+("Scenario: Rate limiting · controls"), over the stage and the detail pane side
+by side from 640 px, and one column below. The tablet's and the phone's stage
+is square. Below 640 px the transport is one sticky row of Play, Step and Send
+at the foot of the viewport, and Speed moves into the Controls disclosure.
+
+"How to read this" opens the glossary: what each word and mark means, in two
+groups ("Reading the page" and "When something goes wrong"), then how the
+controls work, with the keys. From 640 px it takes the detail pane's place, so
+the stage never moves; below, it opens in the page's flow under the header.
+
+Type is a four-step scale of tokens, none below 12 px: caption-sm 12/16 (ticks,
+the key, names on the stage, hints), caption 14/20 (narration, buttons, chart
+titles and captions), body 16/24 (the serif goal, the header, the pane title)
+and heading 20/28 (the stage heading), with the in-disc count at 14 px (12 px
+below 640 px). Every line is a multiple of 4 px (`app.css` rounds each
+element's own leading), serif prose keeps a 34em measure, 45 to 75 characters a
+line, and a number joins its unit with a narrow no-break space ("10 s").
 
 ## Tiering view
 
@@ -167,7 +188,8 @@ report, retransmission and sweep counters, and the error budget. Every figure
 is the runtime's own admin row; the page chooses nothing.
 
 **Controls** (one model: time, traffic, network, membership, configuration).
-The transport holds Play/Pause, Step, Send and Speed. Send sends a burst of
+The transport holds Play/Pause, Step, Send and Speed (Speed sits in the
+Controls disclosure below 640 px). Send sends a burst of
 Requests per Send to the selected node: one-hit requests it decides in order,
 admitting each while its window has room and rejecting the rest, its label
 saying so ("Send 25 requests to node 0", "Send 25 requests" below 640 px,
@@ -191,10 +213,12 @@ coming) and is never disabled for playing. The rail has the scenarios in four
 groups (the current one marked by a rule, never filled, and inert), Requests
 per Send (checked when committed: Enter or leaving the field), Restart, a "Tune the
 cluster" disclosure (edits stage, counted on its summary, until Rebuild;
-"Back to the scenario's settings" restages the scenario's own), the network
-(the list of cuts, each with its own Reconnect; Cut zone X off; Heal k cuts)
-and Add, which adds a node to every zone or to the zone picked, and keeps the
-pick. Each cut is drawn where it happens: a cut zone's ring dashed, a silenced
+"Back to the scenario's settings" restages the scenario's own), then two more
+disclosures, closed at first so the desktop rail fits without scrolling:
+Network (the list of cuts, each with its own Reconnect; Cut zone X off; Heal k
+cuts), which opens itself whenever a cut is listed, and Cluster, whose Add adds
+a node to every zone or to the zone picked, and keeps the pick. The rail's group
+labels are letterspaced small caps. Each cut is drawn where it happens: a cut zone's ring dashed, a silenced
 node's outline dashed and its disc hatched, a node its zone cannot hear barred
 on the side facing its zone. The detail pane offers the selected node's
 gateway faults (Silence node N, Cut node N off from zone X) behind one closed
@@ -234,8 +258,12 @@ watch. Its control is the only filled one on the page (`data-primary`); the
 action line names it by the label the control renders; a wait fills nothing and
 shows a meter of its progress; the goal above the line explains the act and
 never commands. Each story moves through acts in `observe`, the one place a
-run's act changes. "Skip to the next step", the first Tab stop, focuses the
-filled control or the line.
+run's act changes. Three skip links lead the Tab order: "Skip to the next
+step" focuses the filled control or the line, "Skip to the cluster" the
+stage's keyboard grid and "Skip to the time controls" Play. The stage is a
+section labelled by its heading, and the outline runs H1 (the title), H2 (the
+rail's groups, the stage heading, the pane's node title, the glossary) and H3
+(the chart and inspector sections).
 
 **The heading and the narration.** The heading (`lib/heading.ts`) states the
 cluster: how many nodes see how many hits of the limit, the gap, the selected
@@ -334,8 +362,8 @@ text until a face loads; the canvas and the charts wait for the faces
 - `src/lib/components/` — `Stage` (the renderer and the key), `NodeGrid`
   (grid, counts, decisions, tooltip, table), `StageCaption` (goal and action
   line), `StageHeading`, `Charts`, `NodeInspector` with `GossipTargets`,
-  `ControlRail`, `TransportBar`, `RoleGlyph` and `Icon` (the
-  drawn marks), `Sentence` and `InfoTip`.
+  `ControlRail`, `TransportBar`, `Speed`, `Glossary`, `RoleGlyph` and `Icon`
+  (the drawn marks), `Sentence` and `InfoTip`.
 - `src/lib/presets.ts` — the scenario presets: a config, the node
   it selects, Requests per Send, its charts, its story and the scenario it hands
   over to, an optional feed and an `async seed(sim, config)` that
@@ -399,8 +427,8 @@ study dashboard. A rule that assumes the study's data model says "N/A" and why.
 17. Shape carries meaning and colour only repeats it (visual audit).
 18. Seed ticks: N/A, one run, no seeds.
 19. Paint order and halos; labels stay off the series (A3, visual audit).
-20. Colour tokens only, type tokens, named geometry constants, measured labels (grep gates).
-21. Page order, titles, notes, axis units, line length of about 80 characters (visual audit).
+20. Colour tokens only, the four type tokens, named geometry constants, measured labels (grep gates).
+21. Page order, titles, notes, axis units, a prose measure of 45 to 75 characters (`--measure`, 34em) on a 4 px leading grid (A12, visual audit).
 22. Breakpoints that keep everything usable: 1100 px and 640 px, audited at 1440, 1280, 1100, 768 and 400 px (A1, A3).
 23. A "Show as table" fallback and a method section (A4).
 24. Scorecard rules: N/A, no scorecard.
@@ -412,7 +440,9 @@ study dashboard. A rule that assumes the study's data model says "N/A" and why.
 30. One next action: in every state exactly one control is filled, the caption's action line quotes its label, a wait fills nothing and shows its progress, and the goal never commands (A49, A54, A56; story suite); Play is never silent (A61).
 
 The grep gates, which `make hygiene` runs: no colour literal outside
-`tokens.css`, no pixel `font-size`, no token a component names that
+`tokens.css`, every `font-size` a `var(--font-size-*)` token and no
+`--font-size-title` (the title is set at body size; the study dashboard keeps
+its own), no token a component names that
 `tokens.css` does not define (so no pre-token name such as `--ink` survives),
 and no `new Graphics` in `renderer.ts` outside its constructor and
 `#createNode`.
@@ -420,11 +450,11 @@ and no `new Graphics` in `renderer.ts` outside its constructor and
 Automated checks, run on every preset after a walk by Step:
 
 - A1: no page or console errors, no failed requests, no page-level horizontal overflow.
-- A2: no "NaN", "undefined", "null", "Infinity", "[object" or "e+" in page text.
-- A3: no two visible text boxes, DOM or canvas, overlap by 1 px or more, also in a converged state; no text is below the smallest type token (`--font-size-caption-sm`) and none is clipped by an `overflow: hidden` ancestor; no glyph that carries meaning is set from a font; the stage names every node; tooltips stay inside the stage; and for every zone count the stage's rings (grown by the largest disc) and labels lie inside it, no two nodes of different rings touch, and no cross-zone `beamPath` comes within a disc and half a stroke of a third ring, and every line bends through the centre exactly when its nodes' zones differ and wears its packet's kind, tier and fate (a dot for an acknowledgement or a sweep request, a relay marked as one), one line per packet.
+- A2: no "NaN", "undefined", "null", "Infinity", "[object" or "e+" in page text; no number and unit joined by an ASCII space ("10 s" takes U+202F), no spaced percent sign, and no hyphen-minus before a number.
+- A3: no two visible text boxes, DOM or canvas, overlap by 1 px or more, also in a converged state; no text is below the smallest type token (`--font-size-caption-sm`) or 12 px and none is clipped by an `overflow: hidden` ancestor; no glyph that carries meaning is set from a font; the stage names every node; tooltips stay inside the stage; and for every zone count the stage's rings (grown by the largest disc) and labels lie inside it, no two nodes of different rings touch, and no cross-zone `beamPath` comes within a disc and half a stroke of a third ring, and every line bends through the centre exactly when its nodes' zones differ and wears its packet's kind, tier and fate (a dot for an acknowledgement or a sweep request, a relay marked as one), one line per packet.
 - A4: data correctness, recomputed independently from the engine snapshot in the test's own code: the lede's counts, each node's behind-by and gateway-for count, the heading (A18: its form, truth, gap, countdown and censored "not caught up (≥ t)"), R1's total and columns for the selected node, R2's session counters, L's (zone, id) rows, both of S's predictions (with unequal zones) and, for the selected node, its Gossip targets.
 - A5: fixed order across the grid, table, the charts (R1, R2, L, S, as the scenario lists them) and Gossip-targets rows; the key lists exactly the marks drawn.
-- A42: every node mark against the layout and the snapshot: each port on its circle facing its zone and clear of its disc, every ring and count; the selection clear of facing rings; each name a node's name, smaller than the counts, inside the canvas and clear of every mark; the fill's top and brim on the vessel's scale, the cap with the brim decision, the ring's role with the lag.
+- A42: every node mark against the layout and the snapshot: each port on its circle facing its zone and clear of its disc, every ring and count; the selection clear of facing rings; each name a node's name, no larger than the counts, inside the canvas and clear of every mark; the fill's top and brim on the vessel's scale, the cap with the brim decision, the ring's role with the lag.
 - A6: interaction: the zone stepper and Rebuild, each network action and heal, keyboard navigation with focus kept across a rebuild, a tooltip on hover, focus and tap, and the study link's form (`study/` joins the site only in the Pages build, so its href is checked, not followed).
 - A7: contrast from computed styles, text at 4.5:1 and graphics at 3:1 on the surface they sit on, translucent marks composited over it first, in both themes, with targets of at least 24 px.
 - A8: the wording scan (rule 1) and the clock-time scan (rule 2).
@@ -433,15 +463,16 @@ Automated checks, run on every preset after a walk by Step:
 The story, motion and page checks the test titles name:
 
 - A10: every visible text is set in the three self-hosted faces, loaded before the first render, and every request stays on the page's own origin.
-- A12: measure, minimum type size and the 4 px leading grid.
+- A12: every line of text on a multiple of 4 px, and the serif prose (the goal, the glossary) at most 75 characters a line.
 - A13: cause and effect in one frame in every preset: no count rises in a frame before a line into it appears or its own request is admitted.
 - A16: counts equal `window_total`, fit their disc, and keep 4.5:1 on the fill and on the empty inside.
 - A17: a Send's feedback in the frame of the press, and its run, which ends one heartbeat period after its last wave.
 - A18: the stage heading in all its forms, with template ids, the countdown, the over-admission clause, the hops and repairs only.
 - A19: one live region, no claim said twice across the heading, the narration and the decision text, and at most two narration lines.
-- A20: the vocabulary, the title "Gabion rate limiter" and "rate limit" in the first viewport.
+- A20: the vocabulary: no visible text or accessible name says tick, round, converged, informed, lagging, Σ, RTO, relay floor, click any disc, aggregate, origin, burst or server (the glossary's node entry aside), and no button but Send says "send"; the title "Gabion rate limiter" and "rate limit" in the first viewport.
 - A21: keyboard: Space, → and Escape act only from the page itself.
-- A22: reachability and space: the one-row header from 1100 px, the ring radius, and Send in view.
+- A22: reachability and space: the one-row header from 1100 px; from 1100 px the rail fits without scrolling in every preset with its disclosures closed, the outline never skips a level and the three skip links lead the Tab order; below 1100 px nothing scrolls inside the page; the tablet's discs keep a radius of at least 10.9 px; and the phone's transport is one row of at most 56 px with Play and Send in the viewport at every 200 px of scroll.
+- A26: the glossary opens in the detail pane from 640 px without moving or covering the stage, keeps its group order, uses the page's words, and lists the keys.
 - A40: the Rate limiting walkthrough on the stage, state by state.
 - A46: the one time model: a rejected Send runs no time, a paused Send runs until settled or its cap, and the readout says while a run bounds it.
 - A48: Zone partition over-admits on local views, and the heading says so.

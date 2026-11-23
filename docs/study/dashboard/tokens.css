@@ -55,11 +55,11 @@
   --font-sans: 'Source Sans 3', sans-serif;
   --font-serif: 'Source Serif 4', serif;
   --font-mono: 'Source Code Pro', monospace;
-  --font-size-caption-sm: 0.64rem;
-  --font-size-caption: 0.8rem;
+  /* Four steps, none below 12 px; each line is a multiple of 4 px (app.css). */
+  --font-size-caption-sm: 0.75rem;
+  --font-size-caption: 0.875rem;
   --font-size-body: 1rem;
   --font-size-heading: 1.25rem;
-  --font-size-title: 1.563rem;
   /* The count in a node's disc: one step down below 640 px, so three digits
      still fit the smaller disc. */
   --font-size-count: 0.875rem;
@@ -72,6 +72,8 @@
   --pad-xs: 4px;
   --pad-sm: 8px;
   --radius: 8px;
+  /* The prose measure: 45 to 75 characters a line. */
+  --measure: 34em;
   --dur-slow: 0.45s;
 }
 

@@ -118,7 +118,7 @@ export function cappedStop(periods: number, node: number): Blurb {
 export function expiry(left: number, emptied: boolean, windowS: number, subject: number, reopened: boolean): Blurb {
   const again: Blurb = reopened ? blurb` · node ${subject} admits again` : [];
   return emptied
-    ? [...blurb`the ${left} ${noun(left, 'hit')} left the ${windowS} s window · every node stopped counting them at the same instant, without a packet`, ...again]
+    ? [...blurb`the ${left} ${noun(left, 'hit')} left the ${windowS}\u202fs window · every node stopped counting them at the same instant, without a packet`, ...again]
     : [...blurb`the oldest ${left} ${noun(left, 'hit')} left the window`, ...again];
 }
 

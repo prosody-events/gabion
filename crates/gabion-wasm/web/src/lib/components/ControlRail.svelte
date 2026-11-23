@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { Snippet } from 'svelte';
   import { BURST_REQUESTS_MAX, RULE_LIMIT_MAX, type Knobs, type Preset } from '../presets';
   import { nominalBuckets } from '../buckets';
   import { cutName, repairLabel, type Cut } from '../cuts';
@@ -42,6 +43,7 @@
     onHeal,
     onAddNode,
     onPreview,
+    children,
   }: {
     presets: readonly Preset[];
     activeId: string;
@@ -87,6 +89,8 @@
     /** A control that names a node previews it on the stage while hovered or
      *  focused. */
     onPreview: (node: number | null) => void;
+    /** What the page adds at the rail's foot: Speed, on the phone. */
+    children?: Snippet;
   } = $props();
 
   const active = $derived(presets.find((p) => p.id === activeId));
@@ -150,6 +154,12 @@
       event.stopPropagation();
     }
   }
+
+  // Network and Cluster fold away; Network opens whenever a cut is listed.
+  let networkOpen = $state(false);
+  $effect(() => {
+    if (cuts.length > 0) networkOpen = true;
+  });
 
   /** The preview events of a control that names node `id`. */
   const names = (id: number) => ({
@@ -234,7 +244,7 @@
       </select>
     </div>
     <div class="knob" class:changed={changed.has('target_err_bps')}>
-      <label for="knob-bps">Error budget<span class="val" data-field="error-budget-bps">{knobs.target_err_bps} bps</span></label>
+      <label for="knob-bps">Error budget<span class="val" data-field="error-budget-bps">{(knobs.target_err_bps / 100).toFixed(1)}% of the limit</span></label>
       <input id="knob-bps" type="range" min="50" max="2000" step="50" bind:value={knobs.target_err_bps} />
     </div>
     <div class="knob" class:changed={changed.has('uniform_loss')}>
@@ -242,11 +252,11 @@
       <input id="knob-loss" type="range" min="0" max="0.9" step="0.05" bind:value={knobs.uniform_loss} />
     </div>
     <div class="knob" class:changed={changed.has('tick_interval_ms')}>
-      <label for="knob-gossip">Gossip interval<span class="val" data-field="gossip-interval">{knobs.tick_interval_ms} ms</span></label>
+      <label for="knob-gossip">Heartbeat interval<span class="val" data-field="gossip-interval">{knobs.tick_interval_ms} ms</span></label>
       <input id="knob-gossip" type="range" min="50" max="1000" step="50" bind:value={knobs.tick_interval_ms} />
     </div>
     <div class="knob" class:changed={changed.has('rule_window_ms')}>
-      <label for="knob-window">Window<span class="val" data-field="window">{windowSec} s · {windowBuckets} buckets</span></label>
+      <label for="knob-window">Window<span class="val" data-field="window">{windowSec} s · {windowBuckets} buckets</span></label>
       <input id="knob-window" type="range" min="3000" max="30000" step="1000" bind:value={knobs.rule_window_ms} />
     </div>
     <div class="knob" class:changed={changed.has('rule_limit')}>
@@ -283,8 +293,8 @@
     </div>
   </details>
 
-  <section class="group">
-    <h2>Network</h2>
+  <details class="group" bind:open={networkOpen}>
+    <summary><h2>Network</h2></summary>
     {#if cuts.length === 0}
       <p class="hint">no cuts: the network is the scenario's own</p>
     {:else}
@@ -334,10 +344,10 @@
         {:else if healInHeading}<span class="reason" id="heal-reason">its button is in the heading</span>{/if}
       </div>
     {/if}
-  </section>
+  </details>
 
-  <section class="group">
-    <h2>Cluster</h2>
+  <details class="group">
+    <summary><h2>Cluster</h2></summary>
     <div class="members">
       <span class="members-label">Members</span>
       <span class="members-value" data-field="members">{fmtCount(nodeCount)}</span>
@@ -362,7 +372,8 @@
           >the visualizer holds at most <span data-field="max-nodes">{maxNodes}</span> nodes</span
         >{/if}
     </div>
-  </section>
+  </details>
+  {@render children?.()}
 </aside>
 
 <style>
@@ -384,13 +395,35 @@
     gap: var(--gap-sm);
   }
 
-  h2 {
+  /* Group labels: letterspaced small caps at 14 px, the one place they are
+     used; a number inside keeps its own figures. */
+  h2,
+  .tune summary {
     margin: 0;
-    font-size: var(--font-size-caption-sm);
+    font-size: var(--font-size-caption);
     font-weight: 600;
+    font-variant-caps: all-small-caps;
     letter-spacing: 0.06em;
-    text-transform: uppercase;
     color: var(--color-fg-muted);
+  }
+
+  details.group > summary {
+    cursor: pointer;
+  }
+
+  details.group > summary h2 {
+    display: inline;
+  }
+
+  details.group::details-content {
+    display: flex;
+    flex-direction: column;
+    gap: var(--gap-sm);
+  }
+
+  .tune summary [data-field] {
+    font-variant-caps: normal;
+    letter-spacing: 0;
   }
 
   .hint {
@@ -552,11 +585,6 @@
 
   .tune summary {
     cursor: pointer;
-    font-size: var(--font-size-caption-sm);
-    font-weight: 600;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--color-fg-muted);
   }
 
   .tune > .hint {

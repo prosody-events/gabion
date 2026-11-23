@@ -124,7 +124,7 @@ const MAX_BUCKETS = 32;
 // label or a disc (a gateway's packet across its ring passes the zone title at
 // the ring's centre), at the first stop further out either way clear of both,
 // `LABEL_SPACING` from a label as names keep from each other, else the stop
-// furthest from any label.
+// furthest from every zone title and port.
 export const DROP_STOPS = [0.5, 0.42, 0.58, 0.34, 0.66, 0.26, 0.74] as const;
 // The step a lost packet's bar searches its route in when no `DROP_STOPS`
 // place is clear.
@@ -452,6 +452,8 @@ export class StageRenderer {
   #titles: Text[] = [];
   // The names' boxes as last laid out, which a lost packet's bar keeps clear of.
   #labelBoxes: readonly LabelBox[] = [];
+  // How many of `#labelBoxes` are zone titles: they come first.
+  #titleBoxes = 0;
   #layout: StageLayout | null = null;
   #zoneNames: readonly string[] = [];
   #cluster: ClusterState | null = null;
@@ -1296,6 +1298,7 @@ export class StageRenderer {
     const layout = this.#layout;
     const boxes: LabelBox[] = [];
     this.#labelBoxes = boxes;
+    this.#titleBoxes = 0;
     if (layout === null) {
       this.#app.canvas.dataset.labelBoxes = '[]';
       return;
@@ -1342,6 +1345,7 @@ export class StageRenderer {
         h: title.height,
         size,
       });
+      this.#titleBoxes = boxes.length;
     });
     for (const spot of layout.spots) {
       const gfx = this.#nodes.get(spot.id);
@@ -1650,23 +1654,20 @@ export class StageRenderer {
   /** Where on the current route a lost packet's bar stands: of the
    *  `DROP_STOPS` clear of every disc's ring, the first `LABEL_SPACING` from
    *  every label and gateway port; else, along the whole route in
-   *  `FINE_STOP` steps, the place furthest from them; half way when none
-   *  clears the discs. */
+   *  `FINE_STOP` steps, the place furthest from the zone titles and the
+   *  ports, which a bar must never stand against (a node's name beside a
+   *  short chord may leave no room); half way when none clears the discs. */
   #dropStop(): number {
     let best: number = DROP_STOPS[0];
     let room = Number.NEGATIVE_INFINITY;
     for (let s = 0; s < DROP_STOPS.length; s++) {
       const stop = DROP_STOPS[s];
-      const near = this.#stopRoom(stop);
+      const near = this.#stopRoom(stop, this.#labelBoxes.length);
       if (near > LABEL_SPACING) return stop;
-      if (near > room) {
-        room = near;
-        best = stop;
-      }
     }
     // A short chord between ports: search the route finely.
     for (let stop = FINE_STOP; stop < 1; stop += FINE_STOP) {
-      const near = this.#stopRoom(stop);
+      const near = this.#stopRoom(stop, this.#titleBoxes);
       if (near > room) {
         room = near;
         best = stop;
@@ -1676,8 +1677,9 @@ export class StageRenderer {
   }
 
   /** How far a bar at `stop` on the current route stands from the nearest
-   *  label or gateway port, px; −∞ when it touches a disc's ring. */
-  #stopRoom(stop: number): number {
+   *  of the first `labels` label boxes or a gateway port, px; −∞ when it
+   *  touches a disc's ring. */
+  #stopRoom(stop: number, labels: number): number {
     const at = this.#at;
     const spots = this.#layout?.spots;
     const boxes = this.#labelBoxes;
@@ -1687,7 +1689,7 @@ export class StageRenderer {
       if (Math.hypot(at.x - spot.x, at.y - spot.y) <= spot.r + RING_REACH + STOP_BAR / 2) return Number.NEGATIVE_INFINITY;
     }
     let near = Number.POSITIVE_INFINITY;
-    for (let b = 0; b < boxes.length; b++) {
+    for (let b = 0; b < labels; b++) {
       const box = boxes[b];
       const nx = Math.max(box.x, Math.min(at.x, box.x + box.w));
       const ny = Math.max(box.y, Math.min(at.y, box.y + box.h));
