@@ -70,7 +70,13 @@ export function heading(h: HeadingView): Heading {
     }
     if (lag.kind !== 'Stranded') gap = Math.max(gap, t - node.window_total);
   }
-  const repair = h.cuts.length > 0 && stranded > 0 && behind === 0 ? repairLabel(h.cuts, h.zones) : null;
+  // The repair, once waiting can no longer close a gap: nothing is behind (a
+  // feed's newest hits, younger than a heartbeat, aside), and a cut strands
+  // some node or only keeps a gateway's zone from hearing it, which strands
+  // no count.
+  const waiting = h.newer === null ? behind > 0 : missing >= h.tickMs;
+  const unheardOnly = h.cuts.every((c) => c.kind === 'unheard-in-zone');
+  const repair = h.cuts.length > 0 && !waiting && (stranded > 0 || unheardOnly) ? repairLabel(h.cuts, h.zones) : null;
   const over: Blurb = h.onScale && t > h.limit ? blurb` · ${claim(t, 'cluster', 'admitted')} admitted against the limit of ${claim(h.limit, 'cluster', 'limit')}` : [];
   const late: Blurb =
     missing >= h.tickMs && behind > 0 ? [' · not caught up (≥ ', claim(fmtDuration(missing), 'cluster', 'behind'), ')'] : [];

@@ -38,7 +38,7 @@
 import { gsap } from 'gsap';
 import { Application, Container, Graphics, Text, TextStyle, type Ticker } from 'pixi.js';
 import { zoneLabel } from '../format';
-import { brim as brimLine, chord, dashedRing, hatch, port as portGlyph, stopBar } from '../glyphs';
+import { barrier, brim as brimLine, chord, dashedRing, discHatch, hatch, port as portGlyph, stopBar } from '../glyphs';
 import { VESSEL_SCALE } from '../limit';
 import { CARRIES_CELLS, type Admission, type ClusterState, type Lag, type PacketKind, type SimEvent } from '../sim/types';
 import { BEAM_ALPHA, FADED_ALPHA, type Theme } from '../theme';
@@ -88,6 +88,10 @@ export const BOUNCE_MS = 600;
 // reduced motion, px.
 const REBOUND = 0.3;
 const HATCH_STEP = 4;
+// Half the angle a barrier spans either side of the zone it faces.
+const BARRIER_HALF = 0.6;
+// A cut zone's ring: long dashes, so it reads at the zone's scale.
+const ZONE_CUT_DASH: readonly [number, number] = [10, 6];
 // The segments the heartbeat sweep reveals round the selection outline.
 const SWEEP_SEGMENTS = 32;
 // The most nodes the stage holds at once (the page caps live nodes at 100),
@@ -103,6 +107,9 @@ const MAX_BUCKETS = 32;
 // `LABEL_SPACING` from a label as names keep from each other, else the stop
 // furthest from any label.
 export const DROP_STOPS = [0.5, 0.42, 0.58, 0.34, 0.66, 0.26, 0.74] as const;
+// The step a lost packet's bar searches its route in when no `DROP_STOPS`
+// place is clear.
+const FINE_STOP = 0.02;
 export const STOP_BAR = 12;
 // Segments a route is drawn in.
 const ROUTE_SEGMENTS = 8;
@@ -181,8 +188,14 @@ export interface Scale {
   buckets: number;
 }
 
-/** What a named node's label says about it beyond its name. */
+/** What a fault does to one node: silenced, or unheard by its own zone. */
 export type Fault = { kind: 'silenced' } | { kind: 'unheard'; zone: number };
+
+/** The faults the stage draws: per node, and the zones cut off. */
+export interface Faults {
+  readonly nodes: ReadonlyMap<number, Fault>;
+  readonly zones: ReadonlySet<number>;
+}
 
 /** One label's box in CSS px of the canvas, halo included, as published for the
  *  design audit. */
@@ -213,6 +226,9 @@ interface NodeGfx {
   preview: Graphics;
   refusal: Graphics;
   mask: Graphics;
+  /** A fault's mark: a silenced node's dashed outline and hatch, or the
+   *  barrier facing the zone that cannot hear it. */
+  fault: Graphics;
   label: Text;
   zone: number;
   /** The slot this node is gliding to (stage px). */
@@ -397,6 +413,8 @@ export class StageRenderer {
   #selectionStroke: Stroke = { width: SELECTION_WIDTH, color: 0, alpha: 1 };
   #previewStroke: Stroke = { width: SELECTION_WIDTH, color: 0, alpha: 1, cap: 'butt' };
   #hatchStroke: Stroke = { width: 1.5, color: 0, alpha: 1 };
+  #faultStroke: Stroke = { width: 1, color: 0, alpha: 1, cap: 'butt' };
+  #barrierStroke: Stroke = { width: CAP_WIDTH, color: 0, alpha: 1, cap: 'butt' };
   #nameStyle = new TextStyle();
   #namedStyle = new TextStyle();
   #titleStyle = new TextStyle();
@@ -420,7 +438,7 @@ export class StageRenderer {
   #zoneNames: readonly string[] = [];
   #cluster: ClusterState | null = null;
   #roles: Roles | null = null;
-  #faults: ReadonlyMap<number, Fault> = new Map();
+  #faults: Faults = { nodes: new Map(), zones: new Set() };
   #scale: Scale = { limit: 1, onScale: false, requests: 1, buckets: 1 };
   // A lag younger than this does not open a ring: the feed's newest hits.
   #grace = 0;
@@ -624,14 +642,46 @@ export class StageRenderer {
       }
     }
     this.#placeLabels();
+    // A lost packet's bar keeps clear of the ports as they now stand.
+    const pool = this.#pool;
+    for (let i = 0; i < pool.len; i++) if ((pool.flags[i] & DROPPED) !== 0) this.#drawLine(i);
     this.#dirty = true;
   }
 
-  /** Name the nodes a fault picks out: "node 4 · silenced", "node 4 · can't
-   *  reach zone b". */
-  setFaults(faults: ReadonlyMap<number, Fault>): void {
+  /** Draw the faults where they happen and name the nodes they pick out:
+   *  a cut zone's ring dashed; a silenced node's outline dashed and its
+   *  interior hatched, "node 4 · silenced"; a barrier on the side of a node
+   *  its zone cannot hear that faces the zone, "node 4 · can't reach zone b". */
+  setFaults(faults: Faults): void {
     this.#faults = faults;
+    this.#drawGuides();
+    const drawn: Record<Fault['kind'] | 'zone', number[]> = { silenced: [], unheard: [], zone: [...faults.zones] };
+    for (const gfx of this.#nodes.values()) {
+      this.#drawFault(gfx);
+      const fault = faults.nodes.get(gfx.id);
+      if (fault !== undefined) drawn[fault.kind].push(gfx.id);
+    }
+    // For the audit: the marks drawn, by kind.
+    this.#app.canvas.dataset.faults = JSON.stringify(drawn);
     this.#placeLabels();
+  }
+
+  /** Redraw node `gfx`'s fault mark, or clear it. */
+  #drawFault(gfx: NodeGfx): void {
+    const g = gfx.fault.clear();
+    const fault = this.#faults.nodes.get(gfx.id);
+    if (fault === undefined) return;
+    const r = gfx.radius;
+    if (fault.kind === 'silenced') {
+      dashedRing(g, r + 1, PREVIEW_DASH);
+      discHatch(g, r - 2, HATCH_STEP);
+      g.stroke(this.#faultStroke);
+      return;
+    }
+    const ring = this.#layout?.rings[gfx.zone];
+    if (ring === undefined) return;
+    barrier(g, r + SELECTION_GAP, Math.atan2(ring.y - gfx.center.y, ring.x - gfx.center.x), BARRIER_HALF);
+    g.stroke(this.#barrierStroke);
   }
 
   /** Draw the dashed preview of a selection on node `id`, or on none. */
@@ -782,6 +832,8 @@ export class StageRenderer {
     this.#selectionStroke = { width: SELECTION_WIDTH, color: fg, alpha: 1 };
     this.#previewStroke = { width: SELECTION_WIDTH, color: fgMuted, alpha: 1, cap: 'butt' };
     this.#hatchStroke = { width: 1.5, color: bad, alpha: 1 };
+    this.#faultStroke = { width: 1, color: fgMuted, alpha: 1, cap: 'butt' };
+    this.#barrierStroke = { width: CAP_WIDTH, color: bad, alpha: 1, cap: 'butt' };
     const stroke = { color: bg, width: 2 * HALO, join: 'round' as const };
     this.#nameStyle = new TextStyle({ fontFamily: font, fontSize: captionSmPx, fontWeight: '400', fill: fgMuted, stroke });
     this.#namedStyle = new TextStyle({ fontFamily: font, fontSize: captionSmPx, fontWeight: '600', fill: fg, stroke });
@@ -800,11 +852,12 @@ export class StageRenderer {
     const preview = new Graphics();
     const refusal = new Graphics();
     const mask = new Graphics();
+    const fault = new Graphics();
     selection.visible = false;
     preview.visible = false;
     refusal.visible = false;
     refusal.mask = mask;
-    root.addChild(vessel, mask, refusal, ring, selection, preview, port);
+    root.addChild(vessel, mask, refusal, ring, fault, selection, preview, port);
     this.#nodeLayer.addChild(root);
     const label = new Text({ text: `node ${spot.id}`, style: this.#nameStyle });
     this.#labelLayer.addChild(label);
@@ -820,6 +873,7 @@ export class StageRenderer {
       preview,
       refusal,
       mask,
+      fault,
       label,
       zone: spot.zone,
       center: target,
@@ -872,6 +926,7 @@ export class StageRenderer {
   #glide(gfx: NodeGfx, target: Point): void {
     if (gfx.center.x === target.x && gfx.center.y === target.y) return;
     gfx.center = target;
+    this.#drawFault(gfx);
     this.#glyphs.x[gfx.slot] = target.x;
     this.#glyphs.y[gfx.slot] = target.y;
     if (this.#reduceMotion) {
@@ -963,7 +1018,10 @@ export class StageRenderer {
   #drawGuides(): void {
     this.#guides.clear();
     if (this.#layout === null) return;
-    for (const ring of this.#layout.rings) this.#guides.circle(ring.x, ring.y, ring.rz);
+    this.#layout.rings.forEach((ring, z) => {
+      if (this.#faults.zones.has(z)) dashedRing(this.#guides, ring.rz, ZONE_CUT_DASH, ring.x, ring.y);
+      else this.#guides.circle(ring.x, ring.y, ring.rz);
+    });
     this.#guides.stroke({ width: IN_WIDTH, color: this.#theme.grid });
   }
 
@@ -993,6 +1051,7 @@ export class StageRenderer {
     gfx.preview.stroke(this.#previewStroke);
     this.#drawVessel(gfx, Math.max(gfx.total, 0), gfx.capped);
     this.#drawRing(gfx);
+    this.#drawFault(gfx);
     this.#glyphs.r[gfx.slot] = r;
   }
 
@@ -1257,7 +1316,7 @@ export class StageRenderer {
       const gfx = this.#nodes.get(spot.id);
       if (gfx === undefined) continue;
       const label = gfx.label;
-      const fault = this.#faults.get(spot.id);
+      const fault = this.#faults.nodes.get(spot.id);
       label.text =
         fault === undefined
           ? `node ${spot.id}`
@@ -1548,44 +1607,58 @@ export class StageRenderer {
 
   /** Where on the current route a lost packet's bar stands: of the
    *  `DROP_STOPS` clear of every disc's ring, the first `LABEL_SPACING` from
-   *  every label and gateway port, else the one furthest from them; half way
-   *  when none clears the discs. */
+   *  every label and gateway port; else, along the whole route in
+   *  `FINE_STOP` steps, the place furthest from them; half way when none
+   *  clears the discs. */
   #dropStop(): number {
-    const at = this.#at;
-    const spots = this.#layout?.spots;
-    const boxes = this.#labelBoxes;
     let best: number = DROP_STOPS[0];
     let room = Number.NEGATIVE_INFINITY;
     for (let s = 0; s < DROP_STOPS.length; s++) {
       const stop = DROP_STOPS[s];
-      pointOn(this.#path, stop, at);
-      let clear = true;
-      for (let n = 0; clear && spots !== undefined && n < spots.length; n++) {
-        const spot = spots[n];
-        clear = Math.hypot(at.x - spot.x, at.y - spot.y) > spot.r + RING_REACH + STOP_BAR / 2;
-      }
-      if (!clear) continue;
-      let near = Number.POSITIVE_INFINITY;
-      for (let b = 0; b < boxes.length; b++) {
-        const box = boxes[b];
-        const nx = Math.max(box.x, Math.min(at.x, box.x + box.w));
-        const ny = Math.max(box.y, Math.min(at.y, box.y + box.h));
-        near = Math.min(near, Math.hypot(at.x - nx, at.y - ny) - STOP_BAR / 2);
-      }
-      for (let n = 0; spots !== undefined && n < spots.length; n++) {
-        const spot = spots[n];
-        const gfx = this.#nodes.get(spot.id);
-        if (gfx?.ported !== true) continue;
-        const port = Math.hypot(at.x - spot.x - gfx.portX, at.y - spot.y - gfx.portY);
-        near = Math.min(near, port - portHalf(spot.r) - STOP_BAR / 2);
-      }
+      const near = this.#stopRoom(stop);
       if (near > LABEL_SPACING) return stop;
       if (near > room) {
         room = near;
         best = stop;
       }
     }
+    // A short chord between ports: search the route finely.
+    for (let stop = FINE_STOP; stop < 1; stop += FINE_STOP) {
+      const near = this.#stopRoom(stop);
+      if (near > room) {
+        room = near;
+        best = stop;
+      }
+    }
     return best;
+  }
+
+  /** How far a bar at `stop` on the current route stands from the nearest
+   *  label or gateway port, px; −∞ when it touches a disc's ring. */
+  #stopRoom(stop: number): number {
+    const at = this.#at;
+    const spots = this.#layout?.spots;
+    const boxes = this.#labelBoxes;
+    pointOn(this.#path, stop, at);
+    for (let n = 0; spots !== undefined && n < spots.length; n++) {
+      const spot = spots[n];
+      if (Math.hypot(at.x - spot.x, at.y - spot.y) <= spot.r + RING_REACH + STOP_BAR / 2) return Number.NEGATIVE_INFINITY;
+    }
+    let near = Number.POSITIVE_INFINITY;
+    for (let b = 0; b < boxes.length; b++) {
+      const box = boxes[b];
+      const nx = Math.max(box.x, Math.min(at.x, box.x + box.w));
+      const ny = Math.max(box.y, Math.min(at.y, box.y + box.h));
+      near = Math.min(near, Math.hypot(at.x - nx, at.y - ny) - STOP_BAR / 2);
+    }
+    for (let n = 0; spots !== undefined && n < spots.length; n++) {
+      const spot = spots[n];
+      const gfx = this.#nodes.get(spot.id);
+      if (gfx?.ported !== true) continue;
+      const port = Math.hypot(at.x - spot.x - gfx.portX, at.y - spot.y - gfx.portY);
+      near = Math.min(near, port - portHalf(spot.r) - STOP_BAR / 2);
+    }
+    return near;
   }
 
   /** Add a bar across the route at position `head`: where a lost packet died. */

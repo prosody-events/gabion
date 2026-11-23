@@ -92,7 +92,7 @@ export function brim(pen: Pen, r: number, y: number, overhang: number): void {
 
 /** Dashes round a circle of radius `r`, `dash[0]` px drawn and `dash[1]` px
  *  left, as separate subpaths: the selection preview. */
-export function dashedRing(pen: Pen, r: number, dash: readonly [on: number, off: number]): void {
+export function dashedRing(pen: Pen, r: number, dash: readonly [on: number, off: number], cx = 0, cy = 0): void {
   const turn = 2 * Math.PI * r;
   const period = dash[0] + dash[1];
   const count = Math.max(1, Math.floor(turn / period));
@@ -100,8 +100,25 @@ export function dashedRing(pen: Pen, r: number, dash: readonly [on: number, off:
   const on = (step * dash[0]) / period;
   for (let i = 0; i < count; i++) {
     const a = -Math.PI / 2 + i * step;
-    pen.moveTo(r * Math.cos(a), r * Math.sin(a)).arc(0, 0, r, a, a + on);
+    pen.moveTo(cx + r * Math.cos(a), cy + r * Math.sin(a)).arc(cx, cy, r, a, a + on);
   }
+}
+
+/** 45° lines `step` px apart, each clipped to a disc of radius `r`: a
+ *  silenced node's interior. */
+export function discHatch(pen: Pen, r: number, step: number): void {
+  const k = Math.SQRT1_2;
+  for (let c = -r + step / 2; c < r; c += step) {
+    const t = Math.sqrt(r * r - c * c);
+    // Offset `c` along (1, 1)/√2, then ±t along (1, −1)/√2.
+    pen.moveTo((c + t) * k, (c - t) * k).lineTo((c - t) * k, (c + t) * k);
+  }
+}
+
+/** An arc of radius `r` spanning `half` radians either side of `angle`: the
+ *  barrier on a node's side that faces the zone it can no longer reach. */
+export function barrier(pen: Pen, r: number, angle: number, half: number): void {
+  pen.moveTo(r * Math.cos(angle - half), r * Math.sin(angle - half)).arc(0, 0, r, angle - half, angle + half);
 }
 
 /** A bar `2·half` px long across a route at (`x`, `y`), whose unit tangent is

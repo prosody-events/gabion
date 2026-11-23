@@ -322,4 +322,7 @@ export interface ClusterState {
    *  `RuleSpec::bucket_at`: the page dates Sends and window events by it
    *  rather than recomputing the boundary in TS. */
   bucket_epoch_now: number;
+  /** `gossip.suspect_after`: how long a node waits on an unanswered gateway
+   *  before it gives up on it, in ms. */
+  suspect_after_ms: number;
 }

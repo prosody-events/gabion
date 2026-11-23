@@ -1,7 +1,7 @@
 <script lang="ts">
   import { fmtCount, type Blurb } from '../format';
   import { BURST_REQUESTS_MAX } from '../presets';
-  import { GOES_TO, WATCHES, waitClause, type NextAction } from '../next';
+  import { GOES_TO, WATCHES, faultClause, type GatewayFault, type NextAction } from '../next';
   import type { Preset } from '../presets';
   import Icon from './Icon.svelte';
   import Sentence from './Sentence.svelte';
@@ -17,12 +17,14 @@
     label,
     pressClause,
     phone,
-    subject,
+    waitText,
+    requests,
     requestsReason,
     zoneName,
     meter,
     presetLabel,
     onSelect,
+    onFault,
     onUseRequests,
     onGo,
     onPreview,
@@ -35,7 +37,10 @@
     pressClause: Blurb;
     /** Below 640 px the transport is the sticky bar below. */
     phone: boolean;
-    subject: number;
+    /** What a wait waits for, as its clause. */
+    waitText: Blurb;
+    /** Requests per Send, which a gateway fault's press also sends. */
+    requests: number;
     /** Why Requests per Send needs fixing. */
     requestsReason: Blurb;
     zoneName: (zone: number) => string;
@@ -43,6 +48,7 @@
     meter: { value: number; text: string } | null;
     presetLabel: (id: Preset['id']) => string;
     onSelect: (node: number) => void;
+    onFault: (fault: GatewayFault, node: number, zone: number) => void;
     onUseRequests: (requests: number) => void;
     onGo: (to: Preset['id']) => void;
     onPreview: (node: number | null) => void;
@@ -74,6 +80,19 @@
         onblur={() => onPreview(null)}><Sentence parts={label ?? []} field="next" /></button
       >
       <span>in {zoneName(action.action.zone)}, or click its disc</span>
+    {:else if action.kind === 'inline' && action.action.kind === 'fault'}
+      {@const { fault, node, zone, origin } = action.action}
+      <button
+        data-primary=""
+        aria-describedby="next-action"
+        onclick={() => onFault(fault, node, zone)}
+        onpointerenter={() => onPreview(node)}
+        onpointerleave={() => onPreview(null)}
+        onfocus={() => onPreview(node)}
+        onblur={() => onPreview(null)}
+        ><Icon name={fault === 'silenced' ? 'silence' : 'cut'} /><Sentence parts={label ?? []} field="next" /></button
+      >
+      <span><Sentence parts={faultClause(fault, origin, zoneName(zone), requests)} field="next" /></span>
     {:else if action.kind === 'inline' && action.action.kind === 'use-requests'}
       {@const requests = action.action.requests}
       <button data-primary="" aria-describedby="next-action" onclick={() => onUseRequests(requests)}
@@ -96,7 +115,7 @@
         <strong>Requests per Send</strong>, then press Enter</span
       >
     {:else if action.kind === 'wait'}
-      <span><Sentence parts={waitClause(action.reason, subject)} field="next" /></span>
+      <span><Sentence parts={waitText} field="next" /></span>
       {#if meter === null}
         <span class="meter indeterminate" role="progressbar" aria-label="Progress"></span>
       {:else}

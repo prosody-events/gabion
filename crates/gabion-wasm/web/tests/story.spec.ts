@@ -3,7 +3,7 @@ import type { ClusterState } from '../src/lib/sim/types';
 import type { BeamPool, GlyphTable } from '../src/lib/stage/renderer';
 import { CROSS, RELAY, STRATA_MIN_INNER } from '../src/lib/stage/layout';
 import { readTheme } from '../src/lib/theme';
-import { pauseIfPlaying, recordData, send, sendButton, setRange, setSpeed, step, still } from './drive';
+import { breakGateway, pauseIfPlaying, recordData, send, sendButton, setRange, setSpeed, step, still } from './drive';
 import { WATCHES } from '../src/lib/next';
 import { PRESETS, WATCHED_KEY, presetById } from '../src/lib/presets';
 import { COMMANDS, clauses } from './next-actions';
@@ -54,6 +54,15 @@ async function checkState(page: Page, where: string): Promise<string | null> {
     () => {
       const out: string[] = [];
       const ink = getComputedStyle(document.documentElement).color;
+      // A58: one control per action: no two visible, enabled buttons share
+      // an accessible name.
+      const names = new Set<string>();
+      for (const b of document.querySelectorAll<HTMLButtonElement>('button')) {
+        if (!b.checkVisibility() || b.disabled) continue;
+        const name = (b.getAttribute('aria-label') ?? b.textContent ?? '').replace(/\s+/g, ' ').trim();
+        if (names.has(name)) out.push(`two buttons are named "${name}"`);
+        names.add(name);
+      }
       // A49.2: only the primary wears the ink fill, the scenario list included.
       for (const el of document.querySelectorAll<HTMLElement>('button, .preset')) {
         if (!el.checkVisibility()) continue;
@@ -442,10 +451,21 @@ test('a Send while a wave waits for Step sends it first (A55)', async ({ page },
 
 test('a cut while a wave waits for Step sends it, and the run goes on (A55, A49)', async ({ page }, info) => {
   test.skip(info.project.name !== 'audit-1440-light', 'the waiting wave under a command, checked once');
-  test.setTimeout(60_000);
+  test.setTimeout(120_000);
   await open(page);
   await loadPreset(page, 'Propagation');
+  await setSpeed(page, 4);
+  // Faults are offered once the story has ended: play it to its Go, pressing
+  // each primary the line names.
   await primary(page).click();
+  for (let presses = 0; ; presses++) {
+    await untilNext(page, `Propagation, press ${presses}`);
+    const label = await checkState(page, `Propagation, press ${presses}`);
+    if (label === 'Go to Rate limiting') break;
+    expect(presses, 'Propagation reached its end').toBeLessThan(20);
+    await primary(page).click();
+  }
+  await sendButton(page).click();
   await untilNext(page, 'before wave 1');
   expect(await checkState(page, 'wave 1 held')).toBe('Step');
   await record(page, 'narrations', '.narration');
@@ -474,7 +494,8 @@ test('a run that reaches its cap stops there, and Play plays on (A49, A46)', asy
   await page.getByRole('button', { name: 'Rebuild cluster' }).click();
   await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
   await expect(page.locator('.tune summary')).not.toContainText('staged');
-  await page.locator('.rail button', { hasText: /^Silence node \d+$/ }).first().click();
+  await page.locator('.inspector details.faults summary').click();
+  await page.locator('.inspector button', { hasText: /^Silence node \d+$/ }).first().click();
   await expect(page.locator('[data-field="status-cut"]')).toHaveCount(1);
   await setSpeed(page, 4);
   const pane = page.locator('.stage-pane');
@@ -515,6 +536,171 @@ test('a scenario change pauses, and says so once over a held wave (A46)', async 
   await expect(pane).toHaveAttribute('data-clock', 'paused');
   const said = await recorded(page, 'said');
   expect(said.slice(1), 'one mutation over the held wave').toEqual(['Paused at the start of Sandbox']);
+});
+
+/** Every `<button>` or `<summary>` outside the action line whose name offers
+ *  a fault or a heal: none may exist before a story's end (A58). */
+const faultsOutsideLine = (page: Page): Promise<string[]> =>
+  page.evaluate(() =>
+    [...document.querySelectorAll<HTMLElement>('button, summary')]
+      .filter((el) => el.closest('#next-action') === null)
+      .map((el) => (el.textContent ?? '').replace(/\s+/g, ' ').trim())
+      .filter((name) => /Silence|Cut node|Cut zone|Break one of|^Heal\b/.test(name)),
+  );
+
+// Each gateway story: healthy at load with Send the primary and no fault
+// anywhere; after the first Send's run the caption's fault is the one filled
+// control; its press breaks the gateway, draws its mark, brings node 0 its
+// next burst and runs with nothing filled through the failover; the ending's
+// primary is Go, the heading's Reconnect is secondary, and the pane offers
+// node 0's faults again (A45, A58, A43).
+test('each gateway story runs from its Send to its fault to the failover (A45, A58)', async ({ page }, info) => {
+  test.skip(!['audit-1440-light', 'audit-400-dark'].includes(info.project.name), 'the gateway stories, at the widest and narrowest');
+  test.setTimeout(240_000);
+  await open(page);
+  await setSpeed(page, 4);
+  for (const [name, fault, mark, next] of [
+    ['Gateway failure', /^Silence node (\d+)$/, 'silenced', 'Go to Gateway cut'],
+    ['Gateway cut', /^Cut node (\d+) off from zone b$/, 'unheard', 'Go to Sandbox'],
+  ] as const) {
+    const where = `${info.project.name}, ${name}`;
+    await loadPreset(page, name);
+    expect(await checkState(page, `${where}: load`)).toMatch(/^Send/);
+    expect(await faultsOutsideLine(page), `${where}: load`).toEqual([]);
+    await expect(page.locator('#next-action button'), `${where}: no fault offered at load`).toHaveCount(0);
+    await send(page, 0);
+    const label = await checkState(page, `${where}: the offer`);
+    const g = Number(fault.exec(label ?? '')?.[1]);
+    expect(label, `${where}: the fault is the primary`).toMatch(fault);
+    expect(await faultsOutsideLine(page), `${where}: the offer`).toEqual([]);
+    const before = (await snapshot(page)).admitted_hits;
+    await primary(page).click();
+    // One command: the cut, drawn at once, and node 0's next burst.
+    await expect
+      .poll(() => page.locator('.stage canvas').evaluate((c: HTMLCanvasElement, kind) => JSON.parse(c.dataset.faults ?? '{}')[kind] ?? [], mark))
+      .toEqual([g]);
+    await expect.poll(async () => (await snapshot(page)).admitted_hits, `${where}: the press sent node 0's burst`).toBeGreaterThan(before);
+    // Nothing filled and no other fault offered from the press to the
+    // ending, where the pane offers node 0's faults again; then Go, once the
+    // run has paused itself.
+    const deadline = Date.now() + 120_000;
+    for (;;) {
+      if (Date.now() > deadline) throw new Error(`${where}: no ending: "${squash(await line(page).textContent())}"`);
+      // Read in one task: the ending may come between two reads.
+      const seen = await page.evaluate(() => ({
+        ended: document.querySelector('.inspector details.faults') !== null,
+        filled: document.querySelectorAll('[data-primary]').length,
+        faults: [...document.querySelectorAll<HTMLElement>('button, summary')]
+          .filter((el) => el.closest('#next-action') === null)
+          .map((el) => (el.textContent ?? '').replace(/\s+/g, ' ').trim())
+          .filter((name) => /Silence|Cut node|Cut zone|Break one of|^Heal\b/.test(name)),
+      }));
+      if (seen.ended) break;
+      // A run that reached its cap before the failover offers Play.
+      if (seen.filled > 0 && (await page.locator('.stage-pane').getAttribute('data-clock')) === 'capped') {
+        expect(await checkState(page, `${where}: capped before the ending`)).toBe('Play');
+        await primary(page).click();
+        continue;
+      }
+      expect(seen.filled, `${where}: a control filled before the ending`).toBe(0);
+      expect(seen.faults, `${where}: after the press`).toEqual([]);
+      await page.waitForTimeout(100);
+    }
+    await still(page, 60_000);
+    expect(await checkState(page, `${where}: the ending`)).toBe(next);
+    const failovers = (await snapshot(page)).nodes.find((n) => n.id === 0)?.gateway_failovers ?? 0;
+    expect(failovers, `${where}: node 0 failed over`).toBeGreaterThan(0);
+    const repair = page.locator('.stage-heading .repair');
+    await expect(repair, `${where}: the heading's repair`).toHaveText(`Reconnect node ${g}`);
+    await expect(repair).toBeEnabled();
+    await expect(repair).not.toHaveAttribute('data-primary');
+  }
+});
+
+/** The fault marks the stage drew, by kind. */
+const marks = (page: Page): Promise<Record<string, number[]>> =>
+  page.locator('.stage canvas').evaluate((c: HTMLCanvasElement) => JSON.parse(c.dataset.faults ?? '{}'));
+
+// Each cut is drawn where it happens and listed with its own Reconnect, which
+// undoes it alone; Heal undoes the rest (A43). Add keeps its zone across
+// presses, says what the next press does, and a join moves no existing node
+// of its ring more than 360° ÷ (n + 1) (A44).
+test('cuts are drawn, listed and reconnected one by one, and Add keeps its zone (A43, A44)', async ({ page }, info) => {
+  test.skip(info.project.name !== 'audit-1440-light', 'the network and membership controls, checked once');
+  test.setTimeout(120_000);
+  await open(page);
+  await loadPreset(page, 'Sandbox');
+  const heal = page.getByRole('button', { name: /^Heal \d+ cuts?$/ });
+  await expect(heal, 'nothing to heal').toBeDisabled();
+  await page.locator('#cut-zone').selectOption({ label: 'zone c' });
+  await page.getByRole('button', { name: 'Cut zone c off' }).click();
+  await expect.poll(async () => (await marks(page)).zone).toEqual([2]);
+  const faults = page.locator('.inspector details.faults');
+  await faults.locator('summary').click();
+  const silence = faults.getByRole('button', { name: /^Silence node \d+$/ }).first();
+  const g = Number(/\d+/.exec((await silence.textContent()) ?? '')?.[0]);
+  await silence.click();
+  await expect.poll(async () => (await marks(page)).silenced).toEqual([g]);
+  const cuts = page.locator('.rail .cuts li');
+  await expect(cuts).toHaveText([/^zone c cut off/, new RegExp(`^node ${g} silenced`)]);
+  await expect(heal).toHaveText('Heal 2 cuts');
+  // Reconnect zone c alone: the silenced node stays silenced.
+  await page.locator('.rail .cuts').getByRole('button', { name: 'Reconnect zone c' }).click();
+  await expect.poll(async () => (await marks(page)).zone).toEqual([]);
+  expect((await marks(page)).silenced, 'the other cut stays drawn').toEqual([g]);
+  await expect(cuts).toHaveText([new RegExp(`^node ${g} silenced`)]);
+  await expect(page.locator('.lede')).toContainText(`node ${g} silenced`);
+  await still(page, 60_000);
+  // In the engine too: a Send reaches zone c again, and never node g.
+  await send(page, 0);
+  const sent = await snapshot(page);
+  for (const n of sent.nodes) {
+    if (n.id === g) expect(n.window_total, `node ${g} is still silenced`).toBe(0);
+    else if (n.zone === 2) expect(n.window_total, `node ${n.id} in zone c is reconnected`).toBe(25);
+  }
+  await page.getByRole('button', { name: 'Heal 1 cut' }).click();
+  await expect.poll(async () => (await marks(page)).silenced).toEqual([]);
+  await expect(cuts).toHaveCount(0);
+  await still(page, 60_000);
+
+  // Add: every zone by default; a zone picked stays picked.
+  const add = page.locator('.rail').getByRole('button', { name: /^Add a node to/ });
+  await expect(add).toHaveText('Add a node to every zone');
+  const sizes = async (): Promise<number[]> => (await snapshot(page)).zones.map((z) => z.live);
+  /** Each node's angle round its zone ring, in degrees, as the stage placed it. */
+  const angles = async (): Promise<Map<number, number>> =>
+    new Map(await page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { glyphs: GlyphTable }) => {
+      const rings = JSON.parse(c.dataset.rings ?? '[]') as { x: number; y: number }[];
+      const g = c.glyphs;
+      const out: [number, number][] = [];
+      for (let s = 0; s < g.len; s++) {
+        const cell = document.querySelector<HTMLElement>(`[role="gridcell"][data-node="${g.id[s]}"]`);
+        const zone = Number(cell?.closest<HTMLElement>('[role="row"]')?.dataset.zone ?? -1);
+        if (zone < 0) continue;
+        out.push([g.id[s], (Math.atan2(g.y[s] - rings[zone].y, g.x[s] - rings[zone].x) * 180) / Math.PI]);
+      }
+      return out;
+    }));
+  await page.getByLabel('Add to').selectOption({ label: 'zone b' });
+  for (let i = 0; i < 3; i++) {
+    await expect(add).toHaveText('Add a node to zone b');
+    const before = await angles();
+    const n = (await sizes())[1];
+    await add.click();
+    await expect.poll(sizes).toEqual([4, 5 + i, 4]);
+    await still(page, 60_000);
+    const after = await angles();
+    for (const [id, a] of before) {
+      const zone = (await snapshot(page)).nodes.find((x) => x.id === id)?.zone;
+      if (zone !== 1) continue;
+      const moved = Math.abs((((after.get(id)! - a) % 360) + 540) % 360 - 180);
+      expect(moved, `node ${id} moved ${moved}° on a join to ${n + 1}`).toBeLessThanOrEqual(360 / (n + 1) + 1e-6);
+    }
+  }
+  await expect(page.getByLabel('Add to'), 'the pick stays').toHaveValue('1');
+  await page.getByLabel('Add to').selectOption({ label: 'every zone' });
+  await add.click();
+  await expect.poll(sizes).toEqual([5, 8, 5]);
 });
 
 test('Zone partition admits on each side, then counts all of it (A48)', async ({ page }, info) => {
@@ -898,7 +1084,7 @@ test('the next step is reachable from the keyboard (A52, A21)', async ({ page },
   await expect(page.getByRole('button', { name: 'Play' })).toBeVisible();
   // → on a select changes its option and not the time.
   const time = await page.locator('[data-field="virtual-time"]').getAttribute('data-ms');
-  await page.locator('#cut-zone').focus();
+  await page.locator('#add-zone').focus();
   await page.keyboard.press('ArrowRight');
   await expect(page.locator('[data-field="virtual-time"]')).toHaveAttribute('data-ms', time ?? '');
 });
@@ -960,15 +1146,18 @@ test('what can be pressed looks pressable, and a named node is previewed (A51, o
   await expect.poll(async () => (await glyphs()).id).toBe(7);
   await page.mouse.move(0, 0);
   await expect.poll(async () => (await glyphs()).preview).toBe(-1);
-  // Every control that names a node previews that node: the rail's gateway
-  // buttons, under a heading naming whose gateways they are, and the pane's
-  // Remove, also after the cluster grows to 24 nodes.
+  // Every control that names a node previews that node: the pane's gateway
+  // faults, under a summary naming whose gateways they are, and the pane's
+  // Remove, also after the cluster grows to 24 nodes. Sandbox offers them.
+  await loadPreset(page, 'Sandbox');
   const check = async (): Promise<void> => {
-    await expect(page.getByRole('heading', { name: /^node \d+'s gateways$/ })).toBeVisible();
-    const named = page.locator('.rail').getByRole('button', { name: /^(Silence node|Cut node) \d+/ });
+    const faults = page.locator('.inspector details.faults');
+    await expect(faults.locator('summary')).toHaveText(/^Break one of node \d+'s gateways$/);
+    if ((await faults.getAttribute('open')) === null) await faults.locator('summary').click();
+    const named = faults.getByRole('button', { name: /^(Silence node|Cut node) \d+/ });
     for (let i = 0; i < (await named.count()); i++) {
       const button = named.nth(i);
-      const id = Number(await button.locator('[data-field="node"]').textContent());
+      const id = Number(await button.locator('[data-field="fault"]').first().textContent());
       await button.hover();
       await expect.poll(async () => (await glyphs()).id, `"${squash(await button.textContent())}" previews node ${id}`).toBe(id);
     }
@@ -983,8 +1172,9 @@ test('what can be pressed looks pressable, and a named node is previewed (A51, o
     await page.mouse.move(0, 0);
   };
   await check();
+  await page.getByLabel('Add to').selectOption({ label: 'zone a' });
   for (let i = 0; i < 12; i++) {
-    await page.getByRole('button', { name: 'Add node' }).click();
+    await page.getByRole('button', { name: 'Add a node to zone a' }).click();
     await expect(page.locator('[data-field="status-nodes"]')).toHaveText(String(13 + i));
   }
   await check();
@@ -1029,6 +1219,7 @@ test('the page says what it is (A20, A22)', async ({ page }, info) => {
   // The longest lede, with its cut listed after a spaced separator, keeps
   // the header one row.
   await loadPreset(page, 'Gateway cut');
+  await breakGateway(page, true);
   await expect(page.locator('.lede')).toContainText(/share one rate limit · node \d+ unheard by zone b/);
   if (wide) {
     const header = (await page.locator('header').boundingBox())!;

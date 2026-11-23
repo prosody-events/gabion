@@ -5,7 +5,7 @@ import type { ClusterState } from '../src/lib/sim/types';
 import { CONTROL, CROSS, DROPPED, FADE_MS, RELAY } from '../src/lib/stage/layout';
 import { BOUNCE_MS, RING_CAUGHT_UP, type BeamPool, type GlyphTable } from '../src/lib/stage/renderer';
 import { BEAM_ALPHA, FADED_ALPHA } from '../src/lib/theme';
-import { PERIOD_MS, recordData, refusal, send, sendButton, setRange, setSpeed, step, still, virtualMs } from './drive';
+import { PERIOD_MS, breakGateway, recordData, refusal, send, sendButton, setRange, setSpeed, step, still, virtualMs } from './drive';
 import { sourceOf } from './sourcemap';
 
 // The packets in motion (README "Tests"), run once at 1440 px in the light
@@ -317,10 +317,11 @@ test('every preset changes each count only in the frame its line appears', async
   // A feed's eager flush is drawn with its counts too. A node flushes at once
   // only when its unsent hits pass ε, which is 1 at limit 100, so it needs two
   // hits in one heartbeat period: Gateway cut's trickle of two a second at
-  // node 0 puts two in every period of a second.
+  // node 0, which starts at its fault, puts two in every period of a second.
   const name = 'Gateway cut';
   await loadPreset(page, name);
   await rebuildAtLimit(page, 100, 1000);
+  await breakGateway(page, true);
   await installCausality(page);
   await page.evaluate(() => {
     const w = window as unknown as { feedFlushes: number };

@@ -8,7 +8,9 @@ import {
   observe,
   pressClause,
   progress,
+  storyDone,
   verdictOf,
+  waitClause,
   type NextAction,
   type Observation,
   type RateLimiting,
@@ -65,7 +67,17 @@ const refused = { kind: 'Rejected' as const, total: 100, reopens_ms: 1 };
 const all = { kind: 'Admitted' as const, requests: 25, total_before: 0 };
 const some = { kind: 'Rejected' as const, admitted: 10, rejected: 15, total: 100, reopens_ms: 1 };
 const none = { kind: 'Rejected' as const, admitted: 0, rejected: 25, total: 100, reopens_ms: 1 };
-const quiet: Observation = { decided: null, brim: refused, oracle: 100, bucket: 3, cuts: 0, cutZone: null };
+const quiet: Observation = {
+  decided: null,
+  brim: refused,
+  oracle: 100,
+  bucket: 3,
+  cuts: 0,
+  cutZone: null,
+  faulted: null,
+  failovers: 0,
+  agreed: true,
+};
 const actOf = (s: Story): string => ('act' in s ? s.act : s.kind);
 
 test("Rate limiting's acts move on decisions and reopenings only", () => {
@@ -84,6 +96,42 @@ test("Rate limiting's acts move on decisions and reopenings only", () => {
   expect(actOf(s)).toBe('drained');
   s = observe(s, { ...o, decided: verdictOf(all, 2) });
   expect(actOf(s)).toBe('done');
+});
+
+test("each gateway story moves from its Send to its fault to the failover's agreement (A45)", () => {
+  for (const id of ['gateway-failure', 'gateway-cut'] as const) {
+    const opening = PRESETS.find((p) => p.id === id)!.story;
+    expect(storyDone(opening), `${id} opens before its end`).toBe(false);
+    let s = observe(opening, { ...quiet, decided: verdictOf(none, 0) });
+    expect(actOf(s), `${id}: a refused Send offers no fault`).toBe('open');
+    s = observe(s, { ...quiet, decided: verdictOf(all, 0) });
+    expect(actOf(s), `${id}: the first Send's run`).toBe('sent');
+    s = observe(s, quiet);
+    expect(actOf(s), `${id}: no fault until it is pressed`).toBe('sent');
+    s = observe(s, { ...quiet, faulted: 4, failovers: 2 });
+    expect(s, `${id}: the fault names its gateway and the failovers before it`).toMatchObject({ act: 'faulted', gateway: 4, failovers: 2 });
+    s = observe(s, { ...quiet, failovers: 2 });
+    expect(actOf(s), `${id}: no failover yet`).toBe('faulted');
+    s = observe(s, { ...quiet, failovers: 3, agreed: false });
+    expect(actOf(s), `${id}: failed over, zone b still behind`).toBe('faulted');
+    s = observe(s, { ...quiet, failovers: 3 });
+    expect(actOf(s), `${id}: failed over and agreed`).toBe('done');
+    expect(storyDone(s)).toBe(true);
+  }
+});
+
+test('the failover wait counts down on the silent gateway, then measures the run (A45)', () => {
+  const faulted: Story = { kind: 'gateway', fault: 'silenced', next: 'gateway-cut', origin: 0, zone: 1, act: 'faulted', gateway: 4, failovers: 0 };
+  const v: RunView = { ...BASE, story: faulted, gateway: 4, unanswered: 1200, suspectAfterMs: 2000, clock: 'settled' };
+  const from = { reason: 'failover' as const, virtualMs: 0, reopensMs: 0 };
+  expect(progress(v, 'failover', from)).toBeCloseTo(0.6);
+  expect(text(waitClause('failover', v))).toBe(
+    'node 0 has waited 1.2 s for node 4 to answer · it gives up at 2.0 s, then picks another gateway into zone b',
+  );
+  // Failed over: the run's share of the reachable nodes that have the hits.
+  const after: RunView = { ...v, failovers: 1, nodes: BASE.nodes.map((n) => ({ ...n, lag: n.zone === 1 ? { kind: 'Behind', missing_for_ms: 5 } : n.lag })) };
+  expect(progress(after, 'failover', from)).toBeCloseTo(8 / 12);
+  expect(text(waitClause('failover', after))).toBe('node 0 now reaches zone b through another gateway · the hits are spreading');
 });
 
 test('a split Send is a refusal that also counts what it admitted (T3)', () => {
@@ -206,6 +254,13 @@ test("the heading's forms (A18)", () => {
   expect([behind.id, text(behind.parts)]).toEqual(['rl-1', '4 of 12 nodes see 25 of the 100 limit · the rest are up to 10 behind']);
   const over = heading({ ...base, nodes: all(200), oracle: 200 });
   expect(text(over.parts)).toContain('· 200 admitted against the limit of 100');
+  // A gateway its zone cannot hear strands no count: its repair is offered
+  // once nothing is behind, a feed's newest hits aside (Gateway cut's ending).
+  const unheard = [{ kind: 'unheard-in-zone' as const, node: 4, zone: 1 }];
+  expect(text(heading({ ...base, nodes: all(25), oracle: 25, cuts: unheard }).repair ?? []), 'Gateway cut, agreed').toBe('Reconnect node 4');
+  expect(heading({ ...base, nodes: spreading, oracle: 25, cuts: unheard }).repair, 'Gateway cut, still spreading').toBeNull();
+  const young = all(25).map((n) => (n.id === 1 ? node(1, 23, { kind: 'Behind', missing_for_ms: 100 }) : n));
+  expect(text(heading({ ...base, nodes: young, oracle: 25, newer: 2, cuts: unheard }).repair ?? []), "a feed's newest hits aside").toBe('Reconnect node 4');
 });
 
 test('narration forms', () => {
@@ -238,7 +293,7 @@ test("Send's labels and the next action's label (T5)", () => {
   for (const w of ['wide', 'mid', 'narrow'] as const) expect(text(sendLabel(w, null, 0))).toBe('Send');
   const send = sendLabel('wide', 25, 0);
   const label = (action: NextAction): string | null => {
-    const parts = actionLabel(action, send, (id) => PRESETS.find((p) => p.id === id)!.label);
+    const parts = actionLabel(action, send, (id) => PRESETS.find((p) => p.id === id)!.label, (z) => `zone ${'abc'[z]}`);
     return parts === null ? null : text(parts);
   };
   expect(label({ kind: 'press', control: 'send' })).toBe('Send 25 requests to node 0');
@@ -246,6 +301,10 @@ test("Send's labels and the next action's label (T5)", () => {
   expect(label({ kind: 'press', control: 'step' })).toBe('Step');
   expect(label({ kind: 'inline', action: { kind: 'select', node: 1, zone: 1 } })).toBe('Select node 1');
   expect(label({ kind: 'inline', action: { kind: 'use-requests', requests: 25 } })).toBe('Use 25 requests');
+  expect(label({ kind: 'inline', action: { kind: 'fault', fault: 'silenced', node: 4, zone: 1, origin: 0 } })).toBe('Silence node 4');
+  expect(label({ kind: 'inline', action: { kind: 'fault', fault: 'unheard', node: 4, zone: 1, origin: 0 } })).toBe(
+    'Cut node 4 off from zone b',
+  );
   expect(label({ kind: 'repair', label: ['Reconnect zone c'] })).toBe('Reconnect zone c');
   expect(label({ kind: 'go', to: 'partition' })).toBe('Go to Zone partition');
   expect(label({ kind: 'edit' })).toBeNull();

@@ -4,6 +4,15 @@
 
 import { blurb, joined, noun, type Blurb } from './format';
 
+/** A gateway story's fault, pressed: what the broken gateway can still do,
+ *  and the burst the press also brought the origin. */
+export function faultPressed(silenced: boolean, gateway: number, zone: string, origin: number, requests: number): Blurb {
+  const what = silenced
+    ? blurb`node ${gateway} is silenced: it hears nothing and says nothing`
+    : blurb`node ${gateway} can hear ${zone}, but ${zone} cannot hear it`;
+  return [...what, ...blurb` · node ${origin} receives its next ${requests} ${noun(requests, 'request')}`];
+}
+
 /** A gateway as a sentence names it: its node and the zone it carries hits
  *  into. */
 export interface GatewayName {

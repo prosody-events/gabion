@@ -74,3 +74,6 @@ export function zoneLabel(name: string): string {
 
 /** Zone `z`'s name as a sentence says it, or '' for a zone the list lacks. */
 export const zoneAt = (zones: readonly { name: string }[], z: number): string => zoneLabel(zones[z]?.name ?? '');
+
+/** A sentence as plain text, for an accessible name or value text. */
+export const plain = (b: Blurb): string => b.map((p) => (typeof p === 'object' ? String(p.value) : String(p))).join('');

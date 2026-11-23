@@ -1327,6 +1327,17 @@ fn relay_follows_one_prompt_interval_after_the_gateway_hears() {
     });
 }
 
+/// The snapshot publishes `gossip.suspect_after` as the runtimes validated
+/// it, so the page's countdown mirrors nothing by hand.
+#[test]
+fn snapshot_publishes_suspect_after() {
+    with_state(zoned(12, 3), |state| async move {
+        let snap = state.snapshot(None, WATCHED).await;
+        assert_eq!(snap.suspect_after_ms, T_U);
+        state
+    });
+}
+
 /// A gateway that answers nothing is replaced once a packet to it has gone
 /// unanswered for `suspect_after`, and the replacement relays what it missed.
 #[test]

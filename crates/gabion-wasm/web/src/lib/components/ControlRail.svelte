@@ -1,16 +1,20 @@
 <script lang="ts">
   import { BURST_REQUESTS_MAX, RULE_LIMIT_MAX, type Knobs, type Preset } from '../presets';
   import { nominalBuckets } from '../buckets';
-  import { fmtCount, zoneLabel } from '../format';
-  import type { Roles } from '../stage/renderer';
+  import { cutName, repairLabel, type Cut } from '../cuts';
+  import { fmtCount, noun, zoneLabel } from '../format';
   import type { SimConfig, ZoneView } from '../sim/types';
   import Icon from './Icon.svelte';
+  import Sentence from './Sentence.svelte';
 
   // The left control rail: the scenarios in four groups with Requests per Send and
-  // Restart, the rebuild knobs (a collapsed disclosure), the network actions
-  // that cut a zone or one of the selected node's gateways and heal them, and
-  // live membership. Every field is checked when committed (Enter or leaving
-  // it), never while typed, and a disabled control says why beside it.
+  // Restart, the rebuild knobs (a collapsed disclosure), the network (the list
+  // of cuts, each with its Reconnect, a zone cut and Heal), and live
+  // membership. Before a story's end the cut list names its cuts with no
+  // button and no fault or Heal is rendered: the caption offers the story's
+  // fault and the heading its repair. Every field is checked when committed
+  // (Enter or leaving it), never while typed, and a disabled control says why
+  // beside it.
   let {
     presets,
     activeId,
@@ -18,11 +22,10 @@
     requestsValid,
     editing,
     zones,
-    selected,
-    roles,
     maxZones,
-    canAdd,
-    canHeal,
+    cuts,
+    offered,
+    headingRepair,
     maxNodes,
     knobs,
     appliedKnobs,
@@ -35,8 +38,7 @@
     onApplyKnobs,
     onBackToScenario,
     onCutZone,
-    onSilence,
-    onCutFromZone,
+    onReconnect,
     onHeal,
     onAddNode,
     onPreview,
@@ -51,14 +53,16 @@
     editing: boolean;
     /** Every zone with its live members, in zone order. */
     zones: ZoneView[];
-    /** The selected node, whose gateways the network actions name. */
-    selected: number;
-    roles: Roles | null;
     /** The zone stepper's ceiling, from the engine. */
     maxZones: number;
-    canAdd: boolean;
-    /** Whether any cut is listed. */
-    canHeal: boolean;
+    /** The faults made, in the order made. */
+    cuts: readonly Cut[];
+    /** Whether faults and repairs are offered here: the story has ended, or
+     *  has no scripted end. */
+    offered: boolean;
+    /** Whether the stage heading carries a repair: "Reconnect …" for one
+     *  cut, "Heal k cuts" for more. */
+    headingRepair: boolean;
     maxNodes: number;
     // A live `$state` proxy owned by the run: the controls mutate its fields
     // in place. Editing a knob only *stages* it: nothing rebuilds until
@@ -76,10 +80,10 @@
     onApplyKnobs: () => void;
     onBackToScenario: () => void;
     onCutZone: (zone: number) => void;
-    onSilence: (gateway: number) => void;
-    onCutFromZone: (gateway: number, zone: number) => void;
+    /** Undo one listed cut. */
+    onReconnect: (cut: Cut) => void;
     onHeal: () => void;
-    onAddNode: (zone: number) => void;
+    onAddNode: (to: number | 'every') => void;
     /** A control that names a node previews it on the stage while hovered or
      *  focused. */
     onPreview: (node: number | null) => void;
@@ -117,24 +121,24 @@
 
   // The zones a network action can name: those with members.
   const liveZones = $derived(zones.flatMap((z, i) => (z.live > 0 ? [{ i, name: zoneLabel(z.name) }] : [])));
-  // The zone Add defaults to: the fewest live members, the lowest index on a tie.
-  const fewest = $derived(zones.reduce((best, z, i) => (z.live < zones[best].live ? i : best), 0));
-  // The selected node's gateways, one per remote zone, in zone order.
-  const gateways = $derived(
-    roles === null ? [] : [...roles.gateways].map(([id, g]) => ({ id, ...g })).sort((a, b) => a.zone - b.zone),
-  );
 
   let cutPick = $state<number | null>(null);
-  let addPick = $state<number | null>(null);
   $effect(() => {
     if (cutPick === null || !liveZones.some((z) => z.i === cutPick)) cutPick = liveZones[0]?.i ?? null;
   });
-  const addZone = $derived(addPick ?? fewest);
-
-  function add(): void {
-    onAddNode(addZone);
-    addPick = null;
-  }
+  // Where Add puts its nodes: every zone, or one, kept across presses.
+  let addTo = $state<'every' | number>('every');
+  const addCount = $derived(addTo === 'every' ? liveZones.length : 1);
+  const canAdd = $derived(addCount > 0 && nodeCount + addCount <= maxNodes);
+  const addLabel = $derived(
+    addTo === 'every' ? 'Add a node to every zone' : `Add a node to ${zoneLabel(zones[addTo]?.name ?? '')}`,
+  );
+  // The node a cut names, previewed while its row's button is hovered.
+  const nodeOf = (c: Cut): number | null => (c.kind === 'zone' ? null : c.node);
+  // The heading's repair is the one cut's Reconnect, or Heal: either is then
+  // offered nowhere else, so no two buttons share a name.
+  const reconnectInHeading = $derived(headingRepair && cuts.length === 1);
+  const healInHeading = $derived(headingRepair && cuts.length > 1);
 
   function onRequestsKey(event: KeyboardEvent): void {
     if (event.key === 'Escape') {
@@ -281,42 +285,55 @@
 
   <section class="group">
     <h2>Network</h2>
-    <div class="field wide">
-      <label for="cut-zone">Zone</label>
-      <select id="cut-zone" bind:value={cutPick} disabled={liveZones.length === 0}>
-        {#each liveZones as zone (zone.i)}
-          <option value={zone.i}>{zone.name}</option>
+    {#if cuts.length === 0}
+      <p class="hint">no cuts: the network is the scenario's own</p>
+    {:else}
+      <ul class="cuts" aria-label="Cuts">
+        {#each cuts as c, i (i)}
+          {@const node = nodeOf(c)}
+          <li class="cut">
+            <Sentence parts={cutName(c, zones)} field="cut" />
+            {#if reconnectInHeading}
+              <span class="reason">· its Reconnect is in the heading</span>
+            {:else if offered}
+              <button
+                class="btn-secondary action"
+                onclick={() => onReconnect(c)}
+                {...node === null ? {} : names(node)}><Icon name="reconnect" /><Sentence parts={repairLabel([c], zones)} field="repair" /></button
+              >
+            {/if}
+          </li>
         {/each}
-      </select>
-    </div>
-    <button
-      class="btn-secondary action"
-      onclick={() => cutPick !== null && onCutZone(cutPick)}
-      disabled={cutPick === null || liveZones.length < 2}
-    >
-      <Icon name="cut" />Cut {liveZones.find((z) => z.i === cutPick)?.name ?? 'zone'} off
-    </button>
-    {#if gateways.length > 0}
-      <h3>node <span data-field="node">{selected}</span>'s gateways</h3>
-      {#each gateways as gateway (gateway.id)}
-        {@const zone = zoneLabel(zones[gateway.zone].name)}
-        <button class="btn-secondary action" onclick={() => onSilence(gateway.id)} {...names(gateway.id)}>
-          <Icon name="silence" /><span>Silence node <span data-field="node">{gateway.id}</span></span>
-        </button>
-        <button class="btn-secondary action" onclick={() => onCutFromZone(gateway.id, gateway.zone)} {...names(gateway.id)}>
-          <Icon name="cut" /><span>Cut node <span data-field="node">{gateway.id}</span> off from {zone}</span>
-        </button>
-      {/each}
+      </ul>
     {/if}
-    <div class="with-reason">
+    {#if offered}
+      <div class="field wide">
+        <label for="cut-zone">Zone</label>
+        <select id="cut-zone" bind:value={cutPick} disabled={liveZones.length === 0}>
+          {#each liveZones as zone (zone.i)}
+            <option value={zone.i}>{zone.name}</option>
+          {/each}
+        </select>
+      </div>
       <button
         class="btn-secondary action"
-        onclick={onHeal}
-        disabled={!canHeal}
-        aria-describedby={canHeal ? undefined : 'heal-reason'}><Icon name="reconnect" />Heal network</button
+        onclick={() => cutPick !== null && onCutZone(cutPick)}
+        disabled={cutPick === null || liveZones.length < 2}
       >
-      {#if !canHeal}<span class="reason" id="heal-reason">nothing to heal</span>{/if}
-    </div>
+        <Icon name="cut" />Cut {liveZones.find((z) => z.i === cutPick)?.name ?? 'zone'} off
+      </button>
+      <div class="with-reason">
+        <button
+          class="btn-secondary action"
+          onclick={onHeal}
+          disabled={cuts.length === 0 || healInHeading}
+          aria-describedby={cuts.length === 0 || healInHeading ? 'heal-reason' : undefined}
+          ><Icon name="reconnect" />Heal <span data-field="cuts">{cuts.length}</span> {noun(cuts.length, 'cut')}</button
+        >
+        {#if cuts.length === 0}<span class="reason" id="heal-reason">nothing to heal</span>
+        {:else if healInHeading}<span class="reason" id="heal-reason">its button is in the heading</span>{/if}
+      </div>
+    {/if}
   </section>
 
   <section class="group">
@@ -327,7 +344,8 @@
     </div>
     <div class="field wide">
       <label for="add-zone">Add to</label>
-      <select id="add-zone" value={addZone} onchange={(e) => (addPick = Number(e.currentTarget.value))}>
+      <select id="add-zone" bind:value={addTo}>
+        <option value="every">every zone</option>
         {#each liveZones as zone (zone.i)}
           <option value={zone.i}>{zone.name}</option>
         {/each}
@@ -336,10 +354,9 @@
     <div class="with-reason">
       <button
         class="btn-secondary action"
-        aria-label="Add node"
-        onclick={add}
+        onclick={() => onAddNode(addTo)}
         disabled={!canAdd}
-        aria-describedby={canAdd ? undefined : 'add-reason'}>Add node</button
+        aria-describedby={canAdd ? undefined : 'add-reason'}>{addLabel}</button
       >
       {#if !canAdd}<span class="reason" id="add-reason"
           >the visualizer holds at most <span data-field="max-nodes">{maxNodes}</span> nodes</span
@@ -374,13 +391,6 @@
     letter-spacing: 0.06em;
     text-transform: uppercase;
     color: var(--color-fg-muted);
-  }
-
-  h3 {
-    margin: var(--gap-xs) 0 0;
-    font-size: var(--font-size-caption);
-    font-weight: 600;
-    color: var(--color-fg);
   }
 
   .hint {
@@ -503,6 +513,23 @@
   select:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+
+  .cuts {
+    display: flex;
+    flex-direction: column;
+    gap: var(--gap-xs);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    font-size: var(--font-size-caption);
+  }
+
+  .cut {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--gap-xs) var(--gap-sm);
   }
 
   .members {

@@ -192,8 +192,15 @@ groups (the current one marked by a rule, never filled, and inert), Requests
 per Send (checked when committed: Enter or leaving the field), Restart, a "Tune the
 cluster" disclosure (edits stage, counted on its summary, until Rebuild;
 "Back to the scenario's settings" restages the scenario's own), the network
-actions (cut a zone off; under a heading naming the selected node, silence one
-of its gateways or cut it off from its zone; heal) and Add. A scenario button,
+(the list of cuts, each with its own Reconnect; Cut zone X off; Heal k cuts)
+and Add, which adds a node to every zone or to the zone picked, and keeps the
+pick. Each cut is drawn where it happens: a cut zone's ring dashed, a silenced
+node's outline dashed and its disc hatched, a node its zone cannot hear barred
+on the side facing its zone. The detail pane offers the selected node's
+gateway faults (Silence node N, Cut node N off from zone X) behind one closed
+disclosure. Before a story's end no fault and no Heal is rendered: the caption
+offers the story's own fault and the heading its repair, and no two buttons
+share a name. A scenario button,
 Restart and Rebuild build the new run before they tear the old one down, and
 Undo brings the old run back exactly until the next command or 30 s. A disabled
 control says why beside it. The workspace stays mounted across a rebuild, so an
@@ -205,13 +212,19 @@ Zone partition, Packet loss, Gateway failure and Gateway cut; Steady state and
 No zone configured; Sandbox. Each declares its config, the node it selects,
 Requests per Send, its charts, its story and the scenario its story hands over to.
 Rate limiting (limit 100, the default) and Zone partition (limit 100, zone c cut
-at load) put the limit on the scale. Every preset opens on a warmed, settled
-cluster: the page steps whole heartbeat periods until every node has a gateway
+at load) put the limit on the scale. Gateway failure and Gateway cut open
+healthy: after the reader's first Send has run, the caption offers the fault
+on node 0's gateway into zone b (Silence node N, or Cut node N off from zone
+b), whose press breaks it and brings node 0 its next Send in one command; the
+run then plays, with nothing filled and a meter on node 0's wait against
+`suspect_after_ms`, through the detection and the failover to the ending.
+Every preset opens on a warmed, settled cluster: the page steps whole heartbeat periods until every node has a gateway
 into every other zone and a period passes with no packet, then seeds it.
 Propagation settles its seed before the first paint. Only the presets whose
 subject is traffic have a feed (Steady state, No zone configured, Sustained
-overload), plus Gateway cut's trickle of 2 hits/s at node 0, which keeps node 0
-sending data its cut gateway must answer with "cannot relay".
+overload), plus Gateway cut's trickle of 2 hits/s at node 0 from its fault
+on, which keeps node 0 sending data its cut gateway must answer with "cannot
+relay".
 
 **The next action** (`lib/next.ts`). In every state the page decides one next
 action from the run alone: press a transport control, press a button in the
@@ -302,7 +315,7 @@ text until a face loads; the canvas and the charts wait for the faces
   drawn marks), `Sentence` and `InfoTip`.
 - `src/lib/presets.ts` — the scenario presets: a config, the node
   it selects, Requests per Send, its charts, its story and the scenario it hands
-  over to, an optional feed and an `async seed(sim, config, gateways)` that
+  over to, an optional feed and an `async seed(sim, config)` that
   fires the opening commands against a fresh, warmed cluster (`warm`) and
   reports the hits they leave held for the selected node's heartbeat. A feed
   injects ⌊rate·T⌋ hits by virtual time T since the build was handed to the

@@ -263,6 +263,9 @@ pub struct ClusterState {
     /// by the CRDT's own buckets rather than recomputing them. Rule-global in
     /// v1 (one watched rule); moves per-rule in the v1.1 multi-rule shape.
     pub bucket_epoch_now: u32,
+    /// `gossip.suspect_after`, as the runtimes validated it: how long a
+    /// node waits on an unanswered gateway before it gives up on it.
+    pub suspect_after_ms: u64,
 }
 
 /// The rows of the one node the page inspects, read at the same instant as

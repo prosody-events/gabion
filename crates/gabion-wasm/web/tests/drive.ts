@@ -220,3 +220,18 @@ export async function recordData(page: Page): Promise<() => Promise<Drawn[]>> {
       return drawn;
     }, CONTROL);
 }
+
+/** In a gateway story: Send at node 0, then press the fault the caption
+ *  offers once that Send's run has ended, and return the gateway it broke.
+ *  With `pause`, the reader pauses the fault's run as soon as it starts, so
+ *  later Steps draw it one wave at a time. */
+export async function breakGateway(page: Page, pause = false): Promise<number> {
+  await send(page, 0);
+  const fault = page.locator('#next-action [data-primary]');
+  await expect(fault, 'the fault is the one filled control').toHaveText(/^(Silence node \d+|Cut node \d+ off from zone b)$/);
+  const gateway = Number(/node (\d+)/.exec((await fault.textContent()) ?? '')?.[1]);
+  await fault.click();
+  await expect(page.locator('.lede')).toContainText(`node ${gateway}`);
+  if (pause) await pauseIfPlaying(page);
+  return gateway;
+}

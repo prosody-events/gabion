@@ -2,7 +2,7 @@ import { expect, test as base, type Page } from '@playwright/test';
 import { CARRIES_CELLS, type AnswerState, type ClusterState, type EventBatch } from '../src/lib/sim/types';
 import { WATCHED_KEY } from '../src/lib/presets';
 import { CONTROL } from '../src/lib/stage/layout';
-import { pauseIfPlaying, send, sendButton, setRange, setSpeed, step, stepUntil, virtualMs } from './drive';
+import { breakGateway, pauseIfPlaying, send, sendButton, setRange, setSpeed, step, stepUntil, virtualMs } from './drive';
 
 /** Every test fails on an error the page throws. */
 const test = base.extend<{ page: Page }>({
@@ -266,11 +266,9 @@ test('the charts tell the Rate limiting script', async ({ page }) => {
   await page.screenshot({ path: 'screenshots/charts-rate-limiting.png' });
 });
 
-// Live join: "+ Add node" spawns a fresh cold-start member into a settled
-// cluster — no rebuild. It takes the next stable id (12, never reused) in the
-// zone the picker offers (the fewest live members, the lowest index on a tie:
-// zone a) and joins by gossip, then catches up to the settled total by
-// anti-entropy. The screenshots are the proof the join *reads* right: the
+// Live join: Add spawns a fresh cold-start member into a settled cluster — no
+// rebuild. Picked to zone a, it takes the next stable id (12, never reused)
+// and joins by gossip, then catches up to the settled total by anti-entropy. The screenshots are the proof the join *reads* right: the
 // newcomer fades/scales in at its ring slot while the survivors glide to
 // re-space around it.
 test('adding a node joins it live and it catches up by gossip', async ({ page }) => {
@@ -286,7 +284,8 @@ test('adding a node joins it live and it catches up by gossip', async ({ page })
   // Add a fresh node: it takes id 12, joins zone a and starts cold (view zero).
   // The run Add starts may catch it up before a read, so its first count is
   // recorded as its row appears.
-  await expect(page.getByLabel('Add to')).toHaveValue('0');
+  await expect(page.getByRole('button', { name: 'Add a node to every zone' }), 'Add defaults to every zone').toBeVisible();
+  await page.getByLabel('Add to').selectOption({ label: 'zone a' });
   await page.evaluate(() => {
     const w = window as unknown as { joined: string | null };
     w.joined = null;
@@ -299,7 +298,7 @@ test('adding a node joins it live and it catches up by gossip', async ({ page })
     });
     watch.observe(table, { subtree: true, childList: true, characterData: true });
   });
-  await page.getByRole('button', { name: 'Add node' }).click();
+  await page.getByRole('button', { name: 'Add a node to zone a' }).click();
   await expect
     .poll(() => page.evaluate(() => (window as unknown as { joined: string | null }).joined), { message: 'node 12 starts cold' })
     .toBe('0');
@@ -589,15 +588,12 @@ test('a Send that flushes at once draws its packets as it sends', async ({ page 
 });
 
 // Zone partition: zone c is cut off at load. A Send at node 0 reaches zones a
-// and b and never zone c, until Heal reconnects it; a node that joins zone c
-// is cut off with it.
+// and b and never zone c, until the heading's Reconnect zone c; a node that
+// joins zone c is cut off with it.
 test('zone partition splits zone c off until healed', async ({ page }) => {
   await boot(page);
   await loadPreset(page, 'Zone partition');
   await expect(lede(page)).toContainText('zone c cut off');
-  // The same fault made again is listed once: the Send below runs after it.
-  await page.locator('#cut-zone').selectOption({ label: 'zone c' });
-  await page.getByRole('button', { name: 'Cut zone c off' }).click();
 
   await send(page, 0);
   for (const id of [0, 3, 1, 4]) await expect(view(page, id), `node ${id} heard node 0`).toHaveText(BURST_REQUESTS);
@@ -606,8 +602,8 @@ test('zone partition splits zone c off until healed', async ({ page }) => {
   expect((await lede(page).textContent())?.split('zone c cut off').length, 'the lede names the cut once').toBe(2);
   await page.screenshot({ path: 'screenshots/ring-partition.png' });
 
-  // Heal runs until every node has the hits.
-  await page.getByRole('button', { name: 'Heal network' }).click();
+  // The reconnection runs until every node has the hits.
+  await page.locator('.stage-heading .repair').click();
   await expect(page.locator(COUNTS)).toHaveText(Array(NODES).fill(BURST_REQUESTS), { timeout: 15_000 });
   await expect(lede(page)).not.toContainText('cut off');
   await page.screenshot({ path: 'screenshots/ring-healed.png' });
@@ -617,7 +613,7 @@ test('a node that joins a cut zone is cut off with it (A6)', async ({ page }) =>
   await boot(page);
   await loadPreset(page, 'Zone partition');
   await page.getByLabel('Add to').selectOption({ label: 'zone c' });
-  await page.getByRole('button', { name: 'Add node' }).click();
+  await page.getByRole('button', { name: 'Add a node to zone c' }).click();
   await expect(page.locator('.node-table tr[data-node="12"]')).toHaveAttribute('data-zone', '2');
   await expect(page.locator('.stage-pane')).toHaveAttribute('data-clock', 'paused', { timeout: 15_000 });
   // The joiner's own hits reach its zone and stop at the cut.
@@ -711,8 +707,8 @@ test('the inspector shows gateways per remote zone and the error budget', async 
 });
 
 // A gateway going silent is the failure the two-tier design exists to survive.
-// The preset silences the origin's gateway into zone b without telling anyone;
-// after the suspect timeout the origin names another gateway, the stage says so,
+// The reader silences the origin's gateway into zone b from the caption's
+// offer; after the suspect timeout the origin names another gateway, the stage says so,
 // and the zone catches up through it. Bounded Steps, no sleeps: 12 heartbeat
 // periods of virtual time outlast the failover, so a green run has headroom and
 // a red one cannot pass by waiting longer. A silent node's peers include ones it never
@@ -727,6 +723,7 @@ test('gateway failure fails over and the zone catches up', async ({ page }) => {
 
   const gateway = inspector.locator('tr.remote[data-zone="1"] [data-field="gateway"]');
   const g = Number(await gateway.textContent());
+  expect(await breakGateway(page, true), "the offer breaks node 0's gateway into zone b").toBe(g);
   await expect(lede(page)).toContainText(`node ${g} silenced`);
 
   // Step until the narration names a failover off g into zone b and node 0

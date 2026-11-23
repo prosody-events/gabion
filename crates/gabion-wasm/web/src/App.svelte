@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { blurb, fmtCount, fmtSeconds, joined, noun, zoneAt, type Blurb } from './lib/format';
+  import { blurb, fmtCount, fmtSeconds, joined, noun, plain, zoneAt, type Blurb } from './lib/format';
   import { Sim } from './lib/sim/sim';
   import { readTheme, watchTheme } from './lib/theme';
   import {
@@ -16,7 +16,7 @@
     type SimConfig,
     type StepUntil,
   } from './lib/sim/types';
-  import type { Fault, Roles, Scale } from './lib/stage/renderer';
+  import type { Fault, Faults, Roles, Scale } from './lib/stage/renderer';
   import {
     DEFAULT_PRESET,
     PRESETS,
@@ -33,7 +33,7 @@
     type SustainedTraffic,
   } from './lib/presets';
   import { nominalBuckets } from './lib/buckets';
-  import { cutName, cutState } from './lib/cuts';
+  import { cutName, cutState, type Cut } from './lib/cuts';
   import { actionLabel, sendLabel, watchWidth, widthNow, type Width } from './lib/controls';
   import { heading as headingOf, type Badge } from './lib/heading';
   import { onScale } from './lib/limit';
@@ -43,8 +43,11 @@
     observe,
     pressClause,
     progress,
+    storyDone,
     verdictOf,
+    waitClause,
     type Clock,
+    type GatewayFault,
     type NextAction,
     type PresetId,
     type RunView,
@@ -134,7 +137,7 @@
   const virtualMs = $derived(cluster?.virtual_ms ?? 0);
   // A feed's newest hits, younger than one heartbeat period and the floor, do
   // not count a node as behind.
-  const grace = $derived(run?.preset.traffic === undefined ? 0 : tickMs + floorMs);
+  const grace = $derived(run?.traffic === undefined ? 0 : tickMs + floorMs);
 
   // Virtual ms one emit floor after the last wave's instant: a command runs
   // the run on to here first (`pastFloor`). An instant the run has reached
@@ -166,6 +169,8 @@
   // decision that admitted any also when its run ends.
   let decisions = $state.raw<ReadonlyMap<number, Burst>>(new Map());
   let decided: Verdict | null = null;
+  // The gateway a gateway story's fault just broke, for the story to read.
+  let faulted: number | null = null;
   let told: Blurb = [];
   // The badge's count: data waves delivered since the last admitted Send, the
   // Send's instant, whether it waited for a heartbeat, and the packets sent.
@@ -259,13 +264,15 @@
   const scaled = $derived(run !== null && onScale(limit, run.requests));
   const buckets = $derived(run === null ? 1 : nominalBuckets(run.applied.rule_window_ms, bucketMs));
   const scale = $derived<Scale>({ limit, onScale: scaled, requests: run?.requests ?? 1, buckets });
-  const faults = $derived.by((): ReadonlyMap<number, Fault> => {
-    const out = new Map<number, Fault>();
+  const faults = $derived.by((): Faults => {
+    const nodes = new Map<number, Fault>();
+    const zones = new Set<number>();
     for (const c of run?.cuts ?? []) {
-      if (c.kind === 'silenced') out.set(c.node, { kind: 'silenced' });
-      else if (c.kind === 'unheard-in-zone') out.set(c.node, { kind: 'unheard', zone: c.zone });
+      if (c.kind === 'zone') zones.add(c.zone);
+      else if (c.kind === 'silenced') nodes.set(c.node, { kind: 'silenced' });
+      else nodes.set(c.node, { kind: 'unheard', zone: c.zone });
     }
-    return out;
+    return { nodes, zones };
   });
   const cutZone = $derived(run?.cuts.find((c) => c.kind === 'zone')?.zone ?? null);
 
@@ -314,9 +321,10 @@
     const config = effectiveConfig(preset, k, d);
     const fresh = await Sim.create(config);
     try {
-      const held = await preset.seed(fresh, config, await warm(fresh, config));
+      const gateways = await warm(fresh, config);
+      const held = await preset.seed(fresh, config);
       const snap = await fresh.snapshot(ORIGIN, WATCHED_KEY);
-      return new Run(fresh, preset, config, { ...k }, snap, requests, held);
+      return new Run(fresh, preset, config, { ...k }, snap, requests, held, gateways);
     } catch (e) {
       await fresh.shutdown();
       throw e;
@@ -448,8 +456,12 @@
       bucket: snap.bucket_epoch_now,
       cuts: r.cuts.length,
       cutZone,
+      faulted,
+      failovers: failoversOf(r, snap),
+      agreed: !snap.nodes.some((n) => n.lag.kind === 'Behind' && n.lag.missing_for_ms >= grace),
     });
     decided = null;
+    faulted = null;
     if (narration === atStart && snap.virtual_ms !== before.virtual_ms) narration = IDLE;
     const agreed = snap.nodes.every((n) => n.lag.kind === 'CaughtUp');
     if (!agreed) badge = null;
@@ -458,13 +470,19 @@
       badge = { hops, afterMs: waited ? snap.virtual_ms - sentAt : null };
     }
     // Hits leaving the window, told where no feed hides it.
-    if (snap.oracle_total < before.oracle_total && r.preset.traffic === undefined) {
+    if (snap.oracle_total < before.oracle_total && r.traffic === undefined) {
       const left = before.oracle_total - snap.oracle_total;
       emptied = snap.oracle_total === 0;
       badge = null;
       const reopened = before.nodes.find((n) => n.id === r.selected)?.brim.kind === 'Rejected' && brim?.kind === 'Admitted';
       narration = say.expiry(left, emptied, r.applied.rule_window_ms / 1000, r.selected, reopened);
     }
+  }
+
+  /** The gateway story's origin's gateway failovers in `snap`; 0 elsewhere. */
+  function failoversOf(r: Run, snap: ClusterState): number {
+    const s = r.story;
+    return s.kind === 'gateway' ? (snap.nodes.find((n) => n.id === s.origin)?.gateway_failovers ?? 0) : 0;
   }
 
   function frame(now: number): void {
@@ -599,7 +617,7 @@
    *  each drawn as its eager flush's lines; their counts show with the next
    *  snapshot. */
   async function feed(r: Run): Promise<void> {
-    const traffic = r.preset.traffic;
+    const traffic = r.traffic;
     if (traffic === undefined) return;
     const nodes = r.cluster.nodes;
     const owed = Math.floor((traffic.rate_per_sec * (r.cluster.virtual_ms - r.feedFrom)) / 1000) - r.trafficInjected;
@@ -690,52 +708,71 @@
    *  time; the admitted requests' eager flush is drawn with its receivers'
    *  counts in the frame of the press, except that Propagation's paused run
    *  stops before it, as before every wave. */
-  const sendBurst = (): Promise<void> =>
-    command(async (r) => {
-      const node = r.selected;
-      const before = r.cluster.nodes.find((n) => n.id === node);
-      const mode: UntilSettled = r.story.kind === 'propagation' ? 'per-wave' : 'settled';
-      const perWave = mode === 'per-wave' && time.kind !== 'playing';
-      const batch = await r.sim.submitRequest(node, WATCHED_KEY, r.requests, perWave ? EVENT : 'Time');
-      const event = batch.events.find((e) => e.kind.type === 'Decided');
-      if (event === undefined || event.kind.type !== 'Decided') return;
-      const burst = event.kind.burst;
-      decisions = new Map([[node, burst]]);
-      decided = verdictOf(burst, before?.zone ?? 0);
-      const admitted = admittedOf(burst);
-      r.sends.push(node, r.cluster.bucket_epoch_now, admitted, burst.kind === 'Rejected' ? burst.rejected : 0);
-      if (burst.kind === 'Rejected') {
-        stage?.reject(node, burst.rejected);
-        if (burst.admitted === 0) {
-          narration = say.rejected(node, burst.rejected, burst.total, limit, senders(r, burst.total));
-          await refresh(r);
-          return;
-        }
+  const sendBurst = (): Promise<void> => command((r) => burst(r, r.selected));
+
+  /** Send a burst of Requests per Send at `node`, as `sendBurst` says. */
+  async function burst(r: Run, node: number): Promise<void> {
+    const before = r.cluster.nodes.find((n) => n.id === node);
+    const mode: UntilSettled = r.story.kind === 'propagation' ? 'per-wave' : 'settled';
+    const perWave = mode === 'per-wave' && time.kind !== 'playing';
+    const batch = await r.sim.submitRequest(node, WATCHED_KEY, r.requests, perWave ? EVENT : 'Time');
+    const event = batch.events.find((e) => e.kind.type === 'Decided');
+    if (event === undefined || event.kind.type !== 'Decided') return;
+    const burst = event.kind.burst;
+    decisions = new Map([[node, burst]]);
+    decided = verdictOf(burst, before?.zone ?? 0);
+    const admitted = admittedOf(burst);
+    r.sends.push(node, r.cluster.bucket_epoch_now, admitted, burst.kind === 'Rejected' ? burst.rejected : 0);
+    if (burst.kind === 'Rejected') {
+      stage?.reject(node, burst.rejected);
+      if (burst.admitted === 0) {
+        narration = say.rejected(node, burst.rejected, burst.total, limit, senders(r, burst.total));
+        await refresh(r);
+        return;
       }
-      const eager = waves(batch) > 0;
-      hops = 0;
-      dataSent = 0;
-      dataCrossed = 0;
-      sentAt = r.cluster.virtual_ms;
-      waited = !eager;
-      armed = true;
-      emptied = false;
-      // Hits that wait for the node's heartbeat join any it holds; an eager
-      // flush's packets clear them (`note`).
-      if (!eager) r.held = { node, hits: (r.held?.node === node ? r.held.hits : 0) + admitted };
-      told =
-        burst.kind === 'Rejected'
-          ? say.split(node, burst.admitted, burst.rejected, burst.total, limit)
-          : eager
-            ? say.admittedEager(node, burst.requests, burst.total_before, limit)
-            : say.admittedWaiting(node, burst.requests, limit, r.config.target_err_bps);
+    }
+    const eager = waves(batch) > 0;
+    hops = 0;
+    dataSent = 0;
+    dataCrossed = 0;
+    sentAt = r.cluster.virtual_ms;
+    waited = !eager;
+    armed = true;
+    emptied = false;
+    // Hits that wait for the node's heartbeat join any it holds; an eager
+    // flush's packets clear them (`note`).
+    if (!eager) r.held = { node, hits: (r.held?.node === node ? r.held.hits : 0) + admitted };
+    told =
+      burst.kind === 'Rejected'
+        ? say.split(node, burst.admitted, burst.rejected, burst.total, limit)
+        : eager
+          ? say.admittedEager(node, burst.requests, burst.total_before, limit)
+          : say.admittedWaiting(node, burst.requests, limit, r.config.target_err_bps);
+    narration = told;
+    runOn(r, mode);
+    // Only a wave the engine was asked to hold: a Pause pressed while the
+    // Send was decided must not claim one it already delivered.
+    const t = time;
+    if (perWave && eager && t.kind === 'per-wave') await stopBefore(r, t, batch);
+    else await meet(r, batch);
+  }
+
+  /** A gateway story's fault: break `gateway` (silence it, or cut it off
+   *  from `zone`), and in the same command bring the story's origin its next
+   *  burst, whose run plays through the consequence, the detection and the
+   *  failover. */
+  const breakGateway = (fault: GatewayFault, gateway: number, zone: number): Promise<void> =>
+    command(async (r) => {
+      const s = r.story;
+      if (s.kind !== 'gateway') return;
+      const c: Cut = fault === 'silenced' ? { kind: 'silenced', node: gateway } : { kind: 'unheard-in-zone', node: gateway, zone };
+      await r.sim.cut(c, r.cluster.nodes);
+      r.cuts = r.sim.cuts();
+      r.startFeed();
+      faulted = gateway;
+      await burst(r, s.origin);
+      told = say.faultPressed(fault === 'silenced', gateway, zoneAt(r.cluster.zones, zone), s.origin, r.requests);
       narration = told;
-      runOn(r, mode);
-      // Only a wave the engine was asked to hold: a Pause pressed while the
-      // Send was decided must not claim one it already delivered.
-      const t = time;
-      if (perWave && eager && t.kind === 'per-wave') await stopBefore(r, t, batch);
-      else await meet(r, batch);
     });
 
   /** The nodes whose admitted hits fill the window, for the rejection, when
@@ -767,27 +804,36 @@
       if (delivered) narration = [...cutState(c, r.cluster.zones), ...say.ARRIVED_FIRST];
     });
 
-  /** Restore the scenario's own network, its loss included, then run time
-   *  until the nodes agree. */
-  const heal = (): Promise<void> =>
+  /** Undo `cut` alone, or with none every listed cut, restoring the
+   *  scenario's own network, its loss included; then run time until the
+   *  nodes agree. */
+  const heal = (cut?: Cut): Promise<void> =>
     command(async (r) => {
-      await r.sim.heal();
+      if (cut === undefined) await r.sim.heal();
+      else await r.sim.reconnect(cut, r.cluster.nodes);
       r.cuts = r.sim.cuts();
       await refresh(r);
-      told = ['the network is whole again'];
+      told = cut === undefined ? ['the network is whole again'] : repairOf(cut, r);
       narration = told;
       runOn(r, 'settled');
     });
 
-  /** Spawn a fresh cold-start node into zone `zone` of the live cluster, cut
-   *  as the listed faults say, and run time until it has caught up. */
-  const addNode = (zone: number): Promise<void> =>
+  /** What reconnecting `cut` did, as the narration says it. */
+  function repairOf(cut: Cut, r: Run): Blurb {
+    return cut.kind === 'zone' ? blurb`${zoneAt(r.cluster.zones, cut.zone)} is reconnected` : blurb`node ${cut.node} is reconnected`;
+  }
+
+  /** Spawn a fresh cold-start node into zone `to` of the live cluster, or one
+   *  into every zone with members, each cut as the listed faults say, and run
+   *  time until they have caught up. */
+  const addNode = (to: number | 'every'): Promise<void> =>
     command(async (r) => {
-      await r.sim.addNode(zone);
+      const zones = r.cluster.zones.flatMap((z, i) => (z.live > 0 && (to === 'every' || to === i) ? [i] : []));
+      for (const zone of zones) await r.sim.addNode(zone);
       await refresh(r);
       await r.sim.reapply(r.cluster.nodes);
       await refresh(r);
-      told = blurb`a node joined ${zoneAt(r.cluster.zones, zone)}`;
+      told = to === 'every' ? ['a node joined every zone'] : blurb`a node joined ${zoneAt(r.cluster.zones, to)}`;
       narration = told;
       runOn(r, 'settled');
     });
@@ -880,7 +926,7 @@
       if (waves(batch) === 0) {
         await meet(r, batch);
         // A feed always has hits to send, whatever this instant's window holds.
-        if (r.preset.traffic === undefined && expiry === undefined && r.cluster.oracle_total === 0) narration = say.NOTHING_WAITING;
+        if (r.traffic === undefined && expiry === undefined && r.cluster.oracle_total === 0) narration = say.NOTHING_WAITING;
         return;
       }
       // Stopped before the wave: draw it at once, with its counts.
@@ -893,7 +939,7 @@
   /** On Step, say what the wave does, where it is the selected node's own and
    *  no feed muddies it. */
   function tellWave(r: Run, batch: EventBatch): void {
-    if (r.preset.traffic !== undefined) return;
+    if (r.traffic !== undefined) return;
     const data = batch.events.flatMap(({ kind }) =>
       (kind.type === 'PacketSent' || kind.type === 'PacketDropped') && CARRIES_CELLS[kind.kind] ? [kind] : [],
     );
@@ -981,6 +1027,17 @@
 
   // -- What the page shows, derived from the run --------------------------
 
+  // A gateway story's gateway: the one it broke, or before its fault the
+  // origin's gateway into the story's zone as the cluster warmed.
+  const storyGateway = $derived.by((): number | null => {
+    const s = run?.story;
+    if (s === undefined || s.kind !== 'gateway') return null;
+    return s.act === 'faulted' || s.act === 'done' ? s.gateway : (run?.gateways[s.origin]?.[s.zone] ?? null);
+  });
+  // Every fault and repair is offered only once the story has ended, or
+  // where it has no scripted end.
+  const offered = $derived(run !== null && storyDone(run.story));
+
   const view = $derived.by((): RunView | null => {
     const r = run;
     if (r === null || selectedNode === null) return null;
@@ -1009,6 +1066,11 @@
       windowMs: r.applied.rule_window_ms,
       zoneCount: r.cluster.zones.filter((z) => z.live > 0).length,
       loss: r.applied.uniform_loss,
+      zones: r.cluster.zones,
+      gateway: storyGateway,
+      unanswered: inspected?.peers.find((p) => p.id === storyGateway && storyGateway !== null)?.unanswered_ms ?? null,
+      suspectAfterMs: r.cluster.suspect_after_ms,
+      failovers: failoversOf(r, r.cluster),
     };
   });
   const action = $derived<NextAction>(view === null ? { kind: 'wait', reason: 'starting' } : nextAction(view));
@@ -1017,7 +1079,9 @@
   const send = $derived(sendLabel(width, requestsValid && run !== null ? run.requests : null, run?.selected ?? 0));
   // The next action's control label, as the control renders it: the action
   // line and the narration quote it.
-  const label = $derived(actionLabel(action, send, presetLabel));
+  const zoneName = (z: number): string => zoneAt(cluster?.zones ?? [], z);
+  const label = $derived(actionLabel(action, send, presetLabel, zoneName));
+  const waitText = $derived(view === null || action.kind !== 'wait' ? [] : waitClause(action.reason, view));
   const lineClause = $derived(
     view === null || action.kind !== 'press' ? [] : pressClause(view, action.control, hops + 1),
   );
@@ -1030,7 +1094,7 @@
   // Nothing is coming: no feed, no hits held for a heartbeat, and no node a
   // wave can still reach. The hits that leave the window first, if any.
   const quiet = $derived(
-    run !== null && run.preset.traffic === undefined && run.held === null && !run.cluster.nodes.some((n) => n.lag.kind === 'Behind'),
+    run !== null && run.traffic === undefined && run.held === null && !run.cluster.nodes.some((n) => n.lag.kind === 'Behind'),
   );
   const leaving = $derived(cluster?.oracle_buckets.find((n) => n > 0) ?? null);
   // Time runs, nothing is coming, and the next action names a control.
@@ -1077,7 +1141,7 @@
 
   /** The feed's hits younger than the grace, or null with no feed. */
   function newerHits(r: Run): number | null {
-    const traffic = r.preset.traffic;
+    const traffic = r.traffic;
     if (traffic === undefined) return null;
     const fed = (t: number): number => Math.floor((traffic.rate_per_sec * Math.max(t - r.feedFrom, 0)) / 1000);
     return fed(r.cluster.virtual_ms) - fed(r.cluster.virtual_ms - grace);
@@ -1099,7 +1163,9 @@
     const text =
       reason === 'run'
         ? `${Math.round(value * 100)} percent of the reachable nodes have the hits`
-        : `${Math.round(value * 100)} percent of the wait has passed`;
+        : reason === 'failover'
+          ? plain(waitText)
+          : `${Math.round(value * 100)} percent of the wait has passed`;
     return { value, text };
   });
 
@@ -1239,11 +1305,10 @@
             {requestsValid}
             editing={editingRequests}
             zones={cluster.zones}
-            selected={r.selected}
-            {roles}
             {maxZones}
-            canAdd={cluster.nodes.length < MAX_LIVE_NODES}
-            canHeal={r.cuts.length > 0}
+            cuts={r.cuts}
+            {offered}
+            headingRepair={heading.repair !== null}
             maxNodes={MAX_LIVE_NODES}
             knobs={r.knobs}
             appliedKnobs={r.applied}
@@ -1256,10 +1321,9 @@
             onApplyKnobs={rebuild}
             onBackToScenario={backToScenario}
             onCutZone={(zone) => void cut({ kind: 'zone', zone })}
-            onSilence={(node) => void cut({ kind: 'silenced', node })}
-            onCutFromZone={(node, zone) => void cut({ kind: 'unheard-in-zone', node, zone })}
+            onReconnect={(c) => void heal(c)}
             onHeal={() => void heal()}
-            onAddNode={(zone) => void addNode(zone)}
+            onAddNode={(to) => void addNode(to)}
             onPreview={(node) => (namedId = node)}
           />
         </details>
@@ -1276,12 +1340,14 @@
             {label}
             pressClause={lineClause}
             phone={width === 'narrow'}
-            subject={r.selected}
+            {waitText}
+            requests={r.requests}
             {requestsReason}
-            zoneName={(z) => zoneAt(cluster.zones, z)}
+            {zoneName}
             {meter}
             {presetLabel}
             onSelect={(node) => void select(node)}
+            onFault={(fault, node, zone) => void breakGateway(fault, node, zone)}
             onUseRequests={useRequests}
             onGo={go}
             onPreview={(node) => (namedId = node)}
@@ -1355,6 +1421,10 @@
                   peers={inspected.peers}
                   zones={cluster.zones}
                   zoneMode={r.applied.zone_mode}
+                  {offered}
+                  cuts={r.cuts}
+                  onSilence={(node) => void cut({ kind: 'silenced', node })}
+                  onCutFromZone={(node, zone) => void cut({ kind: 'unheard-in-zone', node, zone })}
                   onPreview={(node) => (namedId = node)}
                 />
               {/if}

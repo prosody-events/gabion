@@ -124,6 +124,12 @@ impl ValidGossipConfig {
         &self.membership
     }
 
+    /// `gossip.suspect_after`: how long a packet may go unanswered before its
+    /// peer is suspect and loses any gateway role.
+    pub fn suspect_after(&self) -> Millis {
+        self.suspect_after
+    }
+
     /// Shrink the runtime's request channel to [`MIN_LIMIT_QUEUE_CAPACITY`],
     /// for an adapter whose `gossip.limit_queue_capacity` sizes a queue of its
     /// own that it drains into the runtime (NGINX's shared-memory queue). A

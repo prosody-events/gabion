@@ -134,6 +134,16 @@ export class Sim {
     for (const cut of this.#cuts) await this.#apply(cut, nodes);
   }
 
+  /** Undo fault `cut` alone: the scenario's own network on every link, its
+   *  loss included, then every other listed fault again over the live
+   *  `nodes`. */
+  async reconnect(cut: Cut, nodes: readonly Member[]): Promise<void> {
+    const rest = this.#cuts.filter((c) => !sameCut(c, cut));
+    await this.heal();
+    this.#cuts = rest;
+    await this.reapply(nodes);
+  }
+
   /** Restore the scenario's own network on every link, its loss included,
    *  and clear the list. */
   async heal(): Promise<void> {

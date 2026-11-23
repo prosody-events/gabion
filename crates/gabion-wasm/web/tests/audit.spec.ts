@@ -31,7 +31,7 @@ import { zoneAt } from '../src/lib/format';
 import { PRESETS, WATCHED_KEY } from '../src/lib/presets';
 import { BEAM_ALPHA, readTheme, type Theme } from '../src/lib/theme';
 import timings from './phase-timings.json' with { type: 'json' };
-import { PERIOD_MS, period, refusal, send, sendButton, setSpeed, step, stepUntil, still, virtualMs } from './drive';
+import { PERIOD_MS, breakGateway, period, refusal, send, sendButton, setSpeed, step, stepUntil, still, virtualMs } from './drive';
 
 // How far a node's ring and its selection outline reach outside its disc,
 // summed from the gap and stroke each is drawn with rather than read from the
@@ -467,7 +467,8 @@ async function checkHeading(page: Page, where: string, snap: ClusterState): Prom
  *  layout, the DOM's counts and names, and the engine's snapshot. */
 async function checkGlyphs(page: Page, where: string, name: string): Promise<void> {
   const snap = await snapshot(page);
-  const feed = PRESETS.find((p) => p.label === name)?.traffic !== undefined;
+  // Gateway cut's trickle starts at its fault, which the audit never presses.
+  const feed = PRESETS.find((p) => p.label === name)?.traffic?.starts === 'load';
   // Each node's name: its id, and the fault the engine was given that picks it out.
   const names = new Map(snap.nodes.map((n) => [n.id, `node ${n.id}`]));
   for (const cut of await page.evaluate(() => window.sim!.cuts())) {
@@ -949,10 +950,11 @@ test('S sits on its prediction and follows the placement (A4)', async ({ page },
   const share = Number((await text(field(page, 'share'))).replace('%', '')) / 100;
   expect(Math.abs(share - refs.zones), `the share ${share} sits on (Z − 1) / (N − 1) = ${refs.zones}`).toBeLessThanOrEqual(0.02);
 
-  // Sandbox with unequal zones: Add node in zone a (5, 4, 4) moves the
+  // Sandbox with unequal zones: a node added to zone a (5, 4, 4) moves the
   // no-zone prediction off (N − N/Z) / (N − 1).
   await loadPreset(page, 'Sandbox');
-  await page.getByRole('button', { name: 'Add node' }).click();
+  await page.locator('#add-zone').selectOption({ label: 'zone a' });
+  await page.getByRole('button', { name: 'Add a node to zone a' }).click();
   await expect(page.locator('[data-field="status-nodes"]')).toHaveText('13');
   await expect(page.locator('.stage-pane')).toHaveAttribute('data-clock', 'paused', { timeout: 30_000 });
   await send(page, 0);
@@ -1340,7 +1342,8 @@ test("every drawn beam carries its packet's kind, tier and fate", async ({ page 
   // request and the sweep, are each drawn once as they are sent.
   const seen = new Set<PacketKind>();
   await take();
-  await page.getByRole('button', { name: 'Add node' }).click();
+  await page.locator('#add-zone').selectOption({ label: 'zone a' });
+  await page.getByRole('button', { name: 'Add a node to zone a' }).click();
   await expect(field(page, 'status-nodes')).toHaveText('13');
   await expect(page.locator('.stage-pane')).toHaveAttribute('data-clock', 'paused', { timeout: 30_000 });
   await still(page);
@@ -1370,16 +1373,16 @@ test("every drawn beam carries its packet's kind, tier and fate", async ({ page 
 // key does not define. A route always has room either side of the centre and
 // clear of its ends' ports; a node's name beside a short chord may leave none,
 // so names are kept clear where the route allows, not checked here. It samples
-// the periods the main audit shoots: Gateway failure's node 10 sends to the
-// failed node 4 only after the first two, and that packet's route is the one
-// where a stop runs into node 4's port. The check must have met such a route,
-// or its port half proves nothing.
+// the periods after each gateway story's fault, where node 0's packets to the
+// broken node 4 die, and a stop on such a route runs into node 4's port. The
+// check must have met such a route, or its port half proves nothing.
 test("a lost packet's bar stands clear of every zone's title and gateway port", async ({ page }, info) => {
   test.skip(info.project.name.endsWith('-dark'), 'geometry, the same in either theme');
   await open(page);
   const beside = new Set<string>();
   for (const name of ['Gateway failure', 'Gateway cut']) {
     await loadPreset(page, name);
+    await breakGateway(page, true);
     const bars = new Set<string>();
     const against = new Set<string>();
     const check = async (): Promise<void> => {
@@ -1415,7 +1418,13 @@ test("a lost packet's bar stands clear of every zone's title and gateway port", 
         if (by !== undefined) against.add(`${bar} stands against node ${by.id}'s port`);
       }
     };
-    for (let i = 0; i < STEPS; i++) await period(page, check);
+    // Through the failover and a few periods past it, when the new gateway
+    // relays into a zone holding the broken one.
+    let after = -1;
+    for (let i = 0; i < 20 && after < 4; i++) {
+      await period(page, check);
+      if (after >= 0 || ((await snapshot(page)).nodes.find((n) => n.id === 0)?.gateway_failovers ?? 0) > 0) after += 1;
+    }
     console.log(`${name}: checked ${bars.size} lost packet bar(s)`);
     expect(bars.size, `${name}: a lost packet was drawn`).toBeGreaterThan(0);
     expect([...against], name).toEqual([]);
@@ -1559,18 +1568,20 @@ test('runs go quiet after agreement', async ({ page }, info) => {
     'Propagation: a packet in the second period after agreement',
   ).toEqual([]);
 
-  // Zone partition, healed: the heal's run reconciles and pauses itself,
-  // not at its cap, then the network sends no data.
-  await loadPreset(page, 'Zone partition');
-  await page.getByRole('button', { name: 'Heal network' }).click();
+  // Sandbox, a zone cut and healed: the heal's run reconciles and pauses
+  // itself, not at its cap, then the network sends no data.
+  await loadPreset(page, 'Sandbox');
+  await page.locator('#cut-zone').selectOption({ label: 'zone c' });
+  await page.getByRole('button', { name: 'Cut zone c off' }).click();
+  await page.getByRole('button', { name: 'Heal 1 cut' }).click();
   await expect(field(page, 'status-cut')).toHaveCount(0);
-  await expect(page.locator('.stage-pane'), 'Zone partition: the heal ran to agreement, not its cap').toHaveAttribute('data-clock', 'paused', { timeout: 30_000 });
+  await expect(page.locator('.stage-pane'), 'Sandbox: the heal ran to agreement, not its cap').toHaveAttribute('data-clock', 'paused', { timeout: 30_000 });
   await expect(page.locator('.narration')).toHaveText(/every node has it$/);
   await logPackets(page);
-  await stepUntil(page, () => agreed(page), 16, 'Zone partition agreed');
+  await stepUntil(page, () => agreed(page), 16, 'Sandbox agreed');
   await takePackets(page);
   for (let i = 0; i < 5; i++) await period(page);
-  expect((await takePackets(page)).filter((p) => CARRIES_CELLS[p.kind]), 'Zone partition: data after agreement').toEqual([]);
+  expect((await takePackets(page)).filter((p) => CARRIES_CELLS[p.kind]), 'Sandbox: data after agreement').toEqual([]);
 
   // Packet loss: its resends are not asserted away, but once agreed it stays so.
   await loadPreset(page, 'Packet loss');
@@ -1655,9 +1666,11 @@ test('both gateway presets fail over within the window', async ({ page }, info) 
     ['Gateway cut', timings.gateway_cut, Math.ceil((2 * PERIOD_MS) / 1000)],
   ] as const) {
     await loadPreset(page, name);
+    const gateway = (await snapshot(page, 0)).inspected?.peers.find((p) => p.role === 'gateway' && p.zone === 1)?.id;
+    expect(gateway, `${name}: node 0's gateway into zone b at load`).toBeDefined();
+    const faulted = await breakGateway(page, true);
+    expect(faulted, `${name}: the fault breaks node 0's gateway into zone b`).toBe(gateway);
     const load = await snapshot(page, 0);
-    const faulted = load.inspected?.peers.find((p) => p.role === 'gateway' && p.zone === 1)?.id;
-    expect(faulted, `${name}: node 0's gateway into zone b at load`).toBeDefined();
     const failovers = async (): Promise<number> =>
       (await snapshot(page)).nodes.find((n) => n.id === 0)?.gateway_failovers ?? 0;
     await stepUntil(page, async () => (await failovers()) >= 1, WINDOW_MS / PERIOD_MS, `${name}: node 0 failed over`);
@@ -1674,7 +1687,7 @@ test('both gateway presets fail over within the window', async ({ page }, info) 
       3,
       `${name}: zone b caught up through its new gateway`,
     );
-    console.log(`${name}: failed over ${failedOver - load.virtual_ms} ms after load (the record: ${record.failover_ms} ms)`);
+    console.log(`${name}: failed over ${failedOver - load.virtual_ms} ms after the fault (the record: ${record.failover_ms} ms)`);
   }
 });
 
@@ -1731,23 +1744,24 @@ test.describe('interaction', () => {
     await page.locator('#cut-zone').selectOption({ label: 'zone c' });
     await page.getByRole('button', { name: 'Cut zone c off' }).click();
     await expect(lede).toContainText('zone c cut off');
-    await page.getByRole('button', { name: 'Heal network' }).click();
+    await page.getByRole('button', { name: 'Heal 1 cut' }).click();
     await expect(lede).not.toContainText('cut off');
 
-    // Propagation, with node 0 selected: silence one of its gateways, then cut
-    // another off from its zone. The cluster warmed up before it opened, so
-    // the gateways are already found.
-    await loadPreset(page, 'Propagation');
-    await expect(page.getByRole('heading', { name: "node 0's gateways" })).toBeVisible();
-    const silence = page.getByRole('button', { name: /^Silence node \d+$/ }).first();
-    const silenced = (await silence.locator('[data-field="node"]').textContent()) ?? '';
+    // Sandbox, with node 0 selected: silence one of its gateways, then cut
+    // another off from its zone, from the detail pane's disclosure. The
+    // cluster warmed up before it opened, so the gateways are already found.
+    await loadPreset(page, 'Sandbox');
+    const faults = page.locator('.inspector details.faults');
+    await faults.locator('summary', { hasText: "Break one of node 0's gateways" }).click();
+    const silence = faults.getByRole('button', { name: /^Silence node \d+$/ }).first();
+    const silenced = (await silence.locator('[data-field="fault"]').first().textContent()) ?? '';
     await silence.click();
     await expect(lede).toContainText(`node ${silenced} silenced`);
-    await page.getByRole('button', { name: 'Heal network' }).click();
+    await page.getByRole('button', { name: 'Heal 1 cut' }).click();
     await expect(lede).not.toContainText('silenced');
-    await page.getByRole('button', { name: /^Cut node \d+ off from zone b$/ }).click();
+    await faults.getByRole('button', { name: /^Cut node \d+ off from zone b$/ }).click();
     await expect(lede).toContainText('unheard by zone b');
-    await page.getByRole('button', { name: 'Heal network' }).click();
+    await page.getByRole('button', { name: 'Heal 1 cut' }).click();
     await expect(lede).not.toContainText('unheard');
 
     // The keyboard: Shift+Tab from "Show as table" lands on the grid's one tab
@@ -1779,7 +1793,7 @@ test.describe('interaction', () => {
     // Mark the engine, so the rebuild is seen as a new one rather than as the
     // overlay not having appeared yet.
     await page.evaluate(() => Object.assign(window.sim!, { old: true }));
-    await page.getByRole('button', { name: 'Restart Propagation' }).dispatchEvent('click');
+    await page.getByRole('button', { name: 'Restart Sandbox' }).dispatchEvent('click');
     await expect.poll(() => page.evaluate(() => window.sim !== undefined && !('old' in window.sim))).toBe(true);
     await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
     expect(await focused(), 'focus stayed on node 5 through the rebuild').toBe('5');
@@ -1799,10 +1813,13 @@ test.describe('interaction', () => {
     await expect(title).toHaveText('7');
     await expect(page.locator('.stage-box .tooltip')).toContainText('select node 7');
 
-    // Removing a cut node takes its cut with it.
+    // Removing a cut node takes its cut with it. Node 7's faults are behind
+    // a closed disclosure of their own.
+    await expect(page.locator('.inspector details.faults')).not.toHaveAttribute('open');
+    await page.locator('.inspector details.faults summary').click();
     const cutFrom = page.getByRole('button', { name: /^Cut node \d+ off from zone \w$/ }).first();
     await expect(cutFrom, 'node 7 found its gateways while the cluster warmed up').toBeVisible();
-    const cutNode = Number((await cutFrom.locator('[data-field="node"]').textContent()) ?? '');
+    const cutNode = Number((await cutFrom.locator('[data-field="fault"]').first().textContent()) ?? '');
     await cutFrom.click();
     await expect(lede).toContainText(`node ${cutNode} unheard`);
     await page.locator(`[role="gridcell"][data-node="${cutNode}"]`).press('Enter');

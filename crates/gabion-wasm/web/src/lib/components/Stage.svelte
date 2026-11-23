@@ -6,7 +6,7 @@
   import {
     MARK,
     StageRenderer,
-    type Fault,
+    type Faults,
     type LabelBox,
     type Roles,
     type Scale,
@@ -55,7 +55,7 @@
     scale: Scale;
     /** How long a feed's newest hits may lag before they open a ring. */
     grace: number;
-    faults: ReadonlyMap<number, Fault>;
+    faults: Faults;
     /** How far the selected node is through the wait for its heartbeat, or
      *  null while it holds nothing unsent. */
     awaiting: number | null;

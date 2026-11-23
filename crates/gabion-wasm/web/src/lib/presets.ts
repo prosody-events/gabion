@@ -6,7 +6,7 @@
 //
 // A preset is a config, its feed, the charts its pane shows, the story its
 // caption tells (`lib/next.ts`), the scenario its story hands over to, and an
-// `async seed(sim, config, gateways)` that fires its opening commands (cuts,
+// `async seed(sim, config)` that fires its opening commands (cuts,
 // seed requests) against a freshly built cluster. It is not a timed script:
 // the reader drives every step the caption names.
 //
@@ -14,8 +14,8 @@
 // the page steps whole heartbeat periods until every node has a gateway into
 // every other zone and one period has passed with no packet, so nothing left
 // over from the cold start is drawn when the reader first presses anything. The
-// gateway map `warm` gathers is how the gateway presets name the node they
-// fault.
+// gateway map `warm` gathers is how the gateway stories name the node whose
+// fault they offer: both open healthy, and the reader breaks the gateway.
 //
 // Rate limiting, Zone partition and Sustained overload set a low limit, so
 // the vessels draw it and admission refuses past it; at limit 100 with twelve
@@ -27,11 +27,12 @@
 // node, so the page shows that node's heartbeat coming from the first frame.
 //
 // The feed exists only where traffic is the subject: Steady state, No zone
-// configured and Sustained overload, plus Gateway cut's trickle at node 0,
-// which keeps node 0 sending data that a gateway cut off from its zone must
-// answer with "cannot relay". A feed injects ⌊rate·T⌋ one-hit requests by
-// virtual time T, counted from the moment the build is handed to the reader,
-// so it is deterministic under Step and repeatable from load.
+// configured and Sustained overload, plus Gateway cut's trickle at node 0
+// from its fault on, which keeps node 0 sending data that a gateway cut off
+// from its zone must answer with "cannot relay". A feed injects ⌊rate·T⌋
+// one-hit requests by virtual time T, counted from the moment it starts (the
+// build handed to the reader, or the fault), so it is deterministic under
+// Step and repeatable from load.
 
 import type { PresetId, Story } from './next';
 import type { Member, Sim } from './sim/sim';
@@ -54,6 +55,9 @@ const SEED_REQUESTS = 50;
 /** The node every preset selects on load, and the node the seeded presets
  *  seed and read the gateways of. */
 export const ORIGIN = 0;
+
+/** The zone whose gateway the gateway stories break: zone b. */
+const GATEWAY_ZONE = 1;
 
 /** The limit the far-off presets pin: far above their volumes, so ε stays
  *  large and a request spreads by heartbeat. */
@@ -134,6 +138,9 @@ export function knobsFromPreset(preset: Preset, defaults: SimConfig): Knobs {
 export interface SustainedTraffic {
   readonly rate_per_sec: number;
   readonly at: 'every-node' | { readonly node: number };
+  /** When it starts: as the build is handed to the reader, or at the
+   *  gateway story's fault, so the story's "before" is quiet. */
+  readonly starts: 'load' | 'fault';
 }
 
 /** `gateways[node][zone]`: the gateway each built node's runtime reported into
@@ -169,7 +176,7 @@ export type Preset = {
   /** Fire the preset's opening commands on the warmed cluster, at the current
    *  virtual time, and report the hits they leave held for the selected
    *  node's heartbeat, or null. */
-  seed(sim: Sim, config: SimConfig, gateways: Gateways): Promise<Held | null>;
+  seed(sim: Sim, config: SimConfig): Promise<Held | null>;
 };
 
 /** The nodes a build places: node `i` in zone `i mod zones`. */
@@ -228,15 +235,6 @@ async function opening(sim: Sim, node: number, requests: number): Promise<Held |
   return waves(batch) === 0 ? { node, hits: requests } : null;
 }
 
-/** Throw: node 0 never found a gateway into zone `zone`. */
-function noGateway(zone: number): never {
-  throw new Error(
-    `node ${ORIGIN} found no gateway into zone ${String.fromCharCode(97 + zone)} while the cluster warmed up, ` +
-      `so the gateway scenario cannot start. A zone needs at least one live node that node ${ORIGIN} can hear; ` +
-      'rebuild with more nodes or fewer zones.',
-  );
-}
-
 /** Steady state's and No zone configured's seed: ten requests at one node of
  *  each zone, the first at node 0, whose held hits it reports. */
 async function spreadOut(sim: Sim, c: SimConfig): Promise<Held | null> {
@@ -281,7 +279,7 @@ export const PRESETS: readonly Preset[] = [
     // ≈ rate·window ≈ 800 hits a window, twice the limit, so once the window
     // fills each node admits what expiry frees and rejects the rest.
     config: { nodes: NODES, zones: ZONES, rule_limit: 400 },
-    traffic: { rate_per_sec: OVERLOAD_RATE_PER_SEC, at: 'every-node' },
+    traffic: { rate_per_sec: OVERLOAD_RATE_PER_SEC, at: 'every-node', starts: 'load' },
     charts: ['window', 'requests', 'behind'],
     story: { kind: 'watch', watched: 'overload', next: 'rate-limiting' },
     async seed() {
@@ -316,11 +314,10 @@ export const PRESETS: readonly Preset[] = [
     group: 1,
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
     charts: ['behind'],
-    story: { kind: 'watch', watched: 'gateway-failure', next: 'gateway-cut' },
-    async seed(sim, c, gateways) {
-      const g = gateways[ORIGIN]?.[1] ?? noGateway(1);
-      await sim.cut({ kind: 'silenced', node: g }, buildNodes(c));
-      return opening(sim, ORIGIN, SEED_REQUESTS);
+    story: { kind: 'gateway', fault: 'silenced', next: 'gateway-cut', origin: ORIGIN, zone: GATEWAY_ZONE, act: 'open' },
+    async seed() {
+      // Opens healthy: the reader's Send, then the reader's fault.
+      return null;
     },
   },
   {
@@ -328,13 +325,11 @@ export const PRESETS: readonly Preset[] = [
     label: 'Gateway cut',
     group: 1,
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
-    traffic: { rate_per_sec: TRICKLE_RATE_PER_SEC, at: { node: ORIGIN } },
+    traffic: { rate_per_sec: TRICKLE_RATE_PER_SEC, at: { node: ORIGIN }, starts: 'fault' },
     charts: ['behind'],
-    story: { kind: 'watch', watched: 'gateway-cut', next: 'sandbox' },
-    async seed(sim, c, gateways) {
-      const g = gateways[ORIGIN]?.[1] ?? noGateway(1);
-      await sim.cut({ kind: 'unheard-in-zone', node: g, zone: 1 }, buildNodes(c));
-      return opening(sim, ORIGIN, SEED_REQUESTS);
+    story: { kind: 'gateway', fault: 'unheard', next: 'sandbox', origin: ORIGIN, zone: GATEWAY_ZONE, act: 'open' },
+    async seed() {
+      return null;
     },
   },
   {
@@ -342,7 +337,7 @@ export const PRESETS: readonly Preset[] = [
     label: 'Steady state',
     group: 2,
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
-    traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC, at: 'every-node' },
+    traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC, at: 'every-node', starts: 'load' },
     charts: ['behind', 'share'],
     story: { kind: 'watch', watched: 'steady', next: 'rate-limiting' },
     seed: spreadOut,
@@ -352,7 +347,7 @@ export const PRESETS: readonly Preset[] = [
     label: 'No zone configured',
     group: 2,
     config: { nodes: NODES, zones: ZONES, zone_mode: 'Unset', rule_limit: NARRATIVE_LIMIT },
-    traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC, at: 'every-node' },
+    traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC, at: 'every-node', starts: 'load' },
     charts: ['behind', 'share'],
     story: { kind: 'watch', watched: 'no-zone', next: 'rate-limiting' },
     seed: spreadOut,

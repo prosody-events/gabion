@@ -7,7 +7,7 @@
 import { ChartHistory } from './charts/history';
 import type { Cut } from './cuts';
 import type { Story } from './next';
-import { ORIGIN, type Held, type Knobs, type Preset } from './presets';
+import { ORIGIN, type Gateways, type Held, type Knobs, type Preset, type SustainedTraffic } from './presets';
 import { RequestLog } from './requests';
 import type { Sim } from './sim/sim';
 import type { ClusterState, SimConfig } from './sim/types';
@@ -42,10 +42,14 @@ export class Run {
   /** The hits a node holds for its next heartbeat, whose sweep and countdown
    *  the page shows. */
   held: Held | null = $state.raw(null);
-  /** The feed's start, the instant the build was handed to the reader, and
-   *  the hits it has injected since. */
-  readonly feedFrom: number;
+  /** The feed, once it has started (`SustainedTraffic.starts`), its start
+   *  and the hits it has injected since. */
+  traffic: SustainedTraffic | undefined = $state.raw();
+  feedFrom = 0;
   trafficInjected = 0;
+  /** Each built node's gateway into each other zone as the cluster warmed:
+   *  the gateway a gateway story offers to break. */
+  readonly gateways: Gateways;
 
   constructor(
     sim: Sim,
@@ -55,6 +59,7 @@ export class Run {
     cluster: ClusterState,
     requests: number,
     held: Held | null,
+    gateways: Gateways,
   ) {
     this.sim = sim;
     this.preset = preset;
@@ -64,11 +69,19 @@ export class Run {
     this.selected = ORIGIN;
     this.requests = requests;
     this.held = held;
+    this.gateways = gateways;
     this.cluster = cluster;
     this.cuts = sim.cuts();
     this.seededCuts = this.cuts.length;
     this.story = preset.story;
-    this.feedFrom = cluster.virtual_ms;
+    if (preset.traffic?.starts === 'load') this.startFeed();
     this.history.reset(applied.rule_window_ms);
+  }
+
+  /** Start the preset's feed now, unless it runs already. */
+  startFeed(): void {
+    if (this.traffic !== undefined || this.preset.traffic === undefined) return;
+    this.traffic = this.preset.traffic;
+    this.feedFrom = this.cluster.virtual_ms;
   }
 }

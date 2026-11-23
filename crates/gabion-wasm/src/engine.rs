@@ -541,6 +541,8 @@ struct EngineState {
     counter_reads: u64,
     /// Yields the drains have spent.
     drain_yields: u64,
+    /// `gossip.suspect_after` as every node's runtime validated it, in ms.
+    suspect_after_ms: u64,
 }
 
 impl EngineState {
@@ -588,6 +590,7 @@ impl EngineState {
             gateway_fetches: 0,
             counter_reads: 0,
             drain_yields: 0,
+            suspect_after_ms: 0,
         };
 
         // The initial members are ids 0..N, so the address of id `i` is
@@ -664,6 +667,7 @@ impl EngineState {
             ..self.settings.clone()
         }
         .validate()?;
+        self.suspect_after_ms = gossip_cfg.suspect_after().0.get();
         let identity = NodeIdentity::new(NodeId((id as u128) * 0x100 + 1), 1);
 
         let store = CellStore::new(self.storage, identity, &self.rules);
@@ -1478,6 +1482,7 @@ impl EngineState {
             // The CRDT's own window position at this instant, so the page
             // never recomputes the boundary in TypeScript.
             bucket_epoch_now: current.0,
+            suspect_after_ms: self.suspect_after_ms,
         }
     }
 

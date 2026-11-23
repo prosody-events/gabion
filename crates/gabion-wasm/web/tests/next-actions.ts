@@ -2,7 +2,7 @@
 // and the one action the page must name there. `next.spec.ts` runs every row
 // through `nextAction`.
 
-import type { Control, NextAction, Propagation, RateLimiting, RunView, WaitReason } from '../src/lib/next';
+import type { Control, Gateway, NextAction, Propagation, RateLimiting, RunView, WaitReason } from '../src/lib/next';
 import type { Admission, Lag } from '../src/lib/sim/types';
 
 const caught: Lag = { kind: 'CaughtUp' };
@@ -20,6 +20,19 @@ const rl = (act: RateLimiting['act'], more: Partial<RateLimiting> = {}): RateLim
 const prop = (act: Propagation['act']): Propagation => ({ kind: 'propagation', next: 'rate-limiting', act });
 /** Zone partition's constant half, for its rows' stories. */
 const P = { kind: 'partition', next: 'gateway-failure' } as const;
+/** Gateway failure before its fault, and after it, node 4 broken when node
+ *  0 had failed over `failovers` times. */
+const gw = (act: 'open' | 'sent'): Gateway => ({ kind: 'gateway', fault: 'silenced', next: 'gateway-cut', origin: 0, zone: 1, act });
+const gwAfter = (act: 'faulted' | 'done', fault: Gateway['fault'] = 'silenced'): Gateway => ({
+  kind: 'gateway',
+  fault,
+  next: fault === 'silenced' ? 'gateway-cut' : 'sandbox',
+  origin: 0,
+  zone: 1,
+  act,
+  gateway: 4,
+  failovers: 0,
+});
 
 /** A paused Rate limiting run at load, node 0 selected. */
 export const BASE: RunView = {
@@ -44,6 +57,11 @@ export const BASE: RunView = {
   windowMs: 10_000,
   zoneCount: 3,
   loss: 0,
+  zones: [{ name: 'zone-a' }, { name: 'zone-b' }, { name: 'zone-c' }],
+  gateway: null,
+  unanswered: null,
+  suspectAfterMs: 2000,
+  failovers: 0,
 };
 
 
@@ -102,6 +120,20 @@ export const TABLE: readonly Row[] = [
   { name: 'Partition reconnected', view: { story: { ...P, act: 'counted', both: true }, oracle: 200 }, action: press('play') },
   { name: 'Partition counting down', view: { story: { ...P, act: 'counted', both: true }, oracle: 200, clock: 'playing', brim: refuses }, action: wait('window') },
   { name: 'Partition at the end', view: { story: { ...P, act: 'done', both: true } }, action: { kind: 'go', to: 'gateway-failure' } },
+  // Gateway failure and Gateway cut: Send, the run, the fault in the line,
+  // nothing filled from the press to the ending, then Go.
+  { name: 'Gateway at load', view: { story: gw('open'), gateway: 4 }, action: press('send') },
+  { name: "Gateway's first run", view: { story: gw('sent'), gateway: 4, clock: 'settled' }, action: wait('run') },
+  { name: 'Gateway offers its fault', view: { story: gw('sent'), gateway: 4 }, action: { kind: 'inline', action: { kind: 'fault', fault: 'silenced', node: 4, zone: 1, origin: 0 } } },
+  { name: 'Gateway cut offers its fault', view: { story: { ...gw('sent'), fault: 'unheard', next: 'sandbox' }, gateway: 4 }, action: { kind: 'inline', action: { kind: 'fault', fault: 'unheard', node: 4, zone: 1, origin: 0 } } },
+  { name: "Gateway cut's first run at its cap", view: { story: { ...gw('sent'), fault: 'unheard', next: 'sandbox' }, gateway: 4, clock: 'capped' }, action: { kind: 'inline', action: { kind: 'fault', fault: 'unheard', node: 4, zone: 1, origin: 0 } } },
+  { name: "Gateway cut's ending at its cap", view: { story: gwAfter('done', 'unheard'), gateway: 4, clock: 'capped' }, action: { kind: 'go', to: 'sandbox' } },
+  { name: 'Gateway faulted, its run', view: { story: gwAfter('faulted'), gateway: 4, clock: 'settled' }, action: wait('failover') },
+  { name: 'Gateway faulted, playing', view: { story: gwAfter('faulted'), gateway: 4, clock: 'playing' }, action: wait('failover') },
+  { name: 'Gateway faulted, paused by the reader', view: { story: gwAfter('faulted'), gateway: 4 }, action: press('play') },
+  { name: 'Gateway faulted, capped', view: { story: gwAfter('faulted'), gateway: 4, clock: 'capped' }, action: press('play') },
+  { name: 'Gateway failure at the end', view: { story: gwAfter('done'), gateway: 4, repair: ['Reconnect node 4'] }, action: { kind: 'go', to: 'gateway-cut' } },
+  { name: 'Gateway cut at the end', view: { story: gwAfter('done', 'unheard'), gateway: 4 }, action: { kind: 'go', to: 'sandbox' } },
   // The watched scenarios and Sandbox.
   { name: 'a watched scenario, paused', view: { story: { kind: 'watch', watched: 'loss', next: 'rate-limiting' } }, action: press('play') },
   { name: 'a watched scenario, playing', view: { story: { kind: 'watch', watched: 'loss', next: 'rate-limiting' }, clock: 'playing' }, action: { kind: 'watch', what: 'loss', next: 'rate-limiting' } },
