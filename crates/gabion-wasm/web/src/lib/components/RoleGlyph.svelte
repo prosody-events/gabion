@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { brim, chord, dashedRing, port, SvgPen } from '../glyphs';
+  import { barrier, brim, chord, dashedRing, discHatch, port, SvgPen } from '../glyphs';
   import { PREVIEW_DASH } from '../stage/layout';
 
   // A node mark as the stage draws it, for the DOM: the key, the node table,
@@ -14,6 +14,9 @@
     | 'preview'
     | 'port'
     | 'suspect'
+    | 'silenced'
+    | 'unheard'
+    | 'zone-cut'
     | 'rejected'
     | 'lost'
     | 'ack';
@@ -36,6 +39,10 @@
   const arc = path((p) => p.arc(0, 0, R + 2.5, -Math.PI / 2, Math.PI));
   const preview = path((p) => dashedRing(p, R + 2.5, [PREVIEW_DASH[0] / 2, PREVIEW_DASH[1] / 2]));
   const diamond = path((p) => port(p, 0, 0, 4.5, Math.PI / 2));
+  const hatched = path((p) => discHatch(p, R - 1, 2.5));
+  const silencedEdge = path((p) => dashedRing(p, R, [PREVIEW_DASH[0] / 2, PREVIEW_DASH[1] / 2]));
+  const wall = path((p) => barrier(p, R + 2.5, Math.PI, 0.7));
+  const cutZone = path((p) => dashedRing(p, 7, [3, 2]));
 </script>
 
 <svg class="glyph" width="16" height="16" viewBox="-8 -8 16 16" aria-hidden="true" data-glyph={kind}>
@@ -66,6 +73,15 @@
     <path class="ink" d={diamond} />
   {:else if kind === 'suspect'}
     <path class="hollow" d={diamond} />
+  {:else if kind === 'silenced'}
+    <path class="panel" d={disc} />
+    <path class="grid-stroke" d={hatched} />
+    <path class="ink-stroke" d={silencedEdge} />
+  {:else if kind === 'unheard'}
+    <path class="panel axis-thin" d={disc} />
+    <path class="bad-stroke thick" d={wall} />
+  {:else if kind === 'zone-cut'}
+    <path class="muted-stroke" d={cutZone} />
   {:else if kind === 'lost'}
     <path class="muted-stroke" d="M-7 0L2 0M2 -5L2 5" />
   {:else if kind === 'ack'}
@@ -130,6 +146,11 @@
   .muted-stroke {
     stroke: var(--chart-muted);
     stroke-width: 1.5;
+  }
+
+  .grid-stroke {
+    stroke: var(--chart-grid);
+    stroke-width: 1;
   }
 
   .bad-stroke {

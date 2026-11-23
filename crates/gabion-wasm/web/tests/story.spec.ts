@@ -641,6 +641,13 @@ test('cuts are drawn, listed and reconnected one by one, and Add keeps its zone 
   const g = Number(/\d+/.exec((await silence.textContent()) ?? '')?.[0]);
   await silence.click();
   await expect.poll(async () => (await marks(page)).silenced).toEqual([g]);
+  // The key names each fault mark drawn (A5), and a fault's disabled button
+  // says why beside it (A50).
+  const key = page.locator('.key:not(.sizer) li');
+  await expect(key.filter({ hasText: 'zone cut off' })).toHaveCount(1);
+  await expect(key.filter({ hasText: 'a silenced node' })).toHaveCount(1);
+  await expect(silence).toBeDisabled();
+  await expect(faults.locator('.reason').first()).toHaveText(`node ${g} is silenced`);
   const cuts = page.locator('.rail .cuts li');
   await expect(cuts).toHaveText([/^zone c cut off/, new RegExp(`^node ${g} silenced`)]);
   await expect(heal).toHaveText('Heal 2 cuts');
@@ -648,6 +655,7 @@ test('cuts are drawn, listed and reconnected one by one, and Add keeps its zone 
   await page.locator('.rail .cuts').getByRole('button', { name: 'Reconnect zone c' }).click();
   await expect.poll(async () => (await marks(page)).zone).toEqual([]);
   expect((await marks(page)).silenced, 'the other cut stays drawn').toEqual([g]);
+  await expect(key.filter({ hasText: 'zone cut off' }), 'a key item leaves with its mark').toHaveCount(0);
   await expect(cuts).toHaveText([new RegExp(`^node ${g} silenced`)]);
   await expect(page.locator('.lede')).toContainText(`node ${g} silenced`);
   await still(page, 60_000);

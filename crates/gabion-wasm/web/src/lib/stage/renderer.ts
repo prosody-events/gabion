@@ -88,8 +88,10 @@ export const BOUNCE_MS = 600;
 // reduced motion, px.
 const REBOUND = 0.3;
 const HATCH_STEP = 4;
-// Half the angle a barrier spans either side of the zone it faces.
+// Half the angle a barrier spans either side of the zone it faces, and its gap
+// outside where a port would stand, px: it never meets the port.
 const BARRIER_HALF = 0.6;
+const BARRIER_GAP = 3;
 // A cut zone's ring: long dashes, so it reads at the zone's scale.
 const ZONE_CUT_DASH: readonly [number, number] = [10, 6];
 // The segments the heartbeat sweep reveals round the selection outline.
@@ -162,8 +164,11 @@ export const MARK = {
   PORT: 16,
   SUSPECT: 32,
   CAP: 64,
-  LOST: 128,
-  DOT: 256,
+  SILENCED: 128,
+  UNHEARD: 256,
+  ZONE_CUT: 512,
+  LOST: 1024,
+  DOT: 2048,
 } as const;
 
 /** A ring's colour role: caught up (neutral, closed) or behind (amber arc). */
@@ -413,6 +418,7 @@ export class StageRenderer {
   #selectionStroke: Stroke = { width: SELECTION_WIDTH, color: 0, alpha: 1 };
   #previewStroke: Stroke = { width: SELECTION_WIDTH, color: 0, alpha: 1, cap: 'butt' };
   #hatchStroke: Stroke = { width: 1.5, color: 0, alpha: 1 };
+  #silencedHatch: Stroke = { width: 1.5, color: 0, alpha: 1 };
   #faultStroke: Stroke = { width: 1, color: 0, alpha: 1, cap: 'butt' };
   #barrierStroke: Stroke = { width: CAP_WIDTH, color: 0, alpha: 1, cap: 'butt' };
   #nameStyle = new TextStyle();
@@ -469,6 +475,8 @@ export class StageRenderer {
   #bounceHits = 0;
   // Marks a lost packet or a dot drew since the run began.
   #beamMarks = 0;
+  /** `MARK` bits of the faults drawn now. */
+  #faultMarks = 0;
   readonly #onMarks: (marks: number) => void;
   readonly #onGliding: (ids: readonly number[]) => void;
 
@@ -663,7 +671,12 @@ export class StageRenderer {
     }
     // For the audit: the marks drawn, by kind.
     this.#app.canvas.dataset.faults = JSON.stringify(drawn);
+    this.#faultMarks =
+      (drawn.silenced.length > 0 ? MARK.SILENCED : 0) |
+      (drawn.unheard.length > 0 ? MARK.UNHEARD : 0) |
+      (drawn.zone.length > 0 ? MARK.ZONE_CUT : 0);
     this.#placeLabels();
+    this.#publishMarks();
   }
 
   /** Redraw node `gfx`'s fault mark, or clear it. */
@@ -673,14 +686,18 @@ export class StageRenderer {
     if (fault === undefined) return;
     const r = gfx.radius;
     if (fault.kind === 'silenced') {
-      dashedRing(g, r + 1, PREVIEW_DASH);
+      // A faint hatch, so the count over it still reads, inside a dashed edge.
       discHatch(g, r - 2, HATCH_STEP);
+      g.stroke(this.#silencedHatch);
+      dashedRing(g, r - 1, PREVIEW_DASH);
       g.stroke(this.#faultStroke);
       return;
     }
     const ring = this.#layout?.rings[gfx.zone];
     if (ring === undefined) return;
-    barrier(g, r + SELECTION_GAP, Math.atan2(ring.y - gfx.center.y, ring.x - gfx.center.x), BARRIER_HALF);
+    // Past where its port would stand: the port faces the same zone.
+    const reach = r + RING_REACH + PORT_GAP + 2 * portHalf(r) + BARRIER_GAP + CAP_WIDTH / 2;
+    barrier(g, reach, Math.atan2(ring.y - gfx.center.y, ring.x - gfx.center.x), BARRIER_HALF);
     g.stroke(this.#barrierStroke);
   }
 
@@ -816,7 +833,7 @@ export class StageRenderer {
    *  the theme. A line's strokes and fills are opaque: its Graphics' alpha
    *  carries its ink and its fade. */
   #restyle(): void {
-    const { muted, fg, fgMuted, axis, warn, bad, panel, bg, font, captionSmPx } = this.#theme;
+    const { muted, fg, fgMuted, axis, grid, warn, bad, panel, bg, font, captionSmPx } = this.#theme;
     this.#inStroke = { width: IN_WIDTH, color: muted, alpha: 1, cap: 'round' };
     this.#crossStroke = { width: CROSS_WIDTH, color: fg, alpha: 1, cap: 'round' };
     this.#lostStroke = { width: CROSS_WIDTH, color: muted, alpha: 1, cap: 'round' };
@@ -832,7 +849,8 @@ export class StageRenderer {
     this.#selectionStroke = { width: SELECTION_WIDTH, color: fg, alpha: 1 };
     this.#previewStroke = { width: SELECTION_WIDTH, color: fgMuted, alpha: 1, cap: 'butt' };
     this.#hatchStroke = { width: 1.5, color: bad, alpha: 1 };
-    this.#faultStroke = { width: 1, color: fgMuted, alpha: 1, cap: 'butt' };
+    this.#silencedHatch = { width: 1.5, color: grid, alpha: 1 };
+    this.#faultStroke = { width: 1.5, color: fg, alpha: 1, cap: 'butt' };
     this.#barrierStroke = { width: CAP_WIDTH, color: bad, alpha: 1, cap: 'butt' };
     const stroke = { color: bg, width: 2 * HALO, join: 'round' as const };
     this.#nameStyle = new TextStyle({ fontFamily: font, fontSize: captionSmPx, fontWeight: '400', fill: fgMuted, stroke });
@@ -1241,7 +1259,7 @@ export class StageRenderer {
   /** The kinds of mark drawn now, and tell the page when they change. */
   #publishMarks(): void {
     const glyphs = this.#glyphs;
-    let marks = this.#beamMarks;
+    let marks = this.#beamMarks | this.#faultMarks;
     if (this.#nodes.size > 0) marks |= MARK.RING | (this.#scale.onScale ? MARK.COUNT : MARK.FAR);
     if (glyphs.selected >= 0) marks |= MARK.SELECTED;
     for (let slot = 0; slot < glyphs.len; slot++) {

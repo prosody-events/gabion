@@ -1,6 +1,6 @@
 <script lang="ts">
   import { faultLabel } from '../controls';
-  import type { Cut } from '../cuts';
+  import { cutState, type Cut } from '../cuts';
   import { fmtCount, zoneLabel } from '../format';
   import type { NodeState, PeerView, ZoneMode, ZoneView } from '../sim/types';
   import GossipTargets from './GossipTargets.svelte';
@@ -47,7 +47,9 @@
       .sort((a, b) => a.zone - b.zone),
   );
   const silenced = (id: number): boolean => cuts.some((c) => c.kind === 'silenced' && c.node === id);
-  const unheard = (id: number): boolean => cuts.some((c) => c.kind === 'unheard-in-zone' && c.node === id);
+  /** The cut that already breaks gateway `id`, which disables its buttons. */
+  const breaking = (id: number): Cut | undefined =>
+    cuts.find((c) => (c.kind === 'silenced' || c.kind === 'unheard-in-zone') && c.node === id);
   /** The preview events of a control that names node `id`. */
   const names = (id: number) => ({
     onpointerenter: () => onPreview(id),
@@ -77,17 +79,26 @@
         <details class="faults">
           <summary>Break one of node <span data-field="node">{node.id}</span>'s gateways</summary>
           {#each gateways as g (g.id)}
+            {@const cut = breaking(g.id)}
+            {@const reason = cut === undefined ? undefined : `fault-reason-${g.id}`}
             <div class="fault-row">
-              <button class="btn-secondary" disabled={silenced(g.id)} onclick={() => onSilence(g.id)} {...names(g.id)}
+              <button
+                class="btn-secondary"
+                disabled={silenced(g.id)}
+                aria-describedby={silenced(g.id) ? reason : undefined}
+                onclick={() => onSilence(g.id)}
+                {...names(g.id)}
                 ><Icon name="silence" /><Sentence parts={faultLabel('silenced', g.id, zoneLabel(zones[g.zone].name))} field="fault" /></button
               >
               <button
                 class="btn-secondary"
-                disabled={silenced(g.id) || unheard(g.id)}
+                disabled={cut !== undefined}
+                aria-describedby={reason}
                 onclick={() => onCutFromZone(g.id, g.zone)}
                 {...names(g.id)}
                 ><Icon name="cut" /><Sentence parts={faultLabel('unheard', g.id, zoneLabel(zones[g.zone].name))} field="fault" /></button
               >
+              {#if cut !== undefined}<span class="reason" id={reason}><Sentence parts={cutState(cut, zones)} field="cut" /></span>{/if}
             </div>
           {/each}
         </details>
@@ -157,6 +168,11 @@
     flex-wrap: wrap;
     gap: var(--gap-xs) var(--gap-sm);
     margin-top: var(--gap-xs);
+  }
+
+  .fault-row .reason {
+    align-self: center;
+    color: var(--color-fg-muted);
   }
 
   .fault-row button {

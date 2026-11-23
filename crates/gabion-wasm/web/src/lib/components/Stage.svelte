@@ -290,6 +290,24 @@
       text: ['red brim: at the limit'],
       tip: 'The brim turns red while the node counts the limit: it refuses any request until the oldest hits leave its window.',
     },
+    {
+      bit: MARK.SILENCED,
+      glyph: 'silenced',
+      text: ['a silenced node'],
+      tip: 'A dashed, hatched node is silenced: every packet to or from it is lost. It keeps its count, and the others stop hearing it.',
+    },
+    {
+      bit: MARK.UNHEARD,
+      glyph: 'unheard',
+      text: ["can't reach its zone"],
+      tip: 'The arc faces the node’s own zone, which loses every packet the node sends it. The node still hears its zone.',
+    },
+    {
+      bit: MARK.ZONE_CUT,
+      glyph: 'zone-cut',
+      text: ['zone cut off'],
+      tip: 'A dashed zone ring: every packet between this zone and the others is lost. Inside the zone, its nodes still hear each other.',
+    },
     { bit: MARK.LOST, glyph: 'lost', text: ['lost packet'], tip: 'A packet the network dropped: it stops partway, and is resent.' },
     {
       bit: MARK.DOT,

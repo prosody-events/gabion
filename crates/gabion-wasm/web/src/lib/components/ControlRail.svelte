@@ -292,7 +292,7 @@
         {#each cuts as c, i (i)}
           {@const node = nodeOf(c)}
           <li class="cut">
-            <Sentence parts={cutName(c, zones)} field="cut" />
+            <span><Sentence parts={cutName(c, zones)} field="cut" /></span>
             {#if reconnectInHeading}
               <span class="reason">· its Reconnect is in the heading</span>
             {:else if offered}
