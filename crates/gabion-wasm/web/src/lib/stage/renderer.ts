@@ -33,7 +33,10 @@
 // clock of the renderer's own drives only a ring's sweep and the refusal.
 // Every node's Graphics are built once and redrawn only when what they show
 // changes, so a frame allocates nothing of its own however many packets are
-// drawn.
+// drawn. The stage is drawn only in a frame where something on it changed or
+// moves, not in every frame: an idle stage costs nothing, which on a machine
+// without a GPU (software WebGL, read back for each composited frame) is most
+// of the page's time.
 
 import { gsap } from 'gsap';
 import { Application, Container, Graphics, Text, TextStyle, type Ticker } from 'pixi.js';
@@ -480,6 +483,9 @@ export class StageRenderer {
   // The lines must be faded again though simulated time stood still: a line
   // arrived or the roles changed.
   #dirty = false;
+  // Something on the stage changed since it was last drawn: set by every
+  // public method that draws and by every frame of a node tween.
+  #stale = true;
   // The refusal: its node, its start on the clock and its drop, px.
   #bounceGfx: NodeGfx | null = null;
   #bounceStart = 0;
@@ -528,6 +534,9 @@ export class StageRenderer {
     }
     for (let slot = MAX_STAGE_NODES - 1; slot >= 0; slot--) this.#freeSlots.push(slot);
     this.#restyle();
+    // The tick draws the stage when it changed, in place of Pixi's draw every
+    // frame.
+    this.#app.ticker.remove(this.#app.render, this.#app);
     this.#app.ticker.add(this.#tick, this);
     // The line pool, the Graphics its lines are drawn in (one per slot) and the
     // glyph table, read by the design audit: set once, so a frame pays
@@ -560,6 +569,7 @@ export class StageRenderer {
 
   /** Resize the canvas to `width × height` CSS pixels. */
   resize(width: number, height: number): void {
+    this.#stale = true;
     if (width > 0 && height > 0) this.#app.renderer.resize(width, height);
   }
 
@@ -568,6 +578,7 @@ export class StageRenderer {
    *  the engine's zone names, one per ring. Publishes the stage centre, the
    *  ring geometry and the label boxes on the canvas for the design audit. */
   setLayout(layout: StageLayout, zoneNames: readonly string[]): void {
+    this.#stale = true;
     this.#layout = layout;
     this.#zoneNames = zoneNames;
     const live = new Set<number>();
@@ -632,6 +643,7 @@ export class StageRenderer {
   /** Where the limit sits on the vessels, and how long a feed's newest hits
    *  may lag before they open a ring (0 with no feed). Redraws every vessel. */
   setScale(scale: Scale, grace: number): void {
+    this.#stale = true;
     this.#scale = scale;
     this.#grace = grace;
     this.#glyphs.limit = scale.limit;
@@ -644,6 +656,7 @@ export class StageRenderer {
    *  changed. */
   setCluster(state: ClusterState | null): void {
     if (state === null) return;
+    this.#stale = true;
     this.#cluster = state;
     this.#now = state.virtual_ms;
     this.#syncAll(state);
@@ -651,6 +664,7 @@ export class StageRenderer {
 
   /** Mark the selected node and its gateways' ports, or clear the marks. */
   setRoles(roles: Roles | null): void {
+    this.#stale = true;
     const before = this.#roles;
     this.#roles = roles;
     this.#placeRoles();
@@ -675,6 +689,7 @@ export class StageRenderer {
    *  interior hatched, "node 4 · silenced"; a barrier on the side of a node
    *  its zone cannot hear that faces the zone, "node 4 · can't reach zone b". */
   setFaults(faults: Faults): void {
+    this.#stale = true;
     this.#faults = faults;
     this.#drawGuides();
     const drawn: Record<Fault['kind'] | 'zone', number[]> = { silenced: [], unheard: [], zone: [...faults.zones] };
@@ -717,6 +732,7 @@ export class StageRenderer {
 
   /** Draw the dashed preview of a selection on node `id`, or on none. */
   setPreview(id: number | null): void {
+    this.#stale = true;
     let slot = -1;
     for (const gfx of this.#nodes.values()) {
       gfx.preview.visible = gfx.id === id && gfx.id !== this.#roles?.selected;
@@ -730,6 +746,7 @@ export class StageRenderer {
    *  holds nothing it has not sent. Under reduced motion the outline stays
    *  whole. */
   setAwaiting(fraction: number | null): void {
+    this.#stale = true;
     const sweep = fraction !== null && !this.#reduceMotion;
     this.#sweep.visible = sweep;
     const selected = this.#roles === null ? undefined : this.#nodes.get(this.#roles.selected);
@@ -748,6 +765,7 @@ export class StageRenderer {
   reject(id: number, hits: number): void {
     const gfx = this.#nodes.get(id);
     if (gfx === undefined || !this.#scale.onScale) return;
+    this.#stale = true;
     this.#endBounce();
     const band = gfx.refusal;
     band.visible = true;
@@ -792,6 +810,7 @@ export class StageRenderer {
   /** Draw the packets of `events` as lines, each from the instant it was
    *  sent, at full ink then fading over `FADE_MS` of simulated time. */
   show(events: readonly SimEvent[]): void {
+    this.#stale = true;
     for (let i = 0; i < events.length; i++) {
       const kind = events[i].kind;
       // `PacketDelivered` is the receiver-side echo of a `PacketSent` already
@@ -805,6 +824,7 @@ export class StageRenderer {
 
   /** Drop every line and the refusal: a rebuild. */
   reset(): void {
+    this.#stale = true;
     const pool = this.#pool;
     for (let i = 0; i < pool.len; i++) this.#lines[i].visible = false;
     pool.clear();
@@ -816,6 +836,7 @@ export class StageRenderer {
   /** Re-tint every mark from `theme` (an OS scheme or `data-theme` change),
    *  immediately, including while paused. */
   setTheme(theme: Theme): void {
+    this.#stale = true;
     this.#theme = theme;
     this.#restyle();
     this.#app.renderer.background.color = theme.bg;
@@ -1040,8 +1061,14 @@ export class StageRenderer {
   }
 
   /** Track a node tween so it is killed on destroy, and drop it from the set
-   *  once it finishes so a long session doesn't accumulate inert tweens. */
+   *  once it finishes so a long session doesn't accumulate inert tweens. Each
+   *  of its frames, the last included, marks the stage for drawing. */
   #track(gfx: NodeGfx, tween: gsap.core.Tween): gsap.core.Tween {
+    const update = tween.eventCallback('onUpdate');
+    tween.eventCallback('onUpdate', () => {
+      update?.();
+      this.#stale = true;
+    });
     gfx.tweens.add(tween);
     void tween.then(() => gfx.tweens.delete(tween)).catch(() => {});
     return tween;
@@ -1532,13 +1559,30 @@ export class StageRenderer {
 
   /** The ticker: advance the presentation clock toward the end of the last
    *  sweep or refusal, fade the lines if simulated time or the roles moved,
-   *  then move the rings' sweeps and the refusal. */
+   *  then move the rings' sweeps and the refusal, and draw the stage if any
+   *  of that, a public method or a node tween changed it. */
   #tick(ticker: Ticker): void {
     if (this.#guides.destroyed) return;
-    if (this.#clock < this.#animEnd) this.#clock = Math.min(this.#animEnd, this.#clock + ticker.deltaMS * this.#speed);
-    if (this.#dirty || this.#now !== this.#fadedAt) this.#fadeLines();
-    if (this.#sweeps > 0) this.#tickRings();
-    if (this.#bounceGfx !== null) this.#tickRefusal();
+    let changed = this.#stale;
+    if (this.#clock < this.#animEnd) {
+      this.#clock = Math.min(this.#animEnd, this.#clock + ticker.deltaMS * this.#speed);
+      changed = true;
+    }
+    if (this.#dirty || this.#now !== this.#fadedAt) {
+      this.#fadeLines();
+      changed = true;
+    }
+    if (this.#sweeps > 0) {
+      this.#tickRings();
+      changed = true;
+    }
+    if (this.#bounceGfx !== null) {
+      this.#tickRefusal();
+      changed = true;
+    }
+    if (!changed) return;
+    this.#app.render();
+    this.#stale = false;
   }
 
   /** Move each sweeping ring from its old share toward its new, eased out,
