@@ -236,14 +236,31 @@ export async function recordData(page: Page): Promise<() => Promise<Drawn[]>> {
 /** In a gateway story: Send at node 0, then press the fault the caption
  *  offers once that Send's run has ended, and return the gateway it broke.
  *  With `pause`, the reader pauses the fault's run as soon as it starts, so
- *  later Steps draw it one wave at a time. */
+ *  later Steps draw it one wave at a time. "As soon as" is exact: Pause is
+ *  pressed in the microtask that shows the run playing, before its first
+ *  frame moves simulated time, so where the run stands does not depend on how
+ *  fast the machine is. */
 export async function breakGateway(page: Page, pause = false): Promise<number> {
   await send(page, 0);
   const fault = page.locator('#next-action [data-primary]');
   await expect(fault, 'the fault is the one filled control').toHaveText(/^(Silence node \d+|Cut node \d+ off from zone b)$/);
   const gateway = Number(/node (\d+)/.exec((await fault.textContent()) ?? '')?.[1]);
+  if (pause) {
+    await page.evaluate(() => {
+      const pane = document.querySelector<HTMLElement>('.stage-pane');
+      if (pane === null) throw new Error('the stage pane is missing');
+      const observer = new MutationObserver(() => {
+        if (pane.dataset.playing !== '1') return;
+        observer.disconnect();
+        [...document.querySelectorAll<HTMLButtonElement>('.transport button')].find((b) => b.textContent?.trim() === 'Pause')?.click();
+      });
+      observer.observe(pane, { attributes: true, attributeFilter: ['data-playing'] });
+      (window as unknown as { pauseOnStart: MutationObserver }).pauseOnStart = observer;
+    });
+  }
   await fault.click();
   await expect(page.locator('.lede')).toContainText(`node ${gateway}`);
-  if (pause) await pauseIfPlaying(page);
+  // A run that never started leaves no Pause pending for a later one.
+  if (pause) await page.evaluate(() => (window as unknown as { pauseOnStart: MutationObserver }).pauseOnStart.disconnect());
   return gateway;
 }

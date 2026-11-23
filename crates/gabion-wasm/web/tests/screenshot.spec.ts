@@ -726,20 +726,13 @@ test('gateway failure fails over and the zone catches up', async ({ page }) => {
 
   const gateway = inspector.locator('tr.remote[data-zone="1"] [data-field="gateway"]');
   const g = Number(await gateway.textContent());
-  expect(await breakGateway(page, true), "the offer breaks node 0's gateway into zone b").toBe(g);
-  await expect(lede(page)).toContainText(`node ${g} silenced`);
-
-  // Step until the narration names a failover off g into zone b and node 0
-  // has moved off g. The sentence names the new gateway first, then g.
-  const annotation = page.locator('.narration');
-  const failover = /^node (\d+) now reaches zone b through node (\d+), after node (\d+)$/;
-  const sentence = async (): Promise<RegExpExecArray | null> =>
-    failover.exec(((await annotation.textContent()) ?? '').replace(/\s+/g, ' ').trim());
-  const moved = async (): Promise<boolean> =>
-    Number((await sentence())?.[3]) === g && Number(await gateway.textContent()) !== g;
-  // Each Step, the zone b row wears the glyph and word of the answer state
-  // node 0's runtime reports for its gateway: a port, "ok" while settled or
-  // owed; a hollow port, "suspected" or "cannot relay" otherwise.
+  // The zone b row wears the glyph and word of the answer state node 0's
+  // runtime reports for its gateway: a port, "ok" while settled or owed; a
+  // hollow port, "suspected" or "cannot relay" otherwise. It is checked on the
+  // healthy cluster, where the gateway is settled, then after each Step once
+  // the fault is pressed. The press plays a run in wall time until the test
+  // pauses it, so how far that run gets depends on the machine: the settled
+  // check comes before the press.
   const shown: Record<AnswerState, readonly [string, string]> = {
     settled: ['port', 'ok'],
     owed: ['port', 'ok'],
@@ -760,6 +753,19 @@ test('gateway failure fails over and the zone catches up', async ({ page }) => {
     expect(text.endsWith(` · ${label}`), `a ${answer} gateway's word in "${text}"`).toBe(true);
     answers.add(answer);
   };
+  await checkRow();
+  expect([...answers], "the healthy cluster's gateway into zone b is settled").toEqual(['settled']);
+  expect(await breakGateway(page, true), "the offer breaks node 0's gateway into zone b").toBe(g);
+  await expect(lede(page)).toContainText(`node ${g} silenced`);
+
+  // Step until the narration names a failover off g into zone b and node 0
+  // has moved off g. The sentence names the new gateway first, then g.
+  const annotation = page.locator('.narration');
+  const failover = /^node (\d+) now reaches zone b through node (\d+), after node (\d+)$/;
+  const sentence = async (): Promise<RegExpExecArray | null> =>
+    failover.exec(((await annotation.textContent()) ?? '').replace(/\s+/g, ' ').trim());
+  const moved = async (): Promise<boolean> =>
+    Number((await sentence())?.[3]) === g && Number(await gateway.textContent()) !== g;
   await stepUntil(
     page,
     async () => {
