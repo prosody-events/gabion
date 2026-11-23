@@ -555,7 +555,8 @@ test('Zone partition admits on each side, then counts all of it (A48)', async ({
 test('Requests per Send is checked when committed, not while typed (A59, A50)', async ({ page }, info) => {
   test.skip(info.project.name !== 'audit-1440-light', 'the field, checked once');
   await open(page);
-  const field = page.locator('#burst-requests');
+  const field = page.getByLabel('Requests per Send', { exact: true });
+  await expect(field, 'the field is labelled Requests per Send').toHaveAttribute('id', 'burst-requests');
   const send = sendButton(page);
   await field.click();
   await field.press('ControlOrMeta+a');
@@ -634,10 +635,12 @@ interface Played {
 
 /** Press Play and read the first frame at least 300 ms of simulated time
  *  later: a stage mark changed by then, or the narration says nothing is
- *  coming and quotes the filled control's label verbatim (A61). Simulated
- *  time, not wall time, so the outcome is the same however loaded the
- *  machine; the wall time is printed. The NEXT line, the narration and the
- *  time readout are not marks. Pauses again after. */
+ *  coming and quotes the filled control's label verbatim (A61). The marks are
+ *  first read from a stage at rest, so a ring's sweep or a refusal that a
+ *  Send left playing cannot pass for Play's. Simulated time, not wall time,
+ *  so the outcome is the same however loaded the machine; the wall time is
+ *  printed. The NEXT line, the narration and the time readout are not marks.
+ *  Pauses again after. */
 async function playChecks(page: Page, where: string): Promise<void> {
   await page.mouse.move(0, 0);
   const seen = await page.evaluate(
@@ -660,13 +663,17 @@ async function playChecks(page: Page, where: string): Promise<void> {
           };
         }
         const text = (el: Element | null): string => (el?.textContent ?? '').replace(/\s+/g, ' ').trim();
+        // Each node's count, in grid order, '' while its disc hides it. A
+        // count moved when it shows at both reads and differs: one shown or
+        // hidden as the layout fits it is no hit arriving.
+        const counts = (): string[] => [...document.querySelectorAll('[role="gridcell"]')].map((c) => text(c.querySelector('[data-field="node-view"]')));
+        const moved = (a: string[], b: string[]): boolean => a.length === b.length && a.some((c, i) => c !== '' && b[i] !== '' && c !== b[i]);
         const sig = (): string => {
           const g = canvas.glyphs;
           const marks: number[] = [w.arrivals, g.sweep, g.bounce];
           for (let s = 0; s < g.len; s++) marks.push(g.arc[s], g.ring[s], g.fillTop[s], g.strata[s], g.cap[s]);
-          const counts = [...document.querySelectorAll('[data-field="node-view"]')].map(text);
           const decisions = [...document.querySelectorAll('.decision')].map(text);
-          return JSON.stringify([marks, counts, decisions, text(document.querySelector('[data-template]'))]);
+          return JSON.stringify([marks, decisions, text(document.querySelector('[data-template]'))]);
         };
         const ms = (): number => Number(document.querySelector<HTMLElement>('[data-field="virtual-time"]')?.dataset.ms);
         const meter = (): number => Number(document.querySelector('#next-action [role="progressbar"]')?.getAttribute('aria-valuenow') ?? -1);
@@ -675,31 +682,43 @@ async function playChecks(page: Page, where: string): Promise<void> {
           reject(new Error('no Play button'));
           return;
         }
-        const before = sig();
-        const from = ms();
-        const t0 = performance.now();
-        play.click();
-        let firstMeter = -1;
-        const timer = setTimeout(() => reject(new Error(`300 ms of simulated time did not pass in 15 s (${ms() - from} ms did)`)), 15_000);
-        const frame = (): void => {
-          const m = meter();
-          if (firstMeter < 0) firstMeter = m;
-          if (ms() < from + 300) {
-            requestAnimationFrame(frame);
+        const timer = setTimeout(() => reject(new Error('the stage did not rest, or 300 ms of simulated time did not pass, in 15 s')), 15_000);
+        // At rest: no refusal plays, and no mark or count moved since the
+        // last frame.
+        let before = sig();
+        let shown = counts();
+        const rest = (): void => {
+          const [now, nowShown] = [sig(), counts()];
+          if (now !== before || nowShown.join() !== shown.join() || canvas.glyphs.bounce >= 0) {
+            [before, shown] = [now, nowShown];
+            requestAnimationFrame(rest);
             return;
           }
-          clearTimeout(timer);
-          const primary = document.querySelector<HTMLElement>('[data-primary]');
-          const enabled = primary !== null && !(primary as HTMLButtonElement).disabled;
-          resolve({
-            changed: sig() !== before || (firstMeter >= 0 && m > firstMeter),
-            said: text(document.querySelector('.narration [aria-live]')),
-            label: enabled ? primary.innerText.replace(/\s+/g, ' ').trim() : null,
-            wallMs: performance.now() - t0,
-            ms: ms() - from,
-          });
+          const from = ms();
+          const t0 = performance.now();
+          play.click();
+          let firstMeter = -1;
+          const frame = (): void => {
+            const m = meter();
+            if (firstMeter < 0) firstMeter = m;
+            if (ms() < from + 300) {
+              requestAnimationFrame(frame);
+              return;
+            }
+            clearTimeout(timer);
+            const primary = document.querySelector<HTMLElement>('[data-primary]');
+            const enabled = primary !== null && !(primary as HTMLButtonElement).disabled;
+            resolve({
+              changed: sig() !== before || moved(counts(), shown) || (firstMeter >= 0 && m > firstMeter),
+              said: text(document.querySelector('.narration [aria-live]')),
+              label: enabled ? primary.innerText.replace(/\s+/g, ' ').trim() : null,
+              wallMs: performance.now() - t0,
+              ms: ms() - from,
+            });
+          };
+          requestAnimationFrame(frame);
         };
-        requestAnimationFrame(frame);
+        requestAnimationFrame(rest);
       }),
   );
   console.log(`${where}: read ${seen.ms} ms simulated, ${Math.round(seen.wallMs)} ms wall after Play`);

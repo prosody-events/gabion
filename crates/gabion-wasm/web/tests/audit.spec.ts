@@ -502,6 +502,11 @@ async function checkHeading(page: Page, where: string, snap: ClusterState): Prom
   const selected = Number(await text(page.locator('.pane-title [data-field="node"]')));
   const brim = (await snapshot(page, selected)).nodes.find((n) => n.id === selected)?.brim;
   const reopens = await claims('reopens');
+  // Among the scale's settled forms, rl-3 exactly while the selected node
+  // refuses the next request, by the engine's word, not the heading's.
+  if (id === 'rl-2' || id === 'rl-3' || id === 'rl-5') {
+    expect(id === 'rl-3', `${where}: the heading reads ${id} while node ${selected}'s brim is ${brim?.kind}`).toBe(brim?.kind === 'Rejected');
+  }
   if (id === 'rl-3' && brim?.kind === 'Rejected') {
     expect(reopens, `${where}: the countdown`).toEqual([`${(Math.floor(brim.reopens_ms / 100) / 10).toFixed(1)} s`]);
   } else {
@@ -2021,6 +2026,8 @@ test('the node glyph tells level, strata, cap, refusal and ring (A42, A16)', asy
   }
   const snap = await snapshot(page);
   await checkGlyphs(page, `${where}, at the limit`, 'Rate limiting');
+  // The selected node refuses the next request: the heading counts it down.
+  await checkHeading(page, `${where}, at the limit`, snap);
   const strata = await glyphs(page, (g) => Array.from({ length: g.len }, (_, s) => [g.id[s], g.strata[s]] as [number, number]));
   const buckets = snap.window_buckets.length / snap.nodes.length;
   for (const [i, node] of snap.nodes.entries()) {
