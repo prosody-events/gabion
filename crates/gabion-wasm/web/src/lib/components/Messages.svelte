@@ -81,6 +81,16 @@
   let stale = $state(false);
   let scroller = $state<HTMLDivElement>();
   let hovered = $state<number | null>(null);
+  let width = $state(348);
+
+  /** Below this content width the list drops its time column (the
+   *  instant stays in each row's accessible name and the detail). */
+  const NARROW = 300;
+  /** The message column's width: the content less the columns before it and
+   *  their 8 px gutters, as the grid lays them out. */
+  const messageWidth = $derived(
+    width - (width < NARROW ? 0 : 56) - (pair !== null ? 80 : filter.scope.kind === 'All' ? 136 : 108),
+  );
 
   /** Read the window from ordinal `from`. */
   function read(from: number): void {
@@ -212,7 +222,7 @@
       case 'Escape':
         event.preventDefault();
         if (detail !== null) select(null);
-        else if (view.scope === 'pair') setView({ scope: 'node' });
+        else if (pair !== null) setView({ scope: { kind: 'node' } });
         else document.getElementById('pane-tab-messages')?.focus();
         return;
       case ' ':
@@ -236,7 +246,7 @@
   function wordsOf(r: Extract<Row, { kind: 'message' }>): { role: string; lost: boolean; gist: string; riders: string[]; more: number } {
     const riders = riderWords(r.riders, r.repeat, zoneOf(r.dst));
     // Source Sans 3 at 12 px averages about 5.2 px a character.
-    const budget = Math.floor((pair !== null ? 210 : view.scope === 'all' ? 156 : 184) / 5.2);
+    const budget = Math.floor(messageWidth / 5.2);
     let used = ROLE_WORD[r.role].length + (r.fate === 'lost' ? 7 : 0);
     let g = gist(r);
     if (used + g.length + 3 > budget) g = '';
@@ -260,7 +270,7 @@
   const says = $derived<Says>({ name, zoneOf, cut: detail === null ? undefined : cutWords(detail.src, detail.dst) });
 
   const scopeWords = $derived(
-    pair !== null ? `the messages between node ${pair[0]} and node ${pair[1]}` : view.scope === 'all' ? "every node's messages" : `the messages to and from node ${selected}`,
+    pair !== null ? `the messages between node ${pair[0]} and node ${pair[1]}` : filter.scope.kind === 'All' ? "every node's messages" : `the messages to and from node ${selected}`,
   );
 
   /** The previous message in the window before row `i`, for interval words. */
@@ -281,10 +291,10 @@
   const shownTotal = $derived(head === null ? 0 : head.scopeCount);
 </script>
 
-<div class="messages" data-messages>
+<div class="messages" data-messages bind:clientWidth={width}>
   <div class="scope-row">
-    {#if view.scope === 'all'}
-      <button class="btn-secondary chip-button" onclick={() => setView({ scope: 'node' })} {...{ onpointerenter: () => onPreview(selected), onpointerleave: () => onPreview(null) }}
+    {#if filter.scope.kind === 'All'}
+      <button class="btn-secondary chip-button" onclick={() => setView({ scope: { kind: 'node' } })} {...{ onpointerenter: () => onPreview(selected), onpointerleave: () => onPreview(null) }}
         >Only node {selected}</button
       >
     {:else}
@@ -294,7 +304,7 @@
           class="chip-x"
           aria-label={pair !== null ? `Back to node ${selected}'s messages` : "Show every node's messages"}
           title={pair !== null ? 'Shift+click a second node to see only the two' : undefined}
-          onclick={() => setView({ scope: pair !== null ? 'node' : 'all' })}>×</button
+          onclick={() => setView({ scope: { kind: pair !== null ? 'node' : 'all' } })}>×</button
         >
       </span>
     {/if}
@@ -309,7 +319,7 @@
           <button class="segment" aria-pressed={view.pairWay === w} onclick={() => setView({ pairWay: w as MessagesView['pairWay'] })}>{label}</button>
         {/each}
       </div>
-    {:else if view.scope === 'node'}
+    {:else if filter.scope.kind === 'Node'}
       <div class="segments" role="group" aria-label="Direction">
         {#each ['Both', 'Sent', 'Received'] as w (w)}
           <button class="segment" aria-pressed={view.way === w} onclick={() => setView({ way: w as MessagesView['way'] })}>{w}</button>
@@ -329,13 +339,13 @@
     {/if}
   </div>
 
-  <div class="list-head" class:pair={pair !== null} class:all={view.scope === 'all' && pair === null} aria-hidden="true">
+  <div class="list-head" class:pair={pair !== null} class:all={filter.scope.kind === 'All'} aria-hidden="true">
     <span class="time">Time (s)</span>
     {#if pair !== null}
       <span class="ladder lanes"><span>node {pair[0]}</span><span>node {pair[1]}</span></span>
     {:else}
       <span class="mark"></span>
-      <span class="peer">{view.scope === 'all' ? 'Route' : 'Peer'}</span>
+      <span class="peer">{filter.scope.kind === 'All' ? 'Route' : 'Peer'}</span>
     {/if}
     <span class="message">Message</span>
   </div>
@@ -359,7 +369,7 @@
       {#if empty}
         <p class="empty">
           {#if head !== null && head.total === 0}
-            No messages yet · each Send makes some: data to node {selected}'s zone and its gateways, relays into the other zones, then acknowledgements
+            No messages yet · each wave of requests makes some: data to the sender's zone and its gateways, relays into the other zones, then acknowledgements
           {:else if view.types !== 0 || view.lostOnly}
             No {typeToken ?? 'lost'} messages among {scopeWords.replace('the messages', 'the')} · a gap report asks for a repeat after a packet is lost; the Packet loss scenario has them
           {:else}
@@ -375,7 +385,7 @@
           class:hovered={r.kind === 'message' && hovered === r.seq}
           class:muted={r.kind === 'message' && (r.role === 'Ack' || r.role === 'ProbeAnswer') && r.riders === 0 && r.relation !== 2}
           class:pair={pair !== null}
-          class:all={view.scope === 'all' && pair === null}
+          class:all={filter.scope.kind === 'All'}
           role="row"
           tabindex="-1"
           aria-rowindex={r.ordinal + 2}
@@ -415,7 +425,7 @@
             {:else}
               <span class="mark" role="gridcell"><MessageMark role={r.role} cells={r.cells} tier={r.tier} fate={r.fate} /></span>
               <span class="peer" role="gridcell">
-                {#if view.scope === 'all'}
+                {#if filter.scope.kind === 'All'}
                   <span class:me={r.src === selected}>{name(r.src)}</span>&thinsp;→&thinsp;<span class:me={r.dst === selected}>{name(r.dst)}</span>
                 {:else}
                   {r.src === selected ? `to ${name(r.dst)}` : `from ${name(r.src)}`}
@@ -453,7 +463,7 @@
         {stale}
         pairShown={pair !== null && ((pair[0] === detail.src && pair[1] === detail.dst) || (pair[0] === detail.dst && pair[1] === detail.src))}
         onFollow={follow_link}
-        onPair={(a, b) => setView({ scope: 'pair', other: a === selected ? b : b === selected ? a : b })}
+        onPair={(a, b) => setView({ scope: { kind: 'pair', pair: [a, b], under: selected } })}
         {onPreview}
       />
     {:else if head !== null}
@@ -471,7 +481,7 @@
       {#if head.bytesShown > 0} · <b>{(head.bytesShown / 1000).toFixed(1)}</b>{'\u202F'}kB{/if}
       {#if head.lostShown > 0} · <b>{fmtCount(head.lostShown)}</b> lost{/if}
       {#if !live && head.inFlight > 0} · <b>{fmtCount(head.inFlight)}</b> in flight{/if}
-      {#if !live && head.inFlightAll > head.inFlight && view.scope !== 'all'}
+      {#if !live && head.inFlightAll > head.inFlight && filter.scope.kind !== 'All'}
         · <b>{fmtCount(head.inFlightAll - head.inFlight)}</b> more in flight outside {pair !== null ? `node ${pair[0]} ↔ node ${pair[1]}` : `node ${selected}`}{/if}
       {#if head.total > head.kept} · the last <b>{fmtCount(head.kept)}</b> of <b>{fmtCount(head.total)}</b> are kept{/if}
       {#if !following && newer > 0}
@@ -482,11 +492,20 @@
 </div>
 
 <style>
+  /* The view fills the pane: the bottom region takes what the list leaves,
+     at least 240 px, and scrolls within. */
   .messages {
+    flex: 1 1 0;
+    min-height: 0;
     display: flex;
     flex-direction: column;
     gap: var(--gap-sm);
     min-width: 0;
+    container: messages / inline-size;
+  }
+
+  .messages > :not(.message-bottom) {
+    flex: none;
   }
 
   .scope-row,
@@ -729,7 +748,8 @@
   .message-bottom {
     padding-top: var(--gap-sm);
     border-top: 1px solid var(--color-border-line);
-    max-height: 371px;
+    flex: 1 1 0;
+    min-height: 240px;
     overflow-y: auto;
   }
 
@@ -742,5 +762,31 @@
 
   .newer {
     float: right;
+  }
+
+  /* Keep in step with NARROW: the time column gives way to the message. */
+  @container messages (width < 300px) {
+    .list-head,
+    .row {
+      grid-template-columns: 16px 76px 1fr;
+    }
+
+    .list-head.all,
+    .row.all {
+      grid-template-columns: 16px 104px 1fr;
+    }
+
+    .list-head.pair,
+    .row.pair {
+      grid-template-columns: 72px 1fr;
+    }
+
+    .time {
+      display: none;
+    }
+
+    .marker-text {
+      grid-column: 1 / -1;
+    }
   }
 </style>

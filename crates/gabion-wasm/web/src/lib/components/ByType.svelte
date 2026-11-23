@@ -25,6 +25,10 @@
   } = $props();
 
   const GLYPH: Partial<Record<MessageType, Glyph>> = {
+    OwnData: 'data',
+    RelayData: 'data',
+    Repeat: 'data',
+    SweepPage: 'data',
     Ack: 'ack',
     ProbeAnswer: 'ack',
     Skip: 'ack',

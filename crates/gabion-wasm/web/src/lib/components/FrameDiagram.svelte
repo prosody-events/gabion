@@ -77,7 +77,7 @@
   const summary = $derived.by((): string => {
     const set = FLAG_BITS.filter((b) => (detail.header.flags & (1 << b.bit)) !== 0).map((b) => `bit ${b.bit}, ${b.name}`);
     const kind = `byte 6, kind ${KIND_WORDS[bytes[6]] ?? bytes[6]}`;
-    return `What makes it ${ROLE_WORD[detail.role] === 'ack' ? 'an' : 'a'} ${ROLE_WORD[detail.role]}: ${[kind, ...set].join('; ')}. Point at any field, or move to it with ← →, for its meaning.`;
+    return `What makes it ${/^[aeiou]/.test(ROLE_WORD[detail.role]) ? 'an' : 'a'} ${ROLE_WORD[detail.role]}: ${[kind, ...set].join('; ')}. Point at any field, or move to it with ← →, for its meaning.`;
   });
 
   function onKeydown(event: KeyboardEvent, i: number): void {
@@ -390,5 +390,12 @@
 
   .byte.group {
     margin-left: 6px;
+  }
+
+  /* In a narrow Messages view a field's words wrap inside its box. */
+  @container messages (width < 300px) {
+    .box {
+      white-space: normal;
+    }
   }
 </style>

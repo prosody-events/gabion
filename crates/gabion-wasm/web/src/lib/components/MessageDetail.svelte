@@ -30,7 +30,10 @@
   } = $props();
 
   const fate = $derived(detail.fate.kind === 'Lost' ? ` · lost: ${lostWords(detail.fate.by, detail.dst, detail.src, says.cut)}` : detail.fate.kind === 'InFlight' ? ' · in flight' : '');
-  const shortId = (hex: string): string => `${hex.replace(/^0+/, '').slice(0, 4) || '0'}…`;
+  const shortId = (hex: string): string => {
+    const id = hex.replace(/^0+/, '') || '0';
+    return id.length > 4 ? `${id.slice(0, 4)}…` : id;
+  };
   const names = (id: number) => ({
     onpointerenter: () => onPreview(id),
     onpointerleave: () => onPreview(null),

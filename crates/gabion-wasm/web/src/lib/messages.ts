@@ -65,12 +65,9 @@ export interface MessageFilter {
 }
 
 /** The view a reader chose, kept on the run: whose messages, which way and
- *  tier, which types, lost only, and the message selected. The node scope
- *  follows the selection. */
+ *  tier, which types, lost only, and the message selected. */
 export interface MessagesView {
-  scope: 'node' | 'pair' | 'all';
-  /** The pair's other node, with the selected one. */
-  other: number;
+  scope: ViewScope;
   way: Way;
   pairWay: PairWay;
   tier: TierFilter;
@@ -78,15 +75,21 @@ export interface MessagesView {
   lostOnly: boolean;
 }
 
-export const FRESH_VIEW: MessagesView = { scope: 'node', other: -1, way: 'Both', pairWay: 'Both', tier: 'Any', types: 0, lostOnly: false };
+/** Whose messages: the selected node's, a pair's, or every node's. The node
+ *  scope follows the selection; a pair holds while the node selected when it
+ *  was set stays selected, and a new selection returns to the node scope. */
+export type ViewScope = { kind: 'node' } | { kind: 'pair'; pair: readonly [number, number]; under: number } | { kind: 'all' };
+
+export const FRESH_VIEW: MessagesView = { scope: { kind: 'node' }, way: 'Both', pairWay: 'Both', tier: 'Any', types: 0, lostOnly: false };
 
 /** The engine's filter for `view` with `selected` the selected node. */
 export function filterOf(view: MessagesView, selected: number): MessageFilter {
+  const v = view.scope;
   const scope: MessageScope =
-    view.scope === 'all'
+    v.kind === 'all'
       ? { kind: 'All', tier: view.tier }
-      : view.scope === 'pair' && view.other !== selected
-        ? { kind: 'Pair', pair: [selected, view.other], way: view.pairWay }
+      : v.kind === 'pair' && v.under === selected
+        ? { kind: 'Pair', pair: [v.pair[0], v.pair[1]], way: view.pairWay }
         : { kind: 'Node', node: selected, way: view.way, tier: view.tier };
   return { scope, types: view.types, lost_only: view.lostOnly };
 }

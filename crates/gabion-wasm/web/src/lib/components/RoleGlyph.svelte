@@ -19,6 +19,7 @@
     | 'zone-cut'
     | 'rejected'
     | 'lost'
+    | 'data'
     | 'ack'
     | 'ask'
     | 'gap';
@@ -88,6 +89,8 @@
     <path class="muted-stroke" d={cutZone} />
   {:else if kind === 'lost'}
     <path class="muted-stroke" d="M-7 0L2 0M2 -5L2 5" />
+  {:else if kind === 'data'}
+    <path class="muted" d="M3 0L-3 -3.5L-3 3.5Z" />
   {:else if kind === 'ack'}
     <circle class="muted" r="2" />
   {:else if kind === 'ask'}

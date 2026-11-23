@@ -143,3 +143,45 @@ test('a selected message reads as its frame', async ({ page }) => {
   await expect(page.locator('.messages svg.ladder').first()).toBeVisible();
   await expect(page.locator('[role="tabpanel"] [data-primary]')).toHaveCount(0);
 });
+
+/** The pair button of a message that does not touch the selected node scopes
+ *  to that message's two nodes: the chip and the ladder name them, the
+ *  message is listed and selected, and its rungs are at full ink. */
+test('a pair is the selected message’s two nodes', async ({ page }) => {
+  await boot(page);
+  await tab(page, 'Messages').click();
+  await logMessages(page);
+  await send(page, 0);
+  await page.getByRole('button', { name: "Show every node's messages" }).click();
+  const events = await logged(page);
+  await expect(page.locator('.messages .row.message').first()).toBeVisible();
+  const listed = await page.locator('.messages .row.message').evaluateAll((els) => els.map((el) => Number((el as HTMLElement).dataset.seq)));
+  const far = events.find((e) => e.src !== 0 && e.dst !== 0 && listed.includes(e.seq));
+  expect(far, 'the newest rows hold a message between two other nodes').toBeDefined();
+  const { seq, src, dst } = far!;
+  await page.locator(`.messages .row[data-seq="${seq}"]`).click();
+  await page.getByRole('button', { name: `See only node ${src} ↔ node ${dst}` }).click();
+  await expect(page.locator('[data-field="scope-chip"]')).toContainText(`node ${src} ↔ node ${dst}`);
+  await expect(page.locator('.messages .row.selected')).toHaveAttribute('data-seq', String(seq));
+  await expect(page.getByRole('button', { name: /^See only/ })).toHaveCount(0);
+  await expect(page.locator('.messages svg.ladder:not(.faded)').first()).toBeVisible();
+  await expect(page.locator('.messages .list-head .lanes')).toHaveText(`node ${src}node ${dst}`);
+});
+
+/** At 768 px the list's columns fit the pane: neither the Message head nor
+ *  any row's words are cut at its edge. */
+test('the list fits a 768 px pane', async ({ page }) => {
+  await page.setViewportSize({ width: 768, height: 1024 });
+  await boot(page);
+  await tab(page, 'Messages').click();
+  await send(page, 0);
+  await page.getByRole('button', { name: "Show every node's messages" }).click();
+  await expect(page.locator('.messages .row.message').first()).toBeVisible();
+  const cut = await page.locator('.messages').evaluate((m) => {
+    const edge = m.getBoundingClientRect().right;
+    return [...m.querySelectorAll<HTMLElement>('.list-head .message, .row.message .message')]
+      .filter((el) => el.getBoundingClientRect().right > edge + 0.5 || el.scrollWidth > el.clientWidth + 1)
+      .map((el) => el.textContent);
+  });
+  expect(cut, 'the Message column cuts nothing').toEqual([]);
+});

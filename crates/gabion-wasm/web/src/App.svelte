@@ -1479,7 +1479,7 @@
                 </div>
               </div>
               {#if r.pane === 'messages'}
-                <div id="pane-messages" role="tabpanel" aria-labelledby="pane-tab-messages">
+                <div id="pane-messages" class="messages-panel" role="tabpanel" aria-labelledby="pane-tab-messages">
                   <Messages
                     sim={r.sim}
                     selected={r.selected}
@@ -1767,6 +1767,13 @@
     container-type: size;
   }
 
+  .messages-panel {
+    flex: 1 1 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
   .pane-head {
     display: flex;
     align-items: flex-start;
@@ -1779,6 +1786,17 @@
     margin: 0;
     font-size: var(--font-size-body);
     font-weight: 600;
+  }
+
+  /* A narrow pane gives the title its own line and sets the tabs below it. */
+  @container (width < 320px) {
+    .pane-head {
+      flex-wrap: wrap;
+    }
+
+    .pane-title {
+      flex-basis: 100%;
+    }
   }
 
   /* Details · Messages: a segmented control on the thing it switches. The
@@ -1866,6 +1884,12 @@
     .rail-body {
       flex: none;
       height: 48rem;
+    }
+
+    /* The detail pane runs the height of both rows. */
+    .detail-rail .rail-body {
+      flex: 1;
+      height: auto;
     }
   }
 
