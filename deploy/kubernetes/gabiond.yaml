@@ -23,6 +23,7 @@ data:
       # secret. gabion-nginx.yaml uses the same one, so the two applied
       # together form one mixed cluster.
       cluster_id_hash: 0x6761626e
+    # gabion-nginx.yaml's `per_ip` is this rule's twin.
     limits:
       - name: per_ip
         domain: envoy

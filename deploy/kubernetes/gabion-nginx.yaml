@@ -22,7 +22,9 @@ data:
         # 32m holds 262,144 counters, the table gabiond.yaml's node builds by
         # default; size it from the notes under `gabion_limit_zone`.
         gabion_limit_zone zone=api:32m;
-        gabion_limit_rule per_ip $remote_addr rate=100r/s;
+        # gabiond.yaml's `per_ip` for NGINX: same domain and key, one shared count.
+        # See crates/gabion/README.md, "Writing the same rule for NGINX and gabiond".
+        gabion_limit_rule per_ip remote_address:$remote_addr domain=envoy rate=100r/s;
 
         gabion_gossip_bind 0.0.0.0:9000;
         # Any non-zero id, shared by every node of one cluster: a label, not a
