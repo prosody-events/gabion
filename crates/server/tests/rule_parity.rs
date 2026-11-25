@@ -5,20 +5,28 @@
 //! exactly when the pair also agrees on its bucket, so each adapter's own key
 //! hash is on the line.
 
+use std::num::NonZeroU16;
 use std::sync::Arc;
 
 use gabion::aggregate::Aggregate;
 use gabion::crdt::{CellIdentity, CellStore, DeltaSink, ExpirationSink, NodeId, NodeIdentity};
+use gabion::defaults::{STORAGE_MAX_DESCRIPTOR_COUNT, STORAGE_MAX_KEY_BYTES};
 use gabion::gossip::sim::SimRouter;
 use gabion::gossip::{AggregateStore, FixedClock, GossipRuntime};
+use gabion::rules::RateResolveError::{
+    WindowShorterThanPeriod, WindowTooLong, ZeroBucket, ZeroWindow,
+};
+use gabion::rules::{RuleError, parse_rate};
+use gabion::settings::Settings;
 use gabion_nginx::access::{AccessCtx, AccessOutcome, VariableLookup, decide_all};
 use gabion_nginx::rules::{
-    BindingLookup, CompiledRules, NopBindingCompiler, RuleConfig, parse_rule_directive,
+    BindingLookup, CompiledRules, NopBindingCompiler, RuleConfig, RuleConfigError,
+    parse_rule_directive,
 };
 use gabion_nginx::shm::queue::QueueEvent;
 use gabion_nginx::shm::{QueueControl, QueueSlot, RequestQueue, Stats};
 use gabion_server::admission::Decision;
-use gabion_server::config::AppConfig;
+use gabion_server::config::{AppConfig, ConfigError};
 use gabion_server::{RateLimitDescriptor, SharedLimiter, rate_limit_descriptor};
 
 /// One rule in NGINX's spelling, a request it counts, and whether its
@@ -211,5 +219,179 @@ fn equal_rules_have_equal_identity_in_both_adapters() {
             theirs.spec().limit - 1 - u64::from(shares),
             "{name}: gabiond counts NGINX's hit exactly when the two share a counter"
         );
+    }
+}
+
+/// One `limits:` entry named `name`: domain `api`, descriptor `ip`, rate
+/// `10r/s`, with `fields` added or replacing those.
+fn limit(name: &str, fields: &[(&str, &str)]) -> String {
+    let mut entry = vec![
+        ("domain", "api"),
+        ("descriptors", "[{ key: ip }]"),
+        ("rate", "10r/s"),
+    ];
+    for &(field, value) in fields {
+        match entry.iter_mut().find(|(f, _)| *f == field) {
+            Some(slot) => slot.1 = value,
+            None => entry.push((field, value)),
+        }
+    }
+    let fields: String = entry
+        .iter()
+        .map(|(field, value)| format!("    {field}: {value}\n"))
+        .collect();
+    format!("  - name: {name}\n{fields}")
+}
+
+/// A rule both adapters refuse is refused by the one library constructor,
+/// with the same error the operator reads in either.
+#[test]
+fn both_adapters_refuse_a_rule_with_the_same_error() {
+    let max_count = usize::from(STORAGE_MAX_DESCRIPTOR_COUNT);
+    let many_nginx: String = (0..=max_count).map(|i| format!(" k{i}:$v{i}")).collect();
+    let many_nginx = format!("r{many_nginx} rate=10r/s");
+    let many_yaml: String = (0..=max_count)
+        .map(|i| format!("{{ key: k{i} }},"))
+        .collect();
+    let many_yaml = format!("[{many_yaml}]");
+    let long = "k".repeat(STORAGE_MAX_KEY_BYTES + 1);
+    let long_nginx = format!("r {long}:$t rate=10r/s");
+    let long_yaml = format!("[{{ key: {long} }}]");
+    let rule = || Box::<str>::from("r");
+    let window = |source| RuleError::Window {
+        rule: rule(),
+        source,
+    };
+    let yaml = |entries: String| format!("limits:\n{entries}");
+    let rows: [(&[&str], String, RuleError); 13] = [
+        (
+            &["r rate=10r/s"],
+            yaml(limit("r", &[("descriptors", "[]")])),
+            RuleError::NoDescriptors { rule: rule() },
+        ),
+        (
+            &["r 9x:$t rate=10r/s"],
+            yaml(limit("r", &[("descriptors", "[{ key: 9x }]")])),
+            RuleError::InvalidKey {
+                rule: rule(),
+                key: "9x".into(),
+            },
+        ),
+        (
+            &["r $t rate=10r/s window=0s"],
+            yaml(limit("r", &[("window", "0s")])),
+            window(ZeroWindow),
+        ),
+        (
+            &["r $t rate=10r/s bucket=0s"],
+            yaml(limit("r", &[("bucket", "0s")])),
+            window(ZeroBucket),
+        ),
+        (
+            &["r $t rate=10r/s bucket=500us"],
+            yaml(limit("r", &[("bucket", "500us")])),
+            window(ZeroBucket),
+        ),
+        (
+            &["r $t rate=10r/s window=60d"],
+            yaml(limit("r", &[("window", "60d")])),
+            window(WindowTooLong),
+        ),
+        (
+            &["r $t rate=10r/m window=500ms"],
+            yaml(limit("r", &[("rate", "10r/m"), ("window", "500ms")])),
+            window(WindowShorterThanPeriod),
+        ),
+        (
+            &[&many_nginx],
+            yaml(limit("r", &[("descriptors", &many_yaml)])),
+            RuleError::TooManyDescriptors {
+                rule: rule(),
+                count: max_count + 1,
+                max: max_count,
+            },
+        ),
+        (
+            &[&long_nginx],
+            yaml(limit("r", &[("descriptors", &long_yaml)])),
+            RuleError::KeyTooLong {
+                rule: rule(),
+                key: long.as_str().into(),
+                bytes: STORAGE_MAX_KEY_BYTES + 1,
+                max: STORAGE_MAX_KEY_BYTES,
+            },
+        ),
+        (
+            &["r $t rate=10r/s domain=a\u{7}b"],
+            yaml(limit("r", &[("domain", "\"a b\"")])),
+            RuleError::InvalidDomain {
+                rule: rule(),
+                reason: "with whitespace or a control character",
+            },
+        ),
+        (
+            &["r $t rate=10r/s", "r $u rate=10r/s"],
+            yaml(limit("r", &[]) + &limit("r", &[("rate", "5r/s")])),
+            RuleError::DuplicateRuleName { name: rule() },
+        ),
+        (
+            &["r $t rate=10r/s", "s $t rate=20r/s dry_run"],
+            yaml(limit("r", &[]) + &limit("s", &[("rate", "20r/s")])),
+            RuleError::DuplicateRuleIdentity {
+                first: rule(),
+                second: "s".into(),
+            },
+        ),
+        (
+            &["r $t rate=10r/s", "s $u rate=10r/s"],
+            "storage:\n  rule_dictionary_capacity: 1\n".to_owned()
+                + &yaml(limit("r", &[]) + &limit("s", &[("window", "2s")])),
+            RuleError::TooManyRules {
+                rules: 2,
+                capacity: 1,
+            },
+        ),
+    ];
+    // NGINX's directive parser refuses these rates itself; only gabiond
+    // reaches the library with them.
+    let rate = |text| RuleError::Rate {
+        rule: rule(),
+        reason: parse_rate(text).unwrap_err(),
+    };
+    let gabiond_only = ["0r/s", "10r/500us", "10r/fortnight"]
+        .map(|text| (yaml(limit("r", &[("rate", text)])), rate(text)));
+
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("rule_refusals.yaml");
+    let gabiond_refuses = |yaml: &str, expected: &RuleError| {
+        std::fs::write(&path, yaml).expect("write the gabiond config");
+        match AppConfig::load(Some(&path)) {
+            Err(ConfigError::Rule(error)) => assert_eq!(&error, expected, "{yaml}"),
+            other => panic!("{yaml}: {other:?}"),
+        }
+    };
+    for (directives, yaml, expected) in &rows {
+        let settings = match expected {
+            RuleError::TooManyRules { .. } => Settings {
+                rule_dictionary_capacity: NonZeroU16::new(1),
+                ..Settings::default()
+            },
+            _ => Settings::default(),
+        };
+        let (_, storage) = settings.validate().expect("the settings validate");
+        let configs: Vec<RuleConfig> = directives
+            .iter()
+            .map(|text| {
+                parse_rule_directive(&text.split_whitespace().collect::<Vec<_>>()).expect(text)
+            })
+            .collect();
+        match CompiledRules::compile_with(&configs, &storage, &mut NopBindingCompiler) {
+            Err(RuleConfigError::Rule(error)) => assert_eq!(&error, expected, "{directives:?}"),
+            Err(other) => panic!("{directives:?}: {other}"),
+            Ok(_) => panic!("{directives:?}: NGINX compiled the rules"),
+        }
+        gabiond_refuses(yaml, expected);
+    }
+    for (yaml, expected) in &gabiond_only {
+        gabiond_refuses(yaml, expected);
     }
 }

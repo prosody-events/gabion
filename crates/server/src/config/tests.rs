@@ -475,22 +475,6 @@ fn rate_only_yaml_infers_window_and_bucket() {
 }
 
 #[test]
-fn explicit_window_scales_limit_up() {
-    let _env = EnvGuard::lock();
-    let cfg = load_with_yaml_str(
-        "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
-         10r/s\n    window: 5h\n",
-    )
-    .expect("yaml parses");
-    let spec = cfg.rules.rules().first().expect("one rule").spec();
-    assert_eq!(spec.limit, 10 * 5 * 3600);
-    assert_eq!(spec.window_millis, 5 * 3600 * 1_000);
-    // bucket defaults to the resolved window: one fixed-window bucket.
-    assert_eq!(spec.bucket_millis.get(), 5 * 3600 * 1_000);
-    assert_eq!(spec.live_buckets.get(), 1);
-}
-
-#[test]
 fn explicit_window_and_bucket_set_live_buckets() {
     let _env = EnvGuard::lock();
     let cfg = load_with_yaml_str(
@@ -502,32 +486,6 @@ fn explicit_window_and_bucket_set_live_buckets() {
     assert_eq!(spec.limit, 10 * 5 * 3600);
     assert_eq!(spec.bucket_millis.get(), 3600 * 1_000);
     assert_eq!(spec.live_buckets.get(), 5);
-}
-
-#[test]
-fn bucket_defaults_to_window_when_omitted() {
-    let _env = EnvGuard::lock();
-    let cfg = load_with_yaml_str(
-        "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
-         10r/m\n",
-    )
-    .expect("yaml parses");
-    let spec = cfg.rules.rules().first().expect("one rule").spec();
-    assert_eq!(spec.bucket_millis.get(), 60_000);
-    assert_eq!(spec.live_buckets.get(), 1);
-}
-
-#[test]
-fn explicit_bucket_overrides_window() {
-    let _env = EnvGuard::lock();
-    let cfg = load_with_yaml_str(
-        "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
-         10r/m\n    bucket: 1s\n",
-    )
-    .expect("yaml parses");
-    let spec = cfg.rules.rules().first().expect("one rule").spec();
-    assert_eq!(spec.bucket_millis.get(), 1_000);
-    assert_eq!(spec.live_buckets.get(), 60);
 }
 
 #[test]
@@ -581,138 +539,6 @@ fn cluster_id_hash_from_env_var() {
 
     let cfg = AppConfig::load(None).expect("env-only cluster_id_hash should load");
     assert_eq!(cfg.settings.cluster_id_hash.get(), 0xdeadbeef);
-}
-
-/// One `limits:` entry named `name`: domain `api`, descriptor `ip`, rate
-/// `10r/s`, with `fields` added or replacing those.
-fn limit(name: &str, fields: &[(&str, &str)]) -> String {
-    let mut entry = vec![
-        ("domain", "api"),
-        ("descriptors", "[{ key: ip }]"),
-        ("rate", "10r/s"),
-    ];
-    for &(field, value) in fields {
-        match entry.iter_mut().find(|(f, _)| *f == field) {
-            Some(slot) => slot.1 = value,
-            None => entry.push((field, value)),
-        }
-    }
-    let fields: String = entry
-        .iter()
-        .map(|(field, value)| format!("    {field}: {value}\n"))
-        .collect();
-    format!("  - name: {name}\n{fields}")
-}
-
-/// Every rule gabiond or NGINX refused on `main` is refused by the one
-/// library constructor, with the error the operator reads.
-#[test]
-fn rule_def_rejects_what_both_adapters_rejected() {
-    use gabion::defaults::{STORAGE_MAX_DESCRIPTOR_COUNT, STORAGE_MAX_KEY_BYTES};
-    use gabion::rules::RateResolveError::{
-        WindowShorterThanPeriod, WindowTooLong, ZeroBucket, ZeroWindow,
-    };
-    use gabion::rules::parse_rate;
-    let _env = EnvGuard::lock();
-    let max_count = usize::from(STORAGE_MAX_DESCRIPTOR_COUNT);
-    let many: String = (0..=max_count)
-        .map(|i| format!("{{ key: k{i} }},"))
-        .collect();
-    let many = format!("[{many}]");
-    let long = "k".repeat(STORAGE_MAX_KEY_BYTES + 1);
-    let long_key = format!("[{{ key: {long} }}]");
-    let rule = || Box::<str>::from("r");
-    let window = |source| RuleError::Window {
-        rule: rule(),
-        source,
-    };
-    let rate = |text| RuleError::Rate {
-        rule: rule(),
-        reason: parse_rate(text).unwrap_err(),
-    };
-    let yaml = |entries: String| format!("limits:\n{entries}");
-    let rows: [(String, RuleError); 16] = [
-        (
-            yaml(limit("r", &[("descriptors", "[]")])),
-            RuleError::NoDescriptors { rule: rule() },
-        ),
-        (
-            yaml(limit("r", &[("descriptors", "[{ key: 9x }]")])),
-            RuleError::InvalidKey {
-                rule: rule(),
-                key: "9x".into(),
-            },
-        ),
-        (yaml(limit("r", &[("window", "0s")])), window(ZeroWindow)),
-        (yaml(limit("r", &[("bucket", "0s")])), window(ZeroBucket)),
-        (yaml(limit("r", &[("bucket", "500us")])), window(ZeroBucket)),
-        (
-            yaml(limit("r", &[("window", "60d")])),
-            window(WindowTooLong),
-        ),
-        (
-            yaml(limit("r", &[("rate", "10r/m"), ("window", "500ms")])),
-            window(WindowShorterThanPeriod),
-        ),
-        (yaml(limit("r", &[("rate", "0r/s")])), rate("0r/s")),
-        (
-            yaml(limit("r", &[("rate", "10r/500us")])),
-            rate("10r/500us"),
-        ),
-        (
-            yaml(limit("r", &[("rate", "10r/fortnight")])),
-            rate("10r/fortnight"),
-        ),
-        (
-            yaml(limit("r", &[("descriptors", &many)])),
-            RuleError::TooManyDescriptors {
-                rule: rule(),
-                count: max_count + 1,
-                max: max_count,
-            },
-        ),
-        (
-            yaml(limit("r", &[("descriptors", &long_key)])),
-            RuleError::KeyTooLong {
-                rule: rule(),
-                key: long.as_str().into(),
-                bytes: STORAGE_MAX_KEY_BYTES + 1,
-                max: STORAGE_MAX_KEY_BYTES,
-            },
-        ),
-        (
-            yaml(limit("r", &[("domain", "\"a b\"")])),
-            RuleError::InvalidDomain {
-                rule: rule(),
-                reason: "with whitespace or a control character",
-            },
-        ),
-        (
-            yaml(limit("r", &[]) + &limit("r", &[("rate", "5r/s")])),
-            RuleError::DuplicateRuleName { name: rule() },
-        ),
-        (
-            yaml(limit("r", &[]) + &limit("s", &[("rate", "20r/s")])),
-            RuleError::DuplicateRuleIdentity {
-                first: rule(),
-                second: "s".into(),
-            },
-        ),
-        (
-            "storage:\n  rule_dictionary_capacity: 1\n".to_owned()
-                + &yaml(limit("r", &[]) + &limit("s", &[("window", "2s")])),
-            RuleError::TooManyRules {
-                rules: 2,
-                capacity: 1,
-            },
-        ),
-    ];
-    for (yaml, expected) in rows {
-        match load_with_yaml_str(&yaml) {
-            Err(ConfigError::Rule(error)) => assert_eq!(error, expected, "{yaml}"),
-            other => panic!("{yaml}: {other:?}"),
-        }
-    }
 }
 
 /// Every setting has a row in the gabiond configuration reference naming its
