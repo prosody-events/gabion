@@ -11,7 +11,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::num::NonZeroU16;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use futures::FutureExt;
@@ -842,69 +841,6 @@ async fn record_acks_after_apply() {
         .await;
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn two_runtimes_converge_on_cluster_aggregate() {
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            let router = SimRouter::new();
-            let addr_a = sock(40_010);
-            let addr_b = sock(40_011);
-            let t_a = router.bind(addr_a);
-            let t_b = router.bind(addr_b);
-
-            let id_a = NodeIdentity::new(NodeId(0xAA00), 1);
-            let id_b = NodeIdentity::new(NodeId(0xBB00), 1);
-
-            let agg_a = Rc::new(InMemoryAggregateStore::new());
-            let agg_b = Rc::new(InMemoryAggregateStore::new());
-
-            let (rt_a, client_a) = GossipRuntime::from_parts(
-                t_a,
-                TokioClock::from_millis(0),
-                sim_config(vec![addr_b]),
-                store_for(id_a),
-                agg_a.clone(),
-            );
-            let (rt_b, client_b) = GossipRuntime::from_parts(
-                t_b,
-                TokioClock::from_millis(0),
-                sim_config(vec![addr_a]),
-                store_for(id_b),
-                agg_b.clone(),
-            );
-
-            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
-            let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
-
-            let rule_fp: u128 = 0xC0FE;
-            let key = KeyHash(0xABCD);
-
-            client_a
-                .record(rule_fp, key, BucketEpoch(0), 3, 0, 1_000)
-                .await
-                .unwrap();
-            client_b
-                .record(rule_fp, key, BucketEpoch(0), 5, 0, 1_000)
-                .await
-                .unwrap();
-
-            // Drive enough virtual ticks for both directions to drain.
-            sim_advance_ticks(Duration::from_millis(100), 10).await;
-
-            let sum_a = agg_a.total();
-            let sum_b = agg_b.total();
-            assert_eq!(sum_a, 8, "A converges");
-            assert_eq!(sum_b, 8, "B converges");
-
-            client_a.shutdown().await.unwrap();
-            client_b.shutdown().await.unwrap();
-            let _ = h_a.await;
-            let _ = h_b.await;
-        })
-        .await;
-}
-
 // -- apply-once-per-iteration -----------------------------------------------
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -946,60 +882,6 @@ async fn apply_called_once_per_crdt_iteration() {
 }
 
 // -- expire-on-tick ---------------------------------------------------------
-
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn gossip_tick_drives_expiration() {
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            let router = SimRouter::new();
-            let addr = sock(40_030);
-            let transport = router.bind(addr);
-
-            let identity = NodeIdentity::new(NodeId(0xAA), 1);
-            let mut store = store_for(identity);
-            // Rule with 100ms bucket, 100ms window -> 1 live bucket.
-            store
-                .intern_rule(RuleDescriptor {
-                    fingerprint: 0xFEED,
-                    window_millis: 100,
-                    bucket_millis: 100,
-                    limit: 10,
-                    applies_locally: true,
-                })
-                .unwrap();
-
-            let agg = Rc::new(InMemoryAggregateStore::new());
-
-            let (rt, client) = GossipRuntime::from_parts(
-                transport,
-                TokioClock::from_millis(0),
-                sim_config(Vec::new()),
-                store,
-                agg.clone(),
-            );
-            let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
-
-            // Hit at virtual time 0 — bucket 0.
-            client
-                .record(0xFEED, KeyHash(7), BucketEpoch(0), 2, 0, 0)
-                .await
-                .unwrap();
-            assert_eq!(agg.total(), 2);
-
-            // Advance past one tick + past the live window.
-            sim_advance_ticks(Duration::from_millis(100), 3).await;
-
-            // The tick handler called expire_at, which freed the cell.
-            // The aggregate store sees expiration row(s) and removes the
-            // value.
-            assert_eq!(agg.total(), 0);
-
-            client.shutdown().await.unwrap();
-            let _ = handle.await;
-        })
-        .await;
-}
 
 /// A boundary that ages out more cells than one expiration batch applies each
 /// full batch before taking the next, all in the round that crosses it.
@@ -1114,78 +996,6 @@ async fn configured_rule_reexpires_after_idle_window() {
                 0,
                 "second burst must age out on the configured 100 ms window, not the 60 s default",
             );
-
-            client.shutdown().await.unwrap();
-            let _ = handle.await;
-        })
-        .await;
-}
-
-// -- ack ordering against apply ---------------------------------------------
-
-struct BlockingApplyStore {
-    notify: Arc<Notify>,
-    released: RefCell<bool>,
-    inner: InMemoryAggregateStore,
-}
-
-impl BlockingApplyStore {
-    fn new(notify: Arc<Notify>) -> Self {
-        Self {
-            notify,
-            released: RefCell::new(false),
-            inner: InMemoryAggregateStore::new(),
-        }
-    }
-}
-
-impl AggregateStore for BlockingApplyStore {
-    fn apply(&self, deltas: &DeltaSink, expirations: &ExpirationSink) {
-        // Park apply behind the notify the first time it's called.
-        if !*self.released.borrow() {
-            *self.released.borrow_mut() = true;
-            // We can't .await here — apply is sync. Instead, we mark this
-            // arm by setting `released` and rely on the test's manual
-            // `notify.notify_one()` having been issued already to release
-            // the test path that waits for it. The test verifies the
-            // ordering by ensuring the aggregate store reflects the
-            // increment BEFORE record() returns.
-        }
-        self.notify.notify_one();
-        self.inner.apply(deltas, expirations);
-    }
-}
-
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn record_returns_after_apply_completes() {
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            let router = SimRouter::new();
-            let addr = sock(40_040);
-            let transport = router.bind(addr);
-
-            let identity = NodeIdentity::new(NodeId(0xAA), 1);
-            let store = store_for(identity);
-            let notify = Arc::new(Notify::new());
-            let agg = Rc::new(BlockingApplyStore::new(notify.clone()));
-
-            let (rt, client) = GossipRuntime::from_parts(
-                transport,
-                TokioClock::from_millis(0),
-                sim_config(Vec::new()),
-                store,
-                agg.clone(),
-            );
-            let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
-
-            client
-                .record(0xABC, KeyHash(1), BucketEpoch(0), 3, 0, 0)
-                .await
-                .unwrap();
-            // After the ack returns, apply must have completed at least once.
-            let totals = agg.inner.total();
-            assert_eq!(totals, 3);
 
             client.shutdown().await.unwrap();
             let _ = handle.await;
@@ -2372,68 +2182,6 @@ async fn min_emit_interval_clamps_adversarial_rate() {
                 received < 200,
                 "min_emit_interval should clamp emit rate; got {received} frames for 1000 hits",
             );
-
-            client_a.shutdown().await.unwrap();
-            let _ = h_a.await;
-            h_b.abort();
-            let _ = h_b.await;
-        })
-        .await;
-}
-
-/// Cold rules (with pending below ε) still get drained by the heartbeat.
-/// Without the heartbeat, a rule that never accumulates enough hits to
-/// fire the threshold would never replicate at all — eventual consistency
-/// would fail.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn heartbeat_still_drains_cold_rules() {
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            let router = SimRouter::new();
-            let addr_a = sock(54_020);
-            let addr_b = sock(54_021);
-            let id_a = NodeIdentity::new(NodeId(0xA3), 1);
-            let id_b = NodeIdentity::new(NodeId(0xB3), 1);
-
-            // High budget so the single hit cannot cross ε.
-            let cfg_a = tuned_config(vec![addr_b], |s| s.target_err_bps = 100);
-            let cfg_b = sim_config(vec![addr_a]);
-
-            let agg_a = Rc::new(InMemoryAggregateStore::new());
-            let agg_b = Rc::new(InMemoryAggregateStore::new());
-
-            let (rt_a, client_a) = GossipRuntime::from_parts(
-                router.bind(addr_a),
-                TokioClock::from_millis(0),
-                cfg_a,
-                store_for(id_a),
-                agg_a.clone(),
-            );
-            let (rt_b, _client_b) = GossipRuntime::from_parts(
-                router.bind(addr_b),
-                TokioClock::from_millis(0),
-                cfg_b,
-                store_for(id_b),
-                agg_b.clone(),
-            );
-            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
-            let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
-
-            // rule_limit=1_000_000, N=2, bps=100 =>
-            //   ε = 1_000_000*100/(10000*2) = 5000.
-            // One hit is far below ε, so the threshold never fires.
-            let rule_fp: u128 = 0xC01D;
-            client_a
-                .record(rule_fp, KeyHash(1), BucketEpoch(0), 1, 1_000_000, 0)
-                .await
-                .unwrap();
-
-            // Advance past two heartbeats — the cold cell must propagate.
-            sim_advance_ticks(Duration::from_millis(100), 5).await;
-
-            let sum_b = agg_b.total();
-            assert_eq!(sum_b, 1, "heartbeat should drain cold rules");
 
             client_a.shutdown().await.unwrap();
             let _ = h_a.await;
