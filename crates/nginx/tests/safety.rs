@@ -31,7 +31,7 @@ use std::thread;
 use std::time::Duration;
 
 use gabion::crdt::ValidStorageConfig;
-use gabion::crdt::{BucketEpoch, CellHandle, CellIdentity, DeltaSink, ExpirationSink, KeyHash};
+use gabion::crdt::{BucketEpoch, CellIdentity, DeltaSink, ExpirationSink, KeyHash};
 use gabion::gossip::AggregateStore;
 use gabion::rules::{EnforcementMode, Rule, RuleDef, hash_key};
 use gabion::settings::Settings;
@@ -191,7 +191,6 @@ fn deltas_and_expirations(
             key_hash: kh,
             bucket: BucketEpoch(bucket),
         };
-        d.handles.push(CellHandle::default());
         d.keys.push(key);
         d.previous.push(0);
         d.current.push(delta);
@@ -204,10 +203,8 @@ fn deltas_and_expirations(
             key_hash: kh,
             bucket: BucketEpoch(bucket),
         };
-        e.handles.push(CellHandle::default());
         e.keys.push(key);
         e.last_counts.push(last_count);
-        e.last_update_millis.push(0);
         e.applies_locally.push(1);
     }
     (d, e)

@@ -1,7 +1,7 @@
 //! Column-oriented IO containers: [`ObservationBatch`], [`DeltaSink`], and
 //! [`ExpirationSink`].
 
-use super::{BucketEpoch, CellHandle, CellIdentity, Incarnation, KeyHash, NodeId};
+use super::{BucketEpoch, CellIdentity, Incarnation, KeyHash, NodeId};
 
 /// One row to push into an [`ObservationBatch`]. Bundled so callers can
 /// construct an observation in one expression rather than passing seven
@@ -89,7 +89,6 @@ impl ObservationBatch {
 /// stored count rose. The aggregator folds without per-record dispatch.
 #[derive(Clone, Debug, Default)]
 pub struct DeltaSink {
-    pub handles: Vec<CellHandle>,
     pub keys: Vec<CellIdentity>,
     pub previous: Vec<u32>,
     pub current: Vec<u32>,
@@ -101,7 +100,6 @@ pub struct DeltaSink {
 impl DeltaSink {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            handles: Vec::with_capacity(capacity),
             keys: Vec::with_capacity(capacity),
             previous: Vec::with_capacity(capacity),
             current: Vec::with_capacity(capacity),
@@ -111,7 +109,7 @@ impl DeltaSink {
     }
 
     pub fn len(&self) -> usize {
-        self.handles.len()
+        self.keys.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -119,7 +117,6 @@ impl DeltaSink {
     }
 
     pub fn clear(&mut self) {
-        self.handles.clear();
         self.keys.clear();
         self.previous.clear();
         self.current.clear();
@@ -129,14 +126,12 @@ impl DeltaSink {
 
     pub(super) fn push(
         &mut self,
-        handle: CellHandle,
         key: CellIdentity,
         previous: u32,
         current: u32,
         delta: u32,
         applies_locally: bool,
     ) {
-        self.handles.push(handle);
         self.keys.push(key);
         self.previous.push(previous);
         self.current.push(current);
@@ -150,10 +145,8 @@ impl DeltaSink {
 /// aggregate stores can fold both signal halves without per-record dispatch.
 #[derive(Clone, Debug, Default)]
 pub struct ExpirationSink {
-    pub handles: Vec<CellHandle>,
     pub keys: Vec<CellIdentity>,
     pub last_counts: Vec<u32>,
-    pub last_update_millis: Vec<u64>,
     /// `0`/`1` flags — kept as a byte column rather than `Vec<bool>`.
     pub applies_locally: Vec<u8>,
 }
@@ -161,16 +154,14 @@ pub struct ExpirationSink {
 impl ExpirationSink {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            handles: Vec::with_capacity(capacity),
             keys: Vec::with_capacity(capacity),
             last_counts: Vec::with_capacity(capacity),
-            last_update_millis: Vec::with_capacity(capacity),
             applies_locally: Vec::with_capacity(capacity),
         }
     }
 
     pub fn len(&self) -> usize {
-        self.handles.len()
+        self.keys.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -180,29 +171,18 @@ impl ExpirationSink {
     /// The sink holds as many rows as it can without growing; every column
     /// was given that capacity.
     pub(super) fn is_full(&self) -> bool {
-        self.len() == self.handles.capacity()
+        self.len() == self.keys.capacity()
     }
 
     pub fn clear(&mut self) {
-        self.handles.clear();
         self.keys.clear();
         self.last_counts.clear();
-        self.last_update_millis.clear();
         self.applies_locally.clear();
     }
 
-    pub(super) fn push(
-        &mut self,
-        handle: CellHandle,
-        key: CellIdentity,
-        last_count: u32,
-        last_update_millis: u64,
-        applies_locally: bool,
-    ) {
-        self.handles.push(handle);
+    pub(super) fn push(&mut self, key: CellIdentity, last_count: u32, applies_locally: bool) {
         self.keys.push(key);
         self.last_counts.push(last_count);
-        self.last_update_millis.push(last_update_millis);
         self.applies_locally.push(applies_locally as u8);
     }
 }

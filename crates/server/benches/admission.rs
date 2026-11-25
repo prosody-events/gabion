@@ -17,8 +17,7 @@ use std::time::{Duration, Instant};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use gabion::aggregate::Aggregate;
 use gabion::crdt::{
-    BucketEpoch, CellHandle, CellIdentity, CellStore, DeltaSink, ExpirationSink, NodeId,
-    NodeIdentity,
+    BucketEpoch, CellIdentity, CellStore, DeltaSink, ExpirationSink, NodeId, NodeIdentity,
 };
 use gabion::gossip::sim::SimRouter;
 use gabion::gossip::{AggregateStore, GossipClient, GossipRuntime, TokioClock};
@@ -78,7 +77,6 @@ impl Node {
         let mut deltas = DeltaSink::default();
         for rule in table.rules() {
             for tenant in &hot {
-                deltas.handles.push(CellHandle::default());
                 deltas.keys.push(CellIdentity {
                     rule_fingerprint: rule.fingerprint(),
                     key_hash: hash_key(

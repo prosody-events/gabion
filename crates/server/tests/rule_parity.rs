@@ -8,9 +8,7 @@
 use std::sync::Arc;
 
 use gabion::aggregate::Aggregate;
-use gabion::crdt::{
-    CellHandle, CellIdentity, CellStore, DeltaSink, ExpirationSink, NodeId, NodeIdentity,
-};
+use gabion::crdt::{CellIdentity, CellStore, DeltaSink, ExpirationSink, NodeId, NodeIdentity};
 use gabion::gossip::sim::SimRouter;
 use gabion::gossip::{AggregateStore, FixedClock, GossipRuntime};
 use gabion_nginx::access::{AccessCtx, AccessOutcome, VariableLookup, decide_all};
@@ -94,7 +92,6 @@ impl VariableLookup for Vars<'_> {
 /// Fold one hit NGINX queued into the cluster aggregate, as its leader does.
 fn fold(counts: &Aggregate, hit: QueueEvent) {
     let deltas = DeltaSink {
-        handles: vec![CellHandle::default()],
         keys: vec![CellIdentity {
             rule_fingerprint: hit.rule_fingerprint,
             key_hash: hit.key_hash,

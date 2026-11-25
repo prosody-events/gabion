@@ -50,10 +50,9 @@ pub(crate) fn seed(
     bucket: gabion::crdt::BucketEpoch,
     count: u32,
 ) {
-    use gabion::crdt::{CellHandle, CellIdentity, DeltaSink, ExpirationSink};
+    use gabion::crdt::{CellIdentity, DeltaSink, ExpirationSink};
     use gabion::gossip::AggregateStore;
     let deltas = DeltaSink {
-        handles: vec![CellHandle::default()],
         keys: vec![CellIdentity {
             rule_fingerprint: fingerprint,
             key_hash,

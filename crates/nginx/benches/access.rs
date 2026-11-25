@@ -18,9 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use gabion::crdt::{
-    BucketEpoch, CellHandle, CellIdentity, DeltaSink, ExpirationSink, ValidStorageConfig,
-};
+use gabion::crdt::{BucketEpoch, CellIdentity, DeltaSink, ExpirationSink, ValidStorageConfig};
 use gabion::gossip::AggregateStore;
 use gabion::rules::{Descriptor, hash_key};
 use gabion::settings::Settings;
@@ -84,7 +82,6 @@ impl Worker {
         for (i, rule) in rules.table().rules().iter().enumerate() {
             let key = format!("k{i}");
             for tenant in &hot {
-                deltas.handles.push(CellHandle::default());
                 deltas.keys.push(CellIdentity {
                     rule_fingerprint: rule.fingerprint(),
                     key_hash: hash_key(

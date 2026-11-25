@@ -871,7 +871,6 @@ impl CellStore {
         current: u32,
         rule_slot: RuleSlot,
     ) {
-        let handle = self.handle_for(slot);
         let descriptor = self.rule_dictionary.get(rule_slot);
         let key = CellIdentity {
             rule_fingerprint: descriptor.fingerprint,
@@ -879,7 +878,6 @@ impl CellStore {
             bucket: self.buckets[slot as usize],
         };
         sink.push(
-            handle,
             key,
             previous,
             current,
@@ -894,20 +892,13 @@ impl CellStore {
     /// refcount and may invalidate the `applies_locally` lookup.
     fn emit_expiration(&self, sink: &mut ExpirationSink, slot: u32) {
         let rule_slot = self.rules[slot as usize];
-        let handle = self.handle_for(slot);
         let descriptor = self.rule_dictionary.get(rule_slot);
         let key = CellIdentity {
             rule_fingerprint: descriptor.fingerprint,
             key_hash: self.key_hashes[slot as usize],
             bucket: self.buckets[slot as usize],
         };
-        sink.push(
-            handle,
-            key,
-            self.counts[slot as usize],
-            self.last_update_millis[slot as usize],
-            descriptor.applies_locally,
-        );
+        sink.push(key, self.counts[slot as usize], descriptor.applies_locally);
     }
 
     /// Insert or update a row, emitting a delta when the stored count rose.
@@ -1111,7 +1102,7 @@ impl CellStore {
     /// [`Expiry::More`], and the next call resumes at the same slot.
     pub fn expire(&mut self, ages: &[RuleAge], sink: &mut ExpirationSink) -> Expiry {
         debug_assert!(
-            sink.handles.capacity() > 0,
+            sink.keys.capacity() > 0,
             "a zero-capacity sink takes no row"
         );
         for slot in self.expire_cursor..self.capacity {

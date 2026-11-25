@@ -14,8 +14,7 @@ use tower::ServiceExt;
 
 use gabion::aggregate::Aggregate;
 use gabion::crdt::{
-    BucketEpoch, CellHandle, CellIdentity, CellStore, DeltaSink, ExpirationSink, KeyHash, NodeId,
-    NodeIdentity,
+    BucketEpoch, CellIdentity, CellStore, DeltaSink, ExpirationSink, KeyHash, NodeId, NodeIdentity,
 };
 use gabion::gossip::sim::SimRouter;
 use gabion::gossip::{AdminCommand, AggregateStore, GossipRuntime, TokioClock};
@@ -95,7 +94,6 @@ fn snapshot_json_shape_is_pinned() {
         let store = CellStore::new(storage, identity, &rule_table);
         let counts = Arc::new(Aggregate::new(&storage));
         let row = DeltaSink {
-            handles: vec![CellHandle::default()],
             keys: vec![CellIdentity {
                 rule_fingerprint: rule_table.rules()[0].fingerprint(),
                 key_hash: KeyHash(1),

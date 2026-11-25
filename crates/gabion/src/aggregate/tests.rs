@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use quickcheck_macros::quickcheck;
 
 use super::*;
-use crate::crdt::{CellHandle, CellIdentity};
+use crate::crdt::CellIdentity;
 use crate::mock::with_logs;
 use crate::settings::mock::storage;
 
@@ -139,7 +139,6 @@ fn aggregate_table_matches_model(ops: Vec<(u8, u8, bool)>) -> bool {
 /// One delta row of `delta` hits for `(1, 2, bucket)`.
 fn delta(bucket: BucketEpoch, delta: u32) -> DeltaSink {
     DeltaSink {
-        handles: vec![CellHandle::default()],
         keys: vec![CellIdentity {
             rule_fingerprint: 1,
             key_hash: KeyHash(2),

@@ -15,7 +15,7 @@ use std::alloc::{GlobalAlloc, Layout as AllocLayout, System};
 use std::cell::Cell;
 use std::hint::black_box;
 
-use gabion::crdt::{BucketEpoch, CellHandle, CellIdentity, DeltaSink, ExpirationSink};
+use gabion::crdt::{BucketEpoch, CellIdentity, DeltaSink, ExpirationSink};
 use gabion::gossip::AggregateStore;
 use gabion::rules::{Descriptor, hash_key};
 use gabion::settings::Settings;
@@ -136,7 +136,6 @@ fn admit_without_allocating(rules: u16, max_matched_rules: u16, queue: usize) {
     for (i, rule) in compiled.table().rules().iter().enumerate() {
         for tenant in &hot {
             let key = format!("k{i}");
-            deltas.handles.push(CellHandle::default());
             deltas.keys.push(CellIdentity {
                 rule_fingerprint: rule.fingerprint(),
                 key_hash: hash_key(

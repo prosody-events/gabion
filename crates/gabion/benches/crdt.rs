@@ -1149,10 +1149,8 @@ impl Traffic {
         self.expirations.clear();
         for &key_hash in &keys {
             let key = self.cell(key_hash, BucketEpoch(expired));
-            self.expirations.handles.push(CellHandle::default());
             self.expirations.keys.push(key);
             self.expirations.last_counts.push(1);
-            self.expirations.last_update_millis.push(0);
             self.expirations.applies_locally.push(1);
         }
         keys.clear();
@@ -1160,7 +1158,6 @@ impl Traffic {
             let key_hash = self.active_key();
             keys.push(key_hash);
             let key = self.cell(key_hash, BucketEpoch(self.second));
-            self.deltas.handles.push(CellHandle::default());
             self.deltas.keys.push(key);
             self.deltas.previous.push(0);
             self.deltas.current.push(1);

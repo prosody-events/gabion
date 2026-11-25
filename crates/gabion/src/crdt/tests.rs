@@ -98,11 +98,6 @@ fn remote_merge_one(
         ts,
     ));
     store.merge_remote(&obs, &mut sink, RelayMark::Clear);
-    // A no-op merge (count <= stored) leaves the sink empty; recover the
-    // handle via key lookup instead.
-    if let Some(handle) = sink.handles.first().copied() {
-        return handle;
-    }
     let rule_slot = store.rule_dictionary.find(rule_fp).expect("rule interned");
     let node_slot = store
         .node_dictionary
@@ -139,10 +134,6 @@ fn local_increment_one(
         ts,
     ));
     store.ingest_local(&obs, &mut sink);
-    if let Some(handle) = sink.handles.first().copied() {
-        return handle;
-    }
-    // Saturating-already-at-max case: recover the handle by key.
     let rule_slot = store.rule_dictionary.find(rule_fp).expect("rule interned");
     let node_slot = store
         .node_dictionary
@@ -463,13 +454,11 @@ fn quickcheck_expire_frees_exactly_aged_out_cells(
 
     let cap = cap_seed as usize % 8 + 1;
     let mut exp = ExpirationSink::with_capacity(cap);
-    let mut expired = BTreeSet::new();
     let (mut emitted, mut calls) = (0, 0);
     loop {
         let expiry = store.expire(&ages(&current, &live), &mut exp);
         calls += 1;
         emitted += exp.len();
-        expired.extend(exp.handles.iter().map(|h| h.index));
         match expiry {
             Expiry::More if exp.len() != cap || store.expire_cursor == 0 => return false,
             Expiry::More => exp.clear(),
@@ -477,10 +466,7 @@ fn quickcheck_expire_frees_exactly_aged_out_cells(
             Expiry::Done => break,
         }
     }
-    if expired != expected_expired
-        || emitted != expected_expired.len()
-        || calls != expected_expired.len().div_ceil(cap).max(1)
-    {
+    if emitted != expected_expired.len() || calls != expected_expired.len().div_ceil(cap).max(1) {
         return false;
     }
     for row in before {
@@ -502,7 +488,7 @@ fn merge_remote_is_monotonic() {
     obs.push(observation(0x11, 0xabc, BucketEpoch(0), 7, 1, 5, 100));
     store.merge_remote(&obs, &mut sink, RelayMark::Clear);
     assert_eq!(sink.len(), 1);
-    let handle = sink.handles[0];
+    let handle = store.active_handles(0).next().unwrap();
     assert_eq!(sink.previous[0], 0);
     assert_eq!(sink.current[0], 5);
 
@@ -606,10 +592,8 @@ fn bucket_boundary_expires_in_batches_without_growth() {
     let mut sink = ExpirationSink::with_capacity(8);
     let capacities = |sink: &ExpirationSink| {
         [
-            sink.handles.capacity(),
             sink.keys.capacity(),
             sink.last_counts.capacity(),
-            sink.last_update_millis.capacity(),
             sink.applies_locally.capacity(),
         ]
     };
@@ -1022,18 +1006,16 @@ fn expire_emits_one_row_per_freed_cell() {
     assert!(store.rule_dictionary().descriptor(rule_doomed).is_some());
 
     let mut rows: Vec<usize> = (0..exp.len()).collect();
-    rows.sort_by_key(|&i| exp.handles[i].index);
+    rows.sort_by_key(|&i| exp.keys[i].key_hash);
     let mut expected = [snap_a, snap_b];
-    expected.sort_by_key(|r| r.handle.index);
+    expected.sort_by_key(|r| r.key.key_hash);
     for (&i, snap) in rows.iter().zip(expected.iter()) {
-        assert_eq!(exp.handles[i], snap.handle);
         // The exported identity carries the rule fingerprint, not the
         // node-local rule slot — translate via the dictionary snapshot.
         assert_eq!(exp.keys[i].rule_fingerprint, 0x22);
         assert_eq!(exp.keys[i].key_hash, snap.key.key_hash);
         assert_eq!(exp.keys[i].bucket, snap.key.bucket);
         assert_eq!(exp.last_counts[i], snap.count);
-        assert_eq!(exp.last_update_millis[i], snap.last_update_millis);
         assert_eq!(exp.applies_locally[i], 1);
     }
 }
@@ -1541,10 +1523,12 @@ fn stream_lists_match_model(ops: MixedOps) -> bool {
             return false;
         }
         if let MixedOp::Local(_) = op
-            && let Some(&changed) = sink.handles.first()
-            && (out.last() != Some(&changed)
-                || store.get(changed).map(|row| row.origin_sequence)
-                    != Some(store.head(Stream::Own)))
+            && !sink.is_empty()
+            && out
+                .last()
+                .and_then(|&last| store.get(last))
+                .map(|row| row.origin_sequence)
+                != Some(store.head(Stream::Own))
         {
             return false;
         }
@@ -1884,10 +1868,7 @@ fn quickcheck_expire_at_matches_expire_for_varied_rules(
         Expiry::Done
     );
 
-    let handles_a: BTreeSet<u32> = sink_a.handles.iter().map(|h| h.index).collect();
-    let handles_b: BTreeSet<u32> = sink_b.handles.iter().map(|h| h.index).collect();
-
-    handles_a == handles_b
+    sink_a.len() == sink_b.len()
         && store_a.active_len() == store_b.active_len()
         && portable_snapshot(&store_a) == portable_snapshot(&store_b)
 }

@@ -743,7 +743,6 @@ Mixing the two semantics in one batch is not supported; pick the entry point and
 ```rust
 #[derive(Clone, Debug, Default)]
 pub struct DeltaSink {
-    pub handles: Vec<CellHandle>,
     pub keys: Vec<CellIdentity>,
     pub previous: Vec<u32>,
     pub current: Vec<u32>,
@@ -754,7 +753,6 @@ pub struct DeltaSink {
 
 | Column | Meaning |
 |---|---|
-| `handles`         | Generation-stamped pointer to the cell, so the caller can revisit the row without re-hashing the identity. |
 | `keys`            | **Portable** identity tuple `(rule_fingerprint, key_hash, bucket)` — see §5.4. The aggregate store keys on this; it never sees a node-local slot. |
 | `previous`        | Stored count immediately before the merge. For a brand-new cell, `C::default()`. |
 | `current`         | Stored count after the merge. |
@@ -778,20 +776,16 @@ pub struct DeltaSink {
 ```rust
 #[derive(Clone, Debug, Default)]
 pub struct ExpirationSink {
-    pub handles: Vec<CellHandle>,
     pub keys: Vec<CellIdentity>,
     pub last_counts: Vec<u32>,
-    pub last_update_millis: Vec<u64>,
     pub applies_locally: Vec<u8>,
 }
 ```
 
 | Column | Meaning |
 |---|---|
-| `handles`            | Generation-stamped pointer to the cell that just expired. Resolvable through this call only — after the slot is freed the handle no longer matches. |
 | `keys`               | Portable `CellIdentity` (§5.4). |
 | `last_counts`        | The stored count at the moment of expiry. |
-| `last_update_millis` | The last write timestamp on the cell. |
 | `applies_locally`    | Byte flag, same semantics as `DeltaSink`. |
 
 `ExpirationSink::push` is `pub(super)` so that only `CellStore::expire` and its convenience wrapper `expire_at` (§8) append to it, and the same read-then-`clear()` pattern as `DeltaSink` applies.
@@ -1080,7 +1074,7 @@ A small concrete sequence that ties the previous sections together.
 **Step 3 — bucket 42 expires.**
 
 - `expire_at(now)` computes `ages[R1] = Epoch { current: 44, live: 1 }`. For slot 0, `buckets[0] = 42` and `44 - 42 = 2 > 1` → expired.
-- `emit_expiration(sink, 0)` pushes one `ExpirationSink` row: `(handle {0,1}, CellIdentity { R1_fingerprint, K, 42 }, last_count=6, last_update_millis=…, applies_locally=true)`. The rule descriptor is still live for the lookup.
+- `emit_expiration(sink, 0)` pushes one `ExpirationSink` row: `(CellIdentity { R1_fingerprint, K, 42 }, last_count=6, applies_locally=true)`. The rule descriptor is still live for the lookup.
 - `free_cell_at(0)` removes from `CellIndex`, decrements rule and node refcounts, calls `free_slot(0)`.
 - `generations[0]` goes from 1 → 2 (inactive, ABA tag now 1).
 - Slot 0 pushes back onto freelist; `free_head = 0`, `free_next[0]` points at the old head.
