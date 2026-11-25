@@ -196,7 +196,7 @@ One subtlety is worth flagging: slots are **not** globally stable across peers. 
 
 #### Shared layout
 
-Both dictionaries share the same five fields plus capacity:
+Both dictionaries are one generic `Dictionary<E: Entry>`: `RuleDictionary` is `Dictionary<RuleDescriptor>` and `NodeDictionary` is `Dictionary<NodeDescriptor>`. `Entry` names what differs between them: the descriptor's key (the fingerprint, or the `(NodeId, Incarnation)` pair), the hash of that key, and the slot newtype (`RuleSlot`, `NodeSlot`). Both share these fields:
 
 | Field         | Type             | Role                                                                                         |
 | ------------- | ---------------- | -------------------------------------------------------------------------------------------- |
@@ -244,7 +244,7 @@ pub struct RuleDescriptor {
 
 `applies_locally` is `false` (the `Default`) for a rule known on the wire only. Cells under such rules are still tracked, replicated, and expired, but the local aggregator skips them — which is what happens when a peer is gossiping a rule the local node does not itself enforce.
 
-**Read path.** `descriptor(slot)` bounds-checks and verifies `refcount > 0` before returning. A free slot returns `None` even though the backing array still holds a default value at that index. `find(fingerprint)` hashes via `hash_fingerprint`, asks `CellIndex` for candidate slots, and confirms a match with `fingerprint == fingerprint`.
+**Read path.** `descriptor(slot)` bounds-checks and verifies `refcount > 0` before returning. A free slot returns `None` even though the backing array still holds a default value at that index. The delta and expiration sinks read a cell's rule through `get(slot)` instead, which indexes directly: the cell's own reference keeps the slot live, and a `debug_assert!` checks it. `find(fingerprint)` hashes via `hash_fingerprint`, asks `CellIndex` for candidate slots, and confirms a match with `fingerprint == fingerprint`.
 
 ```mermaid
 flowchart TD
@@ -256,14 +256,11 @@ flowchart TD
     C -->|"no more candidates"| F["return None"]
 ```
 
-**Write path — `intern`.** `intern(descriptor) -> Option<RuleSlot>` is the only way to create a rule slot:
+**Write path — `insert`.** `insert(descriptor) -> Option<RuleSlot>` is the only way to create a rule slot. Every caller has just missed on `find`, so it does not probe again:
 
 ```mermaid
 flowchart TD
-    A["intern(desc)"] --> B{"find(desc.fingerprint)?"}
-    B -- hit --> C["overwrite descriptors[slot] = desc"]
-    C --> D["return Some(slot)"]
-    B -- miss --> E{"free_head == EMPTY?"}
+    E{"free_head == EMPTY?"}
     E -- yes --> F["return None (dictionary full)"]
     E -- no --> G["slot = free_head"]
     G --> H["free_head = free_next[slot]"]
@@ -272,11 +269,14 @@ flowchart TD
     J --> K["len += 1; return Some(slot)"]
 ```
 
-`intern` overwrites the descriptor on a hit. Configured rules are
-interned before any gossip can arrive, so a wire-only intern
-(`applies_locally = false`) never lands on a configured rule's slot. `intern` deliberately does not touch refcounts: a freshly
+Configured rules are interned before any gossip can arrive, so a
+wire-only rule (`applies_locally = false`) never lands on a configured
+rule's slot. `insert` deliberately does not touch refcounts: a freshly
 interned slot starts at `refcount = 0`, and the `CellStore` calls
-`inc_ref` and `dec_ref` as cells reference and release the slot.
+`inc_ref` and `dec_ref` as cells reference and release the slot. When the
+row that interned a slot is dropped, because the node dictionary or the
+cell store is full, `release_unreferenced` frees the slot again if no cell
+or pin references it, so a failed insert never leaves a slot taken.
 
 **Refcounting.** `inc_ref` saturates at `u32::MAX`; `dec_ref` is a no-op at zero. When `dec_ref` drives the count to zero, four things happen in sequence:
 
@@ -297,7 +297,7 @@ The descriptor reset is critical: it clears the fingerprint so that a `find` dur
 
 #### `NodeDictionary`
 
-`NodeDictionary` is structurally a twin of `RuleDictionary` — same five fields, same free list, same hash-index lookup — but with three deliberate differences.
+`NodeDictionary` is the same `Dictionary` over a different `Entry`.
 
 ```rust
 pub struct NodeDescriptor {
@@ -306,13 +306,9 @@ pub struct NodeDescriptor {
 }
 ```
 
-The interned key is the *pair* `(node_id, incarnation)`, not just the node id, and this distinction is load-bearing. When a node restarts (or otherwise increments its incarnation), the new `(node_id, incarnation)` is a different key from the old one: `intern` allocates a fresh slot, and old cells produced by the previous incarnation stay pinned to the old slot until released. The two incarnations cannot alias inside the CRDT, which is exactly what we need; otherwise replayed sequence numbers from the dead incarnation could clobber state from the live one.
+The interned key is the *pair* `(node_id, incarnation)`, not just the node id, and this distinction is load-bearing. When a node restarts (or otherwise increments its incarnation), the new `(node_id, incarnation)` is a different key from the old one: `insert` allocates a fresh slot, and old cells produced by the previous incarnation stay pinned to the old slot until released. The two incarnations cannot alias inside the CRDT, which is exactly what we need; otherwise replayed sequence numbers from the dead incarnation could clobber state from the live one.
 
-The three asymmetries with the rule version are:
-
-1. **`intern` does not overwrite the descriptor on a hit.** There is nothing to overwrite, because the descriptor *is* the key.
-2. **`dec_ref` returns `bool`.** A return value of `true` means this call dropped the refcount to zero and freed the slot, which the caller uses to decide whether to also tear down per-origin auxiliary state — the per-origin sequence allocator.
-3. **Different incarnations get different slots.** A node that bumps its incarnation never shares a `NodeSlot` with its previous identity.
+`dec_ref` returns `true` when it dropped the refcount to zero and freed the slot. The cell store uses that for node slots to tear down per-origin state, the per-origin sequence allocator. A node that bumps its incarnation never shares a `NodeSlot` with its previous identity.
 
 #### Capacity sizing — `pow2_index_capacity_for`
 
@@ -330,12 +326,12 @@ The helper offers three guarantees. The result is always a power of two, which l
 2. **No duplicates.** At any time at most one live slot holds a given key.
 3. **Bounded size.** `len <= capacity <= u16::MAX - 1`.
 4. **No allocation after construction.**
-5. **`intern` never mutates refcounts.**
+5. **`insert` never mutates refcounts.**
 6. **A freed slot is unreachable via `find` before it is recycled** — `dec_ref` removes the index entry and resets the descriptor *before* pushing the slot onto the free list.
-7. **`RuleDictionary::intern` overwrites the descriptor on a hit; `NodeDictionary::intern` does not.**
-8. **Different incarnations get different `NodeSlot`s.**
-9. **`EMPTY_DICT_SLOT = u16::MAX`** is both "no slot" and "end of free list"; the capacity assertion makes the dual use safe.
-10. **`inc_ref` saturates; `dec_ref` is a floor** — refcounts can neither overflow nor underflow.
+7. **Different incarnations get different `NodeSlot`s.**
+8. **`EMPTY_DICT_SLOT = u16::MAX`** is both "no slot" and "end of free list"; the capacity assertion makes the dual use safe.
+9. **`inc_ref` saturates; `dec_ref` is a floor** — refcounts can neither overflow nor underflow.
+10. **Only a referenced slot stays interned.** A slot whose row was dropped is released at once.
 
 ---
 
@@ -1103,7 +1099,7 @@ The whole structure relies on the following properties. They are grouped by subm
 2. **Freelist is a valid linked list.** `free_head` is `NO_FREE` or a slot index in `0..capacity`; each `free_next[slot]` for an inactive slot is `NO_FREE` or another inactive slot index.
 3. **No slot appears on the freelist twice.** `alloc_slot` pops only the head and writes `NO_FREE` into the popped slot's `free_next`; `free_slot` only pushes a slot once.
 4. **Hash index contains an entry iff slot is active.** `upsert`'s insert path calls `index.insert_unchecked`; `free_cell_at` calls `index.remove`.
-5. **Dictionary refcounts cover exactly the live cells.** Insert path calls `inc_ref` on both dictionaries; `free_cell_at` calls `dec_ref`. The local node slot has one extra permanent refcount (pin).
+5. **Dictionary refcounts cover exactly the live cells.** Insert path calls `inc_ref` on both dictionaries; `free_cell_at` calls `dec_ref`; a row the full cell store drops releases the slots it interned. Pinned slots (the local node, configured rules) have one extra permanent refcount.
 6. **`active_len` equals the number of slots with odd generation.** Maintained by `alloc_slot` (`+= 1`) and `free_slot` (`-= 1`).
 7. **`origin_sequences[slot]` is monotonically non-decreasing while a slot is active.** `next_origin_sequence` allocates before each write.
 8. **The own list holds exactly the live own cells, in strictly ascending `origin_sequences`.** `upsert` relinks; `free_cell_at` unlinks.
@@ -1118,12 +1114,12 @@ The whole structure relies on the following properties. They are grouped by subm
 2. No duplicates.
 3. `len <= capacity <= u16::MAX - 1`.
 4. No allocation after construction.
-5. `intern` never mutates refcounts.
+5. `insert` never mutates refcounts.
 6. A freed slot is unreachable via `find` before recycling.
-7. `RuleDictionary::intern` overwrites the descriptor on a hit; `NodeDictionary::intern` does not.
-8. Different incarnations always get different `NodeSlot`s.
-9. `EMPTY_DICT_SLOT = u16::MAX` is both "no slot" and "end of free list."
-10. `inc_ref` saturates; `dec_ref` is a floor.
+7. Different incarnations always get different `NodeSlot`s.
+8. `EMPTY_DICT_SLOT = u16::MAX` is both "no slot" and "end of free list."
+9. `inc_ref` saturates; `dec_ref` is a floor.
+10. Only a referenced slot stays interned.
 
 ### Hash mixers
 
