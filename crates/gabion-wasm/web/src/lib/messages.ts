@@ -4,7 +4,7 @@
 // the page only reads (crates/gabion-wasm/src/capture.rs).
 
 import { fmtCount } from './format';
-import { RIDERS, ROLES, type ListedRepeat, type MessageRole, type PacketKind, type Tier } from './sim/types';
+import { KIND, RIDERS, ROLES, type ListedRepeat, type MessageRole, type PacketKind, type Tier } from './sim/types';
 
 /** The rows buffer's layout: `HEAD` head slots, then up to `MAX_ROWS` rows of
  *  `ROW` slots (`capture::{HEAD_SLOTS, MAX_ROWS, ROW_SLOTS}`). */
@@ -277,7 +277,6 @@ export type Relation =
   | 'ReportedMissingBy'
   | 'ReportsMissing'
   | 'RevealedBy'
-  | 'Reveals'
   | 'RepeatedAs'
   | 'Repeats';
 
@@ -289,7 +288,6 @@ export const RELATION_WORD: Readonly<Record<Relation, string>> = {
   ReportedMissingBy: 'reported missing by',
   ReportsMissing: 'reports missing',
   RevealedBy: 'revealed by',
-  Reveals: 'reveals',
   RepeatedAs: 'repeated as',
   Repeats: 'repeats',
 };
@@ -340,7 +338,6 @@ export function gist(m: { role: MessageRole; flags: number; cells: number; a: nu
 
 /** The header's flag bits (`gabion::wire::header`). */
 export const GAP_OWN = 0x02;
-export const GAP_RELAY = 0x04;
 
 /** The riders' words, in their fixed order. */
 export function riderWords(riders: number, repeat: ListedRepeat | undefined, zone: string | undefined): string[] {
@@ -360,10 +357,10 @@ export const fmtInstant = (ms: number): string => (ms / 1000).toFixed(3);
 /** A signed offset: "+312 ms", "−5 ms". */
 export const fmtOffset = (ms: number): string => `${ms < 0 ? '−' : '+'}${Math.abs(Math.round(ms))} ms`;
 
-/** Whether a message asks its receiver for an answer: data, a probe, or a
- *  probe riding another message. */
+/** Whether a message asks its receiver for an answer: stream data or a skip,
+ *  a probe, or a probe riding another message. */
 export const asksAnswer = (m: { role: MessageRole; riders: number }): boolean =>
-  m.role === 'OwnData' || m.role === 'RelayData' || m.role === 'Probe' || (m.riders & RIDERS.PROBE) !== 0;
+  KIND[m.role] === 'Own' || KIND[m.role] === 'Relay' || m.role === 'Probe' || (m.riders & RIDERS.PROBE) !== 0;
 
 /** A marker's words. */
 export function markerWords(m: Marker, zone: (z: number) => string): string {

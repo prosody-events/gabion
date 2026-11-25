@@ -134,23 +134,27 @@
   });
 
   // A batch landed: follow, at most once a frame, and four times a second
-  // under live pacing; or count what is newer.
+  // under live pacing; or count what is newer. A throttled frame keeps the
+  // read pending, so the last batch before a pause is still read.
   let frame = 0;
   let lastRead = 0;
+  const readFrame = (now: number): void => {
+    if (live && now - lastRead < 250) {
+      frame = requestAnimationFrame(readFrame);
+      return;
+    }
+    frame = 0;
+    lastRead = now;
+    if (following) follow();
+    else {
+      const len = sim.messageRows(0, 0).rows[2];
+      newer = Math.max(len - (first + VISIBLE), 0);
+      head = headOf(sim.messageRows(0, 0).rows);
+    }
+  };
   $effect(() => {
     void version;
-    if (frame !== 0) return;
-    frame = requestAnimationFrame((now) => {
-      frame = 0;
-      if (live && now - lastRead < 250) return;
-      lastRead = now;
-      if (following) follow();
-      else {
-        const len = sim.messageRows(0, 0).rows[2];
-        newer = Math.max(len - (first + VISIBLE), 0);
-        head = headOf(sim.messageRows(0, 0).rows);
-      }
-    });
+    if (frame === 0) frame = requestAnimationFrame(readFrame);
   });
   onDestroy(() => cancelAnimationFrame(frame));
 
