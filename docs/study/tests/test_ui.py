@@ -1198,9 +1198,10 @@ def check_interaction(S, scope):
         S.pg.locator(f'#g3-super .cell[data-arm="{a}"][data-metric="{m}"]').click(force=True); S.settle(250)
         p = prm()
         if p.get('arm') != a or p.get('metric') != m: bad_st.append(f'click strip {a}/{m}: params arm={p.get("arm")} metric={p.get("metric")}')
-        S.pg.wait_for_timeout(900)
-        top = S.pg.evaluate("document.getElementById('g3-hub-sec').getBoundingClientRect().top")
-        if abs(top) > 60: bad_st.append(f'click strip {a}/{m}: #g3-hub-sec top at {top:.0f}px after scroll (expected ~0)')
+        try: S.pg.wait_for_function("Math.abs(document.getElementById('g3-hub-sec').getBoundingClientRect().top) <= 60", timeout=5000)
+        except Exception:
+            top = S.pg.evaluate("document.getElementById('g3-hub-sec').getBoundingClientRect().top")
+            bad_st.append(f'click strip {a}/{m}: #g3-hub-sec top at {top:.0f}px 5 s after the click (expected ~0)')
     S.pg.evaluate("document.querySelector('#g3-super .cell[tabindex=\"0\"]').focus()"); S.pg.keyboard.press('ArrowDown'); S.pg.keyboard.press('Enter'); S.settle(250)
     fails_to_rec('A6.supertable-strip-click-sets-metric-and-arm-and-scrolls', scope, bad_st, 'params + scroll to hub')
     bad_sc = []
