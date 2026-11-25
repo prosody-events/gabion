@@ -175,8 +175,8 @@ export type Preset = {
   readonly story: Story;
   /** Fire the preset's opening commands on the warmed cluster, at the current
    *  virtual time, and report the hits they leave held for the selected
-   *  node's heartbeat, or null. */
-  seed(sim: Sim, config: SimConfig): Promise<Held | null>;
+   *  node's heartbeat, or null. A preset with none opens as warmed. */
+  seed?(sim: Sim, config: SimConfig): Promise<Held | null>;
 };
 
 /** The nodes a build places: node `i` in zone `i mod zones`. */
@@ -252,10 +252,7 @@ export const PRESETS: readonly Preset[] = [
     config: { nodes: NODES, zones: ZONES, rule_limit: RATE_LIMIT },
     charts: ['window', 'requests'],
     story: { kind: 'rate-limiting', next: 'partition', act: 'open', zones: 0, sendBucket: null },
-    async seed() {
-      // Opens settled at 0: the reader's Sends are the story.
-      return null;
-    },
+    // Opens settled at 0: the reader's Sends are the story.
   },
   {
     id: 'propagation',
@@ -282,10 +279,7 @@ export const PRESETS: readonly Preset[] = [
     traffic: { rate_per_sec: OVERLOAD_RATE_PER_SEC, at: 'every-node', starts: 'load' },
     charts: ['window', 'requests', 'behind'],
     story: { kind: 'watch', watched: 'overload', next: 'rate-limiting' },
-    async seed() {
-      // No opening request: the sustained feed (driven during play) is the story.
-      return null;
-    },
+    // No opening request: the sustained feed (driven during play) is the story.
   },
   {
     id: 'partition',
@@ -315,10 +309,7 @@ export const PRESETS: readonly Preset[] = [
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
     charts: ['behind'],
     story: { kind: 'gateway', fault: 'silenced', next: 'gateway-cut', origin: ORIGIN, zone: GATEWAY_ZONE, act: 'open' },
-    async seed() {
-      // Opens healthy: the reader's Send, then the reader's fault.
-      return null;
-    },
+    // Opens healthy: the reader's Send, then the reader's fault.
   },
   {
     id: 'gateway-cut',
@@ -328,9 +319,6 @@ export const PRESETS: readonly Preset[] = [
     traffic: { rate_per_sec: TRICKLE_RATE_PER_SEC, at: { node: ORIGIN }, starts: 'fault' },
     charts: ['behind'],
     story: { kind: 'gateway', fault: 'unheard', next: 'sandbox', origin: ORIGIN, zone: GATEWAY_ZONE, act: 'open' },
-    async seed() {
-      return null;
-    },
   },
   {
     id: 'steady',
@@ -362,10 +350,7 @@ export const PRESETS: readonly Preset[] = [
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
     charts: ['requests', 'behind'],
     story: { kind: 'sandbox' },
-    async seed() {
-      // Deliberately empty: the reader sends the first hit.
-      return null;
-    },
+    // No seed: the reader sends the first hit.
   },
 ];
 

@@ -175,7 +175,7 @@
   $effect(() => {
     if (ready && renderer !== null && layout !== null) {
       renderer.setLayout(layout, untrack(() => cluster?.zones.map((z) => z.name) ?? []));
-      labelBoxes = JSON.parse(container.querySelector('canvas')?.dataset.labelBoxes ?? '[]');
+      labelBoxes = renderer.labelBoxes;
     }
   });
 
@@ -194,14 +194,14 @@
   $effect(() => {
     if (ready && renderer !== null) {
       renderer.setRoles(roles);
-      labelBoxes = JSON.parse(container.querySelector('canvas')?.dataset.labelBoxes ?? '[]');
+      labelBoxes = renderer.labelBoxes;
     }
   });
 
   $effect(() => {
     if (ready && renderer !== null) {
       renderer.setFaults(faults);
-      labelBoxes = JSON.parse(container.querySelector('canvas')?.dataset.labelBoxes ?? '[]');
+      labelBoxes = renderer.labelBoxes;
     }
   });
 

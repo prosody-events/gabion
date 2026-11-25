@@ -573,6 +573,11 @@ export class StageRenderer {
     if (width > 0 && height > 0) this.#app.renderer.resize(width, height);
   }
 
+  /** The name boxes of the last layout. */
+  get labelBoxes(): readonly LabelBox[] {
+    return this.#labelBoxes;
+  }
+
   /** Place every node: enter newcomers, exit departed ones, glide survivors to
    *  their slots, redraw the ring guides and place the names. `zoneNames` are
    *  the engine's zone names, one per ring. Publishes the stage centre, the

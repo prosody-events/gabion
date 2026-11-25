@@ -33,7 +33,6 @@
     type Preset,
     type SustainedTraffic,
   } from './lib/presets';
-  import { nominalBuckets } from './lib/buckets';
   import { cutName, cutState, type Cut } from './lib/cuts';
   import { actionLabel, sendLabel, watchWidth, widthNow, type Width } from './lib/controls';
   import { heading as headingOf, type Badge } from './lib/heading';
@@ -265,7 +264,7 @@
   const selectedNode = $derived(cluster?.nodes.find((n) => n.id === run?.selected) ?? null);
   const limit = $derived(run?.applied.rule_limit ?? 1);
   const scaled = $derived(run !== null && onScale(limit, run.requests));
-  const buckets = $derived(run === null ? 1 : nominalBuckets(run.applied.rule_window_ms, bucketMs));
+  const buckets = $derived(cluster?.oracle_buckets.length ?? 1);
   const scale = $derived<Scale>({ limit, onScale: scaled, requests: run?.requests ?? 1, buckets });
   const faults = $derived.by((): Faults => {
     const nodes = new Map<number, Fault>();
@@ -325,7 +324,7 @@
     const fresh = await Sim.create(config);
     try {
       const gateways = await warm(fresh, config);
-      const held = await preset.seed(fresh, config);
+      const held = (await preset.seed?.(fresh, config)) ?? null;
       // The run's messages are listed from its first paint: a seed that
       // settled before it is warm-up, one that waits plays after it.
       fresh.markRunStart();
