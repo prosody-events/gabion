@@ -18,11 +18,6 @@
 //!   (max-merge collapses duplicates).
 //! * `merge_remote/all_noop`      — peer is behind us on every row.
 //!
-//! * `find/realistic_95_hit`      — what the rate-limit aggregator does on
-//!   every request: 95% of queries hit an existing cell.
-//! * `find/miss`                  — pure miss path, for the Robin Hood
-//!   early-exit baseline.
-//!
 //! * `stream/after`               — reading one peer's own-stream frame from
 //!   the own list in a production-sized store holding `prod-peak`'s 20,070 and
 //!   `prod-4x`'s 79,440 own cells: the steady state (`sent` two below the head,
@@ -48,9 +43,9 @@ use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, 
 
 use gabion::aggregate::Aggregate;
 use gabion::crdt::{
-    BucketEpoch, CellHandle, CellIdentity, CellStore, CompactCellKey, DeltaSink, ExpirationSink,
-    Expiry, Incarnation, KeyHash, NodeId, NodeIdentity, NodeSlot, Observation, ObservationBatch,
-    RelayMark, RuleAge, RuleSlot, Stream, ValidStorageConfig,
+    BucketEpoch, CellHandle, CellIdentity, CellStore, DeltaSink, ExpirationSink, Expiry,
+    Incarnation, KeyHash, NodeId, NodeIdentity, Observation, ObservationBatch, RelayMark, RuleAge,
+    Stream, ValidStorageConfig,
 };
 use gabion::defaults::{GOSSIP_EXPIRATION_BATCH, GOSSIP_MAX_PAYLOAD_BYTES};
 use gabion::gossip::AggregateStore;
@@ -183,8 +178,6 @@ fn peer_node(i: usize) -> NodeId {
 struct Fixture {
     store: CellStore,
     rule_fps: Vec<u128>,
-    rule_slots: Vec<RuleSlot>,
-    local_node_slot: NodeSlot,
     hot_keys: Vec<u128>,
     warm_keys: Vec<u128>,
     /// Cells inserted under remote origins, addressed as `(key, rule_idx,
@@ -203,7 +196,7 @@ struct RemoteRow {
 
 /// Build a fresh store with N rules of a 60 s window in 15 s buckets, and
 /// return the seed material the benches share.
-fn new_store() -> (CellStore, Vec<u128>, Vec<RuleSlot>, NodeSlot) {
+fn new_store() -> (CellStore, Vec<u128>) {
     let table = rules(NUM_RULES, "1000000r/m", Duration::from_secs(15), &config());
     let store = CellStore::new(config(), local_identity(), &table);
     let rule_fps: Vec<u128> = table
@@ -211,12 +204,7 @@ fn new_store() -> (CellStore, Vec<u128>, Vec<RuleSlot>, NodeSlot) {
         .iter()
         .map(|rule| rule.fingerprint())
         .collect();
-    let rule_slots = rule_fps
-        .iter()
-        .map(|&fp| store.rule_dictionary().find(fp).expect("rule interned"))
-        .collect();
-    let local_node_slot = store.local_node_slot();
-    (store, rule_fps, rule_slots, local_node_slot)
+    (store, rule_fps)
 }
 
 /// Seed `count` cells under the local origin, sampling rule and bucket
@@ -323,7 +311,7 @@ fn fresh_key(rng: &mut Rng) -> u128 {
 }
 
 fn build_fixture() -> Fixture {
-    let (mut store, rule_fps, rule_slots, local_node_slot) = new_store();
+    let (mut store, rule_fps) = new_store();
 
     // Pre-generate the key universe deterministically.
     let mut key_rng = Rng::new(0xA110_CA7E_FACE_BEEF);
@@ -365,8 +353,6 @@ fn build_fixture() -> Fixture {
     Fixture {
         store,
         rule_fps,
-        rule_slots,
-        local_node_slot,
         hot_keys,
         warm_keys,
         remote_rows,
@@ -573,7 +559,7 @@ fn bench_ingest_local(c: &mut Criterion) {
     // empty fixture so the freelist actually has room across many
     // iterations.
     let empty = {
-        let (store, rule_fps, ..) = new_store();
+        let (store, rule_fps) = new_store();
         (store, rule_fps)
     };
     group.throughput(Throughput::Elements(32));
@@ -747,202 +733,6 @@ fn bench_merge_remote(c: &mut Criterion) {
     });
 
     group.finish();
-}
-
-// ---------------------------------------------------------------------------
-// find — read-only lookup (the rate-limit aggregator's per-request query).
-// ---------------------------------------------------------------------------
-
-fn bench_find(c: &mut Criterion) {
-    let mut group = c.benchmark_group("crdt/find");
-    group.throughput(Throughput::Elements(1));
-
-    let fixture = build_fixture();
-
-    // Materialise the keys we know live in the store (local seed).
-    let present_keys: Vec<u128> = {
-        let mut v = fixture.hot_keys.clone();
-        v.extend(fixture.warm_keys.iter().take(WARM_KEYS / 2).copied());
-        v
-    };
-
-    // ─── realistic_95_hit ───────────────────────────────────────────────
-    // 95% of queries hit an existing cell, 5% miss. This is what an
-    // aggregator's per-request `find` actually does.
-    group.bench_function("realistic_95_hit", |b| {
-        let mut rng = Rng::new(0x9595_9595);
-        b.iter(|| {
-            let pick = rng.range(100);
-            let (key, rule_idx, bucket) = if pick < 95 {
-                let key = present_keys[rng.range(present_keys.len() as u32) as usize];
-                let rule_idx = pick_rule(&mut rng) as usize;
-                let bucket = pick_bucket(&mut rng);
-                (key, rule_idx, bucket)
-            } else {
-                (fresh_key(&mut rng), 0, BucketEpoch(0))
-            };
-            let rule_slot = fixture.rule_slots[rule_idx];
-            let h = fixture.store.find(black_box(CompactCellKey {
-                rule: rule_slot,
-                key_hash: KeyHash(key),
-                bucket,
-                origin: fixture.local_node_slot,
-                incarnation: LOCAL_INCARNATION,
-            }));
-            black_box(h);
-        });
-    });
-
-    // ─── miss ───────────────────────────────────────────────────────────
-    // Pure miss path — Robin Hood early-exit baseline.
-    group.bench_function("miss", |b| {
-        let rule_slot = fixture.rule_slots[0];
-        let mut rng = Rng::new(0xDEAD_BEEF);
-        b.iter(|| {
-            let h = fixture.store.find(black_box(CompactCellKey {
-                rule: rule_slot,
-                key_hash: KeyHash(fresh_key(&mut rng)),
-                bucket: BucketEpoch(0),
-                origin: fixture.local_node_slot,
-                incarnation: LOCAL_INCARNATION,
-            }));
-            black_box(h);
-        });
-    });
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
-// admission_headers — overhead of populating `X-RateLimit-*` on the allow
-// path. We do *not* keep a separate "cheap allow" code path; this bench is
-// the audit trail confirming the header math is genuinely free enough not
-// to need one.
-// ---------------------------------------------------------------------------
-
-fn bench_admission_headers(c: &mut Criterion) {
-    use std::fmt::Write;
-    let mut group = c.benchmark_group("crdt/admission_headers");
-    group.throughput(Throughput::Elements(1));
-
-    let fixture = build_fixture();
-    let present_keys: Vec<u128> = {
-        let mut v = fixture.hot_keys.clone();
-        v.extend(fixture.warm_keys.iter().take(WARM_KEYS / 2).copied());
-        v
-    };
-
-    // Pick a representative bucket_millis matching the production
-    // 60s / 15s shape the rest of this file's fixture uses.
-    const BUCKET_MILLIS: u64 = 15_000;
-    const RULE_LIMIT: u64 = 1_000;
-
-    // ─── baseline (A) ───────────────────────────────────────────────────
-    // Today's allow path — just the `find` lookup. Used as the reference
-    // the headers variant is compared against.
-    group.bench_function("baseline", |b| {
-        let mut rng = Rng::new(0x9595_9595);
-        let mut now: u64 = 0;
-        b.iter(|| {
-            let pick = rng.range(100);
-            let (key, rule_idx, bucket) = if pick < 95 {
-                let key = present_keys[rng.range(present_keys.len() as u32) as usize];
-                let rule_idx = pick_rule(&mut rng) as usize;
-                let bucket = pick_bucket(&mut rng);
-                (key, rule_idx, bucket)
-            } else {
-                (fresh_key(&mut rng), 0, BucketEpoch(0))
-            };
-            let rule_slot = fixture.rule_slots[rule_idx];
-            let h = fixture.store.find(black_box(CompactCellKey {
-                rule: rule_slot,
-                key_hash: KeyHash(key),
-                bucket,
-                origin: fixture.local_node_slot,
-                incarnation: LOCAL_INCARNATION,
-            }));
-            black_box(h);
-            now = now.wrapping_add(1);
-        });
-    });
-
-    // ─── with_headers (B) ───────────────────────────────────────────────
-    // Same allow path plus the arithmetic that `AdmissionHeaders` emits on
-    // a 200 response: bucket-boundary modulo + saturating remaining +
-    // `reset_unix_seconds` + three u64 format passes into a stack buffer.
-    group.bench_function("with_headers", |b| {
-        let mut rng = Rng::new(0x9595_9595);
-        let mut now: u64 = 0;
-        let mut scratch = [0_u8; 96];
-        b.iter(|| {
-            let pick = rng.range(100);
-            let (key, rule_idx, bucket) = if pick < 95 {
-                let key = present_keys[rng.range(present_keys.len() as u32) as usize];
-                let rule_idx = pick_rule(&mut rng) as usize;
-                let bucket = pick_bucket(&mut rng);
-                (key, rule_idx, bucket)
-            } else {
-                (fresh_key(&mut rng), 0, BucketEpoch(0))
-            };
-            let rule_slot = fixture.rule_slots[rule_idx];
-            let handle = fixture.store.find(black_box(CompactCellKey {
-                rule: rule_slot,
-                key_hash: KeyHash(key),
-                bucket,
-                origin: fixture.local_node_slot,
-                incarnation: LOCAL_INCARNATION,
-            }));
-            // Treat the existing count as the window total. Realistic
-            // enough for the cost we want to measure — the bench is
-            // about the header math, not about an exact admission walk.
-            let total: u64 = handle
-                .and_then(|h| fixture.store.get(h))
-                .map(|row| u64::from(row.count))
-                .unwrap_or(0);
-            let hits: u64 = 1;
-            let remaining = RULE_LIMIT.saturating_sub(total).saturating_sub(hits);
-            let delta = gabion::window::time_until_next_bucket_boundary_millis(
-                now,
-                BUCKET_MILLIS.try_into().unwrap(),
-            );
-            let reset = gabion::window::reset_unix_seconds(now, delta);
-            // Format the three header values into a scratch buffer so the
-            // bench measures the same Display passes the production
-            // builder runs.
-            let mut writer = SliceWriter::new(&mut scratch);
-            let _ = write!(&mut writer, "{}", RULE_LIMIT);
-            let _ = write!(&mut writer, "{}", remaining);
-            let _ = write!(&mut writer, "{}", reset);
-            black_box(writer.len);
-            now = now.wrapping_add(BUCKET_MILLIS / 4);
-        });
-    });
-
-    group.finish();
-}
-
-/// Allocation-free `core::fmt::Write` backed by a stack slice. Truncates
-/// silently on overflow; the bench buffer is sized to hold three `u64`
-/// decimal strings.
-struct SliceWriter<'a> {
-    buf: &'a mut [u8],
-    len: usize,
-}
-
-impl<'a> SliceWriter<'a> {
-    fn new(buf: &'a mut [u8]) -> Self {
-        Self { buf, len: 0 }
-    }
-}
-
-impl std::fmt::Write for SliceWriter<'_> {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        let room = self.buf.len().saturating_sub(self.len);
-        let to_copy = s.len().min(room);
-        self.buf[self.len..self.len + to_copy].copy_from_slice(&s.as_bytes()[..to_copy]);
-        self.len += to_copy;
-        Ok(())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1413,8 +1203,6 @@ criterion_group!(
     benches,
     bench_ingest_local,
     bench_merge_remote,
-    bench_find,
-    bench_admission_headers,
     bench_stream_after,
     bench_merge_relay,
     bench_expire,
