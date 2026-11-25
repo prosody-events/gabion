@@ -11,8 +11,6 @@
 //! it holds is that forwarding, not the cross-process code `safety.rs`
 //! covers, so this binary runs under nextest only.
 
-use std::alloc::{GlobalAlloc, Layout as AllocLayout, System};
-use std::cell::Cell;
 use std::hint::black_box;
 
 use gabion::crdt::{BucketEpoch, CellIdentity, DeltaSink, ExpirationSink};
@@ -26,45 +24,9 @@ use gabion_nginx::rules::{
 use gabion_nginx::shm::queue::QueueEvent;
 use gabion_nginx::shm::{CACHELINE, CachePadded, Layout, ShmAggregateStore, ShmRegion};
 
-thread_local! {
-    /// Set on this thread while a counted section runs.
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
-}
-
-struct Counting;
-
-// SAFETY: every method forwards its arguments unchanged to `System`, which
-// upholds `GlobalAlloc`'s contract; the bookkeeping touches only
-// const-initialised thread-locals with no destructor, so it never allocates
-// or re-enters the allocator.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: AllocLayout) -> *mut u8 {
-        note();
-        // SAFETY: the caller's guarantees for `layout` pass straight through.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: AllocLayout) {
-        // SAFETY: `ptr` came from `System` through `alloc` or `realloc`.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: AllocLayout, new_size: usize) -> *mut u8 {
-        note();
-        // SAFETY: the caller's guarantees pass straight through.
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: Counting = Counting;
-
-fn note() {
-    if COUNTING.get() {
-        ALLOCATIONS.set(ALLOCATIONS.get() + 1);
-    }
-}
+#[path = "../../gabion/tests/support/counting_alloc.rs"]
+mod counting_alloc;
+use counting_alloc::{ALLOCATIONS, COUNTING};
 
 /// Allocations `body` makes on this thread.
 fn allocations<T>(body: impl FnOnce() -> T) -> (T, u64) {
