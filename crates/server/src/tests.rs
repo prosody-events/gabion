@@ -965,9 +965,7 @@ fn grpc_transport_round_trip() {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let server_handle = tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(RateLimitServiceServer::new(EnvoyRateLimitService::new(
-                    limiter,
-                )))
+                .add_service(RateLimitServiceServer::new(limiter))
                 .serve_with_incoming_shutdown(incoming, async {
                     let _ = shutdown_rx.await;
                 }),

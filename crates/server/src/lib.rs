@@ -356,18 +356,6 @@ impl SharedLimiter {
     }
 }
 
-/// Tonic-mounted gRPC service.
-#[derive(Clone)]
-pub struct EnvoyRateLimitService {
-    limiter: SharedLimiter,
-}
-
-impl EnvoyRateLimitService {
-    pub fn new(limiter: SharedLimiter) -> Self {
-        Self { limiter }
-    }
-}
-
 /// gRPC service name reported via the standard `grpc.health.v1.Health`
 /// protocol. Liveness/readiness probes (kube-proxy, gRPC load balancers,
 /// `grpc_health_probe`) should query for this exact name.
@@ -403,9 +391,7 @@ where
     tonic::transport::Server::builder()
         .add_service(health_server)
         .add_service(reflection)
-        .add_service(RateLimitServiceServer::new(EnvoyRateLimitService::new(
-            limiter,
-        )))
+        .add_service(RateLimitServiceServer::new(limiter))
         .serve_with_incoming_shutdown(
             TcpIncoming::from(listener).with_nodelay(Some(true)),
             shutdown,
@@ -417,25 +403,16 @@ where
 
 #[tonic::async_trait]
 impl envoy_types::pb::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService
-    for EnvoyRateLimitService
+    for SharedLimiter
 {
     async fn should_rate_limit(
         &self,
         request: tonic::Request<RateLimitRequest>,
     ) -> Result<tonic::Response<RateLimitResponse>, tonic::Status> {
-        let response = self
-            .limiter
-            .should_rate_limit_at(request.get_ref(), now_millis());
-        Ok(tonic::Response::new(response))
+        Ok(tonic::Response::new(
+            self.should_rate_limit_at(request.get_ref(), now_millis()),
+        ))
     }
-}
-
-fn code_for_decision(decision: Decision) -> i32 {
-    (if decision.is_reject() {
-        rate_limit_response::Code::OverLimit
-    } else {
-        rate_limit_response::Code::Ok
-    }) as i32
 }
 
 /// Build the `DescriptorStatus` Envoy renders into the response. A decision
@@ -450,7 +427,11 @@ fn code_for_decision(decision: Decision) -> i32 {
 /// `(limit, window_millis)` pairs to the discrete `Second/Minute/Hour/Day`
 /// enum, and reporting a wrong unit is worse than reporting none.
 fn descriptor_status_for(decision: Decision) -> rate_limit_response::DescriptorStatus {
-    let code = code_for_decision(decision);
+    let code = (if decision.is_reject() {
+        rate_limit_response::Code::OverLimit
+    } else {
+        rate_limit_response::Code::Ok
+    }) as i32;
     match decision {
         Decision::Reject(RejectReason::GlobalLimit(quota)) | Decision::Allow(Some(quota)) => {
             rate_limit_response::DescriptorStatus {
