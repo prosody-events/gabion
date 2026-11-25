@@ -1,4 +1,5 @@
-// Driving the page the way a reader does, shared by the specs: one Step at a
+// Driving the page the way a reader does, shared by the specs: a node's grid
+// cell, the engine's snapshot, a preset loaded, the layout settled, one Step at a
 // time, Steps by the heartbeat period, Steps until a condition holds (with
 // deadlines in simulated time), a selection through the keyboard grid, a Send
 // that returns once its run has ended, a refused Send's band, frame by frame,
@@ -6,6 +7,7 @@
 
 import { expect, type Locator, type Page } from '@playwright/test';
 import { WATCHED_KEY } from '../src/lib/presets';
+import type { ClusterState } from '../src/lib/sim/types';
 import { CONTROL } from '../src/lib/stage/layout';
 import type { BeamPool, GlyphTable } from '../src/lib/stage/renderer';
 import timings from './phase-timings.json' with { type: 'json' };
@@ -28,6 +30,38 @@ export async function openControls(page: Page): Promise<void> {
   await page.locator('.rail').evaluate((rail) => {
     for (const d of rail.querySelectorAll<HTMLDetailsElement>('details.group')) d.open = true;
   });
+}
+
+/** Node `id`'s grid cell. */
+export const cell = (page: Page, id: number): Locator => page.locator(`[role="gridcell"][data-node="${id}"]`);
+
+/** The page's engine, snapshotted: every node's state, or with `inspect` that
+ *  node's rows too. */
+export const snapshot = (page: Page, inspect: number | null = null): Promise<ClusterState> =>
+  page.evaluate(([id, key]) => window.sim!.snapshot(id, key), [inspect, WATCHED_KEY] as const);
+
+/** Select a scenario by its label and wait for the rebuild to finish. The rail's
+ *  `aria-current` marks the new cluster as live. */
+export async function loadPreset(page: Page, name: string): Promise<Locator> {
+  const preset = page.getByRole('group', { name: 'Scenario preset' }).getByRole('button', { name, exact: true });
+  if ((await preset.getAttribute('aria-current')) !== 'true') await preset.click();
+  await expect(preset).toHaveAttribute('aria-current', 'true');
+  await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
+  return preset;
+}
+
+/** Wait until the layout the renderer published is for the stage's current
+ *  box: a box change reaches the layout, and every grid cell, after a short
+ *  debounce. */
+export async function settled(page: Page): Promise<void> {
+  await expect
+    .poll(() =>
+      page.locator('.stage').evaluate((stage: HTMLElement) => {
+        const centre = JSON.parse(stage.querySelector('canvas')?.dataset.centre ?? '{"x":0,"y":0}');
+        return Math.abs(centre.x * 2 - stage.clientWidth) < 1 && Math.abs(centre.y * 2 - stage.clientHeight) < 1;
+      }),
+    )
+    .toBe(true);
 }
 
 /** The simulated-time readout's value. */

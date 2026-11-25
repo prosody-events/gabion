@@ -30,10 +30,10 @@ import { VESSEL_SCALE } from '../src/lib/limit';
 import { GUTTER, MARGIN } from '../src/lib/charts/draw';
 import { requestLine, windowLine } from '../src/lib/charts/readout';
 import { zoneAt } from '../src/lib/format';
-import { PRESETS, WATCHED_KEY } from '../src/lib/presets';
+import { PRESETS } from '../src/lib/presets';
 import { BEAM_ALPHA, readTheme, type Theme } from '../src/lib/theme';
 import timings from './phase-timings.json' with { type: 'json' };
-import { PERIOD_MS, breakGateway, openControls, period, refusal, send, sendButton, setSpeed, step, stepUntil, still, virtualMs } from './drive';
+import { PERIOD_MS, breakGateway, cell, loadPreset, openControls, period, refusal, send, sendButton, setSpeed, settled, snapshot, step, stepUntil, still, virtualMs } from './drive';
 
 // How far a node's ring and its selection outline reach outside its disc,
 // summed from the gap and stroke each is drawn with rather than read from the
@@ -78,13 +78,7 @@ const duration = (ms: number): string => {
 
 // -- Page helpers --------------------------------------------------------------
 
-const cell = (page: Page, id: number): Locator => page.locator(`[role="gridcell"][data-node="${id}"]`);
 const field = (page: Page, name: string): Locator => page.locator(`[data-field="${name}"]`);
-
-/** The page's engine, snapshotted: every node's state, or with `inspect` that
- *  node's rows too. */
-const snapshot = (page: Page, inspect: number | null = null): Promise<ClusterState> =>
-  page.evaluate(([id, key]) => window.sim!.snapshot(id, key), [inspect, WATCHED_KEY] as const);
 
 /** Load the page, wait for the stage, and open the rail where it folds away. */
 async function open(page: Page): Promise<Locator> {
@@ -97,16 +91,6 @@ async function open(page: Page): Promise<Locator> {
   return canvas;
 }
 
-/** Select a scenario by its label and wait for the rebuild to finish. The rail's
- *  `aria-current` marks the new cluster as live. */
-async function loadPreset(page: Page, name: string): Promise<Locator> {
-  const preset = page.getByRole('group', { name: 'Scenario preset' }).getByRole('button', { name, exact: true });
-  if ((await preset.getAttribute('aria-current')) !== 'true') await preset.click();
-  await expect(preset).toHaveAttribute('aria-current', 'true');
-  await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
-  return preset;
-}
-
 /** Open or close "Show as table" and wait for the stage layout to follow its
  *  shrinking or growing box, so no geometry is read mid-resize. */
 async function setTable(page: Page, open: boolean): Promise<void> {
@@ -116,18 +100,6 @@ async function setTable(page: Page, open: boolean): Promise<void> {
   }
   await expect(page.locator('.node-table table')).toHaveCount(open ? 1 : 0);
   await settled(page);
-}
-
-/** Wait until the layout the renderer published is for the stage's current box. */
-async function settled(page: Page): Promise<void> {
-  await expect
-    .poll(() =>
-      page.locator('.stage').evaluate((stage: HTMLElement) => {
-        const centre = JSON.parse(stage.querySelector('canvas')?.dataset.centre ?? '{"x":0,"y":0}');
-        return Math.abs(centre.x * 2 - stage.clientWidth) < 1 && Math.abs(centre.y * 2 - stage.clientHeight) < 1;
-      }),
-    )
-    .toBe(true);
 }
 
 // -- The main audit ------------------------------------------------------------

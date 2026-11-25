@@ -1,8 +1,7 @@
 import { expect, test as base, type Page } from '@playwright/test';
-import { type AnswerState, type ClusterState, type EventBatch } from '../src/lib/sim/types';
-import { WATCHED_KEY } from '../src/lib/presets';
+import { type AnswerState, type EventBatch } from '../src/lib/sim/types';
 import { CONTROL } from '../src/lib/stage/layout';
-import { breakGateway, openControls, pauseIfPlaying, send, sendButton, setRange, setSpeed, step, stepUntil, virtualMs } from './drive';
+import { breakGateway, cell, loadPreset, openControls, pauseIfPlaying, send, sendButton, setRange, setSpeed, settled, snapshot, step, stepUntil, virtualMs } from './drive';
 
 /** Every test fails on an error the page throws. */
 const test = base.extend<{ page: Page }>({
@@ -26,27 +25,9 @@ const SENT_TOTAL = String(Number(SEED_TOTAL) + Number(BURST_REQUESTS));
 // geometry and its "Show as table" row for numbers, because the canvas is opaque
 // and the table is the in-DOM numeric source. The table stays open across
 // rebuilds, so a test opens it once, right after the page loads.
-const cell = (page: Page, id: number) => page.locator(`[role="gridcell"][data-node="${id}"]`);
 const view = (page: Page, id: number) =>
   page.locator(`.node-table tr[data-node="${id}"] [data-field="view"]`);
 const COUNTS = '.node-table [data-field="view"]';
-
-/** Wait until the stage's layout follows its box: the table opening shrinks the
- *  stage, and the layout (and with it every grid cell) follows after a short
- *  debounce, so a click before then lands where a node used to be. The renderer
- *  publishes the centre of the layout it drew. */
-async function settled(page: Page): Promise<void> {
-  await expect
-    .poll(async () => {
-      const at = await page.locator('.stage').evaluate((stage: HTMLElement) => {
-        const canvas = stage.querySelector('canvas');
-        const centre = JSON.parse(canvas?.dataset.centre ?? '{"x":0,"y":0}') as { x: number; y: number };
-        return { x: centre.x * 2 - stage.clientWidth, y: centre.y * 2 - stage.clientHeight };
-      });
-      return Math.abs(at.x) < 1 && Math.abs(at.y) < 1;
-    })
-    .toBe(true);
-}
 
 /** Load the page, open "Show as table" and play at 4×, so a run ends in a
  *  quarter of its time. The default scenario, Rate limiting, opens at 0 with
@@ -64,10 +45,6 @@ async function boot(page: Page): Promise<void> {
 /** Parse a printed count ("1,234"). */
 const num = (text: string | null): number => Number((text ?? '0').replace(/,/g, ''));
 
-/** The page's engine, snapshotted, with node `inspect`'s rows. */
-const snapshot = (page: Page, inspect: number | null = null): Promise<ClusterState> =>
-  page.evaluate(([id, key]) => window.sim!.snapshot(id, key), [inspect, WATCHED_KEY] as const);
-
 /** Click the middle of node `id`'s disc. The grid cell has no pointer events, so
  *  the click reaches the stage's own hit test, as a user's would. */
 async function clickNode(page: Page, id: number): Promise<void> {
@@ -81,14 +58,6 @@ async function clickBare(page: Page): Promise<void> {
   const box = await page.locator('.stage').boundingBox();
   if (box === null) throw new Error('the stage has no box');
   await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-}
-
-/** Select a scenario by its label and wait for its build. */
-async function loadPreset(page: Page, name: string): Promise<void> {
-  const preset = page.getByRole('group', { name: 'Scenario preset' }).getByRole('button', { name, exact: true });
-  if ((await preset.getAttribute('aria-current')) !== 'true') await preset.click();
-  await expect(preset).toHaveAttribute('aria-current', 'true');
-  await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
 }
 
 const title = (page: Page) => page.locator('.pane-title [data-field="node"]');

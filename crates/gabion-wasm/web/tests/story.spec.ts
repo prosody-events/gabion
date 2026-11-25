@@ -1,11 +1,10 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
-import type { ClusterState } from '../src/lib/sim/types';
 import type { BeamPool, GlyphTable } from '../src/lib/stage/renderer';
 import { CROSS, RELAY, STRATA_MIN_INNER } from '../src/lib/stage/layout';
 import { readTheme } from '../src/lib/theme';
-import { breakGateway, openControls, pauseIfPlaying, recordData, send, sendButton, setRange, setSpeed, step, still } from './drive';
+import { breakGateway, loadPreset, openControls, pauseIfPlaying, recordData, send, sendButton, setRange, setSpeed, snapshot, step, still } from './drive';
 import { WATCHES } from '../src/lib/next';
-import { PRESETS, WATCHED_KEY, presetById } from '../src/lib/presets';
+import { PRESETS, presetById } from '../src/lib/presets';
 import { COMMANDS, clauses } from './next-actions';
 
 // Each scenario's story, walked the way a newcomer walks it: pressing only the
@@ -19,10 +18,6 @@ const line = (page: Page): Locator => page.locator('#next-action');
 const primary = (page: Page): Locator => page.locator('[data-primary]');
 const squash = (s: string | null): string => (s ?? '').replace(/\s+/g, ' ').trim();
 
-/** The page's engine, snapshotted, with node `inspect`'s rows. */
-const snapshot = (page: Page, inspect: number | null = null): Promise<ClusterState> =>
-  page.evaluate(([id, key]) => window.sim!.snapshot(id, key), [inspect, WATCHED_KEY] as const);
-
 async function open(page: Page): Promise<void> {
   await page.goto('/');
   await expect(page.locator('.stage canvas')).toBeVisible({ timeout: 30_000 });
@@ -32,13 +27,6 @@ async function open(page: Page): Promise<void> {
 /** Scenario `name`'s button in the preset list. */
 const presetButton = (page: Page, name: string): Locator =>
   page.getByRole('group', { name: 'Scenario preset' }).getByRole('button', { name, exact: true });
-
-async function loadPreset(page: Page, name: string): Promise<void> {
-  const preset = presetButton(page, name);
-  if ((await preset.getAttribute('aria-current')) !== 'true') await preset.click();
-  await expect(preset).toHaveAttribute('aria-current', 'true');
-  await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
-}
 
 /** The action line's tag: Next, Wait or Watch. */
 const tagOf = async (page: Page): Promise<string> => squash(await line(page).locator('.tag').textContent());

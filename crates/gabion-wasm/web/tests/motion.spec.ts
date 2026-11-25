@@ -5,7 +5,7 @@ import type { ClusterState } from '../src/lib/sim/types';
 import { CONTROL, CROSS, DROPPED, FADE_MS, RELAY } from '../src/lib/stage/layout';
 import { BOUNCE_MS, RING_CAUGHT_UP, type BeamPool, type GlyphTable } from '../src/lib/stage/renderer';
 import { BEAM_ALPHA, FADED_ALPHA } from '../src/lib/theme';
-import { PERIOD_MS, breakGateway, recordData, refusal, send, sendButton, setRange, setSpeed, step, still, virtualMs } from './drive';
+import { PERIOD_MS, breakGateway, loadPreset, recordData, refusal, send, sendButton, setRange, setSpeed, settled, snapshot, step, still, virtualMs } from './drive';
 import { sourceOf } from './sourcemap';
 
 // The packets in motion (README "Tests"), run once at 1440 px in the light
@@ -34,10 +34,6 @@ const MAX_TICK_MS = 100;
 // The Requests per Send every scenario opens with.
 const BURST = 25;
 
-/** The page's engine, snapshotted, with node `inspect`'s rows. */
-const snapshot = (page: Page, inspect: number | null = null): Promise<ClusterState> =>
-  page.evaluate(([id, key]) => window.sim!.snapshot(id, key), [inspect, WATCHED_KEY] as const);
-
 /** Load the page, open "Show as table" (the DOM's counts) and wait for the
  *  stage's layout to follow the smaller box, so no line is drawn mid-resize. */
 async function open(page: Page): Promise<void> {
@@ -45,22 +41,7 @@ async function open(page: Page): Promise<void> {
   await expect(page.locator('.stage canvas')).toBeVisible({ timeout: 30_000 });
   await page.getByText('Show as table').click();
   await expect(page.locator('.node-table tr[data-node]')).toHaveCount(12);
-  await expect
-    .poll(() =>
-      page.locator('.stage').evaluate((stage: HTMLElement) => {
-        const centre = JSON.parse(stage.querySelector('canvas')?.dataset.centre ?? '{"x":0,"y":0}');
-        return Math.abs(centre.x * 2 - stage.clientWidth) < 1 && Math.abs(centre.y * 2 - stage.clientHeight) < 1;
-      }),
-    )
-    .toBe(true);
-}
-
-/** Select a scenario by its label and wait for the rebuild to finish. */
-async function loadPreset(page: Page, name: string): Promise<void> {
-  const preset = page.getByRole('group', { name: 'Scenario preset' }).getByRole('button', { name, exact: true });
-  if ((await preset.getAttribute('aria-current')) !== 'true') await preset.click();
-  await expect(preset).toHaveAttribute('aria-current', 'true');
-  await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
+  await settled(page);
 }
 
 /** Rebuild the running scenario with rule limit `limit` and, if given, a
