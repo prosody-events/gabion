@@ -152,6 +152,17 @@ async fn drain_hands_each_event_to_the_runtime_once_it_has_room() {
         CellStore::new(cell_store, identity, rules(&[]).table()),
         applied.clone(),
     );
+    // A leader whose lease another worker took and released has lost its
+    // term: renewing must not take the idle lease back.
+    let lease = region.lease();
+    assert!(lease.try_acquire(2, now_millis(), LEASE_TTL_MILLIS));
+    assert!(lease.release(2));
+    let lost = drain_loop(client.clone(), region, 1).await;
+    assert!(
+        lost.to_string().contains("lost the leader lease"),
+        "{lost:#}"
+    );
+    assert!(lease.try_acquire(1, now_millis(), LEASE_TTL_MILLIS));
     let drained = || region.stats().snapshot().queue_drained as usize;
     let mut drain = std::pin::pin!(drain_loop(client, region, 1));
     assert!(timeout(DEADLINE, drain.as_mut()).await.is_err());

@@ -70,6 +70,26 @@ fn epoch_bumps_on_takeover_not_renew() {
 }
 
 #[test]
+fn renew_extends_only_the_current_owner_and_never_takes_over() {
+    let lease = lease();
+    assert!(lease.try_acquire(11, 1_000, 500));
+    let epoch = lease.snapshot().epoch;
+    assert!(lease.renew(11, 1_200, 500));
+    assert_eq!(
+        lease.snapshot(),
+        LeaseSnapshot {
+            owner_worker: truncate_owner(11),
+            expires_millis: 1_700,
+            epoch,
+        }
+    );
+    assert!(lease.try_acquire(22, 1_800, 500));
+    assert!(lease.release(22));
+    assert!(!lease.renew(11, 1_900, 500));
+    assert_eq!(lease.snapshot().owner_worker, 0);
+}
+
+#[test]
 fn ms_precision_takeover_just_after_expiry() {
     let lease = lease();
     assert!(lease.try_acquire(1, 0, 1_000));

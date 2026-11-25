@@ -299,7 +299,7 @@ async fn drain_loop(client: GossipClient, shm: ShmRegion, worker_id: u32) -> any
     loop {
         // Renew the lease before popping: a leader that stalled past the TTL
         // and lost it stops here instead of draining beside its successor.
-        if !lease.try_acquire(worker_id, now_millis(), LEASE_TTL_MILLIS) {
+        if !lease.renew(worker_id, now_millis(), LEASE_TTL_MILLIS) {
             return anyhow::anyhow!("worker {worker_id} lost the leader lease to another worker");
         }
         let Ok(permits) = client.reserve(DRAIN_BATCH.get()).await else {
