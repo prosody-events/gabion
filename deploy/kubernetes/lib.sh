@@ -1,7 +1,27 @@
-# Helpers shared by the kind smokes, sourced after `context` and `namespace`
-# are set. A cluster has no event we can block on from a shell, so each wait
-# re-checks an observable condition once a second: a healthy cluster moves on
-# as soon as it is ready, and the deadline only bounds failure.
+# Helpers shared by the kind smokes, sourced after `namespace` is set. Sourcing
+# it sets `context` and `server` and refuses to continue unless the current
+# context is `kind-*` on a localhost API server. A cluster has no event we can
+# block on from a shell, so each wait re-checks an observable condition once a
+# second: a healthy cluster moves on as soon as it is ready, and the deadline
+# only bounds failure.
+
+context="$(kubectl config current-context)"
+server="$(kubectl config view --minify -o 'jsonpath={.clusters[0].cluster.server}')"
+
+case "$context" in
+    kind-*) ;;
+    *)
+        printf '%s\n' "refusing to run: current kubernetes context is '$context', expected 'kind-*'" >&2
+        exit 1 ;;
+esac
+
+case "$server" in
+    https://127.0.0.1:*|https://localhost:*) ;;
+    *)
+        printf '%s\n' "refusing to run: kubernetes API server is '$server', expected localhost" >&2
+        exit 1
+        ;;
+esac
 
 # retry <seconds> <command...>: run the command until it succeeds; name it on
 # stderr once <seconds> of wall time have passed.

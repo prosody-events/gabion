@@ -79,9 +79,10 @@ KUBECONFIG=/tmp/gabion-zones.kubeconfig make kubernetes-zones-test
 Each script builds the images it deploys from this checkout and loads them
 into the kind cluster (`build_and_load_images` in `lib.sh`), then checks that
 every pod runs the image it just built (`assert_pods_run_image`), so a pod
-never tests an image left in the cluster by an older tree. The check compares
-each pod's `imageID` with the image's ID, or, when the Docker image store keys
-images by manifest, with the digest of the image's config.
+never tests an image left in the cluster by an older tree. The check asks
+each pod's node what the tag names there: its layers must be the layers of
+this run's build, and the pod's `imageID` must be that image, by its config
+digest or by a digest containerd recorded when `kind load` imported it.
 
 CI builds the images itself, with the read-only registry cache, loads them,
 and sets `GABION_SKIP_IMAGE_BUILD=1` so the scripts skip their own build;
