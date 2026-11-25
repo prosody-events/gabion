@@ -562,14 +562,14 @@ impl CellStore {
                 rejected_total,
                 capacity = self.rule_dictionary.capacity(),
                 in_use = self.rule_dictionary.len(),
-                rule_fingerprint = %format!("{:032x}", rule_fingerprint),
+                rule_fingerprint = format_args!("{rule_fingerprint:032x}"),
                 config_key = Setting::StorageRuleDictionaryCapacity.yaml_key(),
-                "A rate-limit rule this node does not configure, gossiped by a peer or \
-                 recorded by a worker still on an earlier configuration, found the rule \
-                 dictionary full, so this node drops its hits and that rule under-counts across \
-                 the cluster. Usually more rules are live across the cluster than the \
-                 dictionary holds, for example during a configuration rollout. The default is \
-                 twice the configured rules, at least 256; set {} only above that.",
+                "A rate-limit rule this node does not configure, gossiped by a peer or recorded \
+                 by a worker still on an earlier configuration, found the rule dictionary full, \
+                 so this node drops its hits and that rule under-counts across the cluster. \
+                 Usually more rules are live across the cluster than the dictionary holds, for \
+                 example during a configuration rollout. The default is twice the configured \
+                 rules, at least 256; set {} only above that.",
                 Setting::StorageRuleDictionaryCapacity,
             );
         }
@@ -582,14 +582,14 @@ impl CellStore {
                 rejected_total,
                 capacity = self.node_dictionary.capacity(),
                 in_use = self.node_dictionary.len(),
-                peer_node_id = %format!("{:032x}", node_id.0),
+                peer_node_id = format_args!("{:032x}", node_id.0),
                 peer_incarnation = incarnation,
                 config_key = Setting::StorageNodeDictionaryCapacity.yaml_key(),
-                "Too many gabion peer instances are being tracked (every peer restart counts \
-                 as a new instance until its data ages out). Counts from some peers are now \
-                 being dropped, so cluster-wide rate limits will under-count requests handled \
-                 by those peers. Raise {}; size it above pods × (1 + restarts within your \
-                 longest rule window). The default is twice `gossip.peer_capacity`.",
+                "Too many gabion peer instances are being tracked (every peer restart counts as a \
+                 new instance until its data ages out). Counts from some peers are now being \
+                 dropped, so cluster-wide rate limits will under-count requests handled by those \
+                 peers. Raise {}; size it above pods × (1 + restarts within your longest rule \
+                 window). The default is twice `gossip.peer_capacity`.",
                 Setting::StorageNodeDictionaryCapacity,
             );
         }
