@@ -120,7 +120,6 @@ pub enum DecodeError {
 #[derive(Debug)]
 pub struct PacketBuf {
     inner: Vec<u8>,
-    capacity: usize,
 }
 
 impl PacketBuf {
@@ -128,7 +127,6 @@ impl PacketBuf {
     pub fn for_limits(limits: FrameLimits) -> Self {
         Self {
             inner: Vec::with_capacity(limits.max_payload_bytes),
-            capacity: limits.max_payload_bytes,
         }
     }
 
@@ -137,22 +135,11 @@ impl PacketBuf {
         &self.inner
     }
 
-    /// Maximum byte capacity (fixed at construction).
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
     /// Encode a packet of `header` alone: an ack, a sweep request, a closing
     /// packet or an empty sweep page.
     pub fn header_only<P: Copy + Into<Payload>>(&mut self, header: &Header<P>) {
         self.inner.clear();
         self.inner.extend_from_slice(&write_header(header, 0));
-    }
-}
-
-impl AsRef<[u8]> for PacketBuf {
-    fn as_ref(&self) -> &[u8] {
-        self.as_bytes()
     }
 }
 
