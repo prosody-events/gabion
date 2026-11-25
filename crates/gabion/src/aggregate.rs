@@ -397,14 +397,13 @@ fn note_aggregate_full(capacity: usize, dropped: &std_atomic::AtomicU64) {
 }
 
 /// Mix `(rule_fingerprint, key_hash, bucket)` into a uniform table index.
+/// The fingerprint and key hash are already xxh3-128 outputs, so one
+/// bijective `mix64` over their folded halves spreads them; two buckets of
+/// one key never share the value it mixes.
 fn mix_index(fp: u128, kh: KeyHash, bucket: BucketEpoch) -> usize {
-    use twox_hash::xxhash3_128;
-    let mut buf = [0_u8; 16 + 16 + 4];
-    buf[..16].copy_from_slice(&fp.to_le_bytes());
-    buf[16..32].copy_from_slice(&kh.0.to_le_bytes());
-    buf[32..].copy_from_slice(&bucket.0.to_le_bytes());
-    let h = xxhash3_128::Hasher::oneshot(&buf);
-    (h as u64 ^ (h >> 64) as u64) as usize
+    crate::crdt::mix64(
+        fp as u64 ^ kh.0 as u64 ^ ((kh.0 >> 64) as u64).rotate_left(32) ^ u64::from(bucket.0),
+    ) as usize
 }
 
 /// `gabiond`'s table, allocated once with its write sequence and drop

@@ -191,19 +191,20 @@ fn race_a_rewrite(old: AggregateCell, new: AggregateCell) {
 /// in several words matches neither and passes for a miss. Each rewrite
 /// below changes one stored word of the key, and the count: a stale copy of
 /// that word still matches `old`'s lookup and carries `new`'s count, so a
-/// store outside the seqlock in any word turns this red. 23 is the first
-/// replacement word with which every rewrite still hashes home to slot 0.
+/// store outside the seqlock in any word turns this red. 2 and 3 are the
+/// smallest old and replacement words with which every cell still hashes
+/// home to slot 0.
 #[test]
 fn aggregate_readers_never_see_a_torn_cell() {
     const LO: u128 = u64::MAX as u128;
     let old = AggregateCell {
-        rule_fingerprint: wide(5),
-        key_hash: KeyHash(wide(5)),
-        bucket: BucketEpoch::wrap(5),
-        count: 5,
+        rule_fingerprint: wide(2),
+        key_hash: KeyHash(wide(2)),
+        bucket: BucketEpoch::wrap(2),
+        count: 2,
     };
-    let rewrite = AggregateCell { count: 23, ..old };
-    let (low_word, high_word) = (wide(5) & !LO | 23, 23 << 64 | wide(5) & LO);
+    let rewrite = AggregateCell { count: 3, ..old };
+    let (low_word, high_word) = (wide(2) & !LO | 3, 3 << 64 | wide(2) & LO);
     for new in [
         AggregateCell {
             rule_fingerprint: low_word,
@@ -222,7 +223,7 @@ fn aggregate_readers_never_see_a_torn_cell() {
             ..rewrite
         },
         AggregateCell {
-            bucket: BucketEpoch::wrap(23),
+            bucket: BucketEpoch::wrap(3),
             ..rewrite
         },
     ] {
