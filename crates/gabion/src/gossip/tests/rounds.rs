@@ -4,100 +4,8 @@
 
 use std::task::{Context, Waker};
 
-use futures::channel::mpsc::{UnboundedSender, unbounded};
-
 use super::*;
 use crate::defaults::GOSSIP_GAP_REPORTS;
-use crate::gossip::PeerEntry;
-
-/// One runtime on the simulated network, with its admin channel and the
-/// discovery stream the test drives.
-pub(super) struct Node {
-    pub(super) addr: SocketAddr,
-    pub(super) client: GossipClient,
-    admin: mpsc::Sender<AdminCommand>,
-    pub(super) agg: Rc<InMemoryAggregateStore>,
-    events: UnboundedSender<PeerEvent>,
-    handle: JoinHandle<Result<(), GossipError>>,
-}
-
-impl Node {
-    pub(super) fn start(
-        router: &SimRouter,
-        addr: SocketAddr,
-        store: CellStore,
-        config: ValidGossipConfig,
-    ) -> Self {
-        Self::start_on(router.bind(addr), addr, store, config)
-    }
-
-    /// A node on any transport bound to `addr`.
-    pub(super) fn start_on<T: GossipTransport + 'static>(
-        transport: T,
-        addr: SocketAddr,
-        store: CellStore,
-        config: ValidGossipConfig,
-    ) -> Self {
-        let (admin, admin_rx) = mpsc::channel(4);
-        let (events, events_rx) = unbounded();
-        let agg = Rc::new(InMemoryAggregateStore::new());
-        let (rt, client) = GossipRuntime::from_parts_with_admin(
-            transport,
-            TokioClock::from_millis(0),
-            config,
-            store,
-            agg.clone(),
-            Some(admin_rx),
-        );
-        let handle = tokio::task::spawn_local(rt.run(events_rx));
-        Self {
-            addr,
-            client,
-            admin,
-            agg,
-            events,
-            handle,
-        }
-    }
-
-    pub(super) async fn snapshot(&self) -> AdminSnapshot {
-        admin_snapshot(&self.admin).await
-    }
-
-    pub(super) async fn counters(&self) -> GossipCounters {
-        self.snapshot().await.counters
-    }
-
-    /// This node's view of the peer at `addr`.
-    pub(super) async fn peer(&self, addr: SocketAddr) -> PeerEntry {
-        let peers = self.snapshot().await.peers;
-        *peers.iter().find(|p| p.addr == addr).expect("a peer")
-    }
-
-    pub(super) fn tell(&self, event: PeerEvent) {
-        self.events.unbounded_send(event).expect("the runtime runs");
-    }
-
-    pub(super) async fn hits(&self, keys: std::ops::Range<u128>) {
-        for key in keys {
-            hit(&self.client, key).await;
-        }
-    }
-
-    pub(super) async fn stop(self) {
-        let _ = self.client.shutdown().await;
-        let _ = self.handle.await;
-    }
-}
-
-pub(super) fn addrs(base: u16, n: usize) -> Vec<SocketAddr> {
-    (0..n).map(|i| sock(base + i as u16)).collect()
-}
-
-/// Node `i` of a test cluster, incarnation `incarnation`.
-pub(super) fn id(i: usize, incarnation: u32) -> NodeIdentity {
-    NodeIdentity::new(NodeId(0xD000 + i as u128), incarnation)
-}
 
 /// Start a node at `addrs[i]` that knows every other address.
 fn member(router: &SimRouter, addrs: &[SocketAddr], i: usize) -> Node {
@@ -107,10 +15,6 @@ fn member(router: &SimRouter, addrs: &[SocketAddr], i: usize) -> Node {
         store_for(id(i, 1)),
         sim_config(others(addrs, addrs[i])),
     )
-}
-
-pub(super) async fn run_for(ms: u64) {
-    sim_advance_ticks(Duration::from_millis(1), ms as u32).await;
 }
 
 /// Restart the node at `addr` as a new process: the old runtime stops, and a
@@ -124,13 +28,6 @@ async fn restart(
     let addr = node.addr;
     node.stop().await;
     Node::start(router, addr, store_for(identity), config)
-}
-
-/// Every node's aggregate holds `total` hits.
-pub(super) fn assert_totals(nodes: &[&Node], total: u64) {
-    for node in nodes {
-        assert_eq!(node.agg.total(), total, "{}", node.addr);
-    }
 }
 
 /// One heartbeat sends a new count straight to every peer.

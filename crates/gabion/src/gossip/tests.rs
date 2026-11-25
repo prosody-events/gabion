@@ -14,6 +14,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use futures::FutureExt;
+use futures::channel::mpsc::{UnboundedSender, unbounded};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::{JoinHandle, LocalSet};
 
@@ -29,7 +30,7 @@ use crate::gossip::mock::{MockTransport, Wire, gated};
 use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance, sim_advance_ticks};
 use crate::gossip::{
     AdminCommand, AdminSnapshot, AggregateStore, GossipClient, GossipCounters, GossipError,
-    GossipRuntime, GossipTransport, Role, TokioClock, ValidGossipConfig,
+    GossipRuntime, GossipTransport, PeerEntry, Role, TokioClock, ValidGossipConfig,
 };
 use crate::mock::with_logs;
 use crate::settings::mock::{rules, storage};
@@ -182,6 +183,128 @@ where
         .unwrap();
     let local = LocalSet::new();
     rt.block_on(local.run_until(f))
+}
+
+/// One runtime on the simulated network, with its admin channel and the
+/// discovery stream the test drives.
+struct Node {
+    addr: SocketAddr,
+    client: GossipClient,
+    admin: mpsc::Sender<AdminCommand>,
+    agg: Rc<InMemoryAggregateStore>,
+    events: UnboundedSender<PeerEvent>,
+    handle: JoinHandle<Result<(), GossipError>>,
+}
+
+impl Node {
+    fn start(
+        router: &SimRouter,
+        addr: SocketAddr,
+        store: CellStore,
+        config: ValidGossipConfig,
+    ) -> Self {
+        Self::start_on(router.bind(addr), addr, store, config)
+    }
+
+    /// A node on any transport bound to `addr`.
+    fn start_on<T: GossipTransport + 'static>(
+        transport: T,
+        addr: SocketAddr,
+        store: CellStore,
+        config: ValidGossipConfig,
+    ) -> Self {
+        let (admin, admin_rx) = mpsc::channel(4);
+        let (events, events_rx) = unbounded();
+        let agg = Rc::new(InMemoryAggregateStore::new());
+        let (rt, client) = GossipRuntime::from_parts_with_admin(
+            transport,
+            TokioClock::from_millis(0),
+            config,
+            store,
+            agg.clone(),
+            Some(admin_rx),
+        );
+        let handle = tokio::task::spawn_local(rt.run(events_rx));
+        Self {
+            addr,
+            client,
+            admin,
+            agg,
+            events,
+            handle,
+        }
+    }
+
+    async fn snapshot(&self) -> AdminSnapshot {
+        admin_snapshot(&self.admin).await
+    }
+
+    async fn counters(&self) -> GossipCounters {
+        self.snapshot().await.counters
+    }
+
+    /// This node's view of the peer at `addr`.
+    async fn peer(&self, addr: SocketAddr) -> PeerEntry {
+        let peers = self.snapshot().await.peers;
+        *peers.iter().find(|p| p.addr == addr).expect("a peer")
+    }
+
+    fn tell(&self, event: PeerEvent) {
+        self.events.unbounded_send(event).expect("the runtime runs");
+    }
+
+    async fn hits(&self, keys: std::ops::Range<u128>) {
+        for key in keys {
+            hit(&self.client, key).await;
+        }
+    }
+
+    /// Shut the runtime down, failing the test if it panicked or ended in
+    /// an error.
+    async fn stop(self) {
+        self.client.shutdown().await.expect("the runtime runs");
+        let ran = self.handle.await.expect("the runtime did not panic");
+        ran.expect("the runtime ran until shutdown");
+    }
+}
+
+fn addrs(base: u16, n: usize) -> Vec<SocketAddr> {
+    (0..n).map(|i| sock(base + i as u16)).collect()
+}
+
+/// A node at each of `addrs` that knows every other, node `i` on `store(i)`.
+fn mesh(router: &SimRouter, addrs: &[SocketAddr], store: impl Fn(usize) -> CellStore) -> Vec<Node> {
+    let start = |(i, &addr)| Node::start(router, addr, store(i), sim_config(others(addrs, addr)));
+    addrs.iter().enumerate().map(start).collect()
+}
+
+/// Node `i` of a test cluster, incarnation `incarnation`.
+fn id(i: usize, incarnation: u32) -> NodeIdentity {
+    NodeIdentity::new(NodeId(0xD000 + i as u128), incarnation)
+}
+
+async fn run_for(ms: u64) {
+    sim_advance_ticks(Duration::from_millis(1), ms as u32).await;
+}
+
+/// Every node's aggregate holds `total` hits.
+fn assert_totals(nodes: &[&Node], total: u64) {
+    for node in nodes {
+        assert_eq!(node.agg.total(), total, "{}", node.addr);
+    }
+}
+
+/// Each of `records` on node `record.node` of `mesh`, wrapping.
+async fn record_each(mesh: &[Node], records: &[SimRecord]) {
+    for record in records {
+        let node = &mesh[record.node as usize % mesh.len()];
+        let hits = record.hits.into();
+        let key = key_hash(record.key);
+        node.client
+            .record(rule_fp(record.rule), key, BucketEpoch(0), hits, 0, 0)
+            .await
+            .unwrap();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -347,7 +470,7 @@ async fn run_connected_case(case: ConnectedClusterCase) -> TestResult {
     }
 
     let router = SimRouter::with_channel_capacity(256);
-    let addrs: Vec<SocketAddr> = (0..nodes).map(|i| sock(41_000 + i as u16)).collect();
+    let addrs = addrs(41_000, nodes);
     if nodes > 1 {
         for i in 0..nodes {
             if case.drop_first == 0 {
@@ -364,59 +487,28 @@ async fn run_connected_case(case: ConnectedClusterCase) -> TestResult {
         }
     }
 
-    let mut clients = Vec::with_capacity(nodes);
-    let mut handles = Vec::with_capacity(nodes);
-    let mut aggregates = Vec::with_capacity(nodes);
     let node_capacity =
         ((case.records.len() + 1).next_power_of_two().max(8)).min(u16::MAX as usize) as u16;
-    for i in 0..nodes {
+    // Every node knows every other: with direct mail, a cell reaches a node
+    // only from its origin.
+    let mesh = mesh(&router, &addrs, |i| {
         let identity = NodeIdentity::new(NodeId(0xA000 + i as u128), 1);
-        // Every node knows every other: with direct mail, a cell reaches a
-        // node only from its origin.
-        let cfg = sim_config(others(&addrs, addrs[i]));
-        let agg = Rc::new(InMemoryAggregateStore::new());
-        let (rt, client) = GossipRuntime::from_parts(
-            router.bind(addrs[i]),
-            TokioClock::from_millis(0),
-            cfg,
-            store_for_property_rules(identity, node_capacity),
-            agg.clone(),
-        );
-        handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
-        clients.push(client);
-        aggregates.push(agg);
-    }
-
-    for record in &case.records {
-        let node = record.node as usize % nodes;
-        if clients[node]
-            .record(
-                rule_fp(record.rule),
-                key_hash(record.key),
-                BucketEpoch(0),
-                record.hits as u64,
-                0,
-                0,
-            )
-            .await
-            .is_err()
-        {
-            return TestResult::failed();
-        }
-    }
+        store_for_property_rules(identity, node_capacity)
+    });
+    record_each(&mesh, &case.records).await;
 
     let ticks = if nodes == 1 { 1 } else { 160 };
     sim_advance_ticks(Duration::from_millis(100), ticks).await;
 
     let expected = expected_model(&case.records, nodes);
-    let passed = aggregates.iter().all(|agg| agg.snapshot() == expected);
+    let passed = mesh.iter().all(|node| node.agg.snapshot() == expected);
     if !passed {
-        let mismatches = aggregates
+        let mismatches = mesh
             .iter()
             .enumerate()
-            .filter(|(_, agg)| agg.snapshot() != expected)
+            .filter(|(_, node)| node.agg.snapshot() != expected)
             .take(5)
-            .map(|(i, agg)| (i, agg.snapshot()))
+            .map(|(i, node)| (i, node.agg.snapshot()))
             .collect::<Vec<_>>();
         eprintln!(
             "connected gossip case failed: case={case:?}, expected={expected:?}, \
@@ -424,13 +516,9 @@ async fn run_connected_case(case: ConnectedClusterCase) -> TestResult {
         );
     }
 
-    for client in clients {
-        let _ = client.shutdown().await;
+    for node in mesh {
+        node.stop().await;
     }
-    for handle in handles {
-        let _ = handle.await;
-    }
-
     TestResult::from_bool(passed)
 }
 
@@ -473,7 +561,7 @@ async fn partition_heal_violation(mut case: PartitionCase, heal_ticks: u32) -> O
     }
 
     let router = SimRouter::with_channel_capacity(128);
-    let addrs: Vec<_> = (0..NODES).map(|i| sock(42_000 + i as u16)).collect();
+    let addrs = addrs(42_000, NODES);
     for left in 0..4 {
         for right in 4..8 {
             router.set_link_policy(addrs[left], addrs[right], LinkPolicy::Block);
@@ -481,45 +569,16 @@ async fn partition_heal_violation(mut case: PartitionCase, heal_ticks: u32) -> O
         }
     }
 
-    let mut clients = Vec::with_capacity(NODES);
-    let mut handles = Vec::with_capacity(NODES);
-    let mut aggregates = Vec::with_capacity(NODES);
-    for i in 0..NODES {
-        let identity = NodeIdentity::new(NodeId(0xB000 + i as u128), 1);
-        let cfg = sim_config(others(&addrs, addrs[i]));
-        let agg = Rc::new(InMemoryAggregateStore::new());
-        let (rt, client) = GossipRuntime::from_parts(
-            router.bind(addrs[i]),
-            TokioClock::from_millis(0),
-            cfg,
-            store_for(identity),
-            agg.clone(),
-        );
-        handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
-        clients.push(client);
-        aggregates.push(agg);
-    }
-
-    for record in &case.records {
-        let node = record.node as usize % NODES;
-        clients[node]
-            .record(
-                rule_fp(record.rule),
-                key_hash(record.key),
-                BucketEpoch(0),
-                record.hits as u64,
-                0,
-                0,
-            )
-            .await
-            .unwrap();
-    }
+    let mesh = mesh(&router, &addrs, |i| {
+        store_for(NodeIdentity::new(NodeId(0xB000 + i as u128), 1))
+    });
+    record_each(&mesh, &case.records).await;
 
     sim_advance_ticks(Duration::from_millis(100), case.heal_after_ticks as u32).await;
     let global = expected_model(&case.records, NODES);
     let mut overcount = None;
-    for (node, agg) in aggregates.iter().enumerate() {
-        for (key, count) in agg.snapshot() {
+    for (node, n) in mesh.iter().enumerate() {
+        for (key, count) in n.agg.snapshot() {
             let cap = *global.get(&key).unwrap_or(&0);
             if count > cap {
                 overcount = Some(format!(
@@ -538,8 +597,8 @@ async fn partition_heal_violation(mut case: PartitionCase, heal_ticks: u32) -> O
     }
     sim_advance_ticks(Duration::from_millis(100), heal_ticks).await;
     let mut divergence = None;
-    for (node, agg) in aggregates.iter().enumerate() {
-        let snap = agg.snapshot();
+    for (node, n) in mesh.iter().enumerate() {
+        let snap = n.agg.snapshot();
         if snap != global {
             divergence = Some(format!(
                 "node {node} did not converge {heal_ticks} ticks after heal: has {} keys, cluster \
@@ -550,13 +609,9 @@ async fn partition_heal_violation(mut case: PartitionCase, heal_ticks: u32) -> O
         }
     }
 
-    for client in clients {
-        let _ = client.shutdown().await;
+    for node in mesh {
+        node.stop().await;
     }
-    for handle in handles {
-        let _ = handle.await;
-    }
-
     overcount.or(divergence)
 }
 
@@ -618,59 +673,44 @@ fn foreign_cluster_packet_changes_nothing(case: ClusterCase) -> TestResult {
         let cfg_b = tuned_config(vec![addr_a], |s| {
             s.cluster_id_hash = cluster_b.try_into().unwrap();
         });
-        let agg_a = Rc::new(InMemoryAggregateStore::new());
-        let agg_b = Rc::new(InMemoryAggregateStore::new());
-        let (admin_b, admin_rx_b) = mpsc::channel(4);
-        let (rt_a, client_a) = GossipRuntime::from_parts(
-            router.bind(addr_a),
-            TokioClock::from_millis(0),
+        let a = Node::start(
+            &router,
+            addr_a,
+            store_for(node(0xCA)),
             sim_config(vec![addr_b]),
-            store_for(NodeIdentity::new(NodeId(0xCA), 1)),
-            agg_a.clone(),
         );
-        let (rt_b, client_b) = GossipRuntime::from_parts_with_admin(
-            router.bind(addr_b),
-            TokioClock::from_millis(0),
-            cfg_b,
-            store_for(NodeIdentity::new(NodeId(0xCB), 1)),
-            agg_b.clone(),
-            Some(admin_rx_b),
-        );
-        let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
-        let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
+        let b = Node::start(&router, addr_b, store_for(node(0xCB)), cfg_b);
 
-        client_a
+        a.client
             .record(0xD00D, KeyHash(1), BucketEpoch(0), case.a_hits as u64, 0, 0)
             .await
             .unwrap();
-        client_b
+        b.client
             .record(0xD00D, KeyHash(1), BucketEpoch(0), case.b_hits as u64, 0, 0)
             .await
             .unwrap();
         sim_advance_ticks(Duration::from_millis(100), 20).await;
 
-        let (a, b) = (u64::from(case.a_hits), u64::from(case.b_hits));
-        let snapshot = admin_snapshot(&admin_b).await;
+        let (a_hits, b_hits) = (u64::from(case.a_hits), u64::from(case.b_hits));
+        let snapshot = b.snapshot().await;
         let counters = snapshot.counters;
         let others = (
             counters.decode_rejects_framing,
             counters.decode_rejects_peer_limits,
             counters.decode_rejects_version,
         );
+        let both = a_hits + b_hits;
         let held = if case.same_cluster {
-            agg_a.total() == a + b && agg_b.total() == a + b && counters.decode_rejects_cluster == 0
+            a.agg.total() == both && b.agg.total() == both && counters.decode_rejects_cluster == 0
         } else {
-            agg_a.total() == a
-                && agg_b.total() == b
+            a.agg.total() == a_hits
+                && b.agg.total() == b_hits
                 && snapshot.store_stats.active_cells == 1
                 && counters.decode_rejects_cluster >= 1
         };
 
-        client_a.shutdown().await.unwrap();
-        client_b.shutdown().await.unwrap();
-        let _ = h_a.await;
-        let _ = h_b.await;
-
+        a.stop().await;
+        b.stop().await;
         TestResult::from_bool(held && others == (0, 0, 0))
     })
 }
@@ -678,52 +718,18 @@ fn foreign_cluster_packet_changes_nothing(case: ClusterCase) -> TestResult {
 #[quickcheck]
 fn quickcheck_sim_tick_expiration_removes_converged_cells(case: ExpirationCase) -> TestResult {
     run_paused(async move {
-        let nodes = case.nodes as usize;
         let router = SimRouter::with_channel_capacity(128);
-        let addrs: Vec<_> = (0..nodes).map(|i| sock(44_000 + i as u16)).collect();
-        let mut clients = Vec::with_capacity(nodes);
-        let mut handles = Vec::with_capacity(nodes);
-        let mut aggregates = Vec::with_capacity(nodes);
-
-        for i in 0..nodes {
-            let identity = NodeIdentity::new(NodeId(0xE000 + i as u128), 1);
-            let cfg = sim_config(others(&addrs, addrs[i]));
-            let agg = Rc::new(InMemoryAggregateStore::new());
-            let (rt, client) = GossipRuntime::from_parts(
-                router.bind(addrs[i]),
-                TokioClock::from_millis(0),
-                cfg,
-                store_for_expiring_rule(identity),
-                agg.clone(),
-            );
-            handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
-            clients.push(client);
-            aggregates.push(agg);
-        }
-
-        for record in &case.records {
-            let node = record.node as usize % nodes;
-            clients[node]
-                .record(
-                    rule_fp(record.rule),
-                    key_hash(record.key),
-                    BucketEpoch(0),
-                    record.hits as u64,
-                    0,
-                    0,
-                )
-                .await
-                .unwrap();
-        }
+        let addrs = addrs(44_000, case.nodes as usize);
+        let mesh = mesh(&router, &addrs, |i| {
+            store_for_expiring_rule(NodeIdentity::new(NodeId(0xE000 + i as u128), 1))
+        });
+        record_each(&mesh, &case.records).await;
 
         sim_advance_ticks(Duration::from_millis(100), 8).await;
-        let expired_everywhere = aggregates.iter().all(|agg| agg.snapshot().is_empty());
+        let expired_everywhere = mesh.iter().all(|node| node.agg.snapshot().is_empty());
 
-        for client in clients {
-            let _ = client.shutdown().await;
-        }
-        for handle in handles {
-            let _ = handle.await;
+        for node in mesh {
+            node.stop().await;
         }
         TestResult::from_bool(expired_everywhere)
     })
@@ -733,152 +739,95 @@ fn quickcheck_sim_tick_expiration_removes_converged_cells(case: ExpirationCase) 
 fn quickcheck_sim_peer_membership_controls_delivery(case: MembershipCase) -> TestResult {
     run_paused(async move {
         let router = SimRouter::new();
-        let addr_a = sock(45_000);
         let addr_b = sock(45_001);
-        let id_a = NodeIdentity::new(NodeId(0xFA), 1);
-        let id_b = NodeIdentity::new(NodeId(0xFB), 1);
-
-        let events = if case.remove_after_add {
-            vec![
-                PeerEvent::Added(Peer::new(addr_b)),
-                PeerEvent::Removed(Peer::new(addr_b)),
-            ]
-        } else {
-            vec![PeerEvent::Added(Peer::new(addr_b))]
-        };
-
-        let agg_a = Rc::new(InMemoryAggregateStore::new());
-        let agg_b = Rc::new(InMemoryAggregateStore::new());
-        let (rt_a, client_a) = GossipRuntime::from_parts(
-            router.bind(addr_a),
-            TokioClock::from_millis(0),
-            sim_config(Vec::new()),
-            store_for(id_a),
-            agg_a.clone(),
+        let a = Node::start(
+            &router,
+            sock(45_000),
+            store_for(node(0xFA)),
+            sim_config(vec![]),
         );
-        let (rt_b, client_b) = GossipRuntime::from_parts(
-            router.bind(addr_b),
-            TokioClock::from_millis(0),
-            sim_config(Vec::new()),
-            store_for(id_b),
-            agg_b.clone(),
-        );
-        let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::iter(events)));
-        let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
+        let b = Node::start(&router, addr_b, store_for(node(0xFB)), sim_config(vec![]));
+        a.tell(PeerEvent::Added(Peer::new(addr_b)));
+        if case.remove_after_add {
+            a.tell(PeerEvent::Removed(Peer::new(addr_b)));
+        }
 
         tokio::task::yield_now().await;
-        client_a
+        a.client
             .record(0xFACE, KeyHash(1), BucketEpoch(0), case.hits as u64, 0, 0)
             .await
             .unwrap();
         sim_advance_ticks(Duration::from_millis(100), 20).await;
 
-        let got_b = agg_b.total();
+        let got_b = b.agg.total();
         let expected_b = if case.remove_after_add {
             0
         } else {
             case.hits as u64
         };
 
-        client_a.shutdown().await.unwrap();
-        client_b.shutdown().await.unwrap();
-        let _ = h_a.await;
-        let _ = h_b.await;
+        a.stop().await;
+        b.stop().await;
         TestResult::from_bool(got_b == expected_b)
     })
 }
 
-// -- apply before ack, and convergence --------------------------------------
+// -- apply before ack -------------------------------------------------------
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn record_acks_after_apply() {
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            let router = SimRouter::new();
-            let addr = sock(40_001);
-            let transport = router.bind(addr);
+#[test]
+fn record_acks_after_apply() {
+    run_paused(async {
+        let router = SimRouter::new();
+        let a = Node::start(
+            &router,
+            sock(40_001),
+            store_for(node(0xAA)),
+            sim_config(vec![]),
+        );
 
-            let identity = NodeIdentity::new(NodeId(0xAA), 1);
-            let store = store_for(identity);
-            let agg = Rc::new(InMemoryAggregateStore::new());
-            let clock = TokioClock::from_millis(0);
+        let rule_fp: u128 = 0xDEAD_BEEF;
+        let key = KeyHash(0x1234);
+        a.client
+            .record(rule_fp, key, BucketEpoch(0), 5, 0, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(a.agg.total(), 5);
 
-            let (rt, client) = GossipRuntime::from_parts(
-                transport,
-                clock,
-                sim_config(Vec::new()),
-                store,
-                agg.clone(),
-            );
-            let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+        a.client
+            .record(rule_fp, key, BucketEpoch(0), 3, 0, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(a.agg.total(), 8);
 
-            let rule_fp: u128 = 0xDEAD_BEEF;
-            let key = KeyHash(0x1234);
-            client
-                .record(rule_fp, key, BucketEpoch(0), 5, 0, 1_000)
-                .await
-                .unwrap();
-
-            // Read the count back from the store handle the test holds —
-            // requires looking up the rule_slot.
-            // Use a small dance: send a second record that pushes the store
-            // through one more apply so we know which rule slot was minted.
-            // (The first record itself must have stored the count already.)
-            let totals = agg.total();
-            assert_eq!(totals, 5);
-
-            client
-                .record(rule_fp, key, BucketEpoch(0), 3, 0, 1_000)
-                .await
-                .unwrap();
-            let totals = agg.total();
-            assert_eq!(totals, 8);
-
-            client.shutdown().await.unwrap();
-            let _ = handle.await;
-        })
-        .await;
+        a.stop().await;
+    });
 }
 
 // -- apply-once-per-iteration -----------------------------------------------
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn apply_called_once_per_crdt_iteration() {
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            let router = SimRouter::new();
-            let addr = sock(40_020);
-            let transport = router.bind(addr);
+#[test]
+fn apply_called_once_per_crdt_iteration() {
+    run_paused(async {
+        let router = SimRouter::new();
+        let a = Node::start(
+            &router,
+            sock(40_020),
+            store_for(node(0xAA)),
+            sim_config(vec![]),
+        );
 
-            let identity = NodeIdentity::new(NodeId(0xAA), 1);
-            let store = store_for(identity);
-            let agg = Rc::new(InMemoryAggregateStore::new());
+        // One record => one apply with deltas.len()==1.
+        a.client
+            .record(0x11, KeyHash(1), BucketEpoch(0), 4, 0, 100)
+            .await
+            .unwrap();
+        let calls = a.agg.apply_call_lens();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, 1);
+        assert_eq!(calls[0].1, 0);
 
-            let (rt, client) = GossipRuntime::from_parts(
-                transport,
-                TokioClock::from_millis(0),
-                sim_config(Vec::new()),
-                store,
-                agg.clone(),
-            );
-            let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
-
-            // One record => one apply with deltas.len()==1.
-            client
-                .record(0x11, KeyHash(1), BucketEpoch(0), 4, 0, 100)
-                .await
-                .unwrap();
-            let calls = agg.apply_call_lens();
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].0, 1);
-            assert_eq!(calls[0].1, 0);
-
-            client.shutdown().await.unwrap();
-            let _ = handle.await;
-        })
-        .await;
+        a.stop().await;
+    });
 }
 
 // -- expire-on-tick ---------------------------------------------------------
@@ -938,69 +887,51 @@ fn expiry_applies_each_full_batch_before_the_next() {
 /// Before configured rules were pinned, the first expiry released the rule
 /// slot, so the second wave re-interned `RuleDescriptor::default()` (60 s
 /// window, `applies_locally = false`) and never aged out here.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn configured_rule_reexpires_after_idle_window() {
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            let router = SimRouter::new();
-            let addr = sock(40_031);
-            let transport = router.bind(addr);
+#[test]
+fn configured_rule_reexpires_after_idle_window() {
+    run_paused(async {
+        let mut store = store_for(node(0xAA));
+        // Configured rule: 100 ms bucket, 100 ms window -> 1 live bucket.
+        store
+            .intern_rule(RuleDescriptor {
+                fingerprint: 0xFEED,
+                window_millis: 100,
+                bucket_millis: 100,
+                limit: 10,
+                applies_locally: true,
+            })
+            .unwrap();
+        let router = SimRouter::new();
+        let a = Node::start(&router, sock(40_031), store, sim_config(vec![]));
 
-            let identity = NodeIdentity::new(NodeId(0xAA), 1);
-            let mut store = store_for(identity);
-            // Configured rule: 100 ms bucket, 100 ms window -> 1 live bucket.
-            store
-                .intern_rule(RuleDescriptor {
-                    fingerprint: 0xFEED,
-                    window_millis: 100,
-                    bucket_millis: 100,
-                    limit: 10,
-                    applies_locally: true,
-                })
-                .unwrap();
+        // First burst at bucket 0, then advance past the live window so the
+        // cell ages out and (pre-fix) the rule slot is released.
+        a.client
+            .record(0xFEED, KeyHash(7), BucketEpoch(0), 2, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(a.agg.total(), 2);
+        sim_advance_ticks(Duration::from_millis(100), 3).await;
+        assert_eq!(a.agg.total(), 0);
 
-            let agg = Rc::new(InMemoryAggregateStore::new());
+        // Second burst at the now-current bucket. It must register and then
+        // age out on the same 100 ms window. Under the
+        // released-then-default bug it lands on a 60 s
+        // descriptor and stays here forever.
+        a.client
+            .record(0xFEED, KeyHash(7), BucketEpoch(3), 2, 10, 300)
+            .await
+            .unwrap();
+        assert_eq!(a.agg.total(), 2);
+        sim_advance_ticks(Duration::from_millis(100), 3).await;
+        assert_eq!(
+            a.agg.total(),
+            0,
+            "second burst must age out on the configured 100 ms window, not the 60 s default",
+        );
 
-            let (rt, client) = GossipRuntime::from_parts(
-                transport,
-                TokioClock::from_millis(0),
-                sim_config(Vec::new()),
-                store,
-                agg.clone(),
-            );
-            let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
-
-            // First burst at bucket 0, then advance past the live window so the
-            // cell ages out and (pre-fix) the rule slot is released.
-            client
-                .record(0xFEED, KeyHash(7), BucketEpoch(0), 2, 10, 0)
-                .await
-                .unwrap();
-            assert_eq!(agg.total(), 2);
-            sim_advance_ticks(Duration::from_millis(100), 3).await;
-            assert_eq!(agg.total(), 0);
-
-            // Second burst at the now-current bucket. It must register and then
-            // age out on the same 100 ms window. Under the
-            // released-then-default bug it lands on a 60 s
-            // descriptor and stays here forever.
-            client
-                .record(0xFEED, KeyHash(7), BucketEpoch(3), 2, 10, 300)
-                .await
-                .unwrap();
-            assert_eq!(agg.total(), 2);
-            sim_advance_ticks(Duration::from_millis(100), 3).await;
-            assert_eq!(
-                agg.total(),
-                0,
-                "second burst must age out on the configured 100 ms window, not the 60 s default",
-            );
-
-            client.shutdown().await.unwrap();
-            let _ = handle.await;
-        })
-        .await;
+        a.stop().await;
+    });
 }
 
 // -- UDP smoke --------------------------------------------------------------
@@ -1089,73 +1020,46 @@ async fn udp_round_trip_smoke() {
 
 // -- admin command channel --------------------------------------------------
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn admin_snapshot_reflects_runtime_state() {
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            use tokio::sync::oneshot;
+#[test]
+fn admin_snapshot_reflects_runtime_state() {
+    run_paused(async {
+        let router = SimRouter::new();
+        let identity = NodeIdentity::new(NodeId(0xCAFE), 7);
+        let config = sim_config(vec![sock(40_301)]);
+        let a = Node::start(&router, sock(40_300), store_for(identity), config);
 
-            let router = SimRouter::new();
-            let addr = sock(40_300);
-            let transport = router.bind(addr);
+        // One record so the cell store is non-empty when we sample.
+        a.client
+            .record(0xFEED, KeyHash(0x42), BucketEpoch(0), 4, 0, 100)
+            .await
+            .unwrap();
+        heartbeats(1).await;
 
-            let identity = NodeIdentity::new(NodeId(0xCAFE), 7);
-            let store = store_for(identity);
-            let agg = Rc::new(InMemoryAggregateStore::new());
+        let snapshot = a.snapshot().await;
+        assert_eq!(snapshot.local_identity, identity);
+        // Bootstrap peer is present even though we never heard back from
+        // it — `node_id` stays `None` until first inbound packet.
+        assert_eq!(snapshot.peers.len(), 1);
+        assert_eq!(snapshot.peers[0].addr, sock(40_301));
+        assert!(snapshot.peers[0].node_id.is_none());
+        assert!(snapshot.store_stats.active_cells >= 1);
+        // The peer never answers, so it stays unheard and the one cell
+        // sent stays unacked.
+        assert_eq!(snapshot.peers[0].role, Role::Unheard);
+        assert_eq!(snapshot.peers[0].own_unacked, 1);
 
-            let (admin_tx, admin_rx) = mpsc::channel::<AdminCommand>(4);
+        // The counters alone read what the snapshot's copy holds.
+        let (reply, counters) = tokio::sync::oneshot::channel();
+        a.admin
+            .send(AdminCommand::Counters { reply })
+            .await
+            .unwrap();
+        let counters = counters.await.unwrap();
+        assert!(counters.rounds_heartbeat >= 1);
+        assert_eq!(counters, snapshot.counters);
 
-            let (rt, client) = GossipRuntime::from_parts_with_admin(
-                transport,
-                TokioClock::from_millis(0),
-                sim_config(vec![sock(40_301)]),
-                store,
-                agg.clone(),
-                Some(admin_rx),
-            );
-            let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
-
-            // One record so the cell store is non-empty when we sample.
-            client
-                .record(0xFEED, KeyHash(0x42), BucketEpoch(0), 4, 0, 100)
-                .await
-                .unwrap();
-            heartbeats(1).await;
-
-            let (reply_tx, reply_rx) = oneshot::channel::<AdminSnapshot>();
-            admin_tx
-                .send(AdminCommand::Snapshot { reply: reply_tx })
-                .await
-                .unwrap();
-            let snapshot = reply_rx.await.unwrap();
-
-            assert_eq!(snapshot.local_identity, identity);
-            // Bootstrap peer is present even though we never heard back from
-            // it — `node_id` stays `None` until first inbound packet.
-            assert_eq!(snapshot.peers.len(), 1);
-            assert_eq!(snapshot.peers[0].addr, sock(40_301));
-            assert!(snapshot.peers[0].node_id.is_none());
-            assert!(snapshot.store_stats.active_cells >= 1);
-            // The peer never answers, so it stays unheard and the one cell
-            // sent stays unacked.
-            assert_eq!(snapshot.peers[0].role, Role::Unheard);
-            assert_eq!(snapshot.peers[0].own_unacked, 1);
-
-            // The counters alone read what the snapshot's copy holds.
-            let (reply_tx, reply_rx) = oneshot::channel::<GossipCounters>();
-            admin_tx
-                .send(AdminCommand::Counters { reply: reply_tx })
-                .await
-                .unwrap();
-            let counters = reply_rx.await.unwrap();
-            assert!(counters.rounds_heartbeat >= 1);
-            assert_eq!(counters, snapshot.counters);
-
-            client.shutdown().await.unwrap();
-            let _ = handle.await;
-        })
-        .await;
+        a.stop().await;
+    });
 }
 
 // -- shared helpers ---------------------------------------------------------
@@ -1467,25 +1371,15 @@ fn v1_packet() -> Vec<u8> {
 /// the runtime's counters.
 async fn send_raw(packets: &[Vec<u8>]) -> GossipCounters {
     let router = SimRouter::new();
-    let target = sock(44_000);
-    let (admin, admin_rx) = mpsc::channel(4);
-    let (rt, client) = GossipRuntime::from_parts_with_admin(
-        router.bind(target),
-        TokioClock::from_millis(0),
-        tuned_config(vec![], |s| s.max_payload_bytes = 1400),
-        store_for(node(0xA)),
-        Rc::new(InMemoryAggregateStore::new()),
-        Some(admin_rx),
-    );
-    let runtime = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+    let config = tuned_config(vec![], |s| s.max_payload_bytes = 1400);
+    let target = Node::start(&router, sock(44_000), store_for(node(0xA)), config);
     let raw = router.bind(sock(9));
     for packet in packets {
-        raw.try_send_to(packet, target).unwrap();
+        raw.try_send_to(packet, target.addr).unwrap();
         heartbeats(1).await;
     }
-    let counters = admin_snapshot(&admin).await.counters;
-    client.shutdown().await.unwrap();
-    let _ = runtime.await;
+    let counters = target.counters().await;
+    target.stop().await;
     counters
 }
 
@@ -1545,48 +1439,32 @@ fn full_table_declines_and_still_merges() {
     let ((), logs) = with_logs(|| {
         run_paused(async {
             let router = SimRouter::new();
-            let agg_a = Rc::new(InMemoryAggregateStore::new());
-            let (admin, admin_rx) = mpsc::channel(4);
-            let (rt_a, client_a) = GossipRuntime::from_parts_with_admin(
-                router.bind(a),
-                TokioClock::from_millis(0),
-                tuned_config(vec![], |s| s.peer_capacity = NonZeroU16::MIN),
-                store_for(node(0xA)),
-                agg_a.clone(),
-                Some(admin_rx),
-            );
-            let events = futures::stream::iter([
-                PeerEvent::Added(Peer::new(b)),
-                PeerEvent::Added(Peer::new(c)),
-            ]);
-            let h_a = tokio::task::spawn_local(rt_a.run(events));
-            let (rt_c, client_c) = GossipRuntime::from_parts(
-                router.bind(c),
-                TokioClock::from_millis(0),
-                sim_config(vec![a]),
-                store_for(node(0xC)),
-                Rc::new(InMemoryAggregateStore::new()),
-            );
-            let h_c = tokio::task::spawn_local(rt_c.run(futures::stream::empty()));
-            hit(&client_a, 1).await;
-            hit(&client_c, 2).await;
+            let config = tuned_config(vec![], |s| s.peer_capacity = NonZeroU16::MIN);
+            let node_a = Node::start(&router, a, store_for(node(0xA)), config);
+            node_a.tell(PeerEvent::Added(Peer::new(b)));
+            node_a.tell(PeerEvent::Added(Peer::new(c)));
+            let node_c = Node::start(&router, c, store_for(node(0xC)), sim_config(vec![a]));
+            hit(&node_a.client, 1).await;
+            hit(&node_c.client, 2).await;
             heartbeats(3).await;
-            let snapshot = admin_snapshot(&admin).await;
+            let snapshot = node_a.snapshot().await;
             assert_eq!(snapshot.counters.peers_declined, 1);
             assert_eq!(
                 snapshot.peers.iter().map(|p| p.addr).collect::<Vec<_>>(),
                 [b]
             );
-            assert_eq!(agg_a.total(), 2, "A counts its own hit and the one C sent");
+            assert_eq!(
+                node_a.agg.total(),
+                2,
+                "A counts its own hit and the one C sent"
+            );
             assert_eq!(
                 router.received_count(c),
                 0,
                 "A never sends to the declined peer"
             );
-            client_a.shutdown().await.unwrap();
-            client_c.shutdown().await.unwrap();
-            let _ = h_a.await;
-            let _ = h_c.await;
+            node_a.stop().await;
+            node_c.stop().await;
         })
     });
     assert_logged(
@@ -1874,7 +1752,7 @@ fn quickcheck_sim_converges_under_iid_packet_loss(case: DropProbCase) -> TestRes
         };
         let nodes = case.nodes as usize;
         let router = SimRouter::with_channel_capacity(128);
-        let addrs: Vec<SocketAddr> = (0..nodes).map(|i| sock(52_000 + i as u16)).collect();
+        let addrs = addrs(52_000, nodes);
 
         // Apply DropProb on every directed link.
         for &src in &addrs {
@@ -1885,45 +1763,16 @@ fn quickcheck_sim_converges_under_iid_packet_loss(case: DropProbCase) -> TestRes
             }
         }
 
-        let mut clients = Vec::with_capacity(nodes);
-        let mut handles = Vec::with_capacity(nodes);
-        let mut aggregates = Vec::with_capacity(nodes);
-        for i in 0..nodes {
-            let identity = NodeIdentity::new(NodeId(0xC000 + i as u128), 1);
-            let cfg = sim_config(others(&addrs, addrs[i]));
-            let agg = Rc::new(InMemoryAggregateStore::new());
-            let (rt, client) = GossipRuntime::from_parts(
-                router.bind(addrs[i]),
-                TokioClock::from_millis(0),
-                cfg,
-                store_for(identity),
-                agg.clone(),
-            );
-            handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
-            clients.push(client);
-            aggregates.push(agg);
-        }
-
-        for record in &case.records {
-            let node = record.node as usize % nodes;
-            clients[node]
-                .record(
-                    rule_fp(record.rule),
-                    key_hash(record.key),
-                    BucketEpoch(0),
-                    record.hits as u64,
-                    0,
-                    0,
-                )
-                .await
-                .unwrap();
-        }
+        let mesh = mesh(&router, &addrs, |i| {
+            store_for(NodeIdentity::new(NodeId(0xC000 + i as u128), 1))
+        });
+        record_each(&mesh, &case.records).await;
 
         let expected = expected_model(&case.records, nodes);
         let mut converged = false;
         for _ in 0..40 {
             sim_advance_ticks(Duration::from_millis(100), 5).await;
-            if aggregates.iter().all(|agg| agg.snapshot() == expected) {
+            if mesh.iter().all(|node| node.agg.snapshot() == expected) {
                 converged = true;
                 break;
             }
@@ -1934,18 +1783,14 @@ fn quickcheck_sim_converges_under_iid_packet_loss(case: DropProbCase) -> TestRes
                 p,
                 nodes,
                 case.records.len(),
-                aggregates
-                    .iter()
-                    .map(|agg| agg.snapshot())
+                mesh.iter()
+                    .map(|node| node.agg.snapshot())
                     .collect::<Vec<_>>(),
             );
         }
 
-        for client in clients {
-            let _ = client.shutdown().await;
-        }
-        for handle in handles {
-            let _ = handle.await;
+        for node in mesh {
+            node.stop().await;
         }
         TestResult::from_bool(converged)
     })
@@ -1957,67 +1802,46 @@ fn quickcheck_sim_converges_under_iid_packet_loss(case: DropProbCase) -> TestRes
 /// `Removed` for one it does not. This case walks the sequence
 /// `Added → Added → Removed → Removed → Added` and asserts the table's
 /// length transitions are `1 → 1 → 0 → 0 → 1`.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn peer_event_lifecycle_is_idempotent_and_tolerant() {
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            let router = SimRouter::new();
-            let addr_local = sock(53_000);
-            let addr_other = sock(53_001);
-            let id_local = NodeIdentity::new(NodeId(0xE0E0), 1);
+#[test]
+fn peer_event_lifecycle_is_idempotent_and_tolerant() {
+    run_paused(async {
+        let router = SimRouter::new();
+        let other = sock(53_001);
+        let a = Node::start(
+            &router,
+            sock(53_000),
+            store_for(node(0xE0E0)),
+            sim_config(vec![]),
+        );
 
-            let (admin_tx, admin_rx) = mpsc::channel(8);
-            let (peer_tx, peer_rx) = mpsc::unbounded_channel::<PeerEvent>();
-            let peer_stream = futures::stream::unfold(peer_rx, |mut rx| async move {
-                rx.recv().await.map(|evt| (evt, rx))
-            });
+        let snap0 = a.snapshot().await;
+        assert_eq!(snap0.peers.len(), 0, "initial state should have no peers");
 
-            let (rt, client) = GossipRuntime::from_parts_with_admin(
-                router.bind(addr_local),
-                TokioClock::from_millis(0),
-                sim_config(Vec::new()),
-                store_for(id_local),
-                Rc::new(InMemoryAggregateStore::new()),
-                Some(admin_rx),
+        let events: Vec<(PeerEvent, usize, &'static str)> = vec![
+            (PeerEvent::Added(Peer::new(other)), 1, "first add"),
+            (PeerEvent::Added(Peer::new(other)), 1, "duplicate add"),
+            (PeerEvent::Removed(Peer::new(other)), 0, "first remove"),
+            (
+                PeerEvent::Removed(Peer::new(other)),
+                0,
+                "remove without add",
+            ),
+            (PeerEvent::Added(Peer::new(other)), 1, "re-add"),
+        ];
+        for (evt, expected_len, label) in events {
+            a.tell(evt);
+            // A yield lets the runtime take the event before the snapshot.
+            tokio::task::yield_now().await;
+            let snap = a.snapshot().await;
+            assert_eq!(
+                snap.peers.len(),
+                expected_len,
+                "after {label}: snapshot={snap:?}"
             );
-            let handle = tokio::task::spawn_local(rt.run(peer_stream));
+        }
 
-            // Initial snapshot: no peers.
-            let snap0 = admin_snapshot(&admin_tx).await;
-            assert_eq!(snap0.peers.len(), 0, "initial state should have no peers");
-
-            let events: Vec<(PeerEvent, usize, &'static str)> = vec![
-                (PeerEvent::Added(Peer::new(addr_other)), 1, "first add"),
-                (PeerEvent::Added(Peer::new(addr_other)), 1, "duplicate add"),
-                (PeerEvent::Removed(Peer::new(addr_other)), 0, "first remove"),
-                (
-                    PeerEvent::Removed(Peer::new(addr_other)),
-                    0,
-                    "remove without add",
-                ),
-                (PeerEvent::Added(Peer::new(addr_other)), 1, "re-add"),
-            ];
-
-            for (evt, expected_len, label) in events {
-                peer_tx.send(evt).expect("peer stream open");
-                // Yield enough that the runtime processes the peer event
-                // before we snapshot. Peer events are CRDT-free, so no
-                // time advance is strictly required, but a yield ensures
-                // ordering between the send and the snapshot.
-                tokio::task::yield_now().await;
-                let snap = admin_snapshot(&admin_tx).await;
-                assert_eq!(
-                    snap.peers.len(),
-                    expected_len,
-                    "after {label}: snapshot={snap:?}"
-                );
-            }
-
-            client.shutdown().await.unwrap();
-            let _ = handle.await;
-        })
-        .await;
+        a.stop().await;
+    });
 }
 
 // -- Threshold-triggered anti-entropy ---------------------------------------
@@ -2025,86 +1849,53 @@ async fn peer_event_lifecycle_is_idempotent_and_tolerant() {
 /// Threshold-trigger fires the moment a per-rule pending crosses ε, well
 /// before the proactive heartbeat would have run. Without the trigger,
 /// nothing would arrive at the peer until the heartbeat at `tick_interval`.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn threshold_trigger_fires_before_heartbeat() {
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            let router = SimRouter::new();
-            let addr_a = sock(54_000);
-            let addr_b = sock(54_001);
-            let id_a = NodeIdentity::new(NodeId(0xA1), 1);
-            let id_b = NodeIdentity::new(NodeId(0xB1), 1);
+#[test]
+fn threshold_trigger_fires_before_heartbeat() {
+    run_paused(async {
+        let router = SimRouter::new();
+        let addr_a = sock(54_000);
+        let addr_b = sock(54_001);
 
-            // Heartbeat is far in the future; only the threshold trigger
-            // could possibly deliver in the short window we sample.
-            let cfg_a = tuned_config(vec![addr_b], |s| {
-                s.tick_interval = ms(1_000);
-                s.target_err_bps = 100;
-            });
-            let cfg_b = tuned_config(vec![addr_a], |s| s.tick_interval = ms(1_000));
+        // Heartbeat is far in the future; only the threshold trigger
+        // could possibly deliver in the short window we sample.
+        let cfg_a = tuned_config(vec![addr_b], |s| {
+            s.tick_interval = ms(1_000);
+            s.target_err_bps = 100;
+        });
+        let cfg_b = tuned_config(vec![addr_a], |s| s.tick_interval = ms(1_000));
+        let a = Node::start(&router, addr_a, store_for(node(0xA1)), cfg_a);
+        let b = Node::start(&router, addr_b, store_for(node(0xB1)), cfg_b);
 
-            let agg_a = Rc::new(InMemoryAggregateStore::new());
-            let agg_b = Rc::new(InMemoryAggregateStore::new());
+        // A tokio interval's first tick is immediate: let both runtimes
+        // spend it while nothing is unsent, so it cannot deliver the hits.
+        sim_advance_ticks(Duration::from_millis(10), 1).await;
 
-            let (rt_a, client_a) = GossipRuntime::from_parts(
-                router.bind(addr_a),
-                TokioClock::from_millis(0),
-                cfg_a,
-                store_for(id_a),
-                agg_a.clone(),
-            );
-            let (rt_b, _client_b) = GossipRuntime::from_parts(
-                router.bind(addr_b),
-                TokioClock::from_millis(0),
-                cfg_b,
-                store_for(id_b),
-                agg_b.clone(),
-            );
-            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
-            let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
-
-            // A tokio interval's first tick is immediate: let both runtimes
-            // spend it while nothing is unsent, so it cannot deliver the hits.
-            sim_advance_ticks(Duration::from_millis(10), 1).await;
-
-            // rule_limit=100, N=1 peer, target=100 bps =>
-            // ε = max(1, 100*100/(10000*1)) = 1. First hit puts pending=1
-            // (not yet > 1). Subsequent hits cross the budget.
-            //
-            // The rule has to be interned first or the threshold path is
-            // skipped on the very first hit; the local ingest interns it.
-            let rule_fp: u128 = 0xC0DE;
-            let key = KeyHash(0x99);
-            client_a
-                .record(rule_fp, key, BucketEpoch(0), 1, 100, 0)
+        // rule_limit=100, N=1 peer, target=100 bps =>
+        // ε = max(1, 100*100/(10000*1)) = 1. First hit puts pending=1
+        // (not yet > 1). Subsequent hits cross the budget.
+        //
+        // The rule has to be interned first or the threshold path is
+        // skipped on the very first hit; the local ingest interns it.
+        for _ in 0..3 {
+            a.client
+                .record(0xC0DE, KeyHash(0x99), BucketEpoch(0), 1, 100, 0)
                 .await
                 .unwrap();
-            client_a
-                .record(rule_fp, key, BucketEpoch(0), 1, 100, 0)
-                .await
-                .unwrap();
-            client_a
-                .record(rule_fp, key, BucketEpoch(0), 1, 100, 0)
-                .await
-                .unwrap();
+        }
 
-            // Advance well under the heartbeat. The threshold trigger
-            // should have already pumped the gossip frame through.
-            sim_advance_ticks(Duration::from_millis(10), 5).await;
+        // Advance well under the heartbeat. The threshold trigger
+        // should have already pumped the gossip frame through.
+        sim_advance_ticks(Duration::from_millis(10), 5).await;
 
-            let sum_b = agg_b.total();
-            assert!(
-                sum_b >= 1,
-                "expected threshold-fire to reach B before the 1s heartbeat, got sum_b={sum_b}",
-            );
+        let sum_b = b.agg.total();
+        assert!(
+            sum_b >= 1,
+            "expected threshold-fire to reach B before the 1s heartbeat, got sum_b={sum_b}",
+        );
 
-            client_a.shutdown().await.unwrap();
-            let _ = h_a.await;
-            h_b.abort();
-            let _ = h_b.await;
-        })
-        .await;
+        a.stop().await;
+        b.stop().await;
+    });
 }
 
 /// When ε saturates to 1 and the request stream pins it crossed every
@@ -2112,167 +1903,123 @@ async fn threshold_trigger_fires_before_heartbeat() {
 /// Drives 1000 hits across ~10 ms of virtual time; with a 5 ms floor the
 /// number of distinct emit-triggered ticks (= packets the recipient
 /// observed) must stay well below 1000.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn min_emit_interval_clamps_adversarial_rate() {
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            let router = SimRouter::with_channel_capacity(256);
-            let addr_a = sock(54_010);
-            let addr_b = sock(54_011);
-            let id_a = NodeIdentity::new(NodeId(0xA2), 1);
-            let id_b = NodeIdentity::new(NodeId(0xB2), 1);
+#[test]
+fn min_emit_interval_clamps_adversarial_rate() {
+    run_paused(async {
+        let router = SimRouter::with_channel_capacity(256);
+        let addr_a = sock(54_010);
+        let addr_b = sock(54_011);
 
-            // ε saturates to 1 (limit=1). Heartbeat is far in the future
-            // so the only emissions are threshold-triggered.
-            let cfg_a = tuned_config(vec![addr_b], |s| {
-                s.tick_interval = ms(10_000);
-                s.min_emit_interval = ms(5);
-            });
-            let cfg_b = tuned_config(vec![addr_a], |s| s.tick_interval = ms(10_000));
+        // ε saturates to 1 (limit=1). Heartbeat is far in the future
+        // so the only emissions are threshold-triggered.
+        let cfg_a = tuned_config(vec![addr_b], |s| {
+            s.tick_interval = ms(10_000);
+            s.min_emit_interval = ms(5);
+        });
+        let cfg_b = tuned_config(vec![addr_a], |s| s.tick_interval = ms(10_000));
+        let a = Node::start(&router, addr_a, store_for(node(0xA2)), cfg_a);
+        let b = Node::start(&router, addr_b, store_for(node(0xB2)), cfg_b);
 
-            let agg_a = Rc::new(InMemoryAggregateStore::new());
-            let agg_b = Rc::new(InMemoryAggregateStore::new());
+        let rule_fp: u128 = 0xCAB1E;
+        let key = KeyHash(0x11);
 
-            let (rt_a, client_a) = GossipRuntime::from_parts(
-                router.bind(addr_a),
-                TokioClock::from_millis(0),
-                cfg_a,
-                store_for(id_a),
-                agg_a.clone(),
-            );
-            let (rt_b, _client_b) = GossipRuntime::from_parts(
-                router.bind(addr_b),
-                TokioClock::from_millis(0),
-                cfg_b,
-                store_for(id_b),
-                agg_b.clone(),
-            );
-            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
-            let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
+        // Prime the rule so the threshold path takes effect on the
+        // first burst-loop iteration.
+        a.client
+            .record(rule_fp, key, BucketEpoch(0), 1, 1, 0)
+            .await
+            .unwrap();
 
-            let rule_fp: u128 = 0xCAB1E;
-            let key = KeyHash(0x11);
-
-            // Prime the rule so the threshold path takes effect on the
-            // first burst-loop iteration.
-            client_a
-                .record(rule_fp, key, BucketEpoch(0), 1, 1, 0)
+        // 1000 hits across ~10 ms of virtual time; now_millis
+        // advances by 1 ms per 100 hits. The clamp applies through
+        // `req.now_millis - rule_last_emit_ms`.
+        for i in 0..1000_u64 {
+            let now_ms = i / 100;
+            a.client
+                .record(rule_fp, key, BucketEpoch(0), 1, 1, now_ms)
                 .await
                 .unwrap();
+        }
+        sim_advance_ticks(Duration::from_millis(1), 20).await;
 
-            // 1000 hits across ~10 ms of virtual time; now_millis
-            // advances by 1 ms per 100 hits. The clamp applies through
-            // `req.now_millis - rule_last_emit_ms`.
-            for i in 0..1000_u64 {
-                let now_ms = i / 100;
-                client_a
-                    .record(rule_fp, key, BucketEpoch(0), 1, 1, now_ms)
-                    .await
-                    .unwrap();
-            }
-            sim_advance_ticks(Duration::from_millis(1), 20).await;
+        // Each successful threshold-fire enqueues a single frame to B.
+        // SimRouter counts received frames. With 1000 hits and a 5 ms
+        // floor over ~10 ms, the count must stay well below the hit
+        // count by a large margin.
+        let received = router.received_count(addr_b);
+        assert!(
+            received < 200,
+            "min_emit_interval should clamp emit rate; got {received} frames for 1000 hits",
+        );
 
-            // Each successful threshold-fire enqueues a single frame to B.
-            // SimRouter counts received frames. With 1000 hits and a 5 ms
-            // floor over ~10 ms, the count must stay well below the hit
-            // count by a large margin.
-            let received = router.received_count(addr_b);
-            assert!(
-                received < 200,
-                "min_emit_interval should clamp emit rate; got {received} frames for 1000 hits",
-            );
-
-            client_a.shutdown().await.unwrap();
-            let _ = h_a.await;
-            h_b.abort();
-            let _ = h_b.await;
-        })
-        .await;
+        a.stop().await;
+        b.stop().await;
+    });
 }
 
 /// Under sustained load, the cluster-wide unreplicated error per rule
 /// stays bounded by `target_err_bps / 10_000 × limit` plus slack for
 /// in-flight frames. Asserts a soft bound (≤ 2 × N × ε + tick slack)
 /// across many record batches.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn error_bound_holds_under_load() {
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            const NODES: usize = 4;
-            const LIMIT: u64 = 1_000;
-            const TARGET_BPS: u32 = 100; // 1 %
+#[test]
+fn error_bound_holds_under_load() {
+    run_paused(async {
+        const NODES: usize = 4;
+        const LIMIT: u64 = 1_000;
+        const TARGET_BPS: u32 = 100; // 1 %
 
-            let router = SimRouter::with_channel_capacity(512);
-            let addrs: Vec<SocketAddr> = (0..NODES).map(|i| sock(54_100 + i as u16)).collect();
+        let router = SimRouter::with_channel_capacity(512);
+        let addrs = addrs(54_100, NODES);
+        let start = |(i, &addr)| {
+            let config = tuned_config(others(&addrs, addr), |s| {
+                s.target_err_bps = TARGET_BPS;
+                s.min_emit_interval = ms(1);
+            });
+            let identity = NodeIdentity::new(NodeId(0xC000 + i as u128), 1);
+            Node::start(&router, addr, store_for(identity), config)
+        };
+        let mesh: Vec<Node> = addrs.iter().enumerate().map(start).collect();
 
-            let mut clients = Vec::with_capacity(NODES);
-            let mut handles = Vec::with_capacity(NODES);
-            let mut aggregates = Vec::with_capacity(NODES);
-            for i in 0..NODES {
-                let identity = NodeIdentity::new(NodeId(0xC000 + i as u128), 1);
-                let cfg = tuned_config(others(&addrs, addrs[i]), |s| {
-                    s.target_err_bps = TARGET_BPS;
-                    s.min_emit_interval = ms(1);
-                });
-                let agg = Rc::new(InMemoryAggregateStore::new());
-                let (rt, client) = GossipRuntime::from_parts(
-                    router.bind(addrs[i]),
-                    TokioClock::from_millis(0),
-                    cfg,
-                    store_for(identity),
-                    agg.clone(),
-                );
-                handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
-                clients.push(client);
-                aggregates.push(agg);
+        let rule_fp: u128 = 0xC0FE;
+        let key = KeyHash(0x44);
+        let batches = 50_u32;
+        let per_batch = 8_u64;
+        let mut real_total = 0_u64;
+        let mut max_lag = 0_u64;
+        for batch in 0..batches {
+            for node in &mesh {
+                node.client
+                    .record(rule_fp, key, BucketEpoch(0), per_batch, LIMIT, batch as u64)
+                    .await
+                    .unwrap();
+                real_total += per_batch;
             }
-
-            let rule_fp: u128 = 0xC0FE;
-            let key = KeyHash(0x44);
-            let batches = 50_u32;
-            let per_batch = 8_u64;
-            let mut real_total = 0_u64;
-            let mut max_lag = 0_u64;
-            for batch in 0..batches {
-                for client in clients.iter().take(NODES) {
-                    client
-                        .record(rule_fp, key, BucketEpoch(0), per_batch, LIMIT, batch as u64)
-                        .await
-                        .unwrap();
-                    real_total += per_batch;
-                }
-                sim_advance_ticks(Duration::from_millis(2), 1).await;
-                let min_seen = aggregates
-                    .iter()
-                    .map(|a| a.snapshot().values().copied().sum::<u64>())
-                    .min()
-                    .unwrap_or(0);
-                let lag = real_total.saturating_sub(min_seen);
-                if lag > max_lag {
-                    max_lag = lag;
-                }
+            sim_advance_ticks(Duration::from_millis(2), 1).await;
+            let min_seen = mesh
+                .iter()
+                .map(|node| node.agg.snapshot().values().copied().sum::<u64>())
+                .min()
+                .unwrap_or(0);
+            let lag = real_total.saturating_sub(min_seen);
+            if lag > max_lag {
+                max_lag = lag;
             }
+        }
 
-            // ε per peer ≈ TARGET_BPS / 10_000 × LIMIT; the cluster-wide
-            // bound is N × ε. Allow slack for in-flight frames between
-            // trip and apply across all peers (one tick of writes).
-            let bound = ((LIMIT * TARGET_BPS as u64) / 10_000) * NODES as u64;
-            let tick_slack = NODES as u64 * per_batch * 2;
-            assert!(
-                max_lag <= bound.saturating_add(tick_slack).saturating_mul(2),
-                "error lag {max_lag} exceeded soft bound {bound} (+ slack {tick_slack})",
-            );
+        // ε per peer ≈ TARGET_BPS / 10_000 × LIMIT; the cluster-wide
+        // bound is N × ε. Allow slack for in-flight frames between
+        // trip and apply across all peers (one tick of writes).
+        let bound = ((LIMIT * TARGET_BPS as u64) / 10_000) * NODES as u64;
+        let tick_slack = NODES as u64 * per_batch * 2;
+        assert!(
+            max_lag <= bound.saturating_add(tick_slack).saturating_mul(2),
+            "error lag {max_lag} exceeded soft bound {bound} (+ slack {tick_slack})",
+        );
 
-            for client in clients {
-                let _ = client.shutdown().await;
-            }
-            for handle in handles {
-                let _ = handle.await;
-            }
-        })
-        .await;
+        for node in mesh {
+            node.stop().await;
+        }
+    });
 }
 
 /// A tick resolves to the instant it was scheduled for, not when it was
