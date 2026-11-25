@@ -12,8 +12,8 @@
 //! rendezvous-chosen gateway in each other zone, which relays them into its
 //! zone on a second stream; a gap report or a heartbeat without an ack brings
 //! a resend. A peer that leaves a packet unanswered for
-//! `gossip.suspect_after` is suspect: it loses the gateway role and is sent
-//! only header-only probes until it answers.
+//! `gossip.suspect_after` is suspect: it loses the gateway role, and until it
+//! answers, its retries are header-only probes; new cells still go to it.
 //!
 //! All polymorphic boundaries are monomorphized generics — no `dyn`, no
 //! `Box`. Tests and simulators parameterize the same code paths with

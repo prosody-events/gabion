@@ -260,10 +260,6 @@ pub(super) struct Inbound {
 }
 
 impl Inbound {
-    fn is_open(&self) -> bool {
-        matches!(self.gap, Gap::Open { .. })
-    }
-
     /// A packet closing `range` arrived. `have` moves only over contiguous
     /// ranges; a range above it is stashed and opens a gap, or reopens an
     /// abandoned one.
@@ -1248,7 +1244,7 @@ impl PeerTable {
             .filter(|&at| at > self.judged_ms);
         let link = &mut self.link[row];
         let (own, relay) = (link.own_mark().report_at(), link.relay_in.report_at());
-        let open = link.own_mark().is_open() || link.relay_in.is_open();
+        let open = own.is_some() || relay.is_some();
         self.deadline[row] = [
             self.own_timer(row),
             self.relay_timer(row),
