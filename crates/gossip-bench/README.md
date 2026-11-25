@@ -42,7 +42,7 @@ A change is judged against two baselines, all with the same core:
 
 | Arm | What it is |
 |---|---|
-| `main` | the tree that landed the harness (`H1`), measured with the current core |
+| `main` | the tree that landed the harness (`H1`, `806062f7aa45c1193ef086c3be570e3362d4f773`), measured with the current core |
 | `imp-az-hier-nopk` | the study's measured branch `sim/imp-az-hier-nopk` (`328f7cf`) |
 | `zone` | the checkout under test |
 

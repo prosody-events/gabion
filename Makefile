@@ -271,7 +271,7 @@ SIM := crates/gossip-bench
 SIM_OUT ?= target/sim
 SIM_JOBS ?= 2
 # The commit that landed the harness: its adapter and manifest build every baseline.
-H1 ?= $(shell git log --diff-filter=A --format=%H -- $(SIM)/src/harness/adapter.rs | tail -n 1)
+H1 ?= 806062f7aa45c1193ef086c3be570e3362d4f773
 # The measured branch, sim/imp-az-hier-nopk.
 SIM_NOPK := 328f7cf214b95a505c528dcaa8e1f26498157968
 
@@ -283,7 +283,7 @@ sim-smoke:
 
 .PHONY: sim-baselines
 sim-baselines:
-	@test -n "$(H1)" || { echo 'sim-baselines: no commit added $(SIM)/src/harness/adapter.rs; pass H1=<sha>' >&2; exit 1; }
+	@git cat-file -e '$(H1)^{commit}' 2>/dev/null || { echo 'sim-baselines: commit $(H1) (H1, the tree that landed the harness) is not in this clone; fetch it with `git fetch origin refs/pull/121/head`, or pass H1=<sha>' >&2; exit 1; }
 	set -e; date=$$(git log -1 --format=%cI $(H1)); \
 	for arm in main=$(H1) imp-az-hier-nopk=$(SIM_NOPK); do \
 		label=$${arm%%=*}; wt=$(SIM_OUT)/worktrees/$$label; \
@@ -343,14 +343,6 @@ bench-check:
 	$(CARGO_ENV) $(STABLE_CARGO) bench -p gabion-server --bench admission --no-run
 	$(CARGO_ENV) $(STABLE_CARGO) bench -p gabion-nginx --bench access --no-run
 
-# Gate the visualizer's wasm bridge and frontend: (1) type-check gabion-wasm
-# for wasm32 with the browser getrandom backend (the make-or-break
-# cross-compile), (2) run its native engine + shim tests (no wasm toolchain
-# needed), and (3) build the frontend — `pnpm run build` rebuilds the wasm
-# package with wasm-pack, type-checks the Svelte/TS with svelte-check, and runs
-# the production Vite build. The Playwright screenshot/in-browser smoke
-# (`pnpm run screenshot`) downloads a browser, so it stays a documented
-# on-demand run rather than part of this gate — same treatment as smoke.cjs.
 # The three faces the visualizer and the study dashboard set (web/README.md,
 # "Fonts"): Source Sans 3, Source Serif 4 and Source Code Pro from the
 # google/fonts registry at one pinned commit, instanced to the weights the
@@ -382,6 +374,14 @@ fonts:
 	rm -f docs/study/dashboard/fonts/*
 	cp $(WEB_DIR)/src/fonts/* docs/study/dashboard/fonts/
 
+# Gate the visualizer's wasm bridge and frontend: (1) type-check gabion-wasm
+# for wasm32 with the browser getrandom backend (the make-or-break
+# cross-compile), (2) run its native engine + shim tests (no wasm toolchain
+# needed), and (3) build the frontend — `pnpm run build` rebuilds the wasm
+# package with wasm-pack, type-checks the Svelte/TS with svelte-check, and runs
+# the production Vite build. The Playwright screenshot/in-browser smoke
+# (`pnpm run screenshot`) downloads a browser, so it stays a documented
+# on-demand run rather than part of this gate — same treatment as smoke.cjs.
 .PHONY: wasm-check
 wasm-check: require-nextest require-wasm-target require-wasm-pack require-pnpm require-wasm-nightly
 	$(CARGO_ENV) $(STABLE_CARGO) check --target $(WASM_TARGET) -p gabion-wasm
