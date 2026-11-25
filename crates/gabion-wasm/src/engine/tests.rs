@@ -9,18 +9,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::num::{NonZeroU16, NonZeroU64};
 
-use gabion::crdt::KeyHash;
+use gabion::crdt::{CellStoreStats, KeyHash};
 use gabion::defaults;
-use gabion::gossip::{AnswerState, Role};
+use gabion::gossip::{AdminCommand, AnswerState, Role};
 use gabion::settings::SettingError;
 use tokio::runtime::Builder;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::LocalSet;
 
 use super::{Command, EngineError, EngineState, LinkPolicyKind, StepUntil, run_engine};
+use crate::capture::{Capture, SharedCapture};
 use crate::config::{MAX_NODES, SimConfig, ZoneMode};
 use crate::event::{
-    Burst, CellView, ClusterState, Event, EventBatch, EventKind, Inspected, Lag, PacketKind,
+    Burst, ClusterState, Event, EventBatch, EventKind, Inspected, Lag, Message, PacketKind,
     PeerView, Tier,
 };
 
@@ -73,10 +74,11 @@ fn test_config(nodes: usize) -> SimConfig {
 }
 
 /// Stand up `run_engine` on a paused current-thread runtime and run `driver`
-/// against its command channel. Closing the channel ends the engine cleanly.
-fn with_engine<F, Fut>(config: SimConfig, driver: F)
+/// against its command channel and capture. Closing the channel ends the
+/// engine cleanly.
+pub(crate) fn with_engine<F, Fut>(config: SimConfig, driver: F)
 where
-    F: FnOnce(mpsc::Sender<Command>) -> Fut,
+    F: FnOnce(mpsc::Sender<Command>, SharedCapture) -> Fut,
     Fut: Future<Output = ()>,
 {
     let rt = Builder::new_current_thread()
@@ -88,9 +90,9 @@ where
     local.block_on(&rt, async move {
         let (tx, rx) = mpsc::channel(16);
         let valid = config.validate().expect("test config validates");
-        let engine =
-            tokio::task::spawn_local(run_engine(valid, crate::capture::Capture::shared(), rx));
-        driver(tx.clone()).await;
+        let capture = Capture::shared();
+        let engine = tokio::task::spawn_local(run_engine(valid, capture.clone(), rx));
+        driver(tx.clone(), capture).await;
         drop(tx);
         engine
             .await
@@ -126,13 +128,9 @@ async fn submit(tx: &mpsc::Sender<Command>, node: u32, key: u128, n: u64) -> Eve
 }
 
 async fn snapshot(tx: &mpsc::Sender<Command>) -> ClusterState {
-    snapshot_inspecting(tx, None).await
-}
-
-async fn snapshot_inspecting(tx: &mpsc::Sender<Command>, inspect: Option<u32>) -> ClusterState {
     let (reply, rx) = oneshot::channel();
     tx.send(Command::Snapshot {
-        inspect,
+        inspect: None,
         key: WATCHED,
         reply,
     })
@@ -141,15 +139,12 @@ async fn snapshot_inspecting(tx: &mpsc::Sender<Command>, inspect: Option<u32>) -
     rx.await.unwrap()
 }
 
-/// Node `id`'s cells and peer rows, as the snapshot inspecting it reports them.
-async fn inspect(tx: &mpsc::Sender<Command>, id: u32) -> Inspected {
-    snapshot_inspecting(tx, Some(id))
-        .await
-        .inspected
-        .expect("a live node")
-}
-
-async fn set_link(tx: &mpsc::Sender<Command>, src: u32, dst: u32, policy: LinkPolicyKind) {
+pub(crate) async fn set_link(
+    tx: &mpsc::Sender<Command>,
+    src: u32,
+    dst: u32,
+    policy: LinkPolicyKind,
+) {
     let (reply, rx) = oneshot::channel();
     tx.send(Command::SetLinkPolicy {
         src,
@@ -186,7 +181,7 @@ fn node_ids(state: &ClusterState) -> Vec<u32> {
 /// `Tick` for each, at the instant it ran.
 #[test]
 fn every_node_runs_one_heartbeat_per_period() {
-    with_engine(test_config(2), |tx| async move {
+    with_engine(test_config(2), |tx, _| async move {
         let mut ticks: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
         for _ in 0..5 {
             for event in step(&tx, 500).await.events {
@@ -204,24 +199,15 @@ fn every_node_runs_one_heartbeat_per_period() {
         let state = snapshot(&tx).await;
         assert_eq!(state.nodes.len(), 2);
         assert_eq!(state.virtual_ms, 2_500);
-        assert!(
-            state.nodes.iter().all(|n| n.rounds_heartbeat == 25),
-            "25 heartbeats each: {:?}",
-            state
-                .nodes
-                .iter()
-                .map(|n| n.rounds_heartbeat)
-                .collect::<Vec<_>>()
-        );
     });
 }
 
-/// Submitting a request creates a cell on the local node (visible
-/// both as a `CellCreated` event and via the `CellDump` snapshot) and the hit
+/// Submitting a request creates a cell on the local node, as a
+/// `CellCreated` event, and the hit
 /// gossips to the other node, where the aggregate converges to the oracle.
 #[test]
 fn submit_creates_and_gossips_a_cell() {
-    with_engine(test_config(2), |tx| async move {
+    with_engine(test_config(2), |tx, _| async move {
         let submit_batch = submit(&tx, 0, WATCHED_KEY, 5).await;
         let local_created = submit_batch.events.iter().any(|e| {
             matches!(
@@ -236,14 +222,6 @@ fn submit_creates_and_gossips_a_cell() {
         let before = snapshot(&tx).await;
         assert_eq!(before.oracle_total, 5);
         assert_eq!(before.nodes[0].window_total, 5);
-        assert!(
-            inspect(&tx, 0)
-                .await
-                .cells
-                .iter()
-                .any(|c| c.key == WATCHED_KEY && c.count == 5 && c.is_local),
-            "CellDump should report the local origin cell"
-        );
 
         // Drive gossip forward and gather every event across the whole stream
         // (the submit batch plus every step).
@@ -260,7 +238,7 @@ fn submit_creates_and_gossips_a_cell() {
         let packet_observed = all_events.iter().any(|e| {
             matches!(
                 &e.kind,
-                EventKind::PacketSent { .. } | EventKind::PacketDelivered { .. }
+                EventKind::PacketSent(_) | EventKind::PacketDelivered { .. }
             )
         });
         assert!(node1_cell_event, "the hit should gossip to node 1");
@@ -271,15 +249,6 @@ fn submit_creates_and_gossips_a_cell() {
         assert!(
             after.nodes.iter().all(|n| n.window_total == 5),
             "both nodes converge on the oracle total"
-        );
-        // Node 1's copy is a remote (non-local) cell.
-        assert!(
-            inspect(&tx, 1)
-                .await
-                .cells
-                .iter()
-                .any(|c| c.key == WATCHED_KEY && c.count == 5 && !c.is_local),
-            "node 1 holds the cell as a remote origin"
         );
     });
 }
@@ -299,10 +268,9 @@ fn error_budget_and_gateway_counters_surface_in_snapshot() {
             .submit_request(0, KeyHash(0), requests(7), StepUntil::Time)
             .await
             .unwrap();
-        let origin = state.snapshot(None, WATCHED).await.nodes.swap_remove(0);
-        assert_eq!(origin.id, 0);
+        let origin = state.snapshot(Some(0), WATCHED).await.inspected;
         assert!(
-            origin.error_budget > 0,
+            origin.is_some_and(|o| o.error_budget > 0),
             "the error budget must be recorded once a request is seen",
         );
 
@@ -318,9 +286,11 @@ fn error_budget_and_gateway_counters_surface_in_snapshot() {
         // Checkpoint A, the peer mirror: the rows the page shows are the rows
         // the runtime reports, read at the same virtual instant.
         let snap = state.snapshot(Some(0), WATCHED).await;
-        let direct = super::admin_snapshot(&state.nodes[0].admin_tx)
-            .await
-            .expect("node 0 runs");
+        let direct = super::admin(&state.nodes[0].admin_tx, |reply| AdminCommand::Snapshot {
+            reply,
+        })
+        .await
+        .expect("node 0 runs");
         let rows = &snap.inspected.expect("node 0 is live").peers;
         assert_eq!(rows.len(), direct.peers.len());
         for (row, entry) in rows.iter().zip(&direct.peers) {
@@ -328,7 +298,6 @@ fn error_budget_and_gateway_counters_surface_in_snapshot() {
             assert_eq!(row.answer, entry.answer);
             assert_eq!(row.unanswered_ms, entry.unanswered_ms);
             assert_eq!(row.own_unacked, entry.own_unacked);
-            assert_eq!(row.relay_unacked, entry.relay_unacked);
         }
         let silent = rows
             .iter()
@@ -355,7 +324,9 @@ fn error_budget_and_gateway_counters_surface_in_snapshot() {
         state.step(T_U + 3 * T, StepUntil::Time).await;
         let snap = state.snapshot(None, WATCHED).await;
         for (node, handle) in snap.nodes.iter().zip(&state.nodes) {
-            let c = super::counters(&handle.admin_tx).await.expect("runs");
+            let c = super::admin(&handle.admin_tx, |reply| AdminCommand::Counters { reply })
+                .await
+                .expect("runs");
             assert_eq!(node.gateway_failovers, c.gateway_failovers);
             assert_eq!(node.gap_reports_sent, c.gap_reports_sent);
             assert_eq!(node.rto_rewinds_own, c.rto_rewinds_own);
@@ -381,7 +352,7 @@ fn oracle_total_is_windowed_and_counts_each_origin_once() {
         rule_bucket_ms: 1_000,
         ..test_config(3)
     };
-    with_engine(config, |tx| async move {
+    with_engine(config, |tx, _| async move {
         for peer in [0, 1] {
             set_link(&tx, peer, 2, LinkPolicyKind::Block).await;
             set_link(&tx, 2, peer, LinkPolicyKind::Block).await;
@@ -460,7 +431,7 @@ fn oracle_total_is_windowed_and_counts_each_origin_once() {
 /// drops), and healing the link lets the cluster converge.
 #[test]
 fn partition_blocks_then_heal_converges() {
-    with_engine(test_config(2), |tx| async move {
+    with_engine(test_config(2), |tx, _| async move {
         // Cut both directions between node 0 and node 1.
         set_link(&tx, 0, 1, LinkPolicyKind::Block).await;
         set_link(&tx, 1, 0, LinkPolicyKind::Block).await;
@@ -473,7 +444,7 @@ fn partition_blocks_then_heal_converges() {
             if batch
                 .events
                 .iter()
-                .any(|e| matches!(&e.kind, EventKind::PacketDropped { .. }))
+                .any(|e| matches!(&e.kind, EventKind::PacketDropped(_)))
             {
                 saw_drop = true;
             }
@@ -509,7 +480,7 @@ fn partition_blocks_then_heal_converges() {
 #[test]
 fn lag_dates_the_oldest_change_a_node_lacks() {
     use Lag::{CaughtUp, Stranded};
-    with_engine(test_config(2), |tx| async move {
+    with_engine(test_config(2), |tx, _| async move {
         let missing =
             |state: &ClusterState| -> Vec<Lag> { state.nodes.iter().map(|n| n.lag).collect() };
         submit(&tx, 0, WATCHED_KEY, 7).await;
@@ -616,7 +587,7 @@ fn same_script_produces_identical_events() {
         // N=16 so the determinism check exercises ticks arriving *while*
         // packets are in flight across a sizeable fan — the combined load
         // under which a coalescing (watch) tick source diverged.
-        with_engine(zoned(16, 3), |tx| {
+        with_engine(zoned(16, 3), |tx, _| {
             let batches = &mut batches;
             async move {
                 batches.push(submit(&tx, 0, WATCHED_KEY, 3).await);
@@ -649,23 +620,32 @@ fn same_script_produces_identical_events() {
 }
 
 /// At a larger cluster the per-node tick channel must deliver *every* fired
-/// tick — no coalescing — so each runtime's `rounds_heartbeat` equals the
-/// number of whole ticks stepped, identically across nodes and across runs. (A
-/// `watch` tick source failed exactly here: a busy runtime silently dropped
-/// ticks.)
+/// tick — no coalescing — so each node's `Tick` events, one per heartbeat
+/// round its runtime counts, equal the number of whole ticks stepped,
+/// identically across nodes and across runs. (A `watch` tick source failed
+/// exactly here: a busy runtime silently dropped ticks.)
 #[test]
 fn many_nodes_receive_every_tick_deterministically() {
     fn run() -> Vec<u64> {
         let mut totals = Vec::new();
-        with_engine(test_config(32), |tx| {
+        with_engine(test_config(32), |tx, _| {
             let totals = &mut totals;
             async move {
                 // 1000 ms at 100 ms/tick = 10 whole ticks, and no requests (so
-                // no threshold rounds): every node's rounds_heartbeat must be
-                // 10.
-                step(&tx, 1_000).await;
+                // no threshold rounds): every node must tick 10 times.
+                let batch = step(&tx, 1_000).await;
                 let state = snapshot(&tx).await;
-                *totals = state.nodes.iter().map(|n| n.rounds_heartbeat).collect();
+                *totals = state
+                    .nodes
+                    .iter()
+                    .map(|n| {
+                        let ticks = batch
+                            .events
+                            .iter()
+                            .filter(|e| matches!(e.kind, EventKind::Tick { node } if node == n.id));
+                        ticks.count() as u64
+                    })
+                    .collect();
             }
         });
         totals
@@ -686,7 +666,7 @@ fn many_nodes_receive_every_tick_deterministically() {
 /// next never-reused id) without renumbering any survivor.
 #[test]
 fn added_node_catches_up_by_gossip() {
-    with_engine(test_config(3), |tx| async move {
+    with_engine(test_config(3), |tx, _| async move {
         // Seed and converge a 3-node cluster on a single burst.
         submit(&tx, 0, WATCHED_KEY, 50).await;
         for _ in 0..10 {
@@ -732,7 +712,7 @@ fn added_node_catches_up_by_gossip() {
 /// burst after the removal still converges across exactly the remaining nodes.
 #[test]
 fn removed_node_leaves_and_survivors_keep_converging() {
-    with_engine(test_config(3), |tx| async move {
+    with_engine(test_config(3), |tx, _| async move {
         submit(&tx, 0, WATCHED_KEY, 50).await;
         for _ in 0..10 {
             step(&tx, 100).await;
@@ -791,7 +771,7 @@ fn the_first_round_after_a_join_reaches_the_newcomer() {
             .expect("survivors");
         assert!(
             events.iter().any(|e| e.virtual_ms == beat
-                && matches!(e.kind, EventKind::PacketSent { src, dst, .. }
+                && matches!(e.kind, EventKind::PacketSent(Message { src, dst, .. })
                     if src == first && dst == newcomer)),
             "node {first}, the first to beat after the join, skipped the newcomer at {beat}"
         );
@@ -822,7 +802,7 @@ fn churn_script_is_deterministic() {
     fn run() -> (Vec<EventBatch>, Vec<u32>) {
         let mut batches = Vec::new();
         let mut ids = Vec::new();
-        with_engine(test_config(4), |tx| {
+        with_engine(test_config(4), |tx, _| {
             let batches = &mut batches;
             let ids = &mut ids;
             async move {
@@ -985,14 +965,14 @@ fn propagation() -> SimConfig {
 /// Step one period at a time until a period passes with no packet sent or
 /// lost, and return every event. Panics after 40 periods with the count.
 async fn settle(state: &mut EngineState) -> Vec<Event> {
-    let period = state.config.tick_interval_ms;
+    let period = state.valid.config.tick_interval_ms;
     let mut events = Vec::new();
     for _ in 0..40 {
         let batch = state.step(period, StepUntil::Time).await.events;
         let quiet = !batch.iter().any(|e| {
             matches!(
                 e.kind,
-                EventKind::PacketSent { .. } | EventKind::PacketDropped { .. }
+                EventKind::PacketSent(_) | EventKind::PacketDropped(_)
             )
         });
         events.extend(batch);
@@ -1096,9 +1076,38 @@ async fn gateway_of(state: &EngineState, origin: u32, zone: u8) -> u32 {
         .expect("a gateway")
 }
 
-/// Node `id`'s cells, as the snapshot inspecting it reports them.
+/// One CRDT cell as a node holds it, with its origin resolved to a stable id.
+#[derive(Debug)]
+struct CellView {
+    rule: u128,
+    key: u128,
+    bucket: u32,
+    count: u64,
+    origin: Option<u32>,
+    /// Whether the node holding it is its origin.
+    is_local: bool,
+}
+
+/// Node `id`'s cells, from its runtime's cell dump.
 async fn cells_of(state: &EngineState, id: u32) -> Vec<CellView> {
-    inspected(state, id).await.cells
+    let pos = super::position_of(&state.nodes, id).expect("a live node");
+    let dump = super::admin(&state.nodes[pos].admin_tx, |reply| AdminCommand::CellDump {
+        reply,
+    })
+    .await
+    .expect("node runs");
+    let local = dump.local_identity.node_id.0;
+    dump.cells
+        .iter()
+        .map(|cell| CellView {
+            rule: cell.rule_fingerprint,
+            key: cell.key_hash.0,
+            bucket: cell.bucket.0,
+            count: cell.count,
+            origin: cell.origin_node_id.and_then(crate::capture::stable_id),
+            is_local: cell.origin_node_id == Some(local),
+        })
+        .collect()
 }
 
 /// Node `id`'s peer rows, as the snapshot inspecting it reports them.
@@ -1127,13 +1136,9 @@ fn sent(events: &[Event], src: u32, kind: PacketKind) -> Vec<(u32, Tier, u64)> {
     events
         .iter()
         .filter_map(|e| match e.kind {
-            EventKind::PacketSent {
-                src: s,
-                dst,
-                role,
-                tier,
-                ..
-            } if s == src && role.kind() == kind => Some((dst, tier, e.virtual_ms)),
+            EventKind::PacketSent(m) if m.src == src && m.role.kind() == kind => {
+                Some((m.dst, m.tier, e.virtual_ms))
+            }
             _ => None,
         })
         .collect()
@@ -1162,46 +1167,18 @@ fn bucket_count<'a>(cells: impl Iterator<Item = &'a CellView>, rule: u128, bucke
 }
 
 /// Every sent or dropped packet's bytes, summed by tier and class here, equal
-/// the snapshot's `bytes_by_tier`, and each live node's `own_data_bytes` equal
-/// the `Own` bytes it sent. The classification is this test's own, so it
-/// checks the engine's rather than reusing it.
-fn assert_bytes_by_tier_and_sender(events: &[Event], state: &ClusterState) {
+/// the snapshot's `bytes_by_tier`. The classification is this test's own, so
+/// it checks the engine's rather than reusing it.
+fn assert_bytes_by_tier(events: &[Event], state: &ClusterState) {
     let mut sums = BTreeMap::new();
-    let mut own_by_sender = BTreeMap::new();
     for event in events {
-        if let EventKind::PacketSent {
-            src,
-            bytes,
-            role,
-            tier,
-            ..
-        }
-        | EventKind::PacketDropped {
-            src,
-            bytes,
-            role,
-            tier,
-            ..
-        } = event.kind
-        {
-            let kind = role.kind();
+        if let EventKind::PacketSent(m) | EventKind::PacketDropped(m) = event.kind {
             let data = matches!(
-                kind,
+                m.role.kind(),
                 PacketKind::Own | PacketKind::Relay | PacketKind::Sweep
             );
-            *sums.entry((tier == Tier::InZone, data)).or_insert(0u64) += u64::from(bytes);
-            if kind == PacketKind::Own {
-                *own_by_sender.entry(src).or_insert(0u64) += u64::from(bytes);
-            }
+            *sums.entry((m.tier == Tier::InZone, data)).or_insert(0u64) += u64::from(m.bytes);
         }
-    }
-    for node in &state.nodes {
-        assert_eq!(
-            node.own_data_bytes,
-            own_by_sender.get(&node.id).copied().unwrap_or(0),
-            "node {} own data bytes",
-            node.id
-        );
     }
     let sum = |in_zone, data| sums.get(&(in_zone, data)).copied().unwrap_or(0);
     let by = &state.bytes_by_tier;
@@ -1407,7 +1384,7 @@ fn one_way_cut_is_repaired_by_the_backstop() {
             failed_over |= failover(&events, 0, 1, g).is_some();
             if t1.is_none() {
                 t1 = events.iter().find_map(|e| match e.kind {
-                    EventKind::PacketDropped { src, role, .. }
+                    EventKind::PacketDropped(Message { src, role, .. })
                         if src == g && role.kind() == PacketKind::Relay =>
                     {
                         Some(e.virtual_ms)
@@ -1469,7 +1446,7 @@ fn zone_partition_heals_to_exact_counts() {
             cells.push((node.id, cells_of(&state, node.id).await));
         }
 
-        let rule = state.spec.fingerprint;
+        let rule = state.valid.spec.fingerprint;
         let buckets: BTreeSet<u32> = cells
             .iter()
             .flat_map(|(_, cells)| cells)
@@ -1497,7 +1474,7 @@ fn zone_partition_heals_to_exact_counts() {
             }
         }
         assert_eq!(origin_total, 7, "the origins' own cells hold every hit");
-        assert_bytes_by_tier_and_sender(&all, &snap);
+        assert_bytes_by_tier(&all, &snap);
         state
     });
 }
@@ -1538,7 +1515,7 @@ fn unset_zone_mode_runs_as_one_zone() {
                 "node {node}, told no zone, reports none"
             );
         }
-        assert_bytes_by_tier_and_sender(&all, &snap);
+        assert_bytes_by_tier(&all, &snap);
         state
     });
 }
@@ -1740,10 +1717,12 @@ fn full_round_at_max_nodes_drops_nothing_under_pass() {
         let mut dropped = 0;
         for event in &batch.events {
             match event.kind {
-                EventKind::PacketSent { src, dst, role, .. } if role.kind() == PacketKind::Own => {
+                EventKind::PacketSent(Message { src, dst, role, .. })
+                    if role.kind() == PacketKind::Own =>
+                {
                     *own.entry((src, dst)).or_default() += 1
                 }
-                EventKind::PacketDropped { .. } => dropped += 1,
+                EventKind::PacketDropped(_) => dropped += 1,
                 _ => {}
             }
         }
@@ -1866,53 +1845,64 @@ fn moderate_cluster_runtime_honors_the_shrunk_sizing() {
     };
     let caps = config.settings().expect("settings");
 
-    with_engine(config, |tx| async move {
+    with_state(config, |mut state| async move {
         // Eight origins across two buckets: enough cross-node replication to
         // populate every node's store, while light enough not to saturate the
         // sim transport.
         for node in [0u32, 8, 16, 24] {
-            submit(&tx, node, WATCHED_KEY, 5).await;
+            send(&mut state, node, 5).await;
         }
-        step(&tx, 1_000).await;
+        state.step(1_000, StepUntil::Time).await;
         for node in [4u32, 12, 20, 28] {
-            submit(&tx, node, WATCHED_KEY, 5).await;
+            send(&mut state, node, 5).await;
         }
         // 16 rounds — ample for an 8-origin set to converge across 32 nodes —
         // while staying inside the 10 s window so the first batch (epoch 0)
         // does not age out (1 000 + 16 × 500 = 9 000 ms, the window
         // holds epoch 0).
         for _ in 0..16 {
-            step(&tx, 500).await;
+            state.step(500, StepUntil::Time).await;
         }
 
-        let state = snapshot(&tx).await;
         assert_eq!(state.nodes.len(), NODES);
-        for node in &state.nodes {
-            let s = &node.store_stats;
+        for (id, s) in store_stats(&state).await {
             assert_eq!(
                 s.cell_store_full_rejects, 0,
-                "node {} evicted cells (cell_capacity {})",
-                node.id, s.cell_capacity,
+                "node {id} evicted cells (cell_capacity {})",
+                s.cell_capacity,
             );
-            assert_eq!(s.rule_dictionary_full_rejects, 0, "node {}", node.id);
-            assert_eq!(s.node_dictionary_full_rejects, 0, "node {}", node.id);
+            assert_eq!(s.rule_dictionary_full_rejects, 0, "node {id}");
+            assert_eq!(s.node_dictionary_full_rejects, 0, "node {id}");
             // The runtime was built with the derived (small) capacity, not a
             // production floor — proof the shrink is in effect end-to-end.
             assert_eq!(s.cell_capacity, caps.max_cells.get());
         }
         // The 40 hits (8 origins × 5) propagate to every node within the
         // window.
-        assert_eq!(state.oracle_total, 40);
+        let snap = state.snapshot(None, WATCHED).await;
+        assert_eq!(snap.oracle_total, 40);
         assert!(
-            state.nodes.iter().all(|n| n.window_total == 40),
+            snap.nodes.iter().all(|n| n.window_total == 40),
             "every node converges on 40: {:?}",
-            state
-                .nodes
+            snap.nodes
                 .iter()
                 .map(|n| (n.id, n.window_total))
                 .collect::<Vec<_>>(),
         );
+        state
     });
+}
+
+/// Every live node's id and CRDT store counters, as its runtime reports them.
+async fn store_stats(state: &EngineState) -> Vec<(u32, CellStoreStats)> {
+    let mut stats = Vec::with_capacity(state.nodes.len());
+    for node in &state.nodes {
+        let snap = super::admin(&node.admin_tx, |reply| AdminCommand::Snapshot { reply })
+            .await
+            .expect("node runs");
+        stats.push((node.id, snap.store_stats));
+    }
+    stats
 }
 
 /// Live growth must not overflow the derived caps: a cluster built small and
@@ -1929,37 +1919,35 @@ fn grown_cluster_holds_every_origin_without_overflow() {
         rule_bucket_ms: 1_000,
         ..test_config(12)
     };
-    with_engine(config, |tx| async move {
+    with_state(config, |mut state| async move {
         // Grow 12 → 24 by live joins (well past `config.nodes + slack`, the
         // point the old per-cluster sizing overflowed).
         for _ in 0..12 {
-            add_node(&tx).await;
+            state.add_node(None).await.expect("the node joins");
         }
-        let grown = snapshot(&tx).await;
-        assert_eq!(grown.nodes.len(), 24, "twelve joins grow the cluster to 24");
+        assert_eq!(state.nodes.len(), 24, "twelve joins grow the cluster to 24");
 
         // Every node originates, so all 24 origins must intern on every peer.
-        for id in grown.nodes.iter().map(|n| n.id).collect::<Vec<_>>() {
-            submit(&tx, id, WATCHED_KEY, 1).await;
+        for id in state.nodes.iter().map(|n| n.id).collect::<Vec<_>>() {
+            send(&mut state, id, 1).await;
         }
         for _ in 0..16 {
-            step(&tx, 500).await;
+            state.step(500, StepUntil::Time).await;
         }
 
-        let state = snapshot(&tx).await;
-        for node in &state.nodes {
-            let s = &node.store_stats;
+        for (id, s) in store_stats(&state).await {
             assert_eq!(
                 s.node_dictionary_full_rejects, 0,
-                "node {} overflowed its node dictionary after growth ({} of {} origins)",
-                node.id, s.node_slots_used, s.node_slots_capacity,
+                "node {id} overflowed its node dictionary after growth ({} of {} origins)",
+                s.node_slots_used, s.node_slots_capacity,
             );
             assert_eq!(
                 s.cell_store_full_rejects, 0,
-                "node {} evicted cells after growth (cell_capacity {})",
-                node.id, s.cell_capacity,
+                "node {id} evicted cells after growth (cell_capacity {})",
+                s.cell_capacity,
             );
         }
+        state
     });
 }
 
@@ -1981,7 +1969,7 @@ fn second_burst_after_expiry_still_ages_out() {
         rule_limit: 1_000_000,
         ..test_config(3)
     };
-    with_engine(config, |tx| async move {
+    with_engine(config, |tx, _| async move {
         // First burst, spread and aged out across the whole cluster.
         submit(&tx, 0, WATCHED_KEY, 25).await;
         for _ in 0..130 {
@@ -2065,7 +2053,10 @@ fn snapshot_carries_only_the_inspected_nodes_rows() {
         let peers: BTreeSet<_> = rows.peers.iter().filter_map(|p| p.id).collect();
         assert_eq!(peers, BTreeSet::from([0, 1, 2, 3, 5]), "node 4's peers");
         assert!(
-            rows.cells.iter().any(|c| c.is_local && c.count == 3),
+            cells_of(&state, 4)
+                .await
+                .iter()
+                .any(|c| c.is_local && c.count == 3),
             "node 4's own cell"
         );
         let replica = cells_of(&state, 0).await;
@@ -2114,8 +2105,8 @@ fn a_join_past_the_node_or_id_ceiling_is_refused() {
 #[test]
 fn a_join_its_settings_refuse_spends_no_id() {
     with_state(test_config(3), |mut state| async move {
-        let capacity = state.settings.peer_capacity;
-        state.settings.peer_capacity = NonZeroU16::new(2).unwrap();
+        let capacity = state.valid.settings.peer_capacity;
+        state.valid.settings.peer_capacity = NonZeroU16::new(2).unwrap();
         let refused = state.add_node(None).await;
         assert!(
             matches!(
@@ -2130,7 +2121,7 @@ fn a_join_its_settings_refuse_spends_no_id() {
         );
         assert_eq!(state.next_id, 3, "the refusal spent no id");
         assert_eq!(state.nodes.len(), 3, "the refusal added no member");
-        state.settings.peer_capacity = capacity;
+        state.valid.settings.peer_capacity = capacity;
         state.add_node(None).await.expect("the join succeeds");
         assert_eq!(
             state.nodes.last().map(|n| n.id),

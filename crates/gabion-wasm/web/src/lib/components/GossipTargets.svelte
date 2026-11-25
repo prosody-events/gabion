@@ -1,6 +1,6 @@
 <script lang="ts">
   import { fmtCount, fmtDuration, noun, zoneLabel } from '../format';
-  import { ANSWER, type NodeState, type PeerView, type ZoneMode, type ZoneView } from '../sim/types';
+  import { ANSWER, type Inspected, type NodeState, type ZoneMode, type ZoneView } from '../sim/types';
   import InfoTip from './InfoTip.svelte';
   import RoleGlyph from './RoleGlyph.svelte';
 
@@ -11,14 +11,16 @@
   // reads); the page chooses nothing.
   let {
     node,
-    peers,
+    inspected,
     zones,
     zoneMode,
     onPreview,
     onMessages,
   }: {
     node: NodeState;
-    peers: PeerView[];
+    /** The node's error budget and peer table, as the snapshot inspecting it
+     *  reports them. */
+    inspected: Inspected;
     zones: ZoneView[];
     zoneMode: ZoneMode;
     /** A node the route sentence names, previewed on the stage. */
@@ -30,13 +32,13 @@
   const own = $derived(zones[node.zone]);
   // A peer whose zone is still unknown counts among the zone's: it is sent
   // directly until it answers.
-  const zonePeers = $derived(peers.filter((p) => p.role === 'zone' || p.role === 'unheard').length);
-  const unheard = $derived(peers.filter((p) => p.role === 'unheard').length);
+  const zonePeers = $derived(inspected.peers.filter((p) => p.role === 'zone' || p.role === 'unheard').length);
+  const unheard = $derived(inspected.peers.filter((p) => p.role === 'unheard').length);
   // One row per remote zone that has members, in zone order.
   const remote = $derived(
     zones.flatMap((zone, z) =>
       z !== node.zone && zone.live > 0
-        ? [{ z, name: zoneLabel(zone.name), gateway: peers.find((p) => p.role === 'gateway' && p.zone === z) }]
+        ? [{ z, name: zoneLabel(zone.name), gateway: inspected.peers.find((p) => p.role === 'gateway' && p.zone === z) }]
         : [],
     ),
   );
@@ -134,8 +136,8 @@
         </InfoTip>
       </th>
       <td>
-        {#if node.error_budget > 0}
-          ε <span data-field="error-budget">{fmtCount(node.error_budget)}</span> hits per rule before an eager flush
+        {#if inspected.error_budget > 0}
+          ε <span data-field="error-budget">{fmtCount(inspected.error_budget)}</span> hits per rule before an eager flush
         {:else}
           ε set on this node's first request
         {/if}

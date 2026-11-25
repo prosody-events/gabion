@@ -6,8 +6,8 @@
 // Numeric boundary convention (asserted at runtime in `sim.ts`, checked
 // statically by `pnpm run check`):
 //
-//   • u128 ids — `rule`, `key`, `node_id` — cross as
-//     **hex strings** ("0x…"), serialized by `crate::hex`.
+//   • u128 ids — `rule`, `key`, `node_id` — cross as **32-nibble lowercase
+//     hex strings, no prefix**, serialized by `crate::hex`.
 //   • `Option::None` crosses as `undefined` (serde-wasm-bindgen's default), so
 //     every Option field is typed `T | undefined`, never `T | null`.
 //   • u64 counts and timestamps — `virtual_ms`, `count`, `window_total`,
@@ -18,7 +18,7 @@
 //     scenario can exceed 2^53, flip that serializer flag and widen these to
 //     `bigint`.
 
-/** A u128 identifier rendered as a "0x"-prefixed hex string across the boundary. */
+/** A u128 identifier rendered as a 32-nibble lowercase hex string, no prefix, across the boundary. */
 export type Hex = string;
 
 // -- Configuration ----------------------------------------------------------
@@ -179,14 +179,12 @@ export type Tier = 'InZone' | 'CrossZone';
 export type EventKind =
   | { type: 'Decided'; node: number; burst: Burst }
   | { type: 'Tick'; node: number }
-  | { type: 'ThresholdFire'; node: number }
   | ({ type: 'PacketSent' } & Message)
   | { type: 'PacketDelivered'; src: number; dst: number; bytes: number }
   | ({ type: 'PacketDropped' } & Message)
   | { type: 'GatewayChanged'; origin: number; zone: number; from: number | undefined; to: number | undefined }
   | { type: 'CellCreated'; node: number; rule: Hex; key: Hex; bucket: number; count: number }
-  | { type: 'CellUpdated'; node: number; rule: Hex; key: Hex; bucket: number; count: number }
-  | { type: 'CellExpired'; node: number; rule: Hex; key: Hex; bucket: number };
+  | { type: 'CellUpdated'; node: number; rule: Hex; key: Hex; bucket: number; count: number };
 
 /** A sent or dropped packet's fields: its number in the run, its route and
  *  size, and what it says. */
@@ -216,17 +214,6 @@ export interface EventBatch {
 
 // -- Snapshot ---------------------------------------------------------------
 
-/** Mirror of `crate::event::CellView`. */
-export interface CellView {
-  rule: Hex;
-  key: Hex;
-  bucket: number;
-  count: number;
-  age_ms: number;
-  origin: number | undefined;
-  is_local: boolean;
-}
-
 /** What a peer is to a node (`gabion::gossip::Role`, snake_case). */
 export type Role = 'unheard' | 'zone' | 'gateway' | 'remote' | 'incompatible';
 
@@ -255,41 +242,17 @@ export interface PeerView {
   unanswered_ms: number | undefined;
   /** Own-stream positions sent to the peer and not yet acknowledged. */
   own_unacked: number;
-  /** The same for the relay stream. */
-  relay_unacked: number;
-  /** The peer's gossip node id once an inbound packet has revealed it. */
-  node_id: Hex | undefined;
-}
-
-/** Mirror of `crate::event::StoreStats` — the CRDT store's occupancy and
- *  saturation counters (itself a mirror of `gabion::crdt::CellStoreStats`). */
-export interface StoreStats {
-  active_cells: number;
-  cell_capacity: number;
-  rule_slots_used: number;
-  rule_slots_capacity: number;
-  node_slots_used: number;
-  node_slots_capacity: number;
-  cell_store_full_rejects: number;
-  rule_dictionary_full_rejects: number;
-  node_dictionary_full_rejects: number;
 }
 
 /** Mirror of `crate::event::NodeState`. `id` is the node's stable identity (see
  *  the Rust module note): assigned once, never reused, so it survives other
  *  nodes joining and leaving and has gaps once a member has been removed. The
- *  counters mirror the runtime's `AdminSnapshot`; the window, decision, lag,
- *  heartbeat and hit fields the engine reads or counts; and `store_stats`
- *  mirrors its `CellStoreStats`. */
+ *  counters mirror the runtime's `GossipCounters`; the window, decision, lag,
+ *  heartbeat and hit fields the engine reads or counts. */
 export interface NodeState {
   id: number;
   /** The zone the node is placed in. */
   zone: number;
-  /** The on-the-wire gossip identity (`NodeIdentity.node_id`), distinct from the
-   *  display `id`. */
-  node_id: Hex;
-  /** Incarnation — bumped on restart; always 1 in the sim. */
-  incarnation: number;
   /** gabion's `window_total` of the watched key on this node's own count
    *  table: the number its admission reads. */
   window_total: number;
@@ -302,8 +265,6 @@ export interface NodeState {
   /** Hits this node admitted, and rejected, since it joined, of every key. */
   admitted_hits: number;
   rejected_hits: number;
-  /** Heartbeat rounds the runtime has run. */
-  rounds_heartbeat: number;
   /** Gateways replaced because they went unanswered or said they cannot relay. */
   gateway_failovers: number;
   /** Gap reports sent: a peer's stream skipped positions. */
@@ -319,20 +280,24 @@ export interface NodeState {
   /** Origins whose runtime sends this node's zone their changes through this
    *  node: the gateway rows of every node, inverted. */
   gateway_for: number;
-  /** Bytes of the node's own-stream packets it has sent since it joined,
-   *  delivered or lost. */
-  own_data_bytes: number;
+}
+
+/** Mirror of `crate::event::Inspected`: the inspected node's identity, store
+ *  and peer rows, from its admin snapshot, read at the same instant as the
+ *  rest of the snapshot. */
+export interface Inspected {
+  id: number;
+  /** The on-the-wire gossip identity (`NodeIdentity.node_id`), distinct from the
+   *  display `id`. */
+  node_id: Hex;
+  /** Incarnation — bumped on restart; always 1 in the sim. */
+  incarnation: number;
   /** Per-rule error budget ε at the most recent request; pending crossing it
    *  triggers an eager (threshold) flush. 0 until a request is seen. */
   error_budget: number;
-  store_stats: StoreStats;
-}
-
-/** Mirror of `crate::event::Inspected`: the inspected node's cells and peer
- *  rows, read at the same instant as the rest of the snapshot. */
-export interface Inspected {
-  id: number;
-  cells: CellView[];
+  /** Cells the node's CRDT store holds, and the most it can. */
+  active_cells: number;
+  cell_capacity: number;
   peers: PeerView[];
 }
 

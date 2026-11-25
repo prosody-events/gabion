@@ -13,14 +13,3 @@ pub mod u128_hex {
         ser.serialize_str(&format!("{value:032x}"))
     }
 }
-
-pub mod option_u128_hex {
-    use serde::Serializer;
-
-    pub fn serialize<S: Serializer>(value: &Option<u128>, ser: S) -> Result<S::Ok, S::Error> {
-        match value {
-            Some(v) => ser.serialize_some(&format!("{v:032x}")),
-            None => ser.serialize_none(),
-        }
-    }
-}

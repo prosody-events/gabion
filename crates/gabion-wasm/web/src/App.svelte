@@ -1437,7 +1437,7 @@
               {#if inspected !== null && inspected.id === selectedNode.id}
                 <NodeInspector
                   node={selectedNode}
-                  peers={inspected.peers}
+                  {inspected}
                   zones={cluster.zones}
                   zoneMode={r.applied.zone_mode}
                   {offered}

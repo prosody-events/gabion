@@ -483,7 +483,6 @@ pub enum Relation {
     ReportsMissing,
     /// The delivered data whose arrival showed the selected report's gap.
     RevealedBy,
-    Reveals,
     /// The first later data on the link and stream that covers it.
     RepeatedAs,
     Repeats,
@@ -1018,6 +1017,13 @@ impl Capture {
         match self.view.at(ordinal) {
             Some(Entry::Message(seq)) if self.kept(seq) => {
                 let slot = self.slot(seq);
+                let Ok((header, cells)) = read_header(&self.header[slot], CLUSTER_ID_HASH) else {
+                    return gone;
+                };
+                let (a, b) = match data_of(header.payload) {
+                    Some((_, lower, upper)) => (lower, upper),
+                    None => (own_mark(header.acks.own), header.acks.relay),
+                };
                 let repeat = match self.repeat[slot] {
                     None => 0,
                     Some(ListedRepeat::AfterTimeout) => 1,
@@ -1032,18 +1038,6 @@ impl Capture {
                     | self.fate(seq).code() << 16
                     | tier << 20
                     | repeat << 22;
-                let header = &self.header[slot];
-                let at = |i: usize| {
-                    let mut word = [0; 8];
-                    word.copy_from_slice(&header[i..i + 8]);
-                    u64::from_le_bytes(word) as f64
-                };
-                let (a, b) = match self.role[slot].kind() {
-                    PacketKind::Own | PacketKind::Relay => (at(70), at(78)),
-                    PacketKind::Ack | PacketKind::Sweep | PacketKind::SweepRequest => {
-                        (at(54), at(62))
-                    }
-                };
                 let relation = if self.selected == Some(seq) {
                     2.0
                 } else if self.related[..self.related_len].contains(&seq) {
@@ -1057,12 +1051,12 @@ impl Capture {
                     f64::from(self.src[slot]),
                     f64::from(self.dst[slot]),
                     f64::from(self.wire_len[slot]),
-                    f64::from(cell_count(&self.header[slot])),
+                    f64::from(cells),
                     f64::from(code),
                     relation,
-                    f64::from(header[7]),
-                    a,
-                    b,
+                    f64::from(self.header[slot][7]),
+                    a as f64,
+                    b as f64,
                 ]
             }
             Some(Entry::Marker(index)) => match self.marker(index) {
@@ -1219,14 +1213,23 @@ impl Capture {
         let first = (self.recorded + 1).saturating_sub(self.capacity()).max(1);
         (first..me.seq)
             .rev()
+            .filter(|&seq| self.same_pair(seq, me))
             .filter_map(|seq| self.info(seq))
-            .filter(|i| same_pair(i, me))
     }
 
     fn pair_after<'a>(&'a self, me: &'a Info) -> impl Iterator<Item = Info> + 'a {
         (me.seq + 1..=self.settled)
+            .filter(|&seq| self.same_pair(seq, me))
             .filter_map(|seq| self.info(seq))
-            .filter(|i| same_pair(i, me))
+    }
+
+    /// Whether `seq` travels between `me`'s two nodes, either way, from the
+    /// route columns alone: `seq` must be kept, as every seq the pair scans
+    /// visit is.
+    fn same_pair(&self, seq: u64, me: &Info) -> bool {
+        let slot = self.slot(seq);
+        let pair = (self.src[slot], self.dst[slot]);
+        pair == (me.src, me.dst) || pair == (me.dst, me.src)
     }
 
     /// Every link from `me`, in a fixed order.
@@ -1352,10 +1355,6 @@ impl Capture {
     }
 }
 
-fn same_pair(i: &Info, me: &Info) -> bool {
-    (i.src, i.dst) == (me.src, me.dst) || (i.src, i.dst) == (me.dst, me.src)
-}
-
 /// The stream and range a data payload carries.
 fn data_of(payload: Payload) -> Option<(Stream, u64, u64)> {
     match payload {
@@ -1373,11 +1372,6 @@ fn own_mark(own: OwnAck) -> u64 {
     match own {
         OwnAck::Direct(mark) | OwnAck::AsGateway(mark) => mark,
     }
-}
-
-/// The cell count a raw header states.
-fn cell_count(header: &[u8; HEADER_LEN]) -> u16 {
-    u16::from_le_bytes([header[48], header[49]])
 }
 
 #[cfg(test)]

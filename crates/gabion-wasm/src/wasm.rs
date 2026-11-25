@@ -59,7 +59,7 @@ impl Sim {
         let capture = Capture::shared();
         let engine_capture = capture.clone();
         // The engine drives virtual time itself through `ManualClock` (see the
-        // module-level R2 note), so it needs no tokio time driver —
+        // module note on wasm32), so it needs no tokio time driver —
         // `spawn_local` is all the executor it requires. The node smoke
         // test confirms the spawned task runs the full submit → gossip
         // → snapshot loop on the wasm microtask queue.
@@ -222,16 +222,9 @@ impl Sim {
         to_js(&batch)
     }
 
-    /// Advance virtual time to absolute `virtual_ms` (a no-op if already past).
-    pub async fn step_to(&self, virtual_ms: u64) -> Result<JsValue, JsValue> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::StepTo { virtual_ms, reply }).await?;
-        let batch = rx.await.map_err(|_| engine_gone())?;
-        to_js(&batch)
-    }
-
     /// Pull every node's state of key `key_id` for a re-render, with the
-    /// cells and peer rows of the node with stable id `inspect` alone.
+    /// identity, store and peer rows of the node with stable id `inspect`
+    /// alone.
     pub async fn snapshot(&self, inspect: Option<u32>, key_id: u64) -> Result<JsValue, JsValue> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::Snapshot {

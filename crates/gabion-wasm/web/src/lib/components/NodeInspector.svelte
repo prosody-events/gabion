@@ -2,7 +2,7 @@
   import { faultLabel } from '../controls';
   import { cutState, type Cut } from '../cuts';
   import { fmtCount, zoneLabel } from '../format';
-  import type { NodeState, PeerView, ZoneMode, ZoneView } from '../sim/types';
+  import type { Inspected, NodeState, ZoneMode, ZoneView } from '../sim/types';
   import GossipTargets from './GossipTargets.svelte';
   import Icon from './Icon.svelte';
   import InfoTip from './InfoTip.svelte';
@@ -14,7 +14,7 @@
   // identity.
   let {
     node,
-    peers,
+    inspected,
     zones,
     zoneMode,
     offered,
@@ -25,8 +25,9 @@
     onMessages,
   }: {
     node: NodeState;
-    /** The node's peer table, as the snapshot inspecting it reports it. */
-    peers: PeerView[];
+    /** The node's identity, store and peer table, as the snapshot inspecting
+     *  it reports them. */
+    inspected: Inspected;
     zones: ZoneView[];
     zoneMode: ZoneMode;
     /** Whether faults are offered: the story has ended, or has no scripted
@@ -45,7 +46,7 @@
 
   // The node's gateways, one per remote zone, in zone order.
   const gateways = $derived(
-    peers
+    inspected.peers
       .flatMap((p) => (p.role === 'gateway' && p.id !== undefined && p.zone !== undefined ? [{ id: p.id, zone: p.zone }] : []))
       .sort((a, b) => a.zone - b.zone),
   );
@@ -71,7 +72,7 @@
 <section class="inspector" aria-label={`node ${node.id} details`}>
   <section class="section">
     <h3 class="section-head">Gossip targets</h3>
-    <GossipTargets {node} {peers} {zones} {zoneMode} {onPreview} {onMessages} />
+    <GossipTargets {node} {inspected} {zones} {zoneMode} {onPreview} {onMessages} />
     <!-- With no zone the route sentence already says there are no gateways. -->
     {#if offered && zoneMode === 'Configured'}
       {#if gateways.length === 0}
@@ -114,7 +115,7 @@
   <details class="identity">
     <summary>
       Identity &amp; lease
-      <span class="id-preview"><span data-field="gossip-id">{shortHex(node.node_id)}</span> · inc <span data-field="incarnation">{node.incarnation}</span></span>
+      <span class="id-preview"><span data-field="gossip-id">{shortHex(inspected.node_id)}</span> · inc <span data-field="incarnation">{inspected.incarnation}</span></span>
     </summary>
     <dl class="id-list">
       <div class="id-row">
@@ -123,7 +124,7 @@
             Gossip node id
           </InfoTip>
         </dt>
-        <dd data-field="gossip-id">{node.node_id}</dd>
+        <dd data-field="gossip-id">{inspected.node_id}</dd>
       </div>
       <div class="id-row">
         <dt>
@@ -131,13 +132,13 @@
             Incarnation
           </InfoTip>
         </dt>
-        <dd data-field="incarnation">{node.incarnation}</dd>
+        <dd data-field="incarnation">{inspected.incarnation}</dd>
       </div>
       <div class="id-row">
         <dt>Cells held</dt>
         <dd>
-          <span data-field="cells-held">{fmtCount(node.store_stats.active_cells)}</span> of
-          <span data-field="cells-capacity">{fmtCount(node.store_stats.cell_capacity)}</span>
+          <span data-field="cells-held">{fmtCount(inspected.active_cells)}</span> of
+          <span data-field="cells-capacity">{fmtCount(inspected.cell_capacity)}</span>
         </dd>
       </div>
     </dl>

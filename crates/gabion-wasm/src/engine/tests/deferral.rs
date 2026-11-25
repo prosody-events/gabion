@@ -11,13 +11,9 @@ fn packets(events: &[Event], kind: PacketKind) -> Vec<(u32, u32, Tier, u64)> {
     events
         .iter()
         .filter_map(|e| match e.kind {
-            EventKind::PacketSent {
-                src,
-                dst,
-                role,
-                tier,
-                ..
-            } if role.kind() == kind => Some((src, dst, tier, e.virtual_ms)),
+            EventKind::PacketSent(m) if m.role.kind() == kind => {
+                Some((m.src, m.dst, m.tier, e.virtual_ms))
+            }
             _ => None,
         })
         .collect()

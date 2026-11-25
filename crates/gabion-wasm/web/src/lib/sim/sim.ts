@@ -109,15 +109,8 @@ export class Sim {
     return batch;
   }
 
-  /** Advance virtual time to absolute `virtualMs` (a no-op if already past). */
-  async stepTo(virtualMs: number): Promise<EventBatch> {
-    const batch = (await this.#inner.step_to(BigInt(virtualMs))) as EventBatch;
-    assertBoundary(batch);
-    return batch;
-  }
-
-  /** Pull every node's state of `key` for a re-render, with the cells and
-   *  peer rows of node `inspect` alone. */
+  /** Pull every node's state of `key` for a re-render, with the identity,
+   *  store and peer rows of node `inspect` alone. */
   async snapshot(inspect: number | null, key: number): Promise<ClusterState> {
     return (await this.#inner.snapshot(inspect, BigInt(key))) as ClusterState;
   }

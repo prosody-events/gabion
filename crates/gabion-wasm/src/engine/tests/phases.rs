@@ -114,10 +114,14 @@ fn quiet_cost_by_counters() {
         let joiner = state.nodes.last().expect("the joiner").id;
         state.step(60_000, StepUntil::Time).await;
         let now = state.virtual_ms;
-        for node in state.snapshot(None, WATCHED).await.nodes {
+        for node in &state.nodes {
             let spawned = if node.id == joiner { joined_at } else { 0 };
+            let counters =
+                super::super::admin(&node.admin_tx, |reply| AdminCommand::Counters { reply })
+                    .await
+                    .expect("node runs");
             assert_eq!(
-                node.rounds_heartbeat,
+                counters.rounds_heartbeat,
                 due_instants(node.id, spawned, now),
                 "node {}",
                 node.id
@@ -139,7 +143,7 @@ fn a_wave_reads_its_sender_and_receivers() {
             .events
             .iter()
             .filter_map(|e| match e.kind {
-                EventKind::PacketSent { dst, .. } => Some(dst),
+                EventKind::PacketSent(Message { dst, .. }) => Some(dst),
                 _ => None,
             })
             .collect();
@@ -183,7 +187,7 @@ fn last_packet(events: &[Event]) -> Option<u64> {
         .filter(|e| {
             matches!(
                 e.kind,
-                EventKind::PacketSent { .. } | EventKind::PacketDropped { .. }
+                EventKind::PacketSent(_) | EventKind::PacketDropped(_)
             )
         })
         .map(|e| e.virtual_ms)
@@ -196,7 +200,7 @@ fn sent_at(events: &[Event], src: Option<u32>, kind: PacketKind, at: u64) -> usi
         .iter()
         .filter(|e| {
             e.virtual_ms == at
-                && matches!(e.kind, EventKind::PacketSent { src: s, role, .. }
+                && matches!(e.kind, EventKind::PacketSent(Message { src: s, role, .. })
                     if role.kind() == kind && src.is_none_or(|src| src == s))
         })
         .count()
@@ -596,8 +600,8 @@ async fn drop_rate(state: &mut EngineState, on: impl Fn(u32, u32) -> bool) -> f6
         events.extend(state.step(P, StepUntil::Time).await.events);
         for event in events {
             match event.kind {
-                EventKind::PacketSent { src, dst, .. } if on(src, dst) => sent += 1,
-                EventKind::PacketDropped { src, dst, .. } if on(src, dst) => dropped += 1,
+                EventKind::PacketSent(Message { src, dst, .. }) if on(src, dst) => sent += 1,
+                EventKind::PacketDropped(Message { src, dst, .. }) if on(src, dst) => dropped += 1,
                 _ => {}
             }
         }

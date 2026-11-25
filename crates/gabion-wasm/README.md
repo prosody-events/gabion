@@ -68,10 +68,8 @@ included.
   re-reads every survivor whose gateway the departed node was, and reports the
   gateway gone, or replaced, as that survivor's runtime now has it.
 - `gateway_for` counts, per node, the origins whose runtime routes into its zone
-  through it, inverted from the gateway rows the engine already keeps;
-  `own_data_bytes` counts each node's own-stream bytes, the weights of the share
-  chart's no-zone prediction. `max_zones()` exports the zone ceiling the page's
-  stepper reads.
+  through it, inverted from the gateway rows the engine already keeps.
+  `max_zones()` exports the zone ceiling the page's stepper reads.
 
 ## Node ceiling
 
@@ -91,20 +89,20 @@ To reproduce, build the release wasm (`cd web && pnpm run build:wasm`), serve
 Chromium, and run this in the console. It seeds the steady workload (10 hits on
 one key at each of nodes 0, 3, 6 and 9, then 3 hits a second round-robin) and
 plays each virtual second as the page does with node 0 inspected, 60 frames of
-`step_to` plus `snapshot`:
+`step` plus `snapshot`:
 
 ```js
 const m = await import('/wasm/gabion_wasm.js'); await m.default();
 const N = 100;
 const sim = new m.Sim({ nodes: N, zones: 3, rule_limit: 1000000 });
 for (const n of [0, 3, 6, 9]) await sim.submit_request(n, 1n, 10n, 'Time');
-const out = []; let hit = 0;
+const out = []; let hit = 0; let last = 0;
 for (let s = 0; s < 5; s++) {
   let step = 0, snap = 0;
   for (let f = 1; f <= 60; f++) {
     const v = s * 1000 + Math.round((f * 1000) / 60);
     while (hit < Math.floor((v * 3) / 1000)) await sim.submit_request(hit++ % N, 1n, 1n, 'Time');
-    let t = performance.now(); await sim.step_to(BigInt(v)); step += performance.now() - t;
+    let t = performance.now(); await sim.step(BigInt(v - last), 'Time'); last = v; step += performance.now() - t;
     t = performance.now(); await sim.snapshot(0, 1n); snap += performance.now() - t;
   }
   out.push({ second: s, step, snap, total: step + snap });

@@ -1,5 +1,5 @@
-// Temporary R2 probe: drive the real wasm artifact under node to see whether
-// the `spawn_local` + `tokio::time` engine composition runs or panics.
+// The node smoke: drive the built wasm artifact through submit, gossip,
+// converge and snapshot, as the page does, on node's microtask queue.
 const wasm = require("./pkg/gabion_wasm.js");
 
 async function main() {

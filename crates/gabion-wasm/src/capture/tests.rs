@@ -6,16 +6,15 @@ use std::rc::Rc;
 
 use gabion::crdt::KeyHash;
 use gabion::wire::{CellPayload, HEADER_LEN, Header, MAGIC, Payload, VERSION, read_header};
-use tokio::runtime::Builder;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::LocalSet;
 
 use super::{
     CAPTURE_BODY_BYTES, CAPTURE_PACKETS, Capture, Fate, Filter, HEAD_SLOTS, LostBy, Pair, PairWay,
     ROW_SLOTS, Relation, RepeatCause, Scope, SharedCapture, TierFilter,
 };
 use crate::config::SimConfig;
-use crate::engine::{CLUSTER_ID_HASH, Command, LinkPolicyKind, StepUntil, run_engine};
+use crate::engine::tests::{set_link, with_engine};
+use crate::engine::{CLUSTER_ID_HASH, Command, LinkPolicyKind, StepUntil};
 use crate::event::{
     EventBatch, EventKind, ListedRepeat, MessageRole, MessageType, PacketKind, Riders, Seq, Tier,
 };
@@ -344,31 +343,6 @@ fn the_filter_scopes_and_counts() {
     assert!(Pair::new(3, 3).is_none());
 }
 
-/// Stand up an engine on a paused runtime with its capture in hand.
-fn with_capture<F, Fut>(config: SimConfig, driver: F)
-where
-    F: FnOnce(mpsc::Sender<Command>, SharedCapture) -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let rt = Builder::new_current_thread()
-        .enable_all()
-        .start_paused(true)
-        .build()
-        .expect("build paused current-thread runtime");
-    LocalSet::new().block_on(&rt, async move {
-        let (tx, rx) = mpsc::channel(16);
-        let capture = Capture::shared();
-        let valid = config.validate().expect("test config validates");
-        let engine = tokio::task::spawn_local(run_engine(valid, capture.clone(), rx));
-        driver(tx.clone(), capture).await;
-        drop(tx);
-        engine
-            .await
-            .expect("engine joined")
-            .expect("engine ended cleanly");
-    });
-}
-
 async fn step(tx: &mpsc::Sender<Command>, delta_ms: u64, until: StepUntil) -> EventBatch {
     let (reply, rx) = oneshot::channel();
     tx.send(Command::Step {
@@ -395,19 +369,6 @@ async fn submit(tx: &mpsc::Sender<Command>, node: u32, n: u64, until: StepUntil)
     rx.await.unwrap().expect("the burst is decided")
 }
 
-async fn link(tx: &mpsc::Sender<Command>, src: u32, dst: u32, policy: LinkPolicyKind) {
-    let (reply, rx) = oneshot::channel();
-    tx.send(Command::SetLinkPolicy {
-        src,
-        dst,
-        policy,
-        reply,
-    })
-    .await
-    .unwrap();
-    rx.await.unwrap().unwrap();
-}
-
 fn config(nodes: usize, zones: u8, limit: u64) -> SimConfig {
     SimConfig {
         nodes,
@@ -423,20 +384,13 @@ fn messages(events: &[crate::event::Event]) -> Vec<(u64, u32, u32, MessageRole, 
     events
         .iter()
         .filter_map(|e| match e.kind {
-            EventKind::PacketSent {
-                seq,
-                src,
-                dst,
-                role,
-                ..
-            } => Some((seq.0, src, dst, role, false)),
-            EventKind::PacketDropped {
-                seq,
-                src,
-                dst,
-                role,
-                ..
-            } => Some((seq.0, src, dst, role, true)),
+            EventKind::PacketSent(m) | EventKind::PacketDropped(m) => Some((
+                m.seq.0,
+                m.src,
+                m.dst,
+                m.role,
+                matches!(e.kind, EventKind::PacketDropped(_)),
+            )),
             _ => None,
         })
         .collect()
@@ -447,10 +401,10 @@ fn messages(events: &[crate::event::Event]) -> Vec<(u64, u32, u32, MessageRole, 
 /// say it was cut.
 #[test]
 fn a_lost_packet_links_to_its_gap_report_and_its_repeat() {
-    with_capture(config(2, 1, 100), |tx, capture| async move {
+    with_engine(config(2, 1, 100), |tx, capture| async move {
         step(&tx, 1_000, StepUntil::Time).await;
         capture.borrow_mut().mark_run_start();
-        link(&tx, 0, 1, LinkPolicyKind::DropFirst { count: 1 }).await;
+        set_link(&tx, 0, 1, LinkPolicyKind::DropFirst { count: 1 }).await;
         let mut events = Vec::new();
         for _ in 0..3 {
             events.extend(submit(&tx, 0, 1, StepUntil::Time).await.events);
@@ -503,7 +457,7 @@ fn a_lost_packet_links_to_its_gap_report_and_its_repeat() {
         assert_eq!(again.cells.len(), usize::from(cells));
 
         // Cut the link: what it drops is lost by the cut.
-        link(&tx, 0, 1, LinkPolicyKind::Block).await;
+        set_link(&tx, 0, 1, LinkPolicyKind::Block).await;
         let mut events = submit(&tx, 0, 1, StepUntil::Time).await.events;
         events.extend(step(&tx, 300, StepUntil::Time).await.events);
         let cut = messages(&events)
@@ -524,7 +478,7 @@ fn a_lost_packet_links_to_its_gap_report_and_its_repeat() {
 /// delivers it, and reading the capture delivers nothing.
 #[test]
 fn a_held_wave_is_in_flight_until_it_lands() {
-    with_capture(config(6, 3, 1_000_000), |tx, capture| async move {
+    with_engine(config(6, 3, 1_000_000), |tx, capture| async move {
         step(&tx, 1_000, StepUntil::Time).await;
         capture.borrow_mut().mark_run_start();
         submit(&tx, 0, 25, StepUntil::Time).await;
@@ -567,7 +521,7 @@ fn the_capture_is_deterministic() {
     let run = || {
         let out = Rc::new(RefCell::new((Vec::new(), 0u64)));
         let sink = out.clone();
-        with_capture(
+        with_engine(
             SimConfig {
                 uniform_loss: 0.3,
                 ..config(6, 3, 100)

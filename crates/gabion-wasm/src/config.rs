@@ -150,6 +150,9 @@ pub struct ValidSimConfig {
     pub(crate) spec: RuleSpec,
     /// Every zone's name, parsed and hashed once.
     pub(crate) zone_names: Box<[ZoneName]>,
+    /// `gossip.suspect_after` as every node's runtime validates it, in ms:
+    /// it depends on no node's bind, peers or zone.
+    pub(crate) suspect_after_ms: u64,
 }
 
 impl SimConfig {
@@ -170,7 +173,7 @@ impl SimConfig {
             return Err(ConfigError::ZonesOutOfRange { got: self.zones });
         }
         let settings = self.settings()?;
-        let (_, storage) = settings.validate()?;
+        let (gossip, storage) = settings.validate()?;
         // One table per node, sized for the watched keys: sized from the cell
         // store it would take 1 MiB.
         let cells = AGGREGATE_KEYS
@@ -208,6 +211,7 @@ impl SimConfig {
             rules,
             spec,
             zone_names,
+            suspect_after_ms: gossip.suspect_after().0.get(),
         })
     }
 

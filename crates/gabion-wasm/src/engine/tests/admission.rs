@@ -39,7 +39,7 @@ fn burst_decides_each_request_with_admits() {
         for limit in [0, 1, 99, 100, 101, u64::MAX] {
             let spec = RuleSpec {
                 limit,
-                ..state.spec
+                ..state.valid.spec
             };
             let mut totals = [
                 0,

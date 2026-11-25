@@ -14,7 +14,7 @@ use gabion::wire::{CellPayload, Header, Payload};
 use serde::Serialize;
 use std::num::NonZeroU64;
 
-use crate::hex::{option_u128_hex, u128_hex};
+use crate::hex::u128_hex;
 
 /// One thing that happened in the simulation, stamped with when. `kind` is a
 /// `{ "type": … }`-tagged payload so the frontend can switch on it directly.
@@ -25,10 +25,9 @@ pub struct Event {
     pub kind: EventKind,
 }
 
-/// The event payloads. Cell events mirror the CRDT `DeltaSink` /
-/// `ExpirationSink` rows; packet events come from the logging transport;
-/// tick, threshold and gateway events come from diffing each runtime's
-/// counters; a decision comes from the request's node.
+/// The event payloads. Cell events mirror the CRDT `DeltaSink` rows; packet
+/// events come from the logging transport; tick and gateway events come from
+/// diffing each runtime's counters; a decision comes from the request's node.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "type")]
 pub enum EventKind {
@@ -38,41 +37,17 @@ pub enum EventKind {
     Decided { node: u32, burst: Burst },
     /// A heartbeat round ran on `node`.
     Tick { node: u32 },
-    /// A threshold round ran on `node`.
-    ThresholdFire { node: u32 },
-    /// `src` enqueued message `seq` bound for `dst`, and the router accepted
+    /// `src` enqueued the message bound for `dst`, and the router accepted
     /// it: it lands at the end of its sub-step, which may be the next engine
-    /// call. Its `role`, `riders` and `repeat` are read once from its header
-    /// ([`MessageRole::of`]); `tier` is by placement, never by the zone either
-    /// node reports.
-    PacketSent {
-        seq: Seq,
-        src: u32,
-        dst: u32,
-        bytes: u32,
-        role: MessageRole,
-        riders: Riders,
-        repeat: Option<ListedRepeat>,
-        cells: u16,
-        tier: Tier,
-    },
+    /// call.
+    PacketSent(Message),
     /// `dst` consumed a packet from `src`.
     PacketDelivered { src: u32, dst: u32, bytes: u32 },
-    /// `src`'s message `seq` to `dst` was lost on the link, refused by a full
+    /// `src`'s message to `dst` was lost on the link, refused by a full
     /// router queue, or `dst` had no receiver. Distinct from
     /// [`EventKind::PacketSent`]: a dropped packet never produces a matching
-    /// delivery. The other fields are as for [`EventKind::PacketSent`].
-    PacketDropped {
-        seq: Seq,
-        src: u32,
-        dst: u32,
-        bytes: u32,
-        role: MessageRole,
-        riders: Riders,
-        repeat: Option<ListedRepeat>,
-        cells: u16,
-        tier: Tier,
-    },
+    /// delivery.
+    PacketDropped(Message),
     /// `origin`'s gateway into remote zone `zone` changed, as its runtime
     /// reports it; `None` while it has none there.
     GatewayChanged {
@@ -101,15 +76,22 @@ pub enum EventKind {
         bucket: u32,
         count: u64,
     },
-    /// A cell aged out of the window on `node`.
-    CellExpired {
-        node: u32,
-        #[serde(with = "u128_hex")]
-        rule: u128,
-        #[serde(with = "u128_hex")]
-        key: u128,
-        bucket: u32,
-    },
+}
+
+/// A message `src` sent `dst`, numbered `seq` in the run. Its `role`, `riders`
+/// and `repeat` are read once from its header ([`MessageRole::of`]); `tier`
+/// is by placement, never by the zone either node reports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct Message {
+    pub seq: Seq,
+    pub src: u32,
+    pub dst: u32,
+    pub bytes: u32,
+    pub role: MessageRole,
+    pub riders: Riders,
+    pub repeat: Option<ListedRepeat>,
+    pub cells: u16,
+    pub tier: Tier,
 }
 
 /// A packet's kind on the wire, derived from its [`MessageRole`].
@@ -463,9 +445,9 @@ pub enum Lag {
     },
 }
 
-/// Per-node cluster state, pulled every frame. Only the inspected node's cells
-/// and peer rows are included, so the frame costs one row per node rather than
-/// one per node pair.
+/// Per-node cluster state, pulled every frame. Only the inspected node's peer
+/// rows are included, so the frame costs one row per node rather than one per
+/// node pair.
 #[derive(Clone, Debug, Serialize)]
 pub struct ClusterState {
     pub virtual_ms: u64,
@@ -510,13 +492,27 @@ pub struct ClusterState {
     pub suspect_after_ms: u64,
 }
 
-/// The rows of the one node the page inspects, read at the same instant as
-/// the rest of the snapshot.
+/// The one node the page inspects, from its runtime's admin snapshot, read
+/// at the same instant as the rest of the snapshot.
 #[derive(Clone, Debug, Serialize)]
 pub struct Inspected {
     /// The inspected node's stable id.
     pub id: u32,
-    pub cells: Vec<CellView>,
+    /// The on-the-wire gossip identity it announces (`NodeIdentity`): a pure
+    /// function of `id`, `id·256 + 1`.
+    #[serde(with = "u128_hex")]
+    pub node_id: u128,
+    /// Its incarnation, bumped on restart so peers can supersede a stale
+    /// alias. Always 1 in the sim (no restart path), shown to teach the
+    /// concept.
+    pub incarnation: u32,
+    /// The per-rule error budget ε at the most recent request: a rule's
+    /// pending hits crossing it trigger an eager (threshold) flush. `0` until
+    /// seen.
+    pub error_budget: u64,
+    /// Cells its CRDT store holds, and the most it can.
+    pub active_cells: u32,
+    pub cell_capacity: u32,
     pub peers: Vec<PeerView>,
 }
 
@@ -559,26 +555,16 @@ impl BytesByTier {
 }
 
 /// One node's view at snapshot time. The counters mirror the runtime's
-/// [`AdminSnapshot`](gabion::gossip::AdminSnapshot); the window, decision,
-/// lag, heartbeat and hit fields the engine reads or counts; and `store_stats`
-/// mirrors its [`CellStoreStats`](gabion::crdt::CellStoreStats). The node
+/// [`GossipCounters`](gabion::gossip::GossipCounters); the window, decision,
+/// lag, heartbeat and hit fields the engine reads or counts. The node
 /// inspector renders them directly: see `GossipTargets.svelte` and
 /// `NodeInspector.svelte` in `web/src/lib/components`.
 #[derive(Clone, Debug, Serialize)]
 pub struct NodeState {
-    /// The node's stable id (see the module note). Distinct from `node_id`
-    /// below: this is the frontend's display/identity handle; `node_id` is the
-    /// on-the-wire gossip identity (a pure function of it, `id·256 + 1`).
+    /// The node's stable id (see the module note).
     pub id: u32,
     /// The zone it is placed in.
     pub zone: u8,
-    /// The on-the-wire gossip identity this node announces (`NodeIdentity`).
-    #[serde(with = "u128_hex")]
-    pub node_id: u128,
-    /// The node's incarnation — bumped on restart so peers can supersede a
-    /// stale alias. Always 1 in the sim (no restart path), shown to teach the
-    /// concept.
-    pub incarnation: u32,
     /// gabion's `window_total` of the watched key on this node's own count
     /// table: the number its admission reads.
     pub window_total: u64,
@@ -595,8 +581,6 @@ pub struct NodeState {
     pub admitted_hits: u64,
     /// Hits this node rejected since it joined, of every key.
     pub rejected_hits: u64,
-    /// Heartbeat rounds this runtime has run.
-    pub rounds_heartbeat: u64,
     /// Gateways replaced because they went unanswered for `suspect_after` or
     /// said they cannot relay.
     pub gateway_failovers: u64,
@@ -613,63 +597,6 @@ pub struct NodeState {
     /// Origins whose runtime sends this node's zone their changes through this
     /// node: the gateway rows of every node, inverted.
     pub gateway_for: u32,
-    /// Bytes of the node's own-stream (`Own`) packets it has sent since it
-    /// joined, delivered or lost.
-    pub own_data_bytes: u64,
-    /// The per-rule error budget ε at the most recent request: a rule's pending
-    /// hits crossing it triggers an eager (threshold) flush. `0` until seen.
-    pub error_budget: u64,
-    /// CRDT store occupancy and saturation counters.
-    pub store_stats: StoreStats,
-}
-
-/// Mirror of [`gabion::crdt::CellStoreStats`] — the CRDT store's occupancy and
-/// saturation counters, surfaced for the inspector's storage section.
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-pub struct StoreStats {
-    pub active_cells: u32,
-    pub cell_capacity: u32,
-    pub rule_slots_used: u16,
-    pub rule_slots_capacity: u16,
-    pub node_slots_used: u16,
-    pub node_slots_capacity: u16,
-    pub cell_store_full_rejects: u64,
-    pub rule_dictionary_full_rejects: u64,
-    pub node_dictionary_full_rejects: u64,
-}
-
-impl From<gabion::crdt::CellStoreStats> for StoreStats {
-    fn from(s: gabion::crdt::CellStoreStats) -> Self {
-        Self {
-            active_cells: s.active_cells,
-            cell_capacity: s.cell_capacity,
-            rule_slots_used: s.rule_slots_used,
-            rule_slots_capacity: s.rule_slots_capacity,
-            node_slots_used: s.node_slots_used,
-            node_slots_capacity: s.node_slots_capacity,
-            cell_store_full_rejects: s.cell_store_full_rejects,
-            rule_dictionary_full_rejects: s.rule_dictionary_full_rejects,
-            node_dictionary_full_rejects: s.node_dictionary_full_rejects,
-        }
-    }
-}
-
-/// One CRDT cell as this node currently holds it.
-#[derive(Clone, Debug, Serialize)]
-pub struct CellView {
-    #[serde(with = "u128_hex")]
-    pub rule: u128,
-    #[serde(with = "u128_hex")]
-    pub key: u128,
-    pub bucket: u32,
-    pub count: u64,
-    /// How long since this cell was last updated, in milliseconds.
-    pub age_ms: u64,
-    /// The stable id of the node that originated this cell, if its origin
-    /// identity is still interned and known to the engine.
-    pub origin: Option<u32>,
-    /// Whether this node is itself the origin of the cell.
-    pub is_local: bool,
 }
 
 /// One peer entry from a node's gossip peer table.
@@ -688,11 +615,4 @@ pub struct PeerView {
     pub unanswered_ms: Option<u32>,
     /// Own-stream positions sent to the peer and not yet acknowledged.
     pub own_unacked: u64,
-    /// The same for the relay stream.
-    pub relay_unacked: u64,
-    /// The peer's gossip node id once an inbound packet has revealed it
-    /// (distinct from `id`: this is the on-the-wire identity the peer
-    /// announced, unknown until the first packet from it arrives).
-    #[serde(with = "option_u128_hex")]
-    pub node_id: Option<u128>,
 }

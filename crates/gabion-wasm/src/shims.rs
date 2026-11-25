@@ -17,7 +17,7 @@ use gabion::wire::read_header;
 
 use crate::capture::SharedCapture;
 use crate::engine::CLUSTER_ID_HASH;
-use crate::event::{EventKind, Tier};
+use crate::event::{EventKind, Message, Tier};
 
 /// Shared, single-threaded event sink. Shims push raw [`EventKind`]s here as
 /// they observe them; the engine drains and time-stamps them. `Rc<RefCell<…>>`
@@ -41,7 +41,7 @@ pub type AddressBook = Rc<RefCell<HashMap<SocketAddr, Member>>>;
 
 /// A node's count table, gabion's own [`Aggregate`]: the table admission's
 /// `window_total` reads. Every `apply` goes to it first; then one
-/// `CellCreated` / `CellUpdated` / `CellExpired` event per row goes to the log.
+/// `CellCreated` / `CellUpdated` event per delta row goes to the log.
 pub struct EventEmittingAggregateStore {
     node: u32,
     log: EventLog,
@@ -91,14 +91,6 @@ impl AggregateStore for EventEmittingAggregateStore {
                 }
             };
             log.push(event);
-        }
-        for key in expirations.keys.iter().take(expirations.len()) {
-            log.push(EventKind::CellExpired {
-                node: self.node,
-                rule: key.rule_fingerprint,
-                key: key.key_hash.0,
-                bucket: key.bucket.0,
-            });
         }
     }
 }
@@ -172,32 +164,22 @@ impl GossipTransport for LoggingSimTransport {
                     tier,
                     delivered,
                 );
-                let event = if delivered {
-                    EventKind::PacketSent {
-                        seq,
-                        src,
-                        dst: dst_id,
-                        bytes,
-                        role,
-                        riders,
-                        repeat,
-                        cells,
-                        tier,
-                    }
-                } else {
-                    EventKind::PacketDropped {
-                        seq,
-                        src,
-                        dst: dst_id,
-                        bytes,
-                        role,
-                        riders,
-                        repeat,
-                        cells,
-                        tier,
-                    }
+                let message = Message {
+                    seq,
+                    src,
+                    dst: dst_id,
+                    bytes,
+                    role,
+                    riders,
+                    repeat,
+                    cells,
+                    tier,
                 };
-                self.log.borrow_mut().push(event);
+                self.log.borrow_mut().push(if delivered {
+                    EventKind::PacketSent(message)
+                } else {
+                    EventKind::PacketDropped(message)
+                });
             }
         }
         result

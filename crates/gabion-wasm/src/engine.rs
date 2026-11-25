@@ -14,8 +14,8 @@
 //!
 //! The caller must run `run_engine` on a runtime with **paused time** (native:
 //! `Builder::new_current_thread().enable_all().start_paused(true)`); virtual
-//! time moves only inside a `Step` or `StepTo` handler, which sets the shared
-//! clock every node reads.
+//! time moves only inside a `Step` handler, which sets the shared clock every
+//! node reads.
 //!
 //! **Sub-steps.** Time moves from one due instant to the next: a node's
 //! heartbeat (each node at its own fixed phase), one emit floor after a node
@@ -38,26 +38,26 @@ use std::time::Duration;
 
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gabion::aggregate::AggregateTable;
-use gabion::crdt::{BucketEpoch, CellStore, KeyHash, NodeId, NodeIdentity, ValidStorageConfig};
+use gabion::crdt::{BucketEpoch, CellStore, KeyHash, NodeId, NodeIdentity};
 use gabion::discovery::{Peer, PeerEvent};
 use gabion::gossip::sim::{Deferral, LinkPolicy, SimRouter};
 use gabion::gossip::{
-    AdminCommand, AdminSnapshot, CellDumpSnapshot, GossipClient, GossipCounters, GossipError,
-    GossipRuntime, PeerZone, Role,
+    AdminCommand, AdminSnapshot, GossipClient, GossipCounters, GossipError, GossipRuntime,
+    PeerZone, Role,
 };
-use gabion::rules::{RuleSpec, RuleTable};
+use gabion::rules::RuleSpec;
 use gabion::settings::{SettingError, Settings};
-use gabion::zone::{ZoneHash, ZoneName};
+use gabion::zone::ZoneHash;
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, LocalSet};
 
 use crate::capture::{LostBy, MarkerKind, SharedCapture};
 use crate::clock::{ManualClock, SharedNow, Tickers};
-use crate::config::{MAX_NODES, MAX_ZONES, SimConfig, ValidSimConfig, ZONE_NAMES, ZoneMode};
+use crate::config::{MAX_NODES, MAX_ZONES, ValidSimConfig, ZONE_NAMES, ZoneMode};
 use crate::event::{
-    Admission, Burst, BytesByTier, CellView, ClusterState, Event, EventBatch, EventKind, Inspected,
-    Lag, NodeState, PacketKind, PeerView, ZoneView,
+    Admission, Burst, BytesByTier, ClusterState, Event, EventBatch, EventKind, Inspected, Lag,
+    NodeState, PeerView, ZoneView,
 };
 use crate::shims::{
     AddressBook, EventEmittingAggregateStore, EventLog, LoggingSimTransport, Member,
@@ -355,13 +355,8 @@ pub enum Command {
         until: StepUntil,
         reply: oneshot::Sender<EventBatch>,
     },
-    /// Advance virtual time to absolute `virtual_ms` (no-op if already past).
-    StepTo {
-        virtual_ms: u64,
-        reply: oneshot::Sender<EventBatch>,
-    },
-    /// Per-node cluster snapshot of `key`, with the cells and peer rows of
-    /// node `inspect` alone.
+    /// Per-node cluster snapshot of `key`, with the identity, store and peer
+    /// rows of node `inspect` alone.
     Snapshot {
         inspect: Option<u32>,
         key: KeyHash,
@@ -424,10 +419,6 @@ async fn engine_loop(
             } => {
                 let _ = reply.send(state.step(delta_ms, until).await);
             }
-            Command::StepTo { virtual_ms, reply } => {
-                let delta = virtual_ms.saturating_sub(state.virtual_ms);
-                let _ = reply.send(state.step(delta, StepUntil::Time).await);
-            }
             Command::Snapshot {
                 inspect,
                 key,
@@ -471,8 +462,6 @@ struct NodeHandle {
     seen: GossipCounters,
     /// Its gateway into each zone as last read.
     gateways: [Option<u32>; MAX_ZONES],
-    /// Bytes of `Own` packets this node sent, from the log.
-    own_data_bytes: u64,
     /// The next instant its heartbeat fires: its phase, then every period.
     next_heartbeat: u64,
     /// The instant its prompt ticker fires: one emit floor after the engine
@@ -492,27 +481,12 @@ struct NodeHandle {
 /// All engine state, owned as a local inside [`engine_loop`] (no `Rc<RefCell>`
 /// wrapper — the task owns it outright).
 struct EngineState {
-    config: SimConfig,
-    /// Every node's settings, before its gossip bind and static peers.
-    settings: Settings,
-    /// Every node's storage, sized by [`SimConfig::settings`].
-    storage: ValidStorageConfig,
-    /// Every node's count table's storage, sized for the watched keys.
-    aggregate: ValidStorageConfig,
-    /// The watched rule, which every node interns at construction.
-    rules: RuleTable,
-    /// That rule as admission reads it: the bucket a request is recorded in,
-    /// the limit, and the window.
-    spec: RuleSpec,
-    /// Every zone's name, parsed and hashed once.
-    zone_names: Box<[ZoneName]>,
+    /// The scenario, every node's settings and storage, the watched rule and
+    /// the zones, as `SimConfig::validate` built them once.
+    valid: ValidSimConfig,
     router: SimRouter,
     nodes: Vec<NodeHandle>,
     addresses: AddressBook,
-    /// Reverse map: gossip `NodeId` (the `u128` on the wire) → stable id, for
-    /// resolving a cell's origin identity back to the node that owns it. An
-    /// entry is removed when its node leaves.
-    node_id_index: HashMap<u128, u32>,
     /// The next stable id to hand out. Monotonic and never reset, so ids are
     /// never reused across joins and leaves — a departed node's id stays gone,
     /// and addresses / gossip `NodeId`s derived from it never collide.
@@ -549,42 +523,22 @@ struct EngineState {
     counter_reads: u64,
     /// Yields the drains have spent.
     drain_yields: u64,
-    /// `gossip.suspect_after` as every node's runtime validated it, in ms.
-    suspect_after_ms: u64,
 }
 
 impl EngineState {
-    fn build(
-        ValidSimConfig {
-            config,
-            settings,
-            storage,
-            aggregate,
-            rules,
-            spec,
-            zone_names,
-        }: ValidSimConfig,
-        capture: SharedCapture,
-    ) -> Result<Self, EngineError> {
+    fn build(valid: ValidSimConfig, capture: SharedCapture) -> Result<Self, EngineError> {
         let log: EventLog = Rc::new(RefCell::new(Vec::new()));
         let addresses: AddressBook = Rc::new(RefCell::new(HashMap::new()));
         // One shared time base for the whole cluster; each node gets its own
         // tick channel so a fired tick queues rather than coalescing.
         let now: SharedNow = Rc::new(Cell::new(0));
 
-        let initial_nodes = config.nodes;
+        let initial_nodes = valid.config.nodes;
         let mut state = Self {
-            config,
-            settings,
-            storage,
-            aggregate,
-            rules,
-            spec,
-            zone_names,
+            valid,
             router: SimRouter::with_channel_capacity(VIZ_ROUTER_CAPACITY),
             nodes: Vec::with_capacity(initial_nodes),
             addresses,
-            node_id_index: HashMap::with_capacity(initial_nodes),
             next_id: 0,
             log,
             capture,
@@ -600,14 +554,13 @@ impl EngineState {
             gateway_fetches: 0,
             counter_reads: 0,
             drain_yields: 0,
-            suspect_after_ms: 0,
         };
 
         // The initial members are ids 0..N, so the address of id `i` is
         // `BASE_PORT + i` — the same set every member bootstraps against, and
         // the set a later newcomer will be handed too.
         let addrs: Vec<SocketAddr> = (0..initial_nodes).map(|i| addr_of_id(i as u32)).collect();
-        let zones = state.zone_names.len();
+        let zones = state.valid.zone_names.len();
         for i in 0..initial_nodes {
             state.spawn_node((i % zones) as u8, &addrs)?;
             state.baseline_links(i);
@@ -617,9 +570,9 @@ impl EngineState {
 
     /// The configured network: the scenario's uniform loss on every link.
     fn baseline_policy(&self) -> LinkPolicyKind {
-        if self.config.uniform_loss > 0.0 {
+        if self.valid.config.uniform_loss > 0.0 {
             LinkPolicyKind::DropProb {
-                p: self.config.uniform_loss,
+                p: self.valid.config.uniform_loss,
             }
         } else {
             LinkPolicyKind::Pass
@@ -675,17 +628,16 @@ impl EngineState {
             // node with no peers yet is alone until the engine reports one.
             gossip_bind: (!peers.is_empty()).then_some(addr),
             bootstrap_peers: peers,
-            zone: match self.config.zone_mode {
-                ZoneMode::Configured => Some(self.zone_names[usize::from(zone)].clone()),
+            zone: match self.valid.config.zone_mode {
+                ZoneMode::Configured => Some(self.valid.zone_names[usize::from(zone)].clone()),
                 ZoneMode::Unset => None,
             },
-            ..self.settings.clone()
+            ..self.valid.settings.clone()
         }
         .validate()?;
-        self.suspect_after_ms = gossip_cfg.suspect_after().0.get();
         let identity = NodeIdentity::new(NodeId((id as u128) * 0x100 + 1), 1);
 
-        let store = CellStore::new(self.storage, identity, &self.rules);
+        let store = CellStore::new(self.valid.storage, identity, &self.valid.rules);
 
         let transport = LoggingSimTransport::new(
             self.router.bind(addr),
@@ -699,10 +651,10 @@ impl EngineState {
         let aggregate = Rc::new(EventEmittingAggregateStore::new(
             id,
             self.log.clone(),
-            &self.aggregate,
+            &self.valid.aggregate,
         ));
         let (admin_tx, admin_rx) = mpsc::channel::<AdminCommand>(1);
-        let period = self.config.tick_interval_ms;
+        let period = self.valid.config.tick_interval_ms;
         let (clock, tickers) = ManualClock::new(self.now.clone(), Duration::from_millis(period));
         let (runtime, client) = GossipRuntime::from_parts_with_admin(
             transport,
@@ -719,7 +671,6 @@ impl EngineState {
         let (peer_tx, peer_rx) = unbounded::<PeerEvent>();
         let join = tokio::task::spawn_local(runtime.run(peer_rx));
 
-        self.node_id_index.insert(identity.node_id.0, id);
         self.addresses
             .borrow_mut()
             .insert(addr, Member { id, zone });
@@ -736,7 +687,6 @@ impl EngineState {
             identity,
             seen: GossipCounters::default(),
             gateways: [None; MAX_ZONES],
-            own_data_bytes: 0,
             next_heartbeat: first_heartbeat(id, period, self.virtual_ms),
             prompt_due: None,
             blocked_from: NodeSet::EMPTY,
@@ -779,9 +729,7 @@ impl EngineState {
         let before = self.outbox.len();
         self.drain_log();
         self.outbox[before..].iter().any(|event| match event.kind {
-            EventKind::PacketSent { role, .. } | EventKind::PacketDropped { role, .. } => {
-                role.kind().carries_cells()
-            }
+            EventKind::PacketSent(m) | EventKind::PacketDropped(m) => m.role.kind().carries_cells(),
             _ => false,
         })
     }
@@ -827,7 +775,7 @@ impl EngineState {
     ) -> Result<EventBatch, EngineError> {
         let pos = position_of(&self.nodes, node).ok_or(EngineError::UnknownNode { id: node })?;
         self.close_sub_step().await;
-        let (spec, now) = (self.spec, self.virtual_ms);
+        let (spec, now) = (self.valid.spec, self.virtual_ms);
         let table = self.nodes[pos].aggregate.table();
         let total = table.window_total(spec, key, now);
         let burst = decide_burst(spec, table, key, now, total, requests);
@@ -939,7 +887,7 @@ impl EngineState {
         if self.next_id > MAX_ID {
             return Err(EngineError::IdsExhausted);
         }
-        let zones = self.zone_names.len();
+        let zones = self.valid.zone_names.len();
         let zone = match zone {
             None => self.smallest_zone(),
             Some(zone) => u8::try_from(zone)
@@ -989,7 +937,6 @@ impl EngineState {
             .borrow_mut()
             .mark(self.virtual_ms, MarkerKind::Removed { node: id });
         let addr = self.nodes[pos].addr;
-        let node_id = self.nodes[pos].identity.node_id.0;
 
         // Tell every *other* node it left first, so they drop it from their
         // peer tables and stop gossiping to it.
@@ -1007,8 +954,8 @@ impl EngineState {
         self.router.unbind(addr);
 
         // Drop every trace: the handle (closing its client / admin / tick /
-        // peer channels), its reachability bit in every survivor, the
-        // address-book entry, and the id reverse-map entry.
+        // peer channels), its reachability bit in every survivor, and the
+        // address-book entry.
         let handle = self.nodes.remove(pos);
         drop(handle);
         for survivor in &mut self.nodes {
@@ -1016,7 +963,6 @@ impl EngineState {
             survivor.lossy_from.remove_shift(pos);
         }
         self.addresses.borrow_mut().remove(&addr);
-        self.node_id_index.remove(&node_id);
         self.touched.remove_shift(pos);
 
         // Let survivors process the departure, before any of them runs a
@@ -1047,7 +993,7 @@ impl EngineState {
     /// The zone with the fewest live members, the lowest index on a tie.
     fn smallest_zone(&self) -> u8 {
         let live = self.live_by_zone();
-        let zones = self.zone_names.len();
+        let zones = self.valid.zone_names.len();
         (0..zones)
             .min_by_key(|&zone| (live[zone], zone))
             .map_or(0, |zone| zone as u8)
@@ -1057,7 +1003,7 @@ impl EngineState {
     /// `until` says.
     async fn step(&mut self, delta_ms: u64, until: StepUntil) -> EventBatch {
         self.close_sub_step().await;
-        let floor_ms = self.config.min_emit_interval_ms;
+        let floor_ms = self.valid.config.min_emit_interval_ms;
         let target = self.virtual_ms.saturating_add(delta_ms);
         // No request arrives inside a step, and gossip only copies a bucket
         // some live node holds, so the next expiry is fixed until the step
@@ -1127,7 +1073,7 @@ impl EngineState {
     /// consumes the tick on its next idle poll rather than dropping it. A
     /// closed inbox (the runtime stopped) is ignored.
     async fn fire(&mut self, at: u64) {
-        let period = self.config.tick_interval_ms;
+        let period = self.valid.config.tick_interval_ms;
         for (pos, node) in self.nodes.iter_mut().enumerate() {
             if node.next_heartbeat == at {
                 let _ = node.tickers.heartbeat.send(at).await;
@@ -1144,49 +1090,28 @@ impl EngineState {
 
     /// Drain the shims' raw events into the outbox, stamping each with the
     /// current virtual time and settling each message in the capture. Every
-    /// packet sent or dropped also counts into `bytes_by_tier`, and into its
-    /// sender's `own_data_bytes` when it is an `Own` packet; a packet sent
+    /// packet sent or dropped also counts into `bytes_by_tier`; a packet sent
     /// wakes its receiver, which is marked touched.
     fn drain_log(&mut self) {
         let virtual_ms = self.virtual_ms;
-        let nodes = &mut self.nodes;
+        let nodes = &self.nodes;
         let touched = &mut self.touched;
         let bytes_by_tier = &mut self.bytes_by_tier;
         let mut capture = self.capture.borrow_mut();
         let mut log = self.log.borrow_mut();
         self.outbox.extend(log.drain(..).map(|kind| {
-            match &kind {
-                EventKind::PacketSent {
-                    seq,
-                    src,
-                    dst,
-                    bytes,
-                    role,
-                    tier,
-                    ..
-                } => {
-                    bytes_by_tier.add(*tier, role.kind(), *bytes);
-                    count_own(nodes, *src, role.kind(), *bytes);
-                    capture.settle(*seq, virtual_ms, None);
-                    if let Some(pos) = position_of(nodes, *dst) {
+            if let EventKind::PacketSent(m) | EventKind::PacketDropped(m) = kind {
+                bytes_by_tier.add(m.tier, m.role.kind(), m.bytes);
+                if matches!(kind, EventKind::PacketSent(_)) {
+                    capture.settle(m.seq, virtual_ms, None);
+                    if let Some(pos) = position_of(nodes, m.dst) {
                         touched.insert(pos);
                     }
-                }
-                EventKind::PacketDropped {
-                    seq,
-                    src,
-                    dst,
-                    bytes,
-                    role,
-                    tier,
-                    ..
-                } => {
-                    bytes_by_tier.add(*tier, role.kind(), *bytes);
-                    count_own(nodes, *src, role.kind(), *bytes);
+                } else {
                     // A cut link is exact from the receiver's blocked set; a
                     // link that drops packets loses them; a link that drops
                     // none can only have been full.
-                    let link = position_of(nodes, *src).zip(position_of(nodes, *dst));
+                    let link = position_of(nodes, m.src).zip(position_of(nodes, m.dst));
                     let on = |set: fn(&NodeHandle) -> NodeSet| {
                         link.is_some_and(|(s, d)| set(&nodes[d]).contains(s))
                     };
@@ -1197,9 +1122,8 @@ impl EngineState {
                     } else {
                         LostBy::QueueFull
                     };
-                    capture.settle(*seq, virtual_ms, Some(by));
+                    capture.settle(m.seq, virtual_ms, Some(by));
                 }
-                _ => {}
             }
             Event { virtual_ms, kind }
         }));
@@ -1218,36 +1142,30 @@ impl EngineState {
     }
 
     /// After a sub-step: read the counters of every touched node, clearing
-    /// the set, emit one `Tick` / `ThresholdFire` per round since the last
-    /// read, and diff the gateways of each node whose role count moved, the
+    /// the set, emit one `Tick` per heartbeat round since the last read, and
+    /// diff the gateways of each node whose role count moved, the
     /// only nodes whose snapshot is fetched. A node's events come in that
     /// order, so the stream is deterministic.
     async fn observe(&mut self) {
         let touched = std::mem::replace(&mut self.touched, NodeSet::EMPTY);
         for pos in touched.iter() {
             self.counter_reads += 1;
-            let Some(now) = counters(&self.nodes[pos].admin_tx).await else {
+            let Some(now) = admin(&self.nodes[pos].admin_tx, |reply| AdminCommand::Counters {
+                reply,
+            })
+            .await
+            else {
                 continue;
             };
             let seen = std::mem::replace(&mut self.nodes[pos].seen, now);
             let node = self.nodes[pos].id;
             let virtual_ms = self.virtual_ms;
-            let rounds = [
-                (
-                    now.rounds_heartbeat - seen.rounds_heartbeat,
-                    EventKind::Tick { node },
-                ),
-                (
-                    now.rounds_threshold - seen.rounds_threshold,
-                    EventKind::ThresholdFire { node },
-                ),
-            ];
-            for (count, kind) in rounds {
-                self.outbox.extend((0..count).map(|_| Event {
+            self.outbox.extend(
+                (0..now.rounds_heartbeat - seen.rounds_heartbeat).map(|_| Event {
                     virtual_ms,
-                    kind: kind.clone(),
-                }));
-            }
+                    kind: EventKind::Tick { node },
+                }),
+            );
             if now.role_changes != seen.role_changes {
                 self.diff_gateways(pos).await;
             }
@@ -1257,7 +1175,11 @@ impl EngineState {
     /// Compare node `pos`'s gateway into each zone, as its runtime reports
     /// it, with the last read, and emit a `GatewayChanged` for each that moved.
     async fn diff_gateways(&mut self, pos: usize) {
-        let Some(snap) = admin_snapshot(&self.nodes[pos].admin_tx).await else {
+        let Some(snap) = admin(&self.nodes[pos].admin_tx, |reply| AdminCommand::Snapshot {
+            reply,
+        })
+        .await
+        else {
             return;
         };
         self.gateway_fetches += 1;
@@ -1275,7 +1197,7 @@ impl EngineState {
         let virtual_ms = self.virtual_ms;
         let node = &mut self.nodes[pos];
         let before = std::mem::replace(&mut node.gateways, gateways);
-        for zone in 0..self.zone_names.len() {
+        for zone in 0..self.valid.zone_names.len() {
             if before[zone] != gateways[zone] {
                 self.capture.borrow_mut().mark(
                     virtual_ms,
@@ -1302,7 +1224,8 @@ impl EngineState {
     /// The index of the zone whose name hashes to `hash`, through the
     /// library's own zone hash.
     fn zone_index(&self, hash: ZoneHash) -> Option<u8> {
-        self.zone_names
+        self.valid
+            .zone_names
             .iter()
             .position(|zone| zone.hash() == hash)
             .map(|index| index as u8)
@@ -1313,7 +1236,7 @@ impl EngineState {
     /// table holds a count in, always after now. One probe per node and live
     /// bucket, at most, and no allocation.
     fn next_expiry_ms(&self, key: KeyHash) -> Option<u64> {
-        let (spec, now) = (self.spec, self.virtual_ms);
+        let (spec, now) = (self.valid.spec, self.virtual_ms);
         let current = spec.bucket_at(now);
         let oldest = (0..spec.live_buckets.get()).rev().find(|&back| {
             self.nodes.iter().any(|node| {
@@ -1352,12 +1275,12 @@ impl EngineState {
         }
     }
 
-    /// Every node's scalar state for `key`, plus the cells and peer
-    /// rows of `inspect` alone: the page shows one node's rows, and every
-    /// node's would cost a row per node pair each frame. Reads only: an open
-    /// sub-step stays open, so the snapshot shows its packets still held.
+    /// Every node's scalar state for `key`, plus the admin snapshot of
+    /// `inspect` alone: the page shows one node's peer rows, and every node's
+    /// would cost a row per node pair each frame. Reads only: an open sub-step
+    /// stays open, so the snapshot shows its packets still held.
     async fn snapshot(&self, inspect: Option<u32>, key: KeyHash) -> ClusterState {
-        let spec = self.spec;
+        let spec = self.valid.spec;
         let now = self.virtual_ms;
         let current = spec.bucket_at(now);
         let live = spec.live_buckets.get();
@@ -1378,9 +1301,8 @@ impl EngineState {
         // replica of every origin's cells, so keeping every dump would hold N
         // stores at once.
         let mut origins: Vec<OriginCell> = Vec::new();
-        let mut inspected_cells = None;
         for (pos, handle) in self.nodes.iter().enumerate() {
-            let dump = cell_dump(&handle.admin_tx).await;
+            let dump = admin(&handle.admin_tx, |reply| AdminCommand::CellDump { reply }).await;
             for cell in dump.iter().flat_map(|d| &d.cells) {
                 let Some(origin) = cell.origin_node_id else {
                     continue;
@@ -1411,11 +1333,6 @@ impl EngineState {
                 };
                 held.holders.insert(pos);
             }
-            if inspect == Some(handle.id) {
-                inspected_cells = dump
-                    .as_ref()
-                    .map(|d| self.cells_from_dump(handle.identity, d));
-            }
         }
 
         let mut oracle_buckets = vec![0; live as usize];
@@ -1429,7 +1346,10 @@ impl EngineState {
         // each node.
         let mut gateway_for = vec![0u32; self.nodes.len()];
         for origin in &self.nodes {
-            for &g in origin.gateways[..self.zone_names.len()].iter().flatten() {
+            for &g in origin.gateways[..self.valid.zone_names.len()]
+                .iter()
+                .flatten()
+            {
                 if let Some(pos) = position_of(&self.nodes, g) {
                     gateway_for[pos] += 1;
                 }
@@ -1471,34 +1391,36 @@ impl EngineState {
                     }
                 }
             };
-            // `node_id` / `incarnation` come from the engine's own record of
-            // the node, so they survive even if the runtime has already
-            // stopped and the admin round-trip returns `None` (defaults for
-            // the rest).
-            let snap = admin_snapshot(&handle.admin_tx).await;
+            // A stopped runtime's reads come back `None`: defaults.
+            let counters = admin(&handle.admin_tx, |reply| AdminCommand::Counters { reply })
+                .await
+                .unwrap_or_default();
             if inspect == Some(handle.id) {
+                // `node_id` / `incarnation` come from the engine's own record
+                // of the node, so they survive a stopped runtime.
+                let snap = admin(&handle.admin_tx, |reply| AdminCommand::Snapshot { reply }).await;
                 inspected = Some(Inspected {
                     id: handle.id,
-                    cells: inspected_cells.take().unwrap_or_default(),
+                    node_id: handle.identity.node_id.0,
+                    incarnation: handle.identity.incarnation,
+                    error_budget: snap.as_ref().map_or(0, |s| s.last_error_budget),
+                    active_cells: snap.as_ref().map_or(0, |s| s.store_stats.active_cells),
+                    cell_capacity: snap.as_ref().map_or(0, |s| s.store_stats.cell_capacity),
                     peers: snap
                         .as_ref()
                         .map(|s| self.peers_from_snapshot(handle.zone, s))
                         .unwrap_or_default(),
                 });
             }
-            let counters = snap.as_ref().map(|s| s.counters).unwrap_or_default();
             nodes.push(NodeState {
                 id: handle.id,
                 zone: handle.zone,
-                node_id: handle.identity.node_id.0,
-                incarnation: handle.identity.incarnation,
                 window_total,
                 brim: decide(spec, table, key, now, window_total),
                 lag,
                 next_heartbeat_ms: handle.next_heartbeat,
                 admitted_hits: handle.admitted_hits,
                 rejected_hits: handle.rejected_hits,
-                rounds_heartbeat: counters.rounds_heartbeat,
                 gateway_failovers: counters.gateway_failovers,
                 gap_reports_sent: counters.gap_reports_sent,
                 gaps_abandoned: counters.gaps_abandoned,
@@ -1506,12 +1428,6 @@ impl EngineState {
                 rto_rewinds_relay: counters.rto_rewinds_relay,
                 sweeps_served: counters.sweeps_served,
                 gateway_for: gateway_for[pos],
-                own_data_bytes: handle.own_data_bytes,
-                error_budget: snap.as_ref().map_or(0, |s| s.last_error_budget),
-                store_stats: snap
-                    .as_ref()
-                    .map(|s| s.store_stats.into())
-                    .unwrap_or_default(),
             });
         }
         // The oldest live bucket any node holds a count in, as
@@ -1526,7 +1442,7 @@ impl EngineState {
             })
             .map(|i| fall_off_ms(spec, now, (width - 1 - i) as u32));
         let live_by_zone = self.live_by_zone();
-        let zones = ZONE_NAMES[..self.zone_names.len()]
+        let zones = ZONE_NAMES[..self.valid.zone_names.len()]
             .iter()
             .zip(live_by_zone)
             .map(|(&name, live)| ZoneView { name, live })
@@ -1546,25 +1462,8 @@ impl EngineState {
             // The CRDT's own window position at this instant, so the page
             // never recomputes the boundary in TypeScript.
             bucket_epoch_now: current.0,
-            suspect_after_ms: self.suspect_after_ms,
+            suspect_after_ms: self.valid.suspect_after_ms,
         }
-    }
-
-    fn cells_from_dump(&self, identity: NodeIdentity, dump: &CellDumpSnapshot) -> Vec<CellView> {
-        dump.cells
-            .iter()
-            .map(|cell| CellView {
-                rule: cell.rule_fingerprint,
-                key: cell.key_hash.0,
-                bucket: cell.bucket.0,
-                count: cell.count,
-                age_ms: self.virtual_ms.saturating_sub(cell.last_update_millis),
-                origin: cell
-                    .origin_node_id
-                    .and_then(|id| self.node_id_index.get(&id).copied()),
-                is_local: cell.origin_node_id == Some(identity.node_id.0),
-            })
-            .collect()
     }
 
     /// Node `own_zone`'s peer rows. `PeerZone::Same` means the observer knows
@@ -1581,12 +1480,10 @@ impl EngineState {
                     PeerZone::Same => Some(own_zone),
                     PeerZone::Other(hash) => self.zone_index(hash),
                 },
-                node_id: peer.node_id.map(|id| id.0),
                 role: peer.role,
                 answer: peer.answer,
                 unanswered_ms: peer.unanswered_ms,
                 own_unacked: peer.own_unacked,
-                relay_unacked: peer.relay_unacked,
             })
             .collect()
     }
@@ -1596,9 +1493,7 @@ impl EngineState {
             let _ = node.client.shutdown().await;
         }
         for node in &mut self.nodes {
-            let join =
-                std::mem::replace(&mut node.join, tokio::task::spawn_local(async { Ok(()) }));
-            let _ = join.await;
+            let _ = (&mut node.join).await;
         }
     }
 }
@@ -1730,48 +1625,20 @@ fn blocks(policy: LinkPolicyKind) -> bool {
 
 /// Position in `nodes` of the live node with stable id `id`, or `None` if no
 /// live node has it; `nodes` is sorted by id (see `NodeHandle`).
-/// Count an `Own` packet's bytes into its sender's `own_data_bytes`. A sender
-/// removed since (its last packets drain after the removal) is skipped: the
-/// page weights live origins only.
-fn count_own(nodes: &mut [NodeHandle], src: u32, kind: PacketKind, bytes: u32) {
-    if kind == PacketKind::Own
-        && let Some(pos) = position_of(nodes, src)
-    {
-        nodes[pos].own_data_bytes += u64::from(bytes);
-    }
-}
-
 fn position_of(nodes: &[NodeHandle], id: u32) -> Option<usize> {
     nodes.binary_search_by_key(&id, |h| h.id).ok()
 }
 
-/// One `Snapshot` admin round-trip. `None` if the runtime has already stopped.
-async fn admin_snapshot(tx: &mpsc::Sender<AdminCommand>) -> Option<AdminSnapshot> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    tx.send(AdminCommand::Snapshot { reply: reply_tx })
-        .await
-        .ok()?;
-    reply_rx.await.ok()
-}
-
-/// One `Counters` admin round-trip, which allocates one `oneshot`. `None` if
-/// the runtime has already stopped.
-async fn counters(tx: &mpsc::Sender<AdminCommand>) -> Option<GossipCounters> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    tx.send(AdminCommand::Counters { reply: reply_tx })
-        .await
-        .ok()?;
-    reply_rx.await.ok()
-}
-
-/// One `CellDump` admin round-trip. `None` if the runtime has already stopped.
-async fn cell_dump(tx: &mpsc::Sender<AdminCommand>) -> Option<CellDumpSnapshot> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    tx.send(AdminCommand::CellDump { reply: reply_tx })
-        .await
-        .ok()?;
-    reply_rx.await.ok()
+/// One admin round-trip, which allocates one `oneshot`. `None` if the runtime
+/// has already stopped.
+async fn admin<T>(
+    tx: &mpsc::Sender<AdminCommand>,
+    command: impl FnOnce(oneshot::Sender<T>) -> AdminCommand,
+) -> Option<T> {
+    let (reply, rx) = oneshot::channel();
+    tx.send(command(reply)).await.ok()?;
+    rx.await.ok()
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
