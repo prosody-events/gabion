@@ -91,10 +91,10 @@ async fn run() -> Result<(), Reported> {
     );
     tracing::info!(
         code = "identity_generated",
-        node_id = %format!("{:032x}", identity.node_id.0),
+        node_id = format_args!("{:032x}", identity.node_id.0),
         incarnation = identity.incarnation,
-        "Generated this node's identity. The incarnation number changes on \
-         every restart so peers can tell restarts apart from new nodes.",
+        "Generated this node's identity. The incarnation number changes on every restart so peers \
+         can tell restarts apart from new nodes.",
     );
 
     let cell_store = CellStore::new(config.storage, identity, &rule_table);

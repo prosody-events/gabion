@@ -214,7 +214,7 @@ async fn campaign(
         tracing::error!(
             code = "leader_stopped",
             worker_id = config.worker_id,
-            error = format!("{error:#}"),
+            error = %format_args!("{error:#}"),
             retry_in = ?retry_delay,
             "gabion: this worker stopped leading gossip and released the \
              leader lease; it will campaign again after `retry_in`. Requests \
