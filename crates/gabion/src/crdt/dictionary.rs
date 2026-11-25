@@ -249,13 +249,27 @@ impl<E: Entry> Dictionary<E> {
         if *rc > 0 {
             return false;
         }
+        self.free(row);
+        true
+    }
+
+    /// Free a slot [`Self::insert`] interned for a cell that was never
+    /// stored, so a failed insert does not leave it taken until restart.
+    /// A slot any cell or pin references is untouched.
+    pub(super) fn release_unreferenced(&mut self, slot: E::Slot) {
+        let row = E::row(slot);
+        if self.refcounts[usize::from(row)] == 0 {
+            self.free(row);
+        }
+    }
+
+    fn free(&mut self, row: u16) {
         let key = self.descriptors[usize::from(row)].key();
         self.index.remove(E::hash(key), u32::from(row));
         self.descriptors[usize::from(row)] = E::default();
         self.free_next[usize::from(row)] = self.free_head;
         self.free_head = row;
         self.len -= 1;
-        true
     }
 }
 

@@ -1587,6 +1587,34 @@ fn stream_after_returns_exactly_the_cells_above_sent(ops: MixedOps, pick: u8, ma
 
 // --- Saturation and dictionary-full paths --------------------------------
 
+/// A row the store drops, because the cell store or the node dictionary is
+/// full, leaves no dictionary slot taken for the identity it interned.
+#[test]
+fn a_dropped_row_releases_the_slots_it_interned() {
+    let mut store = CellStore::new(storage(1, 2), local(), &rules(8));
+    let mut merge = |rule: u128, origin: u128| {
+        let mut obs = ObservationBatch::with_capacity(1);
+        obs.push(observation(rule, 0xabc, BucketEpoch(0), origin, 1, 1, 0));
+        store.merge_remote(&obs, &mut DeltaSink::with_capacity(1), RelayMark::Clear);
+        store.stats()
+    };
+    // Fill the one cell and the node dictionary's one peer slot.
+    let before = merge(0x10, 2);
+    for id in 3..8 {
+        // A known node and a new rule: the full cell store drops it.
+        merge(0x10 + id, 2);
+        // A new node: the full node dictionary drops it.
+        merge(0x10 + id, id);
+    }
+    let after = merge(0x10, 2);
+    assert_eq!(after.cell_store_full_rejects, 5);
+    assert_eq!(after.node_dictionary_full_rejects, 5);
+    assert_eq!(
+        (after.rule_slots_used, after.node_slots_used),
+        (before.rule_slots_used, before.node_slots_used),
+    );
+}
+
 #[derive(Clone, Debug)]
 struct TightRemoteRow {
     rule: u8,
@@ -1632,8 +1660,8 @@ fn quickcheck_capacity_rejections_are_counted_and_invariants_hold(
 ) -> TestResult {
     let mut store = quickcheck_store_tight();
     // Model mirrors translate_identity → upsert: rule intern first, then
-    // node intern, then cell alloc. A failing intern is permanent for the
-    // row (skip) but the slot it already took stays consumed.
+    // node intern, then cell alloc. A row that fails a step is dropped and
+    // releases the slots it interned.
     let mut interned_rules: BTreeSet<u128> = BTreeSet::new();
     let mut interned_nodes: BTreeSet<(u128, Incarnation)> = BTreeSet::new();
     interned_nodes.insert((local().node_id.0, local().incarnation));
@@ -1659,25 +1687,30 @@ fn quickcheck_capacity_rejections_are_counted_and_invariants_hold(
         let mut sink = DeltaSink::with_capacity(1);
         store.merge_remote(&obs, &mut sink, RelayMark::Clear);
 
-        if !interned_rules.contains(&fp) {
-            if interned_rules.len() >= 2 {
-                model_rule_full += 1;
-                continue;
-            }
-            interned_rules.insert(fp);
+        if !interned_rules.contains(&fp) && interned_rules.len() >= 2 {
+            model_rule_full += 1;
+            continue;
         }
-        if !interned_nodes.contains(&(origin, inc)) {
-            if interned_nodes.len() >= 3 {
-                model_node_full += 1;
-                continue;
+        let new_rule = interned_rules.insert(fp);
+        if !interned_nodes.contains(&(origin, inc)) && interned_nodes.len() >= 3 {
+            model_node_full += 1;
+            if new_rule {
+                interned_rules.remove(&fp);
             }
-            interned_nodes.insert((origin, inc));
+            continue;
         }
+        let new_node = interned_nodes.insert((origin, inc));
         let key = (fp, 0x200 + row.key as u128, row.bucket as u32, origin, inc);
         if let Some(stored) = cells.get_mut(&key) {
             *stored = (*stored).max(row.count);
         } else if cells.len() >= 4 {
             model_cell_full += 1;
+            if new_rule {
+                interned_rules.remove(&fp);
+            }
+            if new_node {
+                interned_nodes.remove(&(origin, inc));
+            }
         } else {
             cells.insert(key, row.count);
         }

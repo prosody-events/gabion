@@ -963,6 +963,8 @@ impl CellStore {
 
         // Insert path.
         let Some(slot) = self.alloc_slot() else {
+            self.rule_dictionary.release_unreferenced(rule_slot);
+            self.node_dictionary.release_unreferenced(origin_slot);
             self.note_cell_store_full();
             return;
         };
@@ -1032,6 +1034,7 @@ impl CellStore {
             }) {
                 Some(slot) => slot,
                 None => {
+                    self.rule_dictionary.release_unreferenced(rule_slot);
                     self.note_node_dictionary_full(node_id, incarnation);
                     return None;
                 }
