@@ -1,9 +1,6 @@
-//! SHM zone header: magic, version, identity, aggregate write sequence.
+//! SHM zone header: identity, aggregate write sequence.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-
-pub const SHM_MAGIC: u32 = 0x4742_4e58; // "GBNX"
-pub const SHM_VERSION: u32 = 5;
 
 /// Node identity fields stored cross-process. `node_id` is stamped by the
 /// master on every config load, before fork; `incarnation` is updated
@@ -49,13 +46,7 @@ impl NodeIdentityFields {
 #[repr(C)]
 #[derive(Debug)]
 pub struct Header {
-    pub magic: AtomicU32,
-    pub version: AtomicU32,
     pub identity: NodeIdentityFields,
-    pub zone_bytes: AtomicU64,
-    pub queue_capacity: AtomicU64,
-    pub aggregate_capacity: AtomicU64,
-    pub rule_table_digest: AtomicU64,
     /// The next sequence the aggregate writer stamps on a slot. Every leader
     /// continues it, so a reader holding a sequence from a slot that has
     /// since been freed or cleared cannot accept it again over another cell.
@@ -65,13 +56,7 @@ pub struct Header {
 impl Default for Header {
     fn default() -> Self {
         Self {
-            magic: AtomicU32::new(SHM_MAGIC),
-            version: AtomicU32::new(SHM_VERSION),
             identity: NodeIdentityFields::default(),
-            zone_bytes: AtomicU64::new(0),
-            queue_capacity: AtomicU64::new(0),
-            aggregate_capacity: AtomicU64::new(0),
-            rule_table_digest: AtomicU64::new(0),
             aggregate_write_seq: AtomicU64::new(2),
         }
     }

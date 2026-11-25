@@ -1,8 +1,6 @@
 use super::*;
-use crate::shm::header::{SHM_MAGIC, SHM_VERSION};
 use crate::shm::mock::TestZone;
 use gabion::settings::Settings;
-use std::sync::atomic::Ordering;
 
 #[test]
 fn layout_minimum_capacities() {
@@ -69,8 +67,6 @@ fn nginx_queue_capacity_sizes_the_shm_queue() {
 #[test]
 fn initialize_then_read_round_trip() {
     let (_zone, region) = TestZone::new(8, 16);
-    assert_eq!(region.header().magic.load(Ordering::Acquire), SHM_MAGIC);
-    assert_eq!(region.header().version.load(Ordering::Acquire), SHM_VERSION);
     assert_eq!(region.queue().capacity(), 8);
     assert_eq!(region.aggregate().capacity(), 16);
     // Stats fields default to zero.

@@ -43,7 +43,6 @@ use gabion_nginx::rules::{
     BindingLookup, CompiledRules, NopBindingCompiler, RuleConfig, parse_rule_directive,
 };
 use gabion_nginx::shm::aggregate::ShmAggregateStore;
-use gabion_nginx::shm::header::{SHM_MAGIC, SHM_VERSION};
 use gabion_nginx::shm::queue::QueueEvent;
 use gabion_nginx::shm::{CACHELINE, CachePadded, Layout, ShmRegion};
 
@@ -226,8 +225,6 @@ fn master_stamps_node_id_and_initializes_region() {
     let identity = test_identity(0xdead_beef_cafe, 1);
     region.header().identity.store_node_id(identity.node_id.0);
     assert_eq!(region.header().identity.load_node_id(), identity.node_id.0);
-    assert_eq!(region.header().magic.load(Ordering::Acquire), SHM_MAGIC);
-    assert_eq!(region.header().version.load(Ordering::Acquire), SHM_VERSION);
     // Geometry is reachable through the region.
     assert_eq!(region.queue().capacity(), 8);
     assert_eq!(region.aggregate().capacity(), 16);
