@@ -29,9 +29,7 @@ use gabion::crdt::ValidStorageConfig;
 use gabion::gossip::ValidGossipConfig;
 use gabion::settings::{Setting, Settings};
 
-use crate::access::{
-    AccessCtx, AccessOutcome, AllowInfo, RejectInfo, VariableLookup, decide_all, find_query_arg,
-};
+use crate::access::{AccessCtx, AccessOutcome, VariableLookup, decide_all, find_query_arg};
 use crate::headers::AdmissionHeaders;
 use crate::leader::{self, LeaderConfig, LeaderHandle};
 use crate::log;
@@ -581,12 +579,12 @@ http_request_handler!(gabion_access_handler, |request: &mut http::Request| {
     // A pass that counted nothing leaves the next limited location to decide.
     let (status, counted) = match outcome {
         AccessOutcome::Allow(Some(info)) => {
-            apply_admit_headers(request, info);
+            apply_headers(request, AdmissionHeaders::build_for_allow(info));
             (core::Status::NGX_DECLINED, true)
         }
         AccessOutcome::Allow(None) | AccessOutcome::Decline => (core::Status::NGX_DECLINED, false),
         AccessOutcome::Reject(info) => {
-            apply_reject_headers(request, info);
+            apply_headers(request, AdmissionHeaders::build_for_reject(info));
             (http::HTTPStatus::TOO_MANY_REQUESTS.into(), true)
         }
         AccessOutcome::Cardinality => (http::HTTPStatus::BAD_REQUEST.into(), true),
@@ -614,15 +612,7 @@ unsafe extern "C" fn decided_not_found(
     core::Status::NGX_OK.into()
 }
 
-fn apply_admit_headers(request: &mut http::Request, info: AllowInfo) {
-    let headers = AdmissionHeaders::build_for_allow(info);
-    let _ = request.add_header_out("X-RateLimit-Limit", headers.limit.as_str());
-    let _ = request.add_header_out("X-RateLimit-Remaining", headers.remaining.as_str());
-    let _ = request.add_header_out("X-RateLimit-Reset", headers.reset.as_str());
-}
-
-fn apply_reject_headers(request: &mut http::Request, info: RejectInfo) {
-    let headers = AdmissionHeaders::build_for_reject(info);
+fn apply_headers(request: &mut http::Request, headers: AdmissionHeaders) {
     let _ = request.add_header_out("X-RateLimit-Limit", headers.limit.as_str());
     let _ = request.add_header_out("X-RateLimit-Remaining", headers.remaining.as_str());
     let _ = request.add_header_out("X-RateLimit-Reset", headers.reset.as_str());
