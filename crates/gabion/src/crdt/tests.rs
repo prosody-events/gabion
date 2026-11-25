@@ -106,7 +106,7 @@ fn remote_merge_one(
     let rule_slot = store.rule_dictionary.find(rule_fp).expect("rule interned");
     let node_slot = store
         .node_dictionary
-        .find(NodeId(origin), inc)
+        .find((NodeId(origin), inc))
         .expect("origin interned");
     store
         .find(CompactCellKey {
@@ -146,7 +146,7 @@ fn local_increment_one(
     let rule_slot = store.rule_dictionary.find(rule_fp).expect("rule interned");
     let node_slot = store
         .node_dictionary
-        .find(local().node_id, local().incarnation)
+        .find((local().node_id, local().incarnation))
         .expect("local node interned");
     store
         .find(CompactCellKey {
@@ -768,7 +768,7 @@ fn compact_id_round_trip() {
     store.intern_rule(descriptor_for(0xAA)).unwrap();
     let rule_slot = store.rule_dictionary.find(0xAA).unwrap();
     let _ = remote_merge_one(&mut store, 0xAA, 99, 7, 1, 0);
-    let node_slot = store.node_dictionary.find(NodeId(99), 7).unwrap();
+    let node_slot = store.node_dictionary.find((NodeId(99), 7)).unwrap();
     // Round-trip the dictionaries.
     let rd = store.rule_dictionary().descriptor(rule_slot).unwrap();
     assert_eq!(rd.fingerprint, 0xAA);
@@ -973,8 +973,8 @@ fn expire_emits_one_row_per_freed_cell() {
     let rule_doomed_slot = store.rule_dictionary.find(0x22).unwrap();
     assert_eq!(rule_local_slot, rule_local);
     assert_eq!(rule_doomed_slot, rule_doomed);
-    let node5 = store.node_dictionary.find(NodeId(5), 1).unwrap();
-    let node6 = store.node_dictionary.find(NodeId(6), 1).unwrap();
+    let node5 = store.node_dictionary.find((NodeId(5), 1)).unwrap();
+    let node6 = store.node_dictionary.find((NodeId(6), 1)).unwrap();
     let h_doomed_a = store
         .find(CompactCellKey {
             rule: rule_doomed,
@@ -1047,7 +1047,7 @@ fn expire_frees_slots_and_dictionary_refs() {
     assert_eq!(
         store
             .node_dictionary()
-            .refcount(store.node_dictionary().find(NodeId(100), 1).unwrap()),
+            .refcount(store.node_dictionary().find((NodeId(100), 1)).unwrap()),
         1
     );
 
@@ -1059,7 +1059,7 @@ fn expire_frees_slots_and_dictionary_refs() {
     assert_eq!(store.expire(&ages(&cur, &live), &mut exp), Expiry::Done);
     assert_eq!(store.active_len(), 0);
     // Node dictionary no longer holds the (NodeId(100), 1) entry.
-    assert!(store.node_dictionary().find(NodeId(100), 1).is_none());
+    assert!(store.node_dictionary().find((NodeId(100), 1)).is_none());
 }
 
 #[test]

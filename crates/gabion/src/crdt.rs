@@ -415,7 +415,10 @@ impl CellStore {
 
         let mut node_dictionary = NodeDictionary::with_capacity(config.node_dictionary_capacity);
         let local_node_slot = node_dictionary
-            .intern(local_identity.node_id, local_identity.incarnation)
+            .insert(NodeDescriptor {
+                node_id: local_identity.node_id,
+                incarnation: local_identity.incarnation,
+            })
             .expect("a fresh dictionary with a non-zero capacity has a free slot");
         // Pin the local slot so it cannot be freed via dec_ref.
         node_dictionary.inc_ref(local_node_slot);
@@ -528,7 +531,7 @@ impl CellStore {
             self.rule_dictionary.find(descriptor.fingerprint).is_none(),
             "a configured rule is interned once"
         );
-        let slot = self.rule_dictionary.intern(descriptor)?;
+        let slot = self.rule_dictionary.insert(descriptor)?;
         self.rule_dictionary.inc_ref(slot);
         Some(slot)
     }
@@ -869,10 +872,7 @@ impl CellStore {
         rule_slot: RuleSlot,
     ) {
         let handle = self.handle_for(slot);
-        let descriptor = self
-            .rule_dictionary
-            .descriptor(rule_slot)
-            .expect("rule slot live during emit_delta — pinned by cell refcount");
+        let descriptor = self.rule_dictionary.get(rule_slot);
         let key = CellIdentity {
             rule_fingerprint: descriptor.fingerprint,
             key_hash: self.key_hashes[slot as usize],
@@ -895,10 +895,7 @@ impl CellStore {
     fn emit_expiration(&self, sink: &mut ExpirationSink, slot: u32) {
         let rule_slot = self.rules[slot as usize];
         let handle = self.handle_for(slot);
-        let descriptor = self
-            .rule_dictionary
-            .descriptor(rule_slot)
-            .expect("rule slot live during emit_expiration — pinned by cell refcount");
+        let descriptor = self.rule_dictionary.get(rule_slot);
         let key = CellIdentity {
             rule_fingerprint: descriptor.fingerprint,
             key_hash: self.key_hashes[slot as usize],
@@ -1010,7 +1007,7 @@ impl CellStore {
             fingerprint: rule_fingerprint,
             ..RuleDescriptor::default()
         };
-        let slot = self.rule_dictionary.intern(descriptor);
+        let slot = self.rule_dictionary.insert(descriptor);
         if slot.is_none() {
             self.note_rule_dictionary_full(rule_fingerprint);
         }
@@ -1027,9 +1024,12 @@ impl CellStore {
         incarnation: Incarnation,
     ) -> Option<(RuleSlot, NodeSlot)> {
         let rule_slot = self.rule_slot_for(rule_fingerprint)?;
-        let node_slot = match self.node_dictionary.find(node_id, incarnation) {
+        let node_slot = match self.node_dictionary.find((node_id, incarnation)) {
             Some(slot) => slot,
-            None => match self.node_dictionary.intern(node_id, incarnation) {
+            None => match self.node_dictionary.insert(NodeDescriptor {
+                node_id,
+                incarnation,
+            }) {
                 Some(slot) => slot,
                 None => {
                     self.note_node_dictionary_full(node_id, incarnation);

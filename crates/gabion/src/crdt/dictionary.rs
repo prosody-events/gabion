@@ -67,132 +67,79 @@ impl RuleDescriptor {
     }
 }
 
-/// Interns rule fingerprints to a small [`RuleSlot`]. Bounded; rejects on full.
-#[derive(Clone, Debug)]
-pub struct RuleDictionary {
-    descriptors: Box<[RuleDescriptor]>,
-    refcounts: Box<[u32]>,
-    index: CellIndex,
-    free_next: Box<[u16]>,
-    free_head: u16,
-    len: u16,
-    capacity: u16,
-}
-
-impl RuleDictionary {
-    pub(crate) fn with_capacity(capacity: NonZeroU16) -> Self {
-        let index_cap = pow2_index_capacity_for(capacity.into());
-        let capacity = capacity.get();
-        debug_assert!(
-            capacity < EMPTY_DICT_SLOT,
-            "`Settings::validate` bounds RuleDictionary capacity below u16::MAX"
-        );
-        let mut free_next = vec![EMPTY_DICT_SLOT; capacity as usize].into_boxed_slice();
-        for i in 0..capacity {
-            free_next[i as usize] = if i + 1 < capacity {
-                i + 1
-            } else {
-                EMPTY_DICT_SLOT
-            };
-        }
-        Self {
-            descriptors: vec![RuleDescriptor::default(); capacity as usize].into_boxed_slice(),
-            refcounts: vec![0_u32; capacity as usize].into_boxed_slice(),
-            index: CellIndex::with_capacity(index_cap),
-            free_next,
-            free_head: 0,
-            len: 0,
-            capacity,
-        }
-    }
-
-    pub fn capacity(&self) -> u16 {
-        self.capacity
-    }
-
-    pub fn len(&self) -> u16 {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub fn descriptor(&self, slot: RuleSlot) -> Option<&RuleDescriptor> {
-        (self.refcount(slot) > 0).then(|| &self.descriptors[slot.index()])
-    }
-
-    pub fn refcount(&self, slot: RuleSlot) -> u32 {
-        self.refcounts.get(slot.index()).copied().unwrap_or(0)
-    }
-
-    /// Look up an existing rule by fingerprint, without inserting.
-    pub fn find(&self, fingerprint: u128) -> Option<RuleSlot> {
-        let h = hash_fingerprint(fingerprint);
-        let descriptors = &self.descriptors;
-        self.index
-            .find(h, |slot| {
-                descriptors[slot as usize].fingerprint == fingerprint
-            })
-            .map(|s| RuleSlot(s as u16))
-    }
-
-    /// Find or create a rule slot. Refcount is unchanged — callers manage it
-    /// through [`super::CellStore`].
-    pub(super) fn intern(&mut self, descriptor: RuleDescriptor) -> Option<RuleSlot> {
-        if let Some(slot) = self.find(descriptor.fingerprint) {
-            // Replace descriptor metadata (e.g. `applies_locally` may have
-            // changed).
-            self.descriptors[slot.index()] = descriptor;
-            return Some(slot);
-        }
-        if self.free_head == EMPTY_DICT_SLOT {
-            return None;
-        }
-        let slot = self.free_head;
-        self.free_head = self.free_next[slot as usize];
-        self.descriptors[slot as usize] = descriptor;
-        self.refcounts[slot as usize] = 0;
-        self.index
-            .insert_unchecked(hash_fingerprint(descriptor.fingerprint), slot as u32);
-        self.len += 1;
-        Some(RuleSlot(slot))
-    }
-
-    pub(super) fn inc_ref(&mut self, slot: RuleSlot) {
-        self.refcounts[slot.index()] = self.refcounts[slot.index()].saturating_add(1);
-    }
-
-    pub(super) fn dec_ref(&mut self, slot: RuleSlot) {
-        let rc = &mut self.refcounts[slot.index()];
-        if *rc == 0 {
-            return;
-        }
-        *rc -= 1;
-        if *rc == 0 {
-            let fingerprint = self.descriptors[slot.index()].fingerprint;
-            self.index
-                .remove(hash_fingerprint(fingerprint), u32::from(slot.0));
-            self.descriptors[slot.index()] = RuleDescriptor::default();
-            self.free_next[slot.index()] = self.free_head;
-            self.free_head = slot.0;
-            self.len -= 1;
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NodeDescriptor {
     pub node_id: NodeId,
     pub incarnation: Incarnation,
 }
 
+/// What a [`Dictionary`] interns: a descriptor, the key it is found by, and
+/// the slot newtype it hands out.
+pub trait Entry: Copy + Default {
+    type Key: Copy + PartialEq;
+    type Slot: Copy;
+    fn key(&self) -> Self::Key;
+    fn hash(key: Self::Key) -> u64;
+    fn slot(row: u16) -> Self::Slot;
+    fn row(slot: Self::Slot) -> u16;
+}
+
+impl Entry for RuleDescriptor {
+    type Key = u128;
+    type Slot = RuleSlot;
+
+    fn key(&self) -> u128 {
+        self.fingerprint
+    }
+
+    fn hash(fingerprint: u128) -> u64 {
+        hash_fingerprint(fingerprint)
+    }
+
+    fn slot(row: u16) -> RuleSlot {
+        RuleSlot(row)
+    }
+
+    fn row(slot: RuleSlot) -> u16 {
+        slot.0
+    }
+}
+
+impl Entry for NodeDescriptor {
+    type Key = (NodeId, Incarnation);
+    type Slot = NodeSlot;
+
+    fn key(&self) -> (NodeId, Incarnation) {
+        (self.node_id, self.incarnation)
+    }
+
+    fn hash((node_id, incarnation): (NodeId, Incarnation)) -> u64 {
+        hash_node_identity(node_id, incarnation)
+    }
+
+    fn slot(row: u16) -> NodeSlot {
+        NodeSlot(row)
+    }
+
+    fn row(slot: NodeSlot) -> u16 {
+        slot.0
+    }
+}
+
+/// Interns rule fingerprints to a small [`RuleSlot`]. Bounded; rejects on full.
+pub type RuleDictionary = Dictionary<RuleDescriptor>;
+
 /// Interns `(NodeId, Incarnation)` pairs to a small [`NodeSlot`]. Each
 /// distinct pair gets its own slot — incarnation changes always allocate
 /// a fresh slot, so cells from different incarnations cannot alias.
+pub type NodeDictionary = Dictionary<NodeDescriptor>;
+
+/// Interns descriptors to small slots. Bounded; rejects on full. Each cell
+/// holds a reference to its rule and node slots, and a slot frees when its
+/// last reference goes.
 #[derive(Clone, Debug)]
-pub struct NodeDictionary {
-    descriptors: Box<[NodeDescriptor]>,
+pub struct Dictionary<E: Entry> {
+    descriptors: Box<[E]>,
     refcounts: Box<[u32]>,
     index: CellIndex,
     free_next: Box<[u16]>,
@@ -201,13 +148,13 @@ pub struct NodeDictionary {
     capacity: u16,
 }
 
-impl NodeDictionary {
+impl<E: Entry> Dictionary<E> {
     pub(crate) fn with_capacity(capacity: NonZeroU16) -> Self {
         let index_cap = pow2_index_capacity_for(capacity.into());
         let capacity = capacity.get();
         debug_assert!(
             capacity < EMPTY_DICT_SLOT,
-            "`Settings::validate` bounds NodeDictionary capacity below u16::MAX"
+            "`Settings::validate` bounds dictionary capacity below u16::MAX"
         );
         let mut free_next = vec![EMPTY_DICT_SLOT; capacity as usize].into_boxed_slice();
         for i in 0..capacity {
@@ -218,7 +165,7 @@ impl NodeDictionary {
             };
         }
         Self {
-            descriptors: vec![NodeDescriptor::default(); capacity as usize].into_boxed_slice(),
+            descriptors: vec![E::default(); capacity as usize].into_boxed_slice(),
             refcounts: vec![0_u32; capacity as usize].into_boxed_slice(),
             index: CellIndex::with_capacity(index_cap),
             free_next,
@@ -240,70 +187,75 @@ impl NodeDictionary {
         self.len == 0
     }
 
-    pub fn descriptor(&self, slot: NodeSlot) -> Option<&NodeDescriptor> {
-        (self.refcount(slot) > 0).then(|| &self.descriptors[slot.index()])
+    pub fn descriptor(&self, slot: E::Slot) -> Option<&E> {
+        (self.refcount(slot) > 0).then(|| &self.descriptors[usize::from(E::row(slot))])
     }
 
-    pub fn refcount(&self, slot: NodeSlot) -> u32 {
-        self.refcounts.get(slot.index()).copied().unwrap_or(0)
+    /// The descriptor of a slot a cell holds a reference to.
+    pub(super) fn get(&self, slot: E::Slot) -> &E {
+        let row = usize::from(E::row(slot));
+        debug_assert!(
+            self.refcounts[row] > 0,
+            "a cell's reference keeps its slot live"
+        );
+        &self.descriptors[row]
     }
 
-    pub fn find(&self, node_id: NodeId, incarnation: Incarnation) -> Option<NodeSlot> {
-        let h = hash_node_identity(node_id, incarnation);
+    pub fn refcount(&self, slot: E::Slot) -> u32 {
+        self.refcounts
+            .get(usize::from(E::row(slot)))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Look up an existing entry by key, without inserting.
+    pub fn find(&self, key: E::Key) -> Option<E::Slot> {
         let descriptors = &self.descriptors;
         self.index
-            .find(h, |slot| {
-                let d = &descriptors[slot as usize];
-                d.node_id == node_id && d.incarnation == incarnation
-            })
-            .map(|s| NodeSlot(s as u16))
+            .find(E::hash(key), |row| descriptors[row as usize].key() == key)
+            .map(|row| E::slot(row as u16))
     }
 
-    pub(super) fn intern(&mut self, node_id: NodeId, incarnation: Incarnation) -> Option<NodeSlot> {
-        if let Some(slot) = self.find(node_id, incarnation) {
-            return Some(slot);
-        }
+    /// Intern a descriptor whose key [`Self::find`] just missed, at refcount
+    /// zero: callers manage references through [`super::CellStore`]. `None`
+    /// when the dictionary is full.
+    pub(super) fn insert(&mut self, descriptor: E) -> Option<E::Slot> {
         if self.free_head == EMPTY_DICT_SLOT {
             return None;
         }
-        let slot = self.free_head;
-        self.free_head = self.free_next[slot as usize];
-        self.descriptors[slot as usize] = NodeDescriptor {
-            node_id,
-            incarnation,
-        };
-        self.refcounts[slot as usize] = 0;
+        let row = self.free_head;
+        self.free_head = self.free_next[row as usize];
+        self.descriptors[row as usize] = descriptor;
+        self.refcounts[row as usize] = 0;
         self.index
-            .insert_unchecked(hash_node_identity(node_id, incarnation), slot as u32);
+            .insert_unchecked(E::hash(descriptor.key()), u32::from(row));
         self.len += 1;
-        Some(NodeSlot(slot))
+        Some(E::slot(row))
     }
 
-    pub(super) fn inc_ref(&mut self, slot: NodeSlot) {
-        self.refcounts[slot.index()] = self.refcounts[slot.index()].saturating_add(1);
+    pub(super) fn inc_ref(&mut self, slot: E::Slot) {
+        let rc = &mut self.refcounts[usize::from(E::row(slot))];
+        *rc = rc.saturating_add(1);
     }
 
     /// Decrement refcount. Returns `true` if the slot was freed.
-    pub(super) fn dec_ref(&mut self, slot: NodeSlot) -> bool {
-        let rc = &mut self.refcounts[slot.index()];
+    pub(super) fn dec_ref(&mut self, slot: E::Slot) -> bool {
+        let row = E::row(slot);
+        let rc = &mut self.refcounts[usize::from(row)];
         if *rc == 0 {
             return false;
         }
         *rc -= 1;
-        if *rc == 0 {
-            let d = self.descriptors[slot.index()];
-            self.index.remove(
-                hash_node_identity(d.node_id, d.incarnation),
-                u32::from(slot.0),
-            );
-            self.descriptors[slot.index()] = NodeDescriptor::default();
-            self.free_next[slot.index()] = self.free_head;
-            self.free_head = slot.0;
-            self.len -= 1;
-            true
-        } else {
-            false
+        if *rc > 0 {
+            return false;
         }
+        let key = self.descriptors[usize::from(row)].key();
+        self.index.remove(E::hash(key), u32::from(row));
+        self.descriptors[usize::from(row)] = E::default();
+        self.free_next[usize::from(row)] = self.free_head;
+        self.free_head = row;
+        self.len -= 1;
+        true
     }
 }
 
