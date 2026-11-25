@@ -47,13 +47,19 @@ pub(crate) fn incarnation_at(now_millis: u64, previous: Option<Incarnation>) -> 
     }
 }
 
+/// The IPv4 route first, then the IPv6 one, each probed from a socket of
+/// its own family.
 fn local_ip_seed() -> Option<String> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    if socket.connect("1.1.1.1:80").is_err() && socket.connect("[2606:4700:4700::1111]:80").is_err()
-    {
-        return None;
-    }
-    socket.local_addr().ok().map(|sa| sa.ip().to_string())
+    [
+        ("0.0.0.0:0", "1.1.1.1:80"),
+        ("[::]:0", "[2606:4700:4700::1111]:80"),
+    ]
+    .into_iter()
+    .find_map(|(bind, probe)| {
+        let socket = UdpSocket::bind(bind).ok()?;
+        socket.connect(probe).ok()?;
+        Some(socket.local_addr().ok()?.ip().to_string())
+    })
 }
 
 fn random_seed() -> String {
