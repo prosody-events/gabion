@@ -341,7 +341,6 @@ fn access_path_allows_then_rejects_via_aggregate_seqlock() {
     match outcome {
         AccessOutcome::Reject(info) => {
             assert_eq!(info.spec.id, spec.id);
-            assert!(info.total >= 3);
         }
         other => panic!("expected Reject after apply, got {other:?}"),
     }

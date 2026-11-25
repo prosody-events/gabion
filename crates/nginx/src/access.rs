@@ -59,7 +59,6 @@ pub enum AccessOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RejectInfo {
     pub spec: RuleSpec,
-    pub total: u64,
     pub now_millis: u64,
     /// Wall-clock ms from `now_millis` until a request of the same weight
     /// would be admitted under the sliding-window model. Computed once at
@@ -102,7 +101,7 @@ enum RuleOutcome {
     /// partial work, and the rule's quota snapshot feeds the
     /// most-constrained-rule selection that drives the `X-RateLimit-*`
     /// headers on the allowed response.
-    Allow(QuotaSnapshot, QueueEvent),
+    Allow(AllowInfo, QueueEvent),
     /// Rule evaluated and crossed its configured limit while in
     /// `Enforce` mode.
     Reject(RejectInfo),
@@ -119,17 +118,6 @@ enum RuleOutcome {
     /// Predicate `except_if=` resolved truthy; rule is skipped for this
     /// request.
     Exempt,
-}
-
-/// Per-rule quota view captured at the same instant the admission
-/// decision is made. Trivially `Copy` so [`decide_all`] can stash it
-/// while folding sibling outcomes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct QuotaSnapshot {
-    spec: RuleSpec,
-    /// Budget remaining after this request. Saturating: a `DryRun` rule
-    /// already past `spec.limit` reports `0`.
-    remaining: u64,
 }
 
 /// Evaluate one request against every rule in `rule_indices`. Rules
@@ -158,17 +146,15 @@ pub fn decide_all(
     events.clear();
 
     let mut worst_reject: Option<RejectInfo> = None;
-    let mut tightest_allow: Option<QuotaSnapshot> = None;
-    let mut had_non_exempt_outcome = false;
+    let mut tightest_allow: Option<AllowInfo> = None;
     let mut overflowed = false;
     let mut any_exempt = false;
     let mut any_cardinality = false;
 
     for &index in rule_indices {
         match decide_one(ctx, index, vars, now_millis) {
-            RuleOutcome::Allow(snapshot, event) => {
-                had_non_exempt_outcome = true;
-                tightest_allow = Some(pick_min_remaining(tightest_allow, snapshot));
+            RuleOutcome::Allow(info, event) => {
+                tightest_allow = Some(pick_min_remaining(tightest_allow, info));
                 // Past the bound the rule is allowed but not counted: the
                 // bound is gabion's own, so the request under-counts rather
                 // than over-rejects.
@@ -179,7 +165,6 @@ pub fn decide_all(
                 }
             }
             RuleOutcome::Reject(info) => {
-                had_non_exempt_outcome = true;
                 worst_reject = Some(pick_longest_window(worst_reject, info));
             }
             RuleOutcome::Decline => {
@@ -200,7 +185,7 @@ pub fn decide_all(
         ctx.stats.record_reject();
         return AccessOutcome::Reject(info);
     }
-    if had_non_exempt_outcome {
+    if let Some(info) = tightest_allow {
         // One shared write per counter per request, not one per event.
         let (mut pushed, mut dropped) = (0, 0);
         for &event in events.iter() {
@@ -215,11 +200,7 @@ pub fn decide_all(
             ctx.stats.record_matched_rule_overflow();
         }
         ctx.stats.record_allow();
-        return AccessOutcome::Allow(tightest_allow.map(|snap| AllowInfo {
-            spec: snap.spec,
-            remaining: snap.remaining,
-            now_millis,
-        }));
+        return AccessOutcome::Allow(Some(info));
     }
     if any_exempt {
         // Exempt-only outcome: every rule's `except_if=` predicate fired,
@@ -303,7 +284,6 @@ fn decide_one(
             .time_until_admit_millis(spec, key_hash, now_millis, total, hits);
         return RuleOutcome::Reject(RejectInfo {
             spec,
-            total,
             now_millis,
             delta_until_admit_millis,
         });
@@ -320,7 +300,14 @@ fn decide_one(
     // budget; over-limit DryRun (which the gate above lets through)
     // reports 0 rather than underflowing.
     let remaining = spec.limit.saturating_sub(total).saturating_sub(hits);
-    RuleOutcome::Allow(QuotaSnapshot { spec, remaining }, event)
+    RuleOutcome::Allow(
+        AllowInfo {
+            spec,
+            remaining,
+            now_millis,
+        },
+        event,
+    )
 }
 
 /// Pick the rule with the longer window among a candidate and a current
@@ -339,7 +326,7 @@ fn pick_longest_window(current: Option<RejectInfo>, candidate: RejectInfo) -> Re
 /// rule with the *longer* window — mirroring [`pick_longest_window`]'s
 /// rationale: the client should see the most-constraining context, not
 /// the one that resets soonest.
-fn pick_min_remaining(current: Option<QuotaSnapshot>, candidate: QuotaSnapshot) -> QuotaSnapshot {
+fn pick_min_remaining(current: Option<AllowInfo>, candidate: AllowInfo) -> AllowInfo {
     match current {
         Some(c) if c.remaining < candidate.remaining => c,
         Some(c)

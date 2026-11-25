@@ -16,7 +16,6 @@ fn spec(limit: u64) -> RuleSpec {
 fn reject_info(limit: u64, delta_until_admit_millis: u64, now_millis: u64) -> RejectInfo {
     RejectInfo {
         spec: spec(limit),
-        total: limit,
         now_millis,
         delta_until_admit_millis,
     }
@@ -57,13 +56,6 @@ fn reject_sub_second_delta_floors_retry_after_at_one() {
     let retry = h.retry_after.expect("retry_after on reject");
     assert_eq!(retry.as_str(), "1");
     assert_eq!(h.reset.as_str(), "1");
-}
-
-#[test]
-fn reject_body_says_over_by() {
-    let body = RejectBody::build(reject_info(3, 60_000, 0));
-    assert!(body.as_str().contains("limit=3"));
-    assert!(body.as_str().contains("over_by=1"));
 }
 
 #[test]

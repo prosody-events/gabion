@@ -100,7 +100,6 @@ fn reject_when_window_total_exceeds_limit() {
     match outcome {
         AccessOutcome::Reject(info) => {
             assert_eq!(info.spec.id, spec.id);
-            assert_eq!(info.total, 5);
             // Rule: limit=2, window=1s, bucket=250ms (live=4). All 5 hits
             // sit in bucket 4 (now=1000ms). need = 5+1-2 = 4. Walking
             // buckets 1..4 oldest-first: 0,0,0,5 — bucket 4 alone covers
@@ -137,7 +136,6 @@ fn reject_delta_reflects_oldest_non_empty_bucket() {
     let outcome = decide(ctx(&rules, &region, |_| {}), &[0], &vars, 1_000);
     match outcome {
         AccessOutcome::Reject(info) => {
-            assert_eq!(info.total, 5);
             assert_eq!(info.delta_until_admit_millis, 500);
         }
         other => panic!("expected Reject, got {other:?}"),
