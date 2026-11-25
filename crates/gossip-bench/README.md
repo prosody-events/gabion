@@ -154,7 +154,7 @@ with:
 python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, "crates/gossip-bench/judge"); import judge; print(judge.core_hash(sys.argv[1], Path(".")))' "$(git rev-parse HEAD:crates/gossip-bench)"
 ```
 
-Core hash: `eb10374f173bc033483c8ee8c0daffc140d40ce7`. A new or
+Core hash: `85f4dc7d354111da3e76b6478d583d8de5830d0b`. A new or
 changed regime, or any other edit to the core, changes it, requires rerunning
 `make sim-baselines`, and updates this line.
 

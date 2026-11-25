@@ -80,7 +80,7 @@ impl NodePlan {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlanEvent {
     Start(usize),
-    Stop(usize, StopKind),
+    Stop(usize),
     /// Tell pod `to` that pod `about` was added (`true`) or removed.
     Discover {
         to: usize,
@@ -160,7 +160,7 @@ impl Plan {
         for (j, plan) in nodes.iter().enumerate() {
             events.push((plan.start_ns, PlanEvent::Start(j)));
             if let Some(stop) = plan.stop {
-                events.push((stop.at_ns, PlanEvent::Stop(j, stop.kind)));
+                events.push((stop.at_ns, PlanEvent::Stop(j)));
             }
         }
         // Discovery. A starting pod lists every current member at once; the

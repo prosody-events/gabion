@@ -22,7 +22,7 @@ use gabion::crdt::{
     BucketEpoch, CellStore, DeltaSink, ExpirationSink, KeyHash, NodeId, NodeIdentity,
     ValidStorageConfig,
 };
-pub(super) use gabion::defaults as d;
+use gabion::defaults as d;
 use gabion::discovery::{Peer, PeerEvent};
 use gabion::gossip::{
     AdminCommand, AdminSnapshot, AggregateStore, GossipClient, GossipError, GossipRuntime,
@@ -253,7 +253,7 @@ impl HealthReply {
 /// The production settings with the store sized for the regime and the peer
 /// table for every node it starts, which the launcher validates once as
 /// `gabiond` validates them.
-pub(super) fn settings(sizing: &Sizing) -> Result<Settings> {
+fn settings(sizing: &Sizing) -> Result<Settings> {
     Ok(Settings {
         max_cells: sizing.cell_capacity.try_into()?,
         peer_capacity: u16::try_from(sizing.total_nodes)?

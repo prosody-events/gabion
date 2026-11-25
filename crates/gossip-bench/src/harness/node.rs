@@ -75,10 +75,6 @@ impl KeySpace {
         self.kinds.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.kinds.is_empty()
-    }
-
     pub fn bucket_of(&self, now_millis: u64) -> u32 {
         (now_millis / self.bucket_ms) as u32
     }

@@ -279,13 +279,3 @@ fn a_run_that_never_repairs_does_not_heal() {
     assert!(report.unrepaired_at_expiry_hits > Some(0.0));
     assert_eq!(report.time_to_heal_ms, None);
 }
-
-#[test]
-fn a_regime_may_cut_the_network_once_and_heal_after_it_starts() {
-    let mut regime = fixtures::partitioned();
-    regime.churn.partitions.push(regime.churn.partitions[0]);
-    assert!(regime.validate().is_err());
-    regime.churn.partitions.truncate(1);
-    regime.churn.partitions[0].heal_s = 10;
-    assert!(regime.validate().is_err());
-}

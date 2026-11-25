@@ -220,7 +220,7 @@ where
                 }
             }
             Event::Plan(PlanEvent::Start(v)) => self.start(v)?,
-            Event::Plan(PlanEvent::Stop(v, _)) => self.stop(v),
+            Event::Plan(PlanEvent::Stop(v)) => self.stop(v),
             Event::Plan(PlanEvent::Discover { to, about, added }) => {
                 if !matches!(self.pods[to], Pod::Stopped) {
                     let waker = self.world.discover(to, peer_event(node_addr(about), added));
