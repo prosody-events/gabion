@@ -15,7 +15,7 @@
     "audit": "playwright test tests/audit.spec.ts tests/motion.spec.ts tests/story.spec.ts tests/next.spec.ts tests/messages.spec.ts"
   },
   "devDependencies": {
-    "@playwright/test": "^1.64.1",
+    "@playwright/test": "^1.65.1",
     "@sveltejs/vite-plugin-svelte": "^7.3.1",
     "@tsconfig/svelte": "^5.0.8",
     "@types/node": "^26.6.5",
