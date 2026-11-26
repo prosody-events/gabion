@@ -1,24 +1,16 @@
-//! SHM zone header: magic, version, identity, geometry summary, rule digest,
-//! aggregate write sequence.
+//! SHM zone header: identity, aggregate write sequence.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-pub const SHM_MAGIC: u32 = 0x4742_4e58; // "GBNX"
-pub const SHM_VERSION: u32 = 3;
-
-/// Node identity fields stored cross-process. `node_id` is stamped once by
-/// the master process before fork; `incarnation` is updated atomically by
-/// each leader takeover so peers see fresh `(node_id, incarnation)` pairs
-/// after a flip.
+/// Node identity fields stored cross-process. `node_id` is stamped by the
+/// master on every config load, before fork; `incarnation` is updated
+/// atomically by each leader takeover so peers see fresh `(node_id,
+/// incarnation)` pairs after a flip.
 ///
 /// `node_id` is logically a `u128` but stored as a paired
-/// `(AtomicU64, AtomicU64)` for the same reason `MainConfig` in
-/// `module.rs` is `Box::new`'d: the SHM mapping only guarantees
-/// `align_of::<u64>` = 8, and a 16-aligned `u128` placed directly here
-/// would be UB on amd64 (LLVM lowers u128 access to aligned SSE). See
-/// `Module::create_main_conf`'s doc comment for the same hazard in the
-/// nginx pool. `shm/queue.rs` and `shm/aggregate.rs` use the same
-/// paired-u64 convention for their own logical-u128 fields.
+/// `(AtomicU64, AtomicU64)`: stable Rust has no 128-bit atomic.
+/// `shm/queue.rs` and `gabion::aggregate` use the same paired-u64
+/// convention for their own logical-u128 fields.
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct NodeIdentityFields {
@@ -54,13 +46,7 @@ impl NodeIdentityFields {
 #[repr(C)]
 #[derive(Debug)]
 pub struct Header {
-    pub magic: AtomicU32,
-    pub version: AtomicU32,
     pub identity: NodeIdentityFields,
-    pub zone_bytes: AtomicU64,
-    pub queue_capacity: AtomicU64,
-    pub aggregate_capacity: AtomicU64,
-    pub rule_table_digest: AtomicU64,
     /// The next sequence the aggregate writer stamps on a slot. Every leader
     /// continues it, so a reader holding a sequence from a slot that has
     /// since been freed or cleared cannot accept it again over another cell.
@@ -70,24 +56,8 @@ pub struct Header {
 impl Default for Header {
     fn default() -> Self {
         Self {
-            magic: AtomicU32::new(SHM_MAGIC),
-            version: AtomicU32::new(SHM_VERSION),
             identity: NodeIdentityFields::default(),
-            zone_bytes: AtomicU64::new(0),
-            queue_capacity: AtomicU64::new(0),
-            aggregate_capacity: AtomicU64::new(0),
-            rule_table_digest: AtomicU64::new(0),
             aggregate_write_seq: AtomicU64::new(2),
         }
     }
 }
-
-impl Header {
-    pub fn is_initialized(&self) -> bool {
-        self.magic.load(Ordering::Acquire) == SHM_MAGIC
-            && self.version.load(Ordering::Acquire) == SHM_VERSION
-    }
-}
-
-#[cfg(test)]
-mod tests;

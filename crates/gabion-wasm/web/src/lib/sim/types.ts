@@ -6,17 +6,19 @@
 // Numeric boundary convention (asserted at runtime in `sim.ts`, checked
 // statically by `pnpm run check`):
 //
-//   • u128 ids — `rule`, `key`, `node_id`, `rule_fingerprint` — cross as
-//     **hex strings** ("0x…"), serialized by `crate::hex`.
-//   • u64 counts and timestamps — `virtual_ms`, `tick`, `count`,
-//     `aggregate_total`, `oracle_total`, … — cross as JS **numbers**.
+//   • u128 ids — `rule`, `key`, `node_id` — cross as **32-nibble lowercase
+//     hex strings, no prefix**, serialized by `crate::hex`.
+//   • `Option::None` crosses as `undefined` (serde-wasm-bindgen's default), so
+//     every Option field is typed `T | undefined`, never `T | null`.
+//   • u64 counts and timestamps — `virtual_ms`, `count`, `window_total`,
+//     `oracle_total`, … — cross as JS **numbers**.
 //     serde-wasm-bindgen's `serialize_large_number_types_as_bigints` defaults
 //     to `false`, so any u64 within 2^53 is a plain number. The visualizer's
 //     hit volumes stay far below that, so `number` is exact here. If a future
 //     scenario can exceed 2^53, flip that serializer flag and widen these to
 //     `bigint`.
 
-/** A u128 identifier rendered as a "0x"-prefixed hex string across the boundary. */
+/** A u128 identifier rendered as a 32-nibble lowercase hex string, no prefix, across the boundary. */
 export type Hex = string;
 
 // -- Configuration ----------------------------------------------------------
@@ -26,17 +28,20 @@ export type Hex = string;
  *  defaults baked into the Rust side. */
 export interface SimConfig {
   nodes: number;
-  fanout: number;
   tick_interval_ms: number;
   target_err_bps: number;
   min_emit_interval_ms: number;
-  rule_fingerprint: Hex;
   rule_limit: number;
   rule_window_ms: number;
   rule_bucket_ms: number;
-  rng_seed: number;
   uniform_loss: number;
+  /** Zones nodes are placed in, 1 to 6: node `i` at build is in zone `i mod zones`. */
+  zones: number;
+  zone_mode: ZoneMode;
 }
+
+/** Mirror of `crate::config::ZoneMode`: whether nodes are told their zone. */
+export type ZoneMode = 'Configured' | 'Unset';
 
 /** Mirror of `crate::engine::LinkPolicyKind` (serde-tagged by `kind`). */
 export type LinkPolicyKind =
@@ -47,116 +52,307 @@ export type LinkPolicyKind =
 
 // -- Events -----------------------------------------------------------------
 
+/** Mirror of `crate::event::PacketKind`: a packet's kind on the wire. */
+export type PacketKind = 'Ack' | 'Own' | 'Relay' | 'Sweep' | 'SweepRequest';
+
+/** Mirror of `crate::event::MessageRole`, in its declaration order (the
+ *  capture's rows carry the index): the one role a message is listed and
+ *  drawn as, read once from its header. */
+export const ROLES = [
+  'OwnData',
+  'RelayData',
+  'SweepPage',
+  'OwnSkip',
+  'RelaySkip',
+  'GapReport',
+  'Probe',
+  'SweepRequest',
+  'ProbeAnswer',
+  'Ack',
+] as const;
+export type MessageRole = (typeof ROLES)[number];
+
+/** Mirror of `MessageRole::kind`: the wire kind each role is sent as. */
+export const KIND: Readonly<Record<MessageRole, PacketKind>> = {
+  OwnData: 'Own',
+  OwnSkip: 'Own',
+  RelayData: 'Relay',
+  RelaySkip: 'Relay',
+  SweepPage: 'Sweep',
+  SweepRequest: 'SweepRequest',
+  GapReport: 'Ack',
+  Probe: 'Ack',
+  ProbeAnswer: 'Ack',
+  Ack: 'Ack',
+};
+
+/** Mirror of `PacketKind::carries_cells` by role: whether a message streams
+ *  cells (data) rather than controlling the streams. A skip or an empty sweep
+ *  page counts as data, as its kind does. */
+export const CARRIES_CELLS: Readonly<Record<MessageRole, boolean>> = {
+  OwnData: true,
+  OwnSkip: true,
+  RelayData: true,
+  RelaySkip: true,
+  SweepPage: true,
+  SweepRequest: false,
+  GapReport: false,
+  Probe: false,
+  ProbeAnswer: false,
+  Ack: false,
+};
+
+/** Mirror of `crate::event::Riders`: the other signals a message carries. */
+export const RIDERS = {
+  GAP_REPORT: 1,
+  PROBE: 2,
+  PROBE_ANSWER: 4,
+  CANNOT_RELAY: 8,
+  FOR_ZONE: 16,
+} as const;
+
+/** Mirror of `crate::event::ListedRepeat`. */
+export type ListedRepeat = 'AfterTimeout' | 'AfterGapReport';
+
+/** How many waves `batch` holds: the distinct instants at which it sent or lost
+ *  a packet that carries cells, the engine's own test
+ *  (`EngineState::open_sub_step`); events come in time order. A step by event
+ *  stops at its first wave with the engine's sub-step open, so there a batch
+ *  with a wave holds one, its packets not yet delivered. */
+export function waves(batch: EventBatch): number {
+  const events = batch.events;
+  let count = 0;
+  let at = Number.NaN;
+  for (let i = 0; i < events.length; i++) {
+    const { kind, virtual_ms } = events[i];
+    if ((kind.type === 'PacketSent' || kind.type === 'PacketDropped') && CARRIES_CELLS[kind.role] && virtual_ms !== at) {
+      count += 1;
+      at = virtual_ms;
+    }
+  }
+  return count;
+}
+
+/** Mirror of `crate::engine::StepUntil`: where a step stops. `Event` stops
+ *  before a wave of data packets is delivered (the engine holds it until the
+ *  next call), or where some node's window of `key` drops a bucket that holds
+ *  hits. */
+export type StepUntil = 'Time' | { Event: { key: number } };
+
+/** Mirror of `crate::event::Burst`: a node's decisions on a burst of one-hit
+ *  requests, taken in order against its own window. `Rejected` admitted the
+ *  first `admitted` (none if the window was full) and refused the other
+ *  `rejected`; one more request fits in `reopens_ms`. */
+export type Burst =
+  | { kind: 'Admitted'; requests: number; total_before: number }
+  | { kind: 'Rejected'; admitted: number; rejected: number; total: number; reopens_ms: number };
+
+/** The requests `burst` admitted and recorded. */
+export function admittedOf(burst: Burst): number {
+  return burst.kind === 'Admitted' ? burst.requests : burst.admitted;
+}
+
+/** Mirror of `crate::event::Admission`: a node's decision on one more
+ *  request, of one hit. */
+export type Admission =
+  | { kind: 'Admitted'; total_before: number }
+  | { kind: 'Rejected'; total: number; reopens_ms: number };
+
+/** Mirror of `crate::event::Lag`: whether a node holds every in-window change,
+ *  and if not, whether waiting can help (`Behind`) or not (`Stranded`). */
+export type Lag =
+  | { kind: 'CaughtUp' }
+  | { kind: 'Behind'; missing_for_ms: number }
+  | { kind: 'Stranded'; missing_for_ms: number };
+
+/** How long a lagging node has lacked its oldest missing change; absent while
+ *  it is caught up. */
+export function missingFor(lag: Lag): number | undefined {
+  return lag.kind === 'CaughtUp' ? undefined : lag.missing_for_ms;
+}
+
+/** Mirror of `crate::event::Tier`: whether a packet stayed inside its sender's
+ *  zone, by placement. */
+export type Tier = 'InZone' | 'CrossZone';
+
 /** Mirror of `crate::event::EventKind` (serde-tagged by `type`). */
 export type EventKind =
+  | { type: 'Decided'; node: number; burst: Burst }
   | { type: 'Tick'; node: number }
-  | { type: 'ThresholdFire'; node: number }
-  | { type: 'PacketSent'; src: number; dst: number; bytes: number }
+  | ({ type: 'PacketSent' } & Message)
   | { type: 'PacketDelivered'; src: number; dst: number; bytes: number }
-  | { type: 'PacketDropped'; src: number; dst: number; bytes: number }
+  | ({ type: 'PacketDropped' } & Message)
+  | { type: 'GatewayChanged'; origin: number; zone: number; from: number | undefined; to: number | undefined }
   | { type: 'CellCreated'; node: number; rule: Hex; key: Hex; bucket: number; count: number }
-  | { type: 'CellUpdated'; node: number; rule: Hex; key: Hex; bucket: number; count: number }
-  | { type: 'CellExpired'; node: number; rule: Hex; key: Hex; bucket: number };
+  | { type: 'CellUpdated'; node: number; rule: Hex; key: Hex; bucket: number; count: number };
+
+/** A sent or dropped packet's fields: its number in the run, its route and
+ *  size, and what it says. */
+export interface Message {
+  seq: number;
+  src: number;
+  dst: number;
+  bytes: number;
+  role: MessageRole;
+  riders: number;
+  repeat: ListedRepeat | undefined;
+  cells: number;
+  tier: Tier;
+}
 
 /** Mirror of `crate::event::Event`. */
 export interface SimEvent {
-  tick: number;
   virtual_ms: number;
   kind: EventKind;
 }
 
-/** Mirror of `crate::event::EventBatch` — the result of one step / submit. */
+/** Mirror of `crate::event::EventBatch` — the result of one engine command. */
 export interface EventBatch {
   events: SimEvent[];
   virtual_ms: number;
-  tick: number;
 }
 
 // -- Snapshot ---------------------------------------------------------------
 
-/** Mirror of `crate::event::CellView`. */
-export interface CellView {
-  rule: Hex;
-  key: Hex;
-  bucket: number;
-  count: number;
-  age_ms: number;
-  origin: number | null;
-  is_local: boolean;
-}
+/** What a peer is to a node (`gabion::gossip::Role`, snake_case). */
+export type Role = 'unheard' | 'zone' | 'gateway' | 'remote' | 'incompatible';
+
+/** Whether a node waits for a peer's answer (`gabion::gossip::AnswerState`). */
+export type AnswerState = 'settled' | 'owed' | 'suspect' | 'cannot_relay';
+
+/** Each answer state as the page shows it: whether the gateway is suspected
+ *  (a hollow port rather than a solid one) and the word the targets table
+ *  prints. */
+export const ANSWER: Record<AnswerState, { readonly suspect: boolean; readonly label: string }> = {
+  settled: { suspect: false, label: 'ok' },
+  owed: { suspect: false, label: 'ok' },
+  suspect: { suspect: true, label: 'suspected' },
+  cannot_relay: { suspect: true, label: 'cannot relay' },
+};
 
 /** Mirror of `crate::event::PeerView`. */
 export interface PeerView {
   /** The peer's stable id, if the engine can resolve its address. */
-  id: number | null;
-  /** The peer's gossip node id once an inbound packet has revealed it. */
-  node_id: Hex | null;
-}
-
-/** Mirror of `crate::event::StoreStats` — the CRDT store's occupancy and
- *  saturation counters (itself a mirror of `gabion::crdt::CellStoreStats`). */
-export interface StoreStats {
-  active_cells: number;
-  cell_capacity: number;
-  rule_slots_used: number;
-  rule_slots_capacity: number;
-  node_slots_used: number;
-  node_slots_capacity: number;
-  cell_store_full_rejects: number;
-  rule_dictionary_full_rejects: number;
-  node_dictionary_full_rejects: number;
+  id: number | undefined;
+  /** The zone the peer reports, by index; absent while unknown or with no zone. */
+  zone: number | undefined;
+  role: Role;
+  answer: AnswerState;
+  /** How long the oldest packet waiting for the peer's answer has waited. */
+  unanswered_ms: number | undefined;
+  /** Own-stream positions sent to the peer and not yet acknowledged. */
+  own_unacked: number;
 }
 
 /** Mirror of `crate::event::NodeState`. `id` is the node's stable identity (see
  *  the Rust module note): assigned once, never reused, so it survives other
  *  nodes joining and leaving and has gaps once a member has been removed. The
- *  scalar fields mirror the runtime's `AdminSnapshot`. */
+ *  counters mirror the runtime's `GossipCounters`; the window, decision, lag,
+ *  heartbeat and hit fields the engine reads or counts. */
 export interface NodeState {
+  id: number;
+  /** The zone the node is placed in. */
+  zone: number;
+  /** gabion's `window_total` of the watched key on this node's own count
+   *  table: the number its admission reads. */
+  window_total: number;
+  /** The decision one more request, of one hit, would get here now:
+   *  `Rejected` exactly while the node is at its limit. */
+  brim: Admission;
+  lag: Lag;
+  /** The next instant this node's heartbeat fires, in virtual ms. */
+  next_heartbeat_ms: number;
+  /** Hits this node admitted, and rejected, since it joined, of every key. */
+  admitted_hits: number;
+  rejected_hits: number;
+  /** Gateways replaced because they went unanswered or said they cannot relay. */
+  gateway_failovers: number;
+  /** Gap reports sent: a peer's stream skipped positions. */
+  gap_reports_sent: number;
+  /** Gaps given up after their reports went unanswered. */
+  gaps_abandoned: number;
+  /** Own-stream timeouts that resent from the last ack. */
+  rto_rewinds_own: number;
+  /** The same for the relay stream. */
+  rto_rewinds_relay: number;
+  /** Join sweeps this node started answering. */
+  sweeps_served: number;
+  /** Origins whose runtime sends this node's zone their changes through this
+   *  node: the gateway rows of every node, inverted. */
+  gateway_for: number;
+}
+
+/** Mirror of `crate::event::Inspected`: the inspected node's identity, store
+ *  and peer rows, from its admin snapshot, read at the same instant as the
+ *  rest of the snapshot. */
+export interface Inspected {
   id: number;
   /** The on-the-wire gossip identity (`NodeIdentity.node_id`), distinct from the
    *  display `id`. */
   node_id: Hex;
   /** Incarnation — bumped on restart; always 1 in the sim. */
   incarnation: number;
-  aggregate_total: number;
-  ticks_total: number;
-  threshold_fires: number;
-  /** Subset of `ticks_total` that actually carried gossip work (a cell was
-   *  dirty at the peer pick). */
-  dirty_ticks: number;
-  /** The coverage fanout the most recent dirty tick chose — `⌈ln(peers)+c⌉`,
-   *  ≥ the base `fanout` floor, scaled by cluster size not the dirty set.
-   *  0 before the first emit. */
-  effective_fanout: number;
-  /** High-water mark of `effective_fanout` since startup. */
-  peak_fanout: number;
   /** Per-rule error budget ε at the most recent request; pending crossing it
    *  triggers an eager (threshold) flush. 0 until a request is seen. */
   error_budget: number;
-  /** Rows in the local-origin dirty ring awaiting gossip out. */
-  local_dirty_len: number;
-  /** Rows in the forwarded (received-then-re-gossiped) dirty ring. */
-  forwarded_dirty_len: number;
-  /** Outbound packets queued behind the transport right now. */
-  send_pending_depth: number;
-  /** High-water mark of `send_pending_depth` since startup. */
-  max_send_pending_depth: number;
-  /** Inbound packets the wire decoder rejected. */
-  decode_reject_count: number;
-  store_stats: StoreStats;
-  cells: CellView[];
+  /** Cells the node's CRDT store holds, and the most it can. */
+  active_cells: number;
+  cell_capacity: number;
   peers: PeerView[];
 }
 
-/** Mirror of `crate::event::ClusterState` — the full per-node dump pulled on
- *  seek / re-render. `oracle_total` is the simulator-only ground truth. */
+/** Mirror of `crate::event::ZoneView`: a zone and its live members. */
+export interface ZoneView {
+  name: string;
+  live: number;
+}
+
+/** Mirror of `crate::event::ClassBytes`. */
+export interface ClassBytes {
+  data: number;
+  control: number;
+}
+
+/** Mirror of `crate::event::BytesByTier`: bytes sent since the session began,
+ *  delivered or lost. */
+export interface BytesByTier {
+  in_zone: ClassBytes;
+  cross_zone: ClassBytes;
+}
+
+/** Mirror of `crate::event::ClusterState` — every node's state, pulled each
+ *  frame, with one inspected node's rows. `oracle_total` is the simulator-only
+ *  ground truth. */
 export interface ClusterState {
   virtual_ms: number;
-  tick: number;
   nodes: NodeState[];
+  /** The rows of the node the snapshot was taken inspecting; absent when none
+   *  was, or it is not live. */
+  inspected?: Inspected;
+  /** Every zone in index order, with its live members. */
+  zones: ZoneView[];
+  bytes_by_tier: BytesByTier;
+  /** The watched key's hits in the window, summed over every origin's own
+   *  cells, a departed origin's as the fullest replica a live node holds. */
   oracle_total: number;
-  /** The bucket epoch the watched rule sits in at `virtual_ms`, from the CRDT's
-   *  `RuleDescriptor::current_epoch`. The Strata right-anchors its fixed-width
-   *  grid on this epoch rather than recomputing the boundary in TS. */
+  /** `oracle_total` by live bucket, oldest first; its length is the window's
+   *  bucket count. */
+  oracle_buckets: number[];
+  /** Every node's count in each live bucket, oldest first, row by row in
+   *  `nodes` order. */
+  window_buckets: number[];
+  /** Hits the cluster admitted, and rejected, since the session began, of
+   *  every key. */
+  admitted_hits: number;
+  rejected_hits: number;
+  /** The next instant some node's window of the watched key drops a bucket
+   *  that holds hits; absent when no node's window holds any. */
+  next_expiry_ms: number | undefined;
+  /** The bucket epoch the watched rule sits in at `virtual_ms`, from
+   *  `RuleSpec::bucket_at`: the page dates Sends and window events by it
+   *  rather than recomputing the boundary in TS. */
   bucket_epoch_now: number;
+  /** `gossip.suspect_after`: how long a node waits on an unanswered gateway
+   *  before it gives up on it, in ms. */
+  suspect_after_ms: number;
 }

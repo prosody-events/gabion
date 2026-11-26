@@ -3,10 +3,10 @@
 //!
 //! This crate adds **no new simulator**. [`engine::run_engine`] stands up N
 //! [`gabion::gossip::GossipRuntime`]s on one shared
-//! [`gabion::gossip::sim::SimRouter`] under paused virtual time — the exact
-//! machinery `gossip-bench` already exercises — and exposes it over a command
-//! channel so the page can inject requests, partition links, advance time, and
-//! pull a per-node snapshot. Two thin observation shims
+//! [`gabion::gossip::sim::SimRouter`] under paused virtual time — the same
+//! deterministic router the library's own tests run on — and exposes it over a
+//! command channel so the page can inject requests, partition links, advance
+//! time, and pull a per-node snapshot. Two thin observation shims
 //! ([`shims::EventEmittingAggregateStore`], [`shims::LoggingSimTransport`])
 //! turn the runtime's existing push surfaces into a typed [`event::Event`]
 //! log.
@@ -20,6 +20,7 @@
 //! with `cargo nextest`, so the engine and shims are validated without any
 //! wasm toolchain.
 
+pub mod capture;
 pub mod clock;
 pub mod config;
 pub mod engine;

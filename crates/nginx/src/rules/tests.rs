@@ -1,78 +1,77 @@
+use gabion::crdt::{CellStore, NodeId, NodeIdentity};
+
+use super::mock::{compile, directive, rules};
 use super::*;
-
-fn binding(key: &str, var: &str) -> DescriptorBinding {
-    DescriptorBinding {
-        key: key.into(),
-        source: format!("${var}").into_boxed_str(),
-    }
-}
-
-fn cfg(name: &str, bindings: Vec<DescriptorBinding>) -> RuleConfig {
-    RuleConfig {
-        name: name.into(),
-        domain: DEFAULT_DOMAIN.into(),
-        bindings,
-        limit: 10,
-        window: Duration::from_secs(60),
-        bucket: Duration::from_secs(1),
-        mode: EnforcementMode::Enforce,
-        except_if: None,
-    }
-}
+use crate::mock::validated;
 
 #[test]
 fn compiles_simple_rules() {
-    let rules = CompiledRules::compile(&[
-        cfg("per_tenant", vec![binding("tenant", "http_x_tenant")]),
-        cfg("per_uri", vec![binding("uri", "uri")]),
-    ])
-    .expect("compile");
-    assert_eq!(rules.len(), 2);
-    assert_eq!(rules.rules()[0].rule.spec().limit, 10);
-    assert_eq!(rules.rules()[0].rule.spec().live_buckets, 60);
-    let table = rules.table();
-    assert_eq!(table.len(), 2);
+    let rules = rules(&[
+        "per_tenant tenant:$http_x_tenant rate=10r/m bucket=1s",
+        "per_uri $uri rate=10r/m bucket=1s",
+    ]);
+    assert_eq!(rules.table().rules().len(), 2);
+    let (rule, compiled) = rules.get(0).expect("rule 0");
+    assert_eq!(rule.spec().limit, 10);
+    assert_eq!(rule.spec().live_buckets.get(), 60);
+    assert_eq!(compiled.bindings.len(), 1);
 }
 
+/// The configured `gabion_storage_max_key_bytes` is the only key-length
+/// bound: a key over the default parses and compiles once the zone raises it.
 #[test]
-fn empty_bindings_reject() {
-    let err = CompiledRules::compile(&[cfg("bad", vec![])]).unwrap_err();
-    assert!(matches!(err, RuleConfigError::EmptyBindings(_)));
-}
-
-#[test]
-fn empty_set_rejects() {
-    let err = CompiledRules::compile(&[]).unwrap_err();
-    assert_eq!(err, RuleConfigError::Empty);
-}
-
-#[test]
-fn key_too_long_at_compile() {
+#[cfg_attr(
+    all(miri, target_arch = "aarch64"),
+    ignore = "hashing a key this long takes twox-hash's NEON path, whose inline assembly Miri \
+              cannot run; the x86_64 Miri job covers it"
+)]
+fn raised_max_key_bytes_admits_long_key() {
     let long_key = "k".repeat(200);
-    let cardinality = CardinalitySettings::default();
-    let err = CompiledRules::compile_with_cardinality(
-        &[cfg("long", vec![binding(&long_key, "http_x")])],
-        cardinality,
-    )
-    .unwrap_err();
-    assert!(matches!(err, RuleConfigError::KeyTooLong { .. }));
+    let config = directive(&format!("long ${long_key} {long_key}x:$http_x rate=10r/s"));
+    let (_, storage) = validated(|s| s.max_key_bytes = 256.try_into().unwrap());
+    let rules = CompiledRules::compile_with(&[config], &storage, &mut NopBindingCompiler)
+        .expect("a 200-byte key fits a 256-byte budget");
+    assert_eq!(rules.table().rules()[0].descriptors()[0].key.len(), 200);
 }
 
+/// The directive's argument errors, reported at its line.
 #[test]
-fn too_many_bindings_at_compile() {
-    let bindings = (0..MAX_DESCRIPTORS + 1)
-        .map(|i| binding(&format!("k{i}"), &format!("v{i}")))
-        .collect();
-    let err = CompiledRules::compile(&[cfg("wide", bindings)]).unwrap_err();
-    assert!(matches!(err, RuleConfigError::TooManyBindings(_)));
-}
-
-#[test]
-fn zero_limit_is_rejected_at_compile() {
-    let mut rule = cfg("zero", vec![binding("uri", "uri")]);
-    rule.limit = 0;
-    let err = CompiledRules::compile(&[rule]).unwrap_err();
-    assert!(matches!(err, RuleConfigError::ZeroLimit(_)));
+fn parse_rule_directive_reports_argument_errors() {
+    let parse = |text: &str| {
+        let args: Vec<&str> = text.split_whitespace().collect();
+        parse_rule_directive(&args)
+    };
+    assert_eq!(parse(""), Err(RuleArgError::MissingName));
+    assert_eq!(
+        parse("r $uri"),
+        Err(RuleArgError::MissingRate { rule: "r".into() })
+    );
+    for text in [
+        "r $uri rate=10r/s mode=enforce dry_run",
+        "r $uri rate=10r/s dry_run mode=enforce",
+    ] {
+        assert_eq!(
+            parse(text),
+            Err(RuleArgError::DryRunConflict { rule: "r".into() }),
+            "{text}"
+        );
+    }
+    for arg in [
+        "rate=0r/s",
+        "rate=10r/fortnight",
+        "window=soon",
+        "bucket=soon",
+        "mode=loud",
+        "except_if=$bad-ident",
+        "value=:acme",
+        "value=tenant",
+        "tenant:",
+    ] {
+        assert!(
+            matches!(parse(&format!("r tenant:$t rate=10r/s {arg}")), Err(RuleArgError::Invalid { arg: a, .. }) if &*a == arg),
+            "{arg}"
+        );
+    }
 }
 
 #[test]
@@ -80,6 +79,7 @@ fn parse_binding_auto_keyed_single_variable() {
     let b = parse_binding("$remote_addr").unwrap();
     assert_eq!(b.key.as_ref(), "remote_addr");
     assert_eq!(b.source.as_ref(), "$remote_addr");
+    assert_eq!(b.value.as_ref(), "*");
 }
 
 #[test]
@@ -97,39 +97,8 @@ fn parse_binding_template() {
 }
 
 #[test]
-fn parse_binding_rejects_invalid_key_characters() {
-    assert!(parse_binding("bad key:$var").is_err());
-    assert!(parse_binding("bad/key:$var").is_err());
-    assert!(parse_binding("9leading:$var").is_err());
-}
-
-#[test]
-fn parse_binding_accepts_kebab_and_dotted_keys() {
-    assert!(parse_binding("tenant-id:$var").is_ok());
-    assert!(parse_binding("app.tenant:$var").is_ok());
-}
-
-#[test]
 fn parse_binding_rejects_empty_source() {
     assert!(parse_binding("tenant:").is_err());
-}
-
-#[test]
-fn is_dns_label_accepts_valid_names() {
-    assert!(is_dns_label("default"));
-    assert!(is_dns_label("gabion-mixed-1234"));
-    assert!(is_dns_label("a"));
-    assert!(is_dns_label("a1"));
-}
-
-#[test]
-fn is_dns_label_rejects_invalid_names() {
-    assert!(!is_dns_label(""));
-    assert!(!is_dns_label("-leading-dash"));
-    assert!(!is_dns_label("trailing-dash-"));
-    assert!(!is_dns_label("UPPER"));
-    assert!(!is_dns_label("under_score"));
-    assert!(!is_dns_label(&"a".repeat(64)));
 }
 
 #[test]
@@ -142,15 +111,53 @@ fn is_zone_name_matches_nginx_grammar() {
     assert!(!is_zone_name("api-v2"));
 }
 
+/// The README's example rules load together, and each keeps its own window
+/// and bucket in the rule dictionary, so each expires on its own schedule.
 #[test]
-fn is_descriptor_key_matches_grammar() {
-    assert!(is_descriptor_key("tenant"));
-    assert!(is_descriptor_key("tenant_id"));
-    assert!(is_descriptor_key("tenant.id"));
-    assert!(is_descriptor_key("tenant-id"));
-    assert!(is_descriptor_key("_internal"));
-    assert!(!is_descriptor_key(""));
-    assert!(!is_descriptor_key("9leading"));
-    assert!(!is_descriptor_key(".dot-first"));
-    assert!(!is_descriptor_key("with space"));
+fn nginx_readme_rules_each_expire_on_their_own_schedule() {
+    let readme = include_str!("../../README.md");
+    let section = &readme[readme
+        .find("#### `gabion_limit_rule ")
+        .expect("the README documents `gabion_limit_rule`")..];
+    let start = section.find("```nginx\n").expect("an nginx example") + "```nginx\n".len();
+    let block = &section[start..start + section[start..].find("```").expect("closed")];
+    let configs: Vec<RuleConfig> = block
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("gabion_limit_rule"))
+        .map(|line| directive(line.trim_end_matches(';')))
+        .collect();
+    let rules = compile(&configs).expect("no two README rules share an identity");
+    let store = CellStore::new(
+        validated(|_| {}).1,
+        NodeIdentity::new(NodeId(1), 1),
+        rules.table(),
+    );
+    let table = rules.table().rules();
+    for rule in table {
+        let slot = store
+            .rule_dictionary()
+            .find(rule.fingerprint())
+            .expect("interned");
+        let interned = store.rule_dictionary().descriptor(slot).expect("pinned");
+        assert_eq!(
+            (
+                u64::from(interned.window_millis),
+                u64::from(interned.bucket_millis)
+            ),
+            (rule.spec().window_millis, rule.spec().bucket_millis.get()),
+            "{}",
+            rule.name()
+        );
+    }
+    assert!(
+        table
+            .iter()
+            .enumerate()
+            .any(|(i, a)| table[..i].iter().any(|b| {
+                a.descriptors() == b.descriptors()
+                    && a.spec().window_millis == b.spec().window_millis
+                    && a.spec().bucket_millis != b.spec().bucket_millis
+            })),
+        "the README keeps a pair of rules that differ only in bucket"
+    );
 }

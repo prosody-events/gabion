@@ -1,0 +1,12 @@
+__pycache__/
+tests/shots-test/
+# The generated data, a release asset that `make study-data` fetches
+# (README, "Data").
+.data-*
+data/posterior.json
+data/self_posterior.json
+data/runs.json
+data/seed_metrics.json
+data/judge/
+data/stage4-plumtree/
+data/audit/

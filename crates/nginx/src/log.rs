@@ -20,10 +20,10 @@
 //! request that exercises the gabion module logs lines such as:
 //!
 //! ```text
-//! 2026/05/21 12:34:56 [info]  1#1: gabion_nginx::module: gabion: zone ready zone=requests bytes=1048576 reused=false
-//! 2026/05/21 12:34:57 [info] 12#0: gabion_nginx::module: gabion: leader thread spawned worker_id=12
-//! 2026/05/21 12:34:58 [warn] 12#0: gabion_nginx::leader: peer discovery error error=connection refused
-//! 2026/05/21 12:35:00 [info] 13#0: gabion::gossip::runtime: peer accepted addr=10.0.0.5:7234
+//! 2026/05/21 12:34:56 [info]  1#1: gabion_nginx::module: gabion: limit zone ready code=limit_zone_ready limit_zone=api bytes=2097152 slots=16384 queue=8192 reused=false
+//! 2026/05/21 12:34:57 [info] 12#0: gabion_nginx::module: gabion: leader thread spawned code=leader_thread_spawned worker_id=12
+//! 2026/05/21 12:34:58 [warn] 12#0: gabion::discovery: Peer discovery hit an error and skipped an update; gabion will keep retrying. If this keeps happening, check API access (Kubernetes RBAC for Services and EndpointSlices) and the discovery settings (`discovery.*` in gabiond, `gabion_discovery_*` in NGINX). code=discovery_error error=connection refused errors_total=1
+//! 2026/05/21 12:35:00 [info] 12#0: gabion::gossip::runtime: Peer joined the cluster. code=peer_joined peer=10.0.0.5:9000 cluster_size=1
 //! ```
 //!
 //! nginx prepends the timestamp, `[level]`, and `pid#tid:`. Our subscriber

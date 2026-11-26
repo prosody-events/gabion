@@ -1,0 +1,9 @@
+{
+  "id": "idle",
+  "description": "Idle cluster: 80 pods, ~1 req/s from 3 sites every 3.2 s; measures the protocol's floor cost.",
+  "duration_s": 80,
+  "warmup_s": 20,
+  "nodes": 80,
+  "rule": { "limit": 100, "window_ms": 10000, "bucket_ms": 1000 },
+  "traffic": { "site_rate_rps": 1, "site_period_ms": 3200, "site_jitter": 0.5 }
+}

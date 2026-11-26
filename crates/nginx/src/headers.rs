@@ -75,50 +75,6 @@ impl Default for HeaderBuffer {
     }
 }
 
-/// Response body buffer for the 429 rejection text. Bounded at compile time
-/// and only constructed on the reject path.
-#[derive(Clone, Copy)]
-pub struct RejectBody {
-    bytes: [u8; 128],
-    len: u8,
-}
-
-impl RejectBody {
-    pub fn new() -> Self {
-        Self {
-            bytes: [0; 128],
-            len: 0,
-        }
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.len as usize]
-    }
-
-    pub fn as_str(&self) -> &str {
-        std::str::from_utf8(self.as_bytes()).unwrap_or("rate limit exceeded\n")
-    }
-
-    pub fn build(info: RejectInfo) -> Self {
-        let mut body = Self::new();
-        let mut tmp = StackWriter::new(&mut body.bytes);
-        let over = info.total.saturating_add(1).saturating_sub(info.spec.limit);
-        let _ = writeln!(
-            &mut tmp,
-            "rate limit exceeded: rule={} limit={} over_by={}",
-            info.spec.id, info.spec.limit, over
-        );
-        body.len = tmp.len.min(body.bytes.len()) as u8;
-        body
-    }
-}
-
-impl Default for RejectBody {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl AdmissionHeaders {
     /// Build the `X-RateLimit-*` triplet for an allowed response.
     ///

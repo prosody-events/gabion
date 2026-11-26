@@ -1,0 +1,186 @@
+<script lang="ts">
+  import { fmtCount, fmtDuration, noun, zoneLabel } from '../format';
+  import { ANSWER, type Inspected, type NodeState, type ZoneMode, type ZoneView } from '../sim/types';
+  import InfoTip from './InfoTip.svelte';
+  import RoleGlyph from './RoleGlyph.svelte';
+
+  // Who the selected node sends its changes to, and how that is going: its own
+  // zone, the peers in it, one row per remote zone naming the gateway the node's
+  // runtime chose, the counters of its failovers and resends, and the error
+  // budget. Every figure is the runtime's own (the admin snapshot the engine
+  // reads); the page chooses nothing.
+  let {
+    node,
+    inspected,
+    zones,
+    zoneMode,
+    onPreview,
+    onMessages,
+  }: {
+    node: NodeState;
+    /** The node's error budget and peer table, as the snapshot inspecting it
+     *  reports them. */
+    inspected: Inspected;
+    zones: ZoneView[];
+    zoneMode: ZoneMode;
+    /** A node the route sentence names, previewed on the stage. */
+    onPreview: (node: number | null) => void;
+    /** Show the Messages view, scoped to this node. */
+    onMessages: () => void;
+  } = $props();
+
+  const own = $derived(zones[node.zone]);
+  // A peer whose zone is still unknown counts among the zone's: it is sent
+  // directly until it answers.
+  const zonePeers = $derived(inspected.peers.filter((p) => p.role === 'zone' || p.role === 'unheard').length);
+  const unheard = $derived(inspected.peers.filter((p) => p.role === 'unheard').length);
+  // One row per remote zone that has members, in zone order.
+  const remote = $derived(
+    zones.flatMap((zone, z) =>
+      z !== node.zone && zone.live > 0
+        ? [{ z, name: zoneLabel(zone.name), gateway: inspected.peers.find((p) => p.role === 'gateway' && p.zone === z) }]
+        : [],
+    ),
+  );
+</script>
+
+{#if zoneMode === 'Configured'}
+  <p class="route">
+    node <span data-field="node">{node.id}</span> sends to its own zone directly{#each remote as { z, name, gateway }, i (z)}{i ===
+      remote.length - 1
+        ? ', and'
+        : ','} to {name}
+      {#if gateway?.id === undefined}with no gateway yet{:else}through <span
+          class="named"
+          role="note"
+          onpointerenter={() => onPreview(gateway.id ?? null)}
+          onpointerleave={() => onPreview(null)}>node <span data-field="node">{gateway.id}</span></span
+        >{/if}{/each}.
+  </p>
+{:else}
+  <p class="route">node <span data-field="node">{node.id}</span> knows no zone, so it sends to every peer directly.</p>
+{/if}
+
+<table class="targets">
+  <tbody>
+    <tr class="own-zone">
+      <th scope="row">Own zone</th>
+      <td>
+        {#if zoneMode === 'Unset'}
+          no zone set: this node sends every change to every peer directly
+        {:else}
+          {zoneLabel(own.name)} · <span data-field="members">{fmtCount(own.live)}</span>
+          {noun(own.live, 'node')}
+        {/if}
+      </td>
+    </tr>
+    <tr class="zone-peers">
+      <th scope="row">Zone peers</th>
+      <td>
+        <span data-field="count">{fmtCount(zonePeers)}</span>
+        {#if unheard > 0}
+          · <span data-field="unheard">{fmtCount(unheard)}</span> zone not heard yet (sent directly)
+        {/if}
+      </td>
+    </tr>
+    {#if zoneMode === 'Configured'}
+      {#each remote as { z, name, gateway } (z)}
+        <tr class="remote" data-zone={z}>
+          <th scope="row">{name}</th>
+          {#if gateway === undefined}
+            <td>no gateway yet</td>
+          {:else}
+            <td>
+              <RoleGlyph kind={ANSWER[gateway.answer].suspect ? 'suspect' : 'port'} />
+              gateway node <span data-field="gateway">{gateway.id ?? '—'}</span> ·
+              <span data-field="unacked">{fmtCount(gateway.own_unacked)}</span>
+              {noun(gateway.own_unacked, 'change')} not yet acknowledged ·
+              {#if gateway.unanswered_ms !== undefined}
+                waiting <span data-field="waiting">{fmtDuration(gateway.unanswered_ms)}</span>
+              {:else}
+                answered
+              {/if}
+              · {ANSWER[gateway.answer].label}
+            </td>
+          {/if}
+        </tr>
+      {/each}
+    {/if}
+    <tr class="counters">
+      <th scope="row">Counters</th>
+      <td>
+        <span data-field="gap-reports">{fmtCount(node.gap_reports_sent)}</span>
+        <InfoTip text="Gap reports sent counts flags: a message reporting gaps in both streams counts twice."
+          >gap {noun(node.gap_reports_sent, 'report')} sent</InfoTip
+        > ·
+        <span data-field="repeats">{fmtCount(node.rto_rewinds_own + node.rto_rewinds_relay)}</span>
+        <InfoTip
+          text={`Counts each time this node went back to repeat what a peer had not acknowledged: after waiting too long, or after an answer showed packets still owed. It counts going back, not the messages repeated; repeats after a gap report are not in it.`}
+          >{node.rto_rewinds_own + node.rto_rewinds_relay === 1 ? 'time' : 'times'} it repeated</InfoTip
+        > ·
+        <span data-field="gaps-abandoned">{fmtCount(node.gaps_abandoned)}</span>
+        <InfoTip text="After four gap reports a node stops asking.">{noun(node.gaps_abandoned, 'gap')} given up</InfoTip> ·
+        <span data-field="failovers">{fmtCount(node.gateway_failovers)}</span> gateway
+        {noun(node.gateway_failovers, 'change')} ·
+        <span data-field="sweeps">{fmtCount(node.sweeps_served)}</span>
+        {noun(node.sweeps_served, 'sweep')} served ·
+        <button class="btn-tertiary messages-link" onclick={onMessages}
+          >See node <span data-field="node">{node.id}</span>'s messages</button
+        >
+      </td>
+    </tr>
+    <tr class="budget">
+      <th scope="row">
+        <InfoTip text="How many unsent local hits per rule this node may hold before it sends early, instead of waiting for the next heartbeat.">
+          Error budget
+        </InfoTip>
+      </th>
+      <td>
+        {#if inspected.error_budget > 0}
+          ε <span data-field="error-budget">{fmtCount(inspected.error_budget)}</span> hits per rule before an eager flush
+        {:else}
+          ε set on this node's first request
+        {/if}
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+<style>
+  .route {
+    margin: 0 0 var(--gap-sm);
+    font-size: var(--font-size-caption);
+  }
+
+  .route :global([data-field]) {
+    font-weight: 600;
+  }
+
+  .named {
+    cursor: default;
+  }
+
+  .targets {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--font-size-caption);
+  }
+
+  th,
+  td {
+    padding: var(--gap-xs) var(--gap-sm) var(--gap-xs) 0;
+    border-bottom: 1px solid var(--color-border-line);
+    text-align: left;
+    vertical-align: baseline;
+  }
+
+  th {
+    width: 6.5rem;
+    font-weight: 600;
+    color: var(--color-fg-muted);
+  }
+
+  .messages-link {
+    min-height: 24px;
+  }
+</style>

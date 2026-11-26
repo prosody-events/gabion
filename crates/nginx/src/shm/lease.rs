@@ -135,6 +135,32 @@ impl LeaderLease {
         }
     }
 
+    /// Extend `worker_id`'s lease through `now_millis + ttl_millis`. Unlike
+    /// [`Self::try_acquire`] it never takes the lease over, so a leader that
+    /// lost it, even to a worker that has since released it, ends its term.
+    pub fn renew(&self, worker_id: u32, now_millis: u64, ttl_millis: u64) -> bool {
+        let owner_id = truncate_owner(worker_id);
+        let expires = now_millis
+            .min(EXPIRES_MASK)
+            .saturating_add(ttl_millis)
+            .min(EXPIRES_MASK);
+        // A compare-exchange loop rather than `fetch_update`, which std
+        // deprecates in favor of `try_update`, which loom lacks.
+        let mut state = self.state.load(Ordering::Acquire);
+        while unpack(state).0 == owner_id {
+            match self.state.compare_exchange(
+                state,
+                pack(owner_id, expires),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => state = current,
+            }
+        }
+        false
+    }
+
     pub fn release(&self, worker_id: u32) -> bool {
         let owner_id = truncate_owner(worker_id);
         loop {

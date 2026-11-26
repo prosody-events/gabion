@@ -7,3 +7,4 @@ src/wasm/
 test-results/
 playwright-report/
 screenshots/
+audit-shots/

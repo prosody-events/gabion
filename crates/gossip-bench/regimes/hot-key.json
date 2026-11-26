@@ -1,0 +1,80 @@
+{
+  "id": "hot-key",
+  "description": "prod-peak background plus 20 hot keys, each offered 5x its limit (50 req/s against 100 per 10 s) from every node for the whole run; the 60 s after warm-up measure over-admission and under-count at a binding limit.",
+  "duration_s": 80,
+  "warmup_s": 20,
+  "nodes": 183,
+  "rule": {
+    "limit": 100,
+    "window_ms": 10000,
+    "bucket_ms": 1000
+  },
+  "traffic": {
+    "site_rate_rps": 1800,
+    "site_period_ms": 3200,
+    "site_jitter": 0.5,
+    "hot_keys": [
+      {
+        "limit_multiple": 5.0
+      },
+      {
+        "limit_multiple": 5.0
+      },
+      {
+        "limit_multiple": 5.0
+      },
+      {
+        "limit_multiple": 5.0
+      },
+      {
+        "limit_multiple": 5.0
+      },
+      {
+        "limit_multiple": 5.0
+      },
+      {
+        "limit_multiple": 5.0
+      },
+      {
+        "limit_multiple": 5.0
+      },
+      {
+        "limit_multiple": 5.0
+      },
+      {
+        "limit_multiple": 5.0
+      },
+      {
+        "limit_multiple": 5.0
+      },
+      {
+        "limit_multiple": 5.0
+      },
+      {
+        "limit_multiple": 5.0
+      },
+      {
+        "limit_multiple": 5.0
+      },
+      {
+        "limit_multiple": 5.0
+      },
+      {
+        "limit_multiple": 5.0
+      },
+      {
+        "limit_multiple": 5.0
+      },
+      {
+        "limit_multiple": 5.0
+      },
+      {
+        "limit_multiple": 5.0
+      },
+      {
+        "limit_multiple": 5.0
+      }
+    ],
+    "bursts": []
+  }
+}

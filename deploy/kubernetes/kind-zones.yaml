@@ -1,0 +1,20 @@
+# A kind cluster of three zones for `make kubernetes-zones-test`: one control
+# plane and one worker in each of `kind-a`, `kind-b` and `kind-c`. The
+# EndpointSlice controller copies each worker's zone label into the entries
+# of the pods it runs, where gabion reads its zone.
+#
+#   kind create cluster --name gabion-zones --config deploy/kubernetes/kind-zones.yaml \
+#     --kubeconfig /tmp/gabion-zones.kubeconfig
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+    labels:
+      topology.kubernetes.io/zone: kind-a
+  - role: worker
+    labels:
+      topology.kubernetes.io/zone: kind-b
+  - role: worker
+    labels:
+      topology.kubernetes.io/zone: kind-c

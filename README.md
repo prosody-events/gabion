@@ -35,7 +35,33 @@ ingress (HTTP through nginx, gRPC through `gabiond`) while gossiping
 with every other process about what it has just admitted. The same
 library sits underneath both adapters, so an nginx worker and a
 `gabiond` replica are interchangeable peers as long as they share a
-cluster id.
+cluster id, and they count a rule together when it is written the same way
+in both
+([how](crates/gabion/README.md#writing-the-same-rule-for-nginx-and-gabiond)).
+
+## Rate limiting in two minutes
+
+A **limit** is a number of requests per span of time for one key, such as
+"100 requests a second per client IP" or "1,000 a minute per tenant". gabion
+writes it as a *rate* (`100r/s`), enforced over a *window* (the rate's own
+period unless you widen it), counted in *buckets* inside the window: one
+bucket per window for a fixed window, several for a sliding one. A request
+whose key has already used the limit in the current window is rejected
+(`429` from NGINX, `OVER_LIMIT` to Envoy).
+
+**Why one node's count is not enough.** A deployment of N replicas, each
+counting only the requests it sees, admits up to N times the limit: each
+replica lets its own share through. gabion makes every replica count every
+replica's requests, so a key gets its limit once across the cluster.
+
+**What it costs.** Each replica decides alone, from its local copy of the
+cluster's counts, so a decision never waits on the network. The copies are
+*eventually consistent*: a hit admitted on one replica reaches every other
+replica's count a moment later, in 337 ms at the 99th percentile on an
+80-pod cluster in the study. A burst that arrives everywhere at once can
+therefore overshoot a limit by what lands in that moment; measured, the
+cluster admitted about 1 % more than the limit on the keys that reached it
+([what we measured](crates/gabion/README.md#what-we-measured)).
 
 ## Try the simulator in your browser
 
@@ -62,12 +88,18 @@ curve the protocol produces.
 
 ## Contents
 
+- [Rate limiting in two minutes](#rate-limiting-in-two-minutes)
 - [When to use gabion](#when-to-use-gabion)
+- [Quickstart](#quickstart)
 - [How it works](#how-it-works)
 - [Choose your adapter](#choose-your-adapter)
 - [Glossary](#glossary)
 - [Running across a cluster](#running-across-a-cluster)
+  - [Kubernetes checklist](#kubernetes-checklist)
+  - [Running outside Kubernetes](#running-outside-kubernetes)
 - [Fail-open invariant](#fail-open-invariant)
+- [When something is wrong](#when-something-is-wrong)
+- [Versioning](#versioning)
 - [Repository layout](#repository-layout)
 - [Further reading](#further-reading)
 - [Contributing](#contributing)
@@ -95,15 +127,28 @@ Gabion is a young project, and the Envoy adapter in particular is
 still considered experimental at this stage; both its gRPC surface
 and its YAML schema may shift before they settle.
 
+## Quickstart
+
+- **NGINX.** Load the module (or run the published image, which loads it
+  for you) and follow [Your first rule](crates/nginx/README.md#your-first-rule):
+  a limit zone, one `gabion_limit_rule` and one `gabion_limit`.
+- **Envoy.** Run `gabiond` with the configuration in
+  [Your first YAML](crates/server/README.md#your-first-yaml) and point
+  Envoy's rate-limit filter at it.
+- **Kubernetes.** Apply the manifests in
+  [`deploy/kubernetes/`](deploy/kubernetes/README.md): one adapter's
+  Deployment and Service, the discovery RBAC and the NetworkPolicy. The pods
+  find each other and their zones with no further configuration.
+
 ## How it works
 
 Admission sits on every request's hot path, so the work it does has
 to be both cheap and bounded. Each cluster member matches the request
 against its rule table and then, for each matched rule, reads the
 cluster-wide aggregate for that rule's live buckets — through atomic
-loads against a shared-memory zone in the case of nginx, or through
-`DashMap` reads in the case of `gabiond`, in either case one read per
-live bucket. The decision is taken without issuing any system calls
+loads against one aggregate table, which nginx keeps in a shared-memory
+limit zone and `gabiond` on its heap, in either case one probe per live
+bucket. The decision is taken without issuing any system calls
 or allocating on the heap. If the aggregate plus the hits attributed
 to the current request would cross the rule's configured limit the
 request is rejected; otherwise it is allowed through and the hit is
@@ -111,30 +156,24 @@ recorded into a local queue.
 
 Everything else happens asynchronously, driven by those recorded hits.
 A background gossip task on each member folds them into a CRDT,
-exchanges dirty rows with peers over UDP roughly every 500 ms, applies
-inbound deltas back into the local aggregate, and expires bucket rows
-as time advances. The wire codec is self-describing and tolerant of
-loss, so a dropped UDP frame costs the cluster one tick of staleness
-rather than a missed update.
+sends its changed counts over UDP at each 500 ms heartbeat or sooner,
+directly to the peers of its zone and to one gateway per remote zone that
+relays them, resends what a peer has not acknowledged, applies inbound
+deltas back into the local aggregate, and expires bucket rows as time
+advances. Each packet decodes on its own, so a dropped UDP packet costs
+the cluster at most one heartbeat of staleness rather than a missed
+update.
 
-Two adaptive aspects of the gossip protocol are worth naming together,
-because operators who only learn one half tend to misjudge how the
-cluster behaves under load:
+The gossip cadence adapts to per-rule pressure (the **adaptive emit
+rate**): a hot rule can fire a threshold round between heartbeats so that
+each rule's contribution to cluster-wide unreplicated error stays inside a
+per-rule error budget, while a cold rule simply rides the heartbeat.
 
-- **Coverage fanout** — the per-tick peer count is sized to the
-  coverage threshold `⌈ln(n)+c⌉` (`n` = peer count), the fanout that
-  reliably reaches every node. It scales with cluster size, not the
-  dirty set; a burst rides one fat frame instead of widening the pick.
-- **Adaptive emit rate** — the gossip cadence itself adapts to
-  per-rule pressure. A hot rule can fire a synthetic tick between
-  heartbeats so that each rule's contribution to cluster-wide
-  unreplicated error stays inside a per-rule error budget, while a
-  cold rule simply rides the heartbeat.
-
-The full protocol, including the dirty rings, the peer frontier, the
-math behind the budget, and the operator knobs that control them, is
-documented in
-[`crates/gabion/README.md`](crates/gabion/README.md#how-gossip-works).
+The full protocol, including the two tiers, the streams and acks, failure
+detection, the math behind the budget and the wire format, is documented in
+[`crates/gabion/GOSSIP.md`](crates/gabion/GOSSIP.md); the operator knobs that
+control it are in
+[`crates/gabion/README.md`](crates/gabion/README.md#operator-knobs).
 The CRDT data structures themselves are described in
 [`crates/gabion/CRDT.md`](crates/gabion/CRDT.md).
 
@@ -172,7 +211,8 @@ or a YAML field — and the precise syntax is documented in
 | Term            | Definition                                                                                                                                |
 |-----------------|-------------------------------------------------------------------------------------------------------------------------------------------|
 | **rule**        | One rate-limit policy (e.g. `per_ip`, `per_tenant`).                                                                                      |
-| **zone**        | The shared-memory area where counters live (nginx only).                                                                                  |
+| **zone**        | An availability zone, from `gossip.zone` or the node's own Kubernetes EndpointSlice entry.                                                |
+| **limit zone**  | The shared-memory area where counters live (nginx only, `gabion_limit_zone`).                                                             |
 | **descriptor**  | A `key=value` pair like `tenant=acme` that names what the rule is counting.                                                               |
 | **binding**     | The recipe for building a descriptor from request data — e.g. `tenant:$arg_tenant` (nginx) or an Envoy descriptor action (`gabiond`).     |
 | **predicate**   | An `except_if=$var` condition that exempts a request from a rule when the variable is truthy (nginx only).                                |
@@ -182,6 +222,11 @@ or a YAML field — and the precise syntax is documented in
 | **cardinality** | How many distinct counters a rule can hold; bounded to keep memory steady when descriptor keys are unbounded user input.                  |
 | **fail-open**   | Gabion never rejects on its own internal errors; only on a measured limit overflow. See [Fail-open invariant](#fail-open-invariant).      |
 | **gossip**      | The UDP background exchange that keeps counters in sync across nodes.                                                                     |
+| **origin**      | The node that admitted a hit; every count is kept per origin and summed across origins.                                                   |
+| **cell**        | One counter: one rule's key, in one bucket, from one origin.                                                                              |
+| **tick**        | The heartbeat, every `gossip.tick_interval` (500 ms by default): a node sends what it has not yet sent, even when nothing pushes it sooner. |
+| **gateway**     | The one node of another zone that a node sends its changes to, for relaying into that zone.                                               |
+| **relay**       | What a gateway does with those changes: it passes them to the other nodes of its own zone.                                                |
 | **cluster**     | The set of gabion processes (nginx workers and/or `gabiond` replicas) that share counters via gossip.                                     |
 
 ## Running across a cluster
@@ -197,34 +242,94 @@ regardless of which adapter they are running:
    both to send and to receive.
 
 2. **Pick a cluster id.** Every gabion process that should share
-   counters declares the same non-zero u128. Frames from peers with a
-   mismatched cluster id are dropped on the floor, which provides a
-   cheap firewall against accidental cross-cluster contamination —
-   most obviously, the case where staging traffic bleeds into a
-   production counter store.
+   counters declares the same non-zero u128, and a node drops gossip
+   carrying any other id, so two clusters on one network stay apart.
+   The id is a label, not a secret, and gossip packets carry no
+   authentication: isolate the gossip port with a Kubernetes NetworkPolicy
+   (or a security group outside Kubernetes) that admits UDP only from
+   gabion pods.
+   [`deploy/kubernetes/gabion-networkpolicy.yaml`](deploy/kubernetes/gabion-networkpolicy.yaml)
+   is one.
 
-3. **Run on Kubernetes.** Peer discovery is built around Kubernetes
-   EndpointSlices, and at present this is the only implementation the
-   library ships. A member is configured with the namespaces and
-   Service names it should watch, and from there it picks peer pods
-   up and lets them go as the corresponding EndpointSlice changes;
-   there is no static peer list in the configuration, and no restart
-   is needed when the topology shifts. The `PeerDiscovery` trait is a
-   single-method extension point, so an operator who wanted to run
-   gabion against a different control plane could plug their own
-   implementation in, but nobody has done so in tree. In practice,
-   gabion is a Kubernetes workload.
+3. **Find the peers and the zone.** On Kubernetes (see the
+   [Kubernetes checklist](#kubernetes-checklist)) a member watches the
+   EndpointSlices of the namespaces and Services it is configured with,
+   picks peer pods up and lets them go as those slices change, with no
+   restart when the topology shifts. It also finds its own entry there by
+   pod name and reads its zone from it, so zones need no configuration.
+   Outside Kubernetes, list the peers in `gossip.bootstrap_peers` (one
+   list may name every node, the node itself included) and set each
+   node's `gossip.zone`; static peers are never removed. See
+   [Zones](crates/gabion/README.md#zones), which also gives commands that
+   read the zone from cloud metadata.
 
-The directive names differ between adapters (`gabion_gossip_*` for
-nginx, the `gossip:` and `discovery:` blocks in `gabiond` YAML), but
+The directive names differ between adapters (`gabion_gossip_*` and
+`gabion_discovery_*` for nginx, the `gossip:` and `discovery:` blocks in
+`gabiond` YAML), but
 the shape is identical. The precise syntax for each is documented in
 [`crates/nginx/README.md#running-across-a-cluster`](crates/nginx/README.md#running-across-a-cluster)
 and
 [`crates/server/README.md#running-across-a-cluster`](crates/server/README.md#running-across-a-cluster).
 
-Tuning the gossip cadence is rarely necessary, since the defaults
-converge in well under a second at production scale. The
-operator-knob reference and measured convergence curves are in
+### Kubernetes checklist
+
+Discovery finds peers through three Kubernetes objects. If one is missing,
+the pod logs the code in parentheses and finds no peers; each code has an
+entry in [`crates/gabion/TROUBLESHOOTING.md`](crates/gabion/TROUBLESHOOTING.md).
+
+- **A Service with a UDP port named `gabion`** whose `port` is the gossip bind
+  port, in a namespace discovery watches. Without it discovery logs
+  `no_gabion_service`.
+
+  ```yaml
+  ports:
+    - name: gabion
+      protocol: UDP
+      port: 9000
+  ```
+
+- **A Role** that lets the pods read what discovery watches, in every
+  namespace discovery watches. Without it discovery logs `kubernetes_forbidden`
+  and stops.
+
+  ```yaml
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: Role
+  metadata:
+    name: gabion-endpointslice-reader
+  rules:
+    - apiGroups: [""]
+      resources: ["services"]
+      verbs: ["get", "list", "watch"]
+    - apiGroups: ["discovery.k8s.io"]
+      resources: ["endpointslices"]
+      verbs: ["get", "list", "watch"]
+  ```
+
+- **A RoleBinding** from that Role to the pods' ServiceAccount, in the same
+  namespace. A complete set, with the ServiceAccount, is in
+  [`deploy/kubernetes/gabion-discovery-rbac.yaml`](deploy/kubernetes/gabion-discovery-rbac.yaml).
+
+- **A `topology.kubernetes.io/zone` label on every node.** Kubernetes copies
+  it into each pod's EndpointSlice entry, where gabion reads its zone. EKS,
+  GKE and AKS set it; on a self-managed cluster run
+  `kubectl label node <node> topology.kubernetes.io/zone=<zone>`. Without it
+  the pod logs `zone_unknown` and runs as one zone: counts stay correct, but
+  cross-zone traffic is not reduced.
+
+### Running outside Kubernetes
+
+List every node's gossip address in `gossip.bootstrap_peers` (NGINX: one
+`gabion_gossip_bootstrap_peers` per peer) and give each node its zone with
+`gossip.zone`; the list may name the node itself, and its peers are never
+removed. [Outside Kubernetes](crates/gabion/README.md#outside-kubernetes)
+gives the settings in both adapters and commands that read the zone from
+cloud metadata.
+
+The defaults need no tuning at production sizes: in the study, a hit
+reached every pod in 337 ms at the 99th percentile on 80 pods and 301 ms on
+183 ([what we measured](crates/gabion/README.md#what-we-measured)). The
+operator-knob reference is in
 [`crates/gabion/README.md`](crates/gabion/README.md#operator-knobs).
 
 ## Fail-open invariant
@@ -262,6 +367,33 @@ under-counting as it happens; the `/snapshot` admin endpoint on
 adapter's README lists the specific log lines and the runbook entries
 they map to.
 
+## When something is wrong
+
+Every log line gabion writes for an operator carries a `code` field; find its
+entry by that code. The library's codes are in
+[`crates/gabion/TROUBLESHOOTING.md`](crates/gabion/TROUBLESHOOTING.md), each
+adapter's own in its README.
+
+| Symptom | Where to look |
+|---|---|
+| Requests over the limit are admitted | The fail-open warnings: [`cell_store_full`](crates/gabion/TROUBLESHOOTING.md#cell_store_full), [`aggregate_full`](crates/gabion/TROUBLESHOOTING.md#aggregate_full), [`queue_dropped`](crates/nginx/README.md#queue_dropped), [`request_queue_full`](crates/server/README.md#request_queue_full), [`matched_rule_overflow`](crates/server/README.md#matched_rule_overflow); then [`peer_version_mismatch`](crates/gabion/TROUBLESHOOTING.md#peer_version_mismatch) during an upgrade; then whether NGINX and `gabiond` write the rule [the same way](crates/gabion/README.md#writing-the-same-rule-for-nginx-and-gabiond). |
+| `nginx -t` fails | The line ends with ` code=NAME`: [Configuration errors](crates/nginx/README.md#configuration-errors-nginx--t). |
+| `gabiond` exits with status 1 | Its one error line: [`gabiond_exit`](crates/server/README.md#gabiond_exit), [`listener_failed`](crates/server/README.md#listener_failed), [`server_stopped`](crates/server/README.md#server_stopped) or [`gossip_stopped`](crates/server/README.md#gossip_stopped). |
+| No peers are found | [`no_gabion_service`](crates/gabion/TROUBLESHOOTING.md#no_gabion_service), [`kubernetes_forbidden`](crates/gabion/TROUBLESHOOTING.md#kubernetes_forbidden), [`kubernetes_unreachable`](crates/gabion/TROUBLESHOOTING.md#kubernetes_unreachable); the [Kubernetes checklist](#kubernetes-checklist). |
+| The zone is unknown or wrong | [`zone_unknown`](crates/gabion/TROUBLESHOOTING.md#zone_unknown), [`zone_conflict`](crates/gabion/TROUBLESHOOTING.md#zone_conflict). |
+| A warning says something is full | Its entry names the setting to raise: [`cell_store_full`](crates/gabion/TROUBLESHOOTING.md#cell_store_full), [`peer_table_full`](crates/gabion/TROUBLESHOOTING.md#peer_table_full), [`rule_dictionary_full`](crates/gabion/TROUBLESHOOTING.md#rule_dictionary_full), [`node_dictionary_full`](crates/gabion/TROUBLESHOOTING.md#node_dictionary_full). |
+| Gossip packets are rejected | [`decode_rejected`](crates/gabion/TROUBLESHOOTING.md#decode_rejected) (its `reason` field), [`peer_version_mismatch`](crates/gabion/TROUBLESHOOTING.md#peer_version_mismatch). |
+| Gateways keep switching | [`gateway_failover`](crates/gabion/TROUBLESHOOTING.md#gateway_failover), [`relay_stalled`](crates/gabion/TROUBLESHOOTING.md#relay_stalled). |
+
+## Versioning
+
+gabion is versioned 0.x under semantic versioning, released by
+release-please from the conventional commits on `main`; each release's notes
+are in [`CHANGELOG.md`](CHANGELOG.md). While the major version is 0, a minor
+release may change the gossip wire format or remove settings. Every node of a
+cluster, NGINX and `gabiond` alike, runs one release; roll a new one through
+quickly, as [Upgrading](crates/gabion/README.md#upgrading) describes.
+
 ## Repository layout
 
 The workspace lives under `crates/`:
@@ -273,7 +405,7 @@ The workspace lives under `crates/`:
 | [`gabion-nginx`](crates/nginx/README.md)           | The nginx dynamic module. Builds with `cargo build -p gabion-nginx --features ngx-module --release`. |
 | `gabion-loader`                                    | Load generator. Drives the gRPC service (or an HTTP endpoint sitting in front of nginx) with a configurable tenant / hit-rate mix. |
 | [`gabion-wasm`](crates/gabion-wasm/README.md)      | The visualizer's WebAssembly bridge. Stands up N gossip runtimes on the deterministic in-process router and exposes them over a command channel to the browser frontend that ships to the hosted simulator. |
-| [`gossip-bench`](crates/gossip-bench/README.md)    | Headless gossip propagation harness. Runs scenario JSON specs through the same deterministic sim transport and emits result JSON; a Python script turns the JSON into convergence plots. |
+| [`gossip-bench`](crates/gossip-bench/README.md)    | The study harness: a deterministic simulator of a gabion cluster under production-shaped load, scored against the true count, with the judge and regression gate that compare a change with the measured baselines. |
 
 Deployment manifests, the nginx docker-compose harness, Kubernetes
 smoke tests, and the cross-version nginx / OpenResty build matrices
@@ -282,12 +414,15 @@ live under [`deploy/`](deploy).
 ## Further reading
 
 - [Interactive gossip simulator](https://prosody-events.github.io/gabion/) — the gabion runtime in a browser, for stepping through convergence interactively.
-- [`crates/gabion/README.md`](crates/gabion/README.md) — the gossip protocol explainer, operator-knob reference, and benchmark results.
+- [`crates/gabion/README.md`](crates/gabion/README.md) — the library guide: operator knobs, sizing, zones, upgrading and what we measured.
+- [`crates/gabion/GOSSIP.md`](crates/gabion/GOSSIP.md) — the gossip protocol as built, and the wire format byte by byte.
 - [`crates/gabion/CRDT.md`](crates/gabion/CRDT.md) — design of the counter store, end to end.
+- [`crates/gabion/TROUBLESHOOTING.md`](crates/gabion/TROUBLESHOOTING.md) — what each library log message means and what to do about it.
 - [`crates/nginx/README.md`](crates/nginx/README.md) — operator guide for the nginx module.
 - [`crates/server/README.md`](crates/server/README.md) — operator guide for `gabiond` (experimental).
 - [`crates/gabion-wasm/README.md`](crates/gabion-wasm/README.md) — how the visualizer is wired to the gossip core.
-- [`crates/gossip-bench/README.md`](crates/gossip-bench/README.md) — how to re-run the benchmark suite locally.
+- [`crates/gossip-bench/README.md`](crates/gossip-bench/README.md) — running the study harness, its CI smoke and the regression gate.
+- [`deploy/kubernetes/README.md`](deploy/kubernetes/README.md) — the Kubernetes manifests, and the smokes that check them.
 - [`deploy/nginx/README.md`](deploy/nginx/README.md) — building the module against different nginx / OpenResty base images.
 
 ## Contributing
