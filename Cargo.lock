@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "gabion"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "ahash",
  "async-stream",
@@ -861,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "gabion-loader"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "envoy-types",
@@ -872,7 +872,7 @@ dependencies = [
 
 [[package]]
 name = "gabion-nginx"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "gabion-server"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -919,7 +919,7 @@ dependencies = [
 
 [[package]]
 name = "gabion-wasm"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "futures",
  "gabion",
@@ -1005,7 +1005,7 @@ dependencies = [
 
 [[package]]
 name = "gossip-bench"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "ahash",
  "anyhow",
